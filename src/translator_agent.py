@@ -39,9 +39,65 @@ from enum import Enum, IntEnum
 from pathlib import Path
 from typing import List, Dict, Optional, Any, Callable
 
-# 新增：配置加载器
-from src.config import get_config
-_config = get_config()
+# 配置加载器（支持单文件模式降级）
+try:
+    from src.config import get_config as _get_config_external
+    _config = _get_config_external()
+except ImportError:
+    # 单文件部署模式：src.config 不可用，使用内建默认配置
+    class _BuiltinConfig:
+        """单体聚合版内建默认配置（仅在 src.config 不可用时启用）"""
+        llm_backend = "mock"
+        task_routing = {
+            "reference_extraction": {"model": "reasoning_primary", "params_override": {}},
+            "literal_translation": {"model": "literal_translator", "params_override": {}},
+            "literary_rewrite": {"model": "reasoning_primary", "params_override": {}},
+            "critic_scoring": {"model": "reasoning_primary", "params_override": {}},
+            "judge_decision": {"model": "reasoning_heavy", "params_override": {}},
+        }
+        mlx_models = {
+            "literal_translator": {"model_id": "google/gemma-2-9b-it-mlx-4bit", "default_params": {}},
+            "reasoning_primary": {"model_id": "qwen/Qwen2.5-7B-Instruct-MLX-4bit", "default_params": {}},
+            "reasoning_heavy": {"model_id": "qwen/Qwen2.5-7B-Instruct-MLX-4bit", "default_params": {}},
+        }
+        openai_models = {
+            "literal_translator": {"model_name": "gpt-4o-mini", "default_params": {}},
+            "reasoning_primary": {"model_name": "gpt-4o-mini", "default_params": {}},
+            "reasoning_heavy": {"model_name": "gpt-4o", "default_params": {}},
+        }
+        mlx_memory = {"warning_threshold": 0.8, "auto_unload_on_pressure": True}
+        openai_api = {"api_base": "http://127.0.0.1:1234/v1", "api_key": "lm-studio",
+                      "max_retries": 3, "retry_delay": 2.0, "request_timeout": 300,
+                      "max_concurrent_requests": 4}
+        pipeline = {"batch_size": 50, "max_retries": 3, "max_concurrent_chunks": 4, "poll_interval": 0.5}
+        chunker = {"soft_limit": 1000, "hard_limit": 2500, "respect_scene_breaks": True}
+        decision_engine = {"terminology_triggers_backtrack": True,
+                           "reference_triggers_backtrack": True,
+                           "style_triggers_backtrack": True,
+                           "max_affected_chunks_per_decision": 50}
+        critic_thresholds = {"fluency": 7.0, "readability": 7.0, "style_compliance": 7.0,
+                            "voice_consistency": 7.0, "semantic_preservation": 7.0,
+                            "average_score_min": 7.5}
+        style_guide = {"avg_sentence_length": "较长且富有韵律",
+                       "lexicon_preference": "古典、史诗感、冷硬",
+                       "author_priority_ratio": 0.7}
+        paths = {"db_dir": "db", "input_dir": "input", "output_dir": "output",
+                 "docs_dir": "docs", "golden_test_file": "input/golden/hyperion_5k.md",
+                 "decision_db": "decision_db.sqlite", "workflow_db": "workflow.db"}
+        logging = {"level": "INFO", "log_llm_calls": False, "perf_log_interval": 10}
+
+        def resolve_task_model(self, task_name: str):
+            routing = self.task_routing.get(task_name, {})
+            model_key = routing.get("model", "reasoning_primary")
+            return model_key, routing.get("params_override", {})
+
+        def _get_model_config(self, model_key: str):
+            if self.llm_backend == "mlx":
+                return self.mlx_models.get(model_key, {})
+            return self.openai_models.get(model_key, {})
+
+    _config = _BuiltinConfig()
+    print("[WARN] 未找到 src.config，使用内建默认配置（单文件模式）", file=sys.stderr)
 
 # ────────────────────────────────────────────────────────────────────
 # Section 1 — 枚举与类型定义
@@ -90,9 +146,6 @@ class DecisionLevel(IntEnum):
 # ────────────────────────────────────────────────────────────────────
 # Section 2 — LLM 适配层
 # ────────────────────────────────────────────────────────────────────
-
-# 全局配置实例
-_config = get_config()
 
 
 class LLMAdapter(ABC):
@@ -880,10 +933,12 @@ Schema 如下：
         # 1. 调用 LLM (使用配置路由)
         prompt = self._build_prompt(text_chunk)
         model_key, params = _config.resolve_task_model("reference_extraction")
+        model_cfg = _config._get_model_config(model_key)
+        model_name = model_cfg.get("model_id") or model_cfg.get("model_name", "qwen/Qwen2.5-7B-Instruct-MLX-4bit")
 
         raw_output = self.llm.generate(
             prompt=prompt,
-            model_name=model_key,
+            model_name=model_name,
             **params
         )
 
@@ -1446,6 +1501,7 @@ class TranslationPipeline:
             self.scheduler.batch_update_state(success_ids, TaskState.JUDGING)
 
     def _process_judging_batch(self, tasks):
+        max_retries = _config.pipeline.get("max_retries", 3)
         for task in tasks:
             try:
                 chunk_id = task['chunk_id']
@@ -1459,7 +1515,7 @@ class TranslationPipeline:
                     self._save_intermediate(chunk_id, "final", judge_result.get("final_text", lit_text))
                     self.scheduler.update_task_state(chunk_id, TaskState.COMPLETED)
                     print(f"✅ [Pipeline] {chunk_id} 定稿完成。")
-                elif retries >= 3:
+                elif retries >= max_retries:
                     # 重试已达上限，直接转入终态
                     self.scheduler.update_task_state(chunk_id, TaskState.PERMANENTLY_FAILED, error_msg=judge_result.get("reject_reason"))
                     print(f"❌ [Pipeline] {chunk_id} 连续 {retries+1} 次未通过裁决，转入 PERMANENTLY_FAILED")
@@ -1783,10 +1839,6 @@ def init_project(chapter_id: str = "ch01", force: bool = False):
     db_dir = root_dir / "db"
     db_file = db_dir / "workflow.db"
     input_file = root_dir / "input" / f"{chapter_id}.md"
-
-    print(f"DEBUG: 项目根目录: {root_dir}")
-    print(f"DEBUG: 检查输入文件: {input_file} -> {'存在' if input_file.exists() else '不存在'}")
-    print(f"DEBUG: 目标数据库路径: {db_file}")
 
     if not input_file.exists():
         print(f"❌ 找不到文件: {input_file}")
@@ -2428,9 +2480,6 @@ def split_input_to_chapters(
     else:
         raise ValueError(f"不支持的格式: {input_format}")
 
-    # 切分并写入
-    if hasattr(splitter, 'book') or input_format == 'epub':
-        splitter.load() if input_format != 'epub' else splitter
     splitter.chapters = splitter.split()
     generated = splitter.write_files()
 
