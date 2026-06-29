@@ -1,0 +1,127 @@
+llm_backend: mock
+mlx:
+  models:
+    literal_translator:
+      model_id: google/gemma-2-9b-it-mlx-4bit
+      alias: gemma-2-9b-it (直译专用)
+      default_params:
+        max_tokens: 1024
+        temperature: 0.1
+        top_p: 0.9
+    reasoning_primary:
+      model_id: qwen/Qwen2.5-7B-Instruct-MLX-4bit
+      alias: qwen2.5-7b-instruct (推理主力)
+      default_params:
+        max_tokens: 2048
+        temperature: 0.3
+        top_p: 0.95
+    reasoning_heavy:
+      model_id: qwen/Qwen2.5-14B-Instruct-MLX-4bit
+      alias: qwen2.5-14b-instruct (重度推理)
+      default_params:
+        max_tokens: 3072
+        temperature: 0.2
+        top_p: 0.95
+  memory:
+    warning_threshold: 0.8
+    auto_unload_on_pressure: true
+    preload_models: []
+openai_api:
+  api_base: https://api.mistral.ai/v1
+  api_key: X20ARh1Hh4BjtYiqmPUjHtpbL4QUf2fc
+  max_retries: 3
+  retry_delay: 2.0
+  request_timeout: 300
+  models:
+    literal_translator:
+      model_name: mistral-small-latest
+      alias: mistral-small-latest (直译)
+      default_params:
+        max_tokens: 1024
+        temperature: 0.1
+        top_p: 0.9
+    reasoning_primary:
+      model_name: mistral-small-latest
+      alias: mistral-small-latest (推理主力)
+      default_params:
+        max_tokens: 2048
+        temperature: 0.3
+        top_p: 0.95
+    reasoning_heavy:
+      model_name: mistral-small-latest
+      alias: mistral-small-latest (重度推理)
+      default_params:
+        max_tokens: 3072
+        temperature: 0.2
+        top_p: 0.95
+  max_concurrent_requests: 4
+task_routing:
+  reference_extraction:
+    model: reasoning_primary
+    params_override:
+      temperature: 0.1
+      max_tokens: 1536
+  literal_translation:
+    model: literal_translator
+    params_override:
+      temperature: 0.1
+      max_tokens: 1024
+  literary_rewrite:
+    model: reasoning_primary
+    params_override:
+      temperature: 0.6
+      max_tokens: 2048
+      top_p: 0.95
+  critic_scoring:
+    model: reasoning_primary
+    params_override:
+      temperature: 0.2
+      max_tokens: 1024
+  judge_decision:
+    model: reasoning_heavy
+    params_override:
+      temperature: 0.3
+      max_tokens: 2048
+  golden_test:
+    reference_extraction: reasoning_primary
+    literal_translation: literal_translator
+    literary_rewrite: reasoning_primary
+    critic_scoring: reasoning_primary
+    judge_decision: reasoning_heavy
+pipeline:
+  batch_size: 10
+  max_retries: 3
+  max_concurrent_chunks: 4
+  poll_interval: 0.5
+chunker:
+  soft_limit: 1000
+  hard_limit: 2500
+  respect_scene_breaks: true
+decision_engine:
+  terminology_triggers_backtrack: true
+  reference_triggers_backtrack: true
+  style_triggers_backtrack: true
+  max_affected_chunks_per_decision: 50
+critic_thresholds:
+  fluency: 7.0
+  readability: 7.0
+  style_compliance: 7.0
+  voice_consistency: 7.0
+  semantic_preservation: 7.0
+  average_score_min: 7.5
+style_guide:
+  avg_sentence_length: 较长且富有韵律
+  lexicon_preference: 古典、史诗感、冷硬
+  author_priority_ratio: 0.7
+paths:
+  db_dir: db
+  input_dir: input
+  output_dir: output
+  docs_dir: docs
+  golden_test_file: input/golden/hyperion_5k.md
+  decision_db: decision_db.sqlite
+  workflow_db: workflow.db
+logging:
+  level: INFO
+  log_llm_calls: false
+  perf_log_interval: 10

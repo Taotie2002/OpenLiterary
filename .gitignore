@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 虚拟环境
+venv/
+env/
+.venv/
+
+# 工具内部状态
+.sisyphus/
+.opencode/
+
+# 数据库 (运行产物, 可从空 db 重建)
+db/*.db
+db/*.sqlite
+db/*.sqlite-journal
+db/*.db-wal
+db/*.db-shm
+
+# 输入输出产物
+input/ch*.md
+input/_chapters_summary.txt
+output/ch*/
+output/golden_test_report.json
+output/translated_full.md
+output/._.DS_Store
+output/.DS_Store
+
+# 系统文件
+.DS_Store
+._.DS_Store
+._*
+Thumbs.db
+
+# 日志
+*.log
