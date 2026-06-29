@@ -2,15 +2,7 @@ import json
 import re
 from typing import Dict, Any
 from utils.llm_adapter import get_llm_client
-
-# Critic 评分阈值配置
-CRITIC_THRESHOLDS = {
-    "fluency": 7.0,
-    "style_compliance": 7.0,
-    "voice_consistency": 7.0,
-    "semantic_preservation": 7.0,
-    "readability": 7.0,
-}
+from src.config import config
 
 class CriticAgent:
     def __init__(self):
@@ -59,11 +51,13 @@ Schema 要求：
         print(f"🧐 [Critic Agent] 正在对 {chunk_id} 进行多维度文学审计...")
         prompt = self._build_prompt(source_text, raw_trans, lit_trans, style_guide)
         
+        model_key, params = config.resolve_task_model("critic_scoring")
+        model_cfg = config._get_model_config(model_key)
+        model_name = model_cfg.get("model_id") or model_cfg.get("model_name", "qwen/Qwen2.5-7B-Instruct-MLX-4bit")
         raw_output = self.llm.generate(
             prompt=prompt,
-            model_name="qwen/Qwen2.5-7B-Instruct-MLX-4bit",
-            max_tokens=1024,
-            temperature=0.2
+            model_name=model_name,
+            **params
         )
         
         cleaned = re.sub(r'^```json\s*', '', raw_output, flags=re.IGNORECASE)
@@ -78,7 +72,7 @@ Schema 要求：
         scores = result.get("scores", {})
         is_flawed = result.get("is_flawed", False)
         if not is_flawed and scores:
-            for dim, threshold in CRITIC_THRESHOLDS.items():
+            for dim, threshold in config.critic_thresholds.items():
                 if dim in scores and scores[dim] < threshold:
                     is_flawed = True
                     result["critique"] = f"{result.get('critique', '')} [自动判定: {dim}={scores[dim]} < {threshold}]"

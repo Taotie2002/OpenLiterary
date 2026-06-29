@@ -23,6 +23,8 @@ db/*.sqlite
 db/*.sqlite-journal
 db/*.db-wal
 db/*.db-shm
+src/db/*.db
+src/db/*.sqlite
 
 # 输入输出产物
 input/ch*.md
@@ -41,3 +43,7 @@ Thumbs.db
 
 # 日志
 *.log
+
+# 备份/副本文件
+* (copy).*
+*_copy.*

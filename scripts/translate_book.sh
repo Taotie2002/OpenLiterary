@@ -25,6 +25,7 @@ FORCE_INIT=false
 DRY_RUN=false
 MAX_PARALLEL=1
 CLEAN_INTERMEDIATE=false
+CLEAN_ONLY=false
 SKIP_EPUB_CONVERT=false
 CHAPTERS_DIR="input"
 
@@ -46,6 +47,7 @@ log_err()  { echo -e "${RED}[ERR]${NC} $*" >&2; }
 usage() {
     cat <<EOF
 用法: $0 <input.epub> [output_dir] [选项]
+       $0 --clean-only                          # 独立清理模式，无需输入文件
 
 选项:
   -b, --backend BACKEND    LLM 后端: mlx | openai_api | mock (默认: mlx)
@@ -55,6 +57,7 @@ usage() {
   -j, --jobs N             并行章节数 (默认: 1，建议 ≤4)
   --skip-epub              跳过 EPUB 转换，直接用现有 input/ 下的 .md
   -c, --clean              完成后清理中间产物 (raw/literary/critic_report，保留 final.json 和 DB)
+  --clean-only             独立清理模式：清理 output/ 中间产物后退出，无需输入文件
   -h, --help               显示帮助
 
 环境变量 (优先级高于参数):
@@ -73,6 +76,9 @@ usage() {
 
   # 仅测试流程 (不消耗 token)
   $0 book.epub output --backend mock --dry-run
+
+  # 独立清理中间产物（无需输入文件）
+  $0 --clean-only
 EOF
 }
 
@@ -89,6 +95,7 @@ parse_args() {
             -j|--jobs) MAX_PARALLEL="$2"; shift 2 ;;
             --skip-epub) SKIP_EPUB_CONVERT=true; shift ;;
             -c|--clean) CLEAN_INTERMEDIATE=true; shift ;;
+            --clean-only) CLEAN_ONLY=true; shift ;;
             -h|--help) usage; exit 0 ;;
             -*) log_err "未知选项: $1"; usage; exit 1 ;;
             *)
@@ -106,7 +113,7 @@ parse_args() {
         esac
     done
 
-    if [[ -z "$EPUB_FILE" ]]; then
+    if [[ -z "$EPUB_FILE" && "$CLEAN_ONLY" != "true" ]]; then
         log_err "必须指定输入 EPUB 文件"
         usage
         exit 1
@@ -347,6 +354,13 @@ clean_intermediate() {
 # ===========================
 main() {
     parse_args "$@"
+
+    # --clean-only 独立模式：清理后立即退出
+    if [[ "$CLEAN_ONLY" == "true" ]]; then
+        cd "$PROJECT_ROOT"
+        clean_intermediate
+        exit 0
+    fi
 
     log_info "========================================"
     log_info "OpenLiterary 一键翻译"

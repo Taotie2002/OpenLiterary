@@ -3,6 +3,8 @@ import re
 from typing import Dict, Any, List
 from utils.llm_adapter import get_llm_client
 from core.decision_engine import DecisionEngine, DecisionLevel
+from src.config import config
+from src.config import config
 
 class JudgeAgent:
     def __init__(self, decision_engine: DecisionEngine):
@@ -36,11 +38,13 @@ class JudgeAgent:
         print(f"⚖️ [Judge Agent] 正在对 {chunk_id} 进行最终裁决...")
         prompt = self._build_prompt(source_text, lit_trans, critic_report)
         
+        model_key, params = config.resolve_task_model("judge_decision")
+        model_cfg = config._get_model_config(model_key)
+        model_name = model_cfg.get("model_id") or model_cfg.get("model_name", "qwen/Qwen2.5-7B-Instruct-MLX-4bit")
         raw_output = self.llm.generate(
             prompt=prompt,
-            model_name="qwen/Qwen2.5-7B-Instruct-MLX-4bit",
-            max_tokens=1500,
-            temperature=0.3
+            model_name=model_name,
+            **params
         )
         
         cleaned = re.sub(r'^```json\s*', '', raw_output, flags=re.IGNORECASE)
@@ -63,7 +67,8 @@ class JudgeAgent:
         # 额外检查：平均分过低也 REJECT
         if not is_flawed and scores:
             avg_score = sum(v for v in scores.values() if isinstance(v, (int, float))) / len(scores)
-            if avg_score < 7.5:
+            avg_min = config.critic_thresholds.get("average_score_min", 7.5)
+            if avg_score < avg_min:
                 result["decision"] = "REJECT"
                 result["reject_reason"] = f"平均分 {avg_score:.1f} 过低，需提升整体质量。"
 

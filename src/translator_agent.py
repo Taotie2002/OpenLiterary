@@ -291,7 +291,7 @@ class OpenAICompatibleAdapter(LLMAdapter):
             "Content-Type": "application/json"
         }
 
-    def generate(self, prompt: str, model_name: str, max_tokens: int = 2048, temperature: float = 0.3) -> str:
+    def generate(self, prompt: str, model_name: str, max_tokens: int = 2048, temperature: float = 0.3, **kwargs) -> str:
         import requests as _requests
         payload = {
             "model": model_name,
@@ -356,7 +356,7 @@ class MLXNativeAdapter(LLMAdapter):
             self.model, self.tokenizer = self.mlx_load(model_name)
             self.current_model_name = model_name
 
-    def generate(self, prompt: str, model_name: str, max_tokens: int = 2048, temperature: float = 0.3) -> str:
+    def generate(self, prompt: str, model_name: str, max_tokens: int = 2048, temperature: float = 0.3, **kwargs) -> str:
         # 先检查内存，必要时在加载前卸载旧模型，避免无效加载
         if self.current_model_name and self.current_model_name != model_name:
             if self.check_memory_pressure():
@@ -1888,12 +1888,12 @@ def debug_db():
 def print_banner():
     """横幅输出到 stderr，避免污染 stdout（stdout 留给机器可解析的输出，如章节路径）"""
     print(r"""
-   ____       _            _   _                 _       _
-  / __ \     | |          | | (_)               | |     | |
- | |  | | ___| | ___ _ __ | |_ _  ___  _ __   __| | __ _| |_ __ _
- | |  | |/ _ \ |/ _ \ '_ \| __| |/ _ \| '_ \ / _` |/ _` | __/ _` |
- | |__| |  __/ |  __/ | | | |_| | (_) | | | | (_| | (_| | |_ (_| |
-  \____/ \___|_|\___|_| |_|\__|_|\___/|_| |_|\__,_|\__,_|\__\__,_|
+   ____                   __    _ __                            
+  / __ \____  ___  ____  / /   (_) /____  _________ ________  __
+ / / / / __ \/ _ \/ __ \/ /   / / __/ _ \/ ___/ __ `/ ___/ / / /
+/ /_/ / /_/ /  __/ / / / /___/ / /_/  __/ /  / /_/ / /  / /_/ / 
+\____/ .___/\___/_/ /_/_____/_/\__/\___/_/   \__,_/_/   \__, /  
+    /_/                                                /____/   
 
   OpenLiterary — AI 文学语义编译系统  (单体聚合版)
   共 {} 个模块 | 用于全量代码审计 / 单文件部署

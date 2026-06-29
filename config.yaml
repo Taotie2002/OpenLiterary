@@ -1,127 +1,218 @@
-llm_backend: mock
+# =============================================================================
+# OpenLiterary 配置文件
+# =============================================================================
+# 本文件控制翻译管线的所有行为：LLM 后端选择、模型路由、切分策略、评判阈值等。
+# 所有值均可通过环境变量覆盖（见下方"环境变量覆盖"说明）。
+#
+# 【快速开始】
+#   1. MLX 本地推理（macOS Apple Silicon）：
+#        llm_backend: mlx
+#        # 确保已安装: pip install mlx-lm
+#
+#   2. OpenAI 兼容 API（LM Studio / vLLM / Mistral / OpenAI）：
+#        llm_backend: openai_api
+#        # 修改 openai_api.api_base 指向你的服务地址
+#
+#   3. Mock 模式（开发测试，不调用真实 LLM）：
+#        llm_backend: mock
+#        # 无需任何模型，返回模拟响应
+#
+# 【环境变量覆盖】
+#   所有配置项均可通过环境变量 OPENLITERARY_<PATH> 覆盖，嵌套键用 __ 分隔。
+#   优先级：环境变量 > config.yaml > 代码默认值。
+#
+#   示例：
+#     export OPENLITERARY_LLM_BACKEND=openai_api
+#     export OPENLITERARY_OPENAI_API__API_BASE=https://api.mistral.ai/v1
+#     export OPENLITERARY_OPENAI_API__MODELS__REASONING_PRIMARY__MODEL_NAME=mistral-medium-latest
+#     export OPENLITERARY_PIPELINE__MAX_RETRIES=5
+#     export OPENLITERARY_CHUNKER__SOFT_LIMIT=800
+#
+#   映射规则：
+#     config.yaml 键路径              → 环境变量
+#     llm_backend                    → OPENLITERARY_LLM_BACKEND
+#     openai_api.api_base            → OPENLITERARY_OPENAI_API__API_BASE
+#     pipeline.max_retries           → OPENLITERARY_PIPELINE__MAX_RETRIES
+#     openai_api.models.reasoning_primary.model_name
+#                                    → OPENLITERARY_OPENAI_API__MODELS__REASONING_PRIMARY__MODEL_NAME
+# =============================================================================
+
+llm_backend: openai_api
 mlx:
   models:
     literal_translator:
       model_id: google/gemma-2-9b-it-mlx-4bit
       alias: gemma-2-9b-it (直译专用)
       default_params:
-        max_tokens: 1024
+        max_tokens: 8192
         temperature: 0.1
         top_p: 0.9
     reasoning_primary:
       model_id: qwen/Qwen2.5-7B-Instruct-MLX-4bit
       alias: qwen2.5-7b-instruct (推理主力)
       default_params:
-        max_tokens: 2048
+        max_tokens: 8192
         temperature: 0.3
         top_p: 0.95
     reasoning_heavy:
       model_id: qwen/Qwen2.5-14B-Instruct-MLX-4bit
       alias: qwen2.5-14b-instruct (重度推理)
       default_params:
-        max_tokens: 3072
+        max_tokens: 8192
         temperature: 0.2
         top_p: 0.95
   memory:
     warning_threshold: 0.8
     auto_unload_on_pressure: true
     preload_models: []
+    # ^ MLX 内存管理：
+    #   warning_threshold:    内存使用率超过此值触发 warning（0.0~1.0）
+    #   auto_unload_on_pressure: true 时自动卸载当前模型释放显存
+    #   preload_models:        启动时预加载的模型列表（实验性）
 openai_api:
+  # OpenAI 兼容 API 配置。
+  # 支持：Mistral API、OpenAI API、LM Studio、vLLM、ollama 等所有兼容 OpenAI /v1/chat/completions 格式的服务。
   api_base: https://api.mistral.ai/v1
+  #   ^ 完整 URL，末尾通常包含 /v1（例：http://localhost:1234/v1）
   api_key: X20ARh1Hh4BjtYiqmPUjHtpbL4QUf2fc
+  #   ^ API 密钥。LM Studio 本地部署可填任意值（如 "lm-studio"）
   max_retries: 3
+  #   ^ HTTP 请求失败时的最大重试次数
   retry_delay: 2.0
+  #   ^ 重试间隔基数（秒），实际延迟 = retry_delay × 2^attempt + random(0~1)
   request_timeout: 300
   models:
+    # --- 三阶模型池（每种角色独立配置模型和参数）---
     literal_translator:
+      # 直译模型：追求字面忠实，低温度，不需要强推理能力
       model_name: mistral-small-latest
       alias: mistral-small-latest (直译)
       default_params:
-        max_tokens: 1024
-        temperature: 0.1
+        max_tokens: 8192    # 输出上限（token）。Judge 的 final_text 需容纳整段译文，建议 ≥4096
+        temperature: 0.1     # 低温度保证翻译一致性
         top_p: 0.9
     reasoning_primary:
+      # 主力推理模型：润色、评审、裁决等需要一定文学理解力的任务
       model_name: mistral-small-latest
       alias: mistral-small-latest (推理主力)
       default_params:
-        max_tokens: 2048
+        max_tokens: 8192
         temperature: 0.3
         top_p: 0.95
     reasoning_heavy:
+      # 重度推理模型：最终裁决等关键决策，需更强推理能力（可换更大模型）
       model_name: mistral-small-latest
       alias: mistral-small-latest (重度推理)
       default_params:
-        max_tokens: 3072
+        max_tokens: 8192
         temperature: 0.2
         top_p: 0.95
   max_concurrent_requests: 4
+  #   ^ 最大并发请求数。设为 1 可严格避免 429（但会降低吞吐量）
 task_routing:
+  # --- 任务→模型路由表 ---
+  # 每个管线任务指定使用哪个模型池 + 参数覆盖。
+  # params_override 会合并（覆盖）模型池中的 default_params。
+  # 如果某项参数不需要覆盖，移除对应的 params_override 键即可。
+
   reference_extraction:
+    # 典故/术语提取：需要一定推理能力识别文学引用
     model: reasoning_primary
     params_override:
       temperature: 0.1
-      max_tokens: 1536
+      max_tokens: 8192
   literal_translation:
+    # 直译：字面忠实，低温，不需要推理
     model: literal_translator
     params_override:
       temperature: 0.1
-      max_tokens: 1024
+      max_tokens: 8192
   literary_rewrite:
+    # 文学润色：需要创意，适当提高温度
     model: reasoning_primary
     params_override:
       temperature: 0.6
-      max_tokens: 2048
+      max_tokens: 8192
       top_p: 0.95
   critic_scoring:
+    # 评审打分：用主力模型即可
     model: reasoning_primary
     params_override:
       temperature: 0.2
-      max_tokens: 1024
+      max_tokens: 8192
   judge_decision:
+    # 最终裁决：关键决策，使用最强模型
     model: reasoning_heavy
     params_override:
       temperature: 0.3
-      max_tokens: 2048
+      max_tokens: 8192    # ← 如果 Judge 输出被截断，请调大此值（建议 4096~8192）
   golden_test:
+    # 黄金测试集映射（旧格式兼容）
     reference_extraction: reasoning_primary
     literal_translation: literal_translator
     literary_rewrite: reasoning_primary
     critic_scoring: reasoning_primary
     judge_decision: reasoning_heavy
 pipeline:
+  # --- 管线执行参数 ---
   batch_size: 10
+  #   ^ 每批从 DB 拉取的最大任务数
   max_retries: 3
+  #   ^ 每个任务的最大重试次数（包括 Judge REJECT 回 Rewriter 的循环）
   max_concurrent_chunks: 4
+  #   ^ 并行处理的 chunk 数（多线程实验性）
   poll_interval: 0.5
+  #   ^ 轮询间隔（秒），空闲时等待下次轮询的时间
 chunker:
+  # --- 文本切分参数 ---
   soft_limit: 1000
+  #   ^ 软上限（字符数）：chunk 达到此长度后尝试在段落/场景断点处切分
   hard_limit: 2500
+  #   ^ 硬上限（字符数）：达到此长度强制切分，不论断点位置
   respect_scene_breaks: true
+  #   ^ 是否优先在场景分隔线（--- 或 ***）处切分
 decision_engine:
+  # --- 决策引擎（回溯机制）---
   terminology_triggers_backtrack: true
+  #   ^ 术语级新决策出现时，是否回溯影响到的旧 chunk
   reference_triggers_backtrack: true
+  #   ^ 典故级新决策出现时，是否回溯
   style_triggers_backtrack: true
+  #   ^ 风格约束级新决策出现时，是否回溯
   max_affected_chunks_per_decision: 50
+  #   ^ 单条决策最多影响多少个 chunk（防止回溯爆炸）
 critic_thresholds:
-  fluency: 7.0
-  readability: 7.0
-  style_compliance: 7.0
-  voice_consistency: 7.0
-  semantic_preservation: 7.0
+  # --- 评审 Agent 评分阈值 ---
+  # 每个维度满分 10。低于阈值的维度将导致自动 REJECT。
+  fluency: 7.0          # 流畅度
+  readability: 7.0      # 可读性
+  style_compliance: 7.0 # 风格合规度
+  voice_consistency: 7.0# 语体一致性
+  semantic_preservation: 7.0  # 语义保留度
   average_score_min: 7.5
+  #   ^ 所有维度平均分低于此值也触发 REJECT（即使单维过线）
 style_guide:
+  # --- 全局风格指南（传递给 Rewriter 和 Critic）---
   avg_sentence_length: 较长且富有韵律
+  #   ^ 目标句式描述（自由文本，给 LLM 的指令）
   lexicon_preference: 古典、史诗感、冷硬
+  #   ^ 词汇偏好描述
   author_priority_ratio: 0.7
+  #   ^ 作者风格 vs 译者风格的权重比例（0~1，越高越尊重原文风格）
 paths:
-  db_dir: db
-  input_dir: input
-  output_dir: output
-  docs_dir: docs
-  golden_test_file: input/golden/hyperion_5k.md
-  decision_db: decision_db.sqlite
-  workflow_db: workflow.db
+  # --- 路径配置（相对于项目根目录）---
+  db_dir: db              # 数据库存放目录
+  input_dir: input        # 原文 Markdown 输入目录
+  output_dir: output      # 翻译输出目录
+  docs_dir: docs          # 文档目录
+  golden_test_file: input/golden/hyperion_5k.md  # 黄金测试集路径
+  decision_db: decision_db.sqlite   # 决策记录数据库文件名（放在 db_dir 下）
+  workflow_db: workflow.db          # 工作流状态数据库文件名（放在 db_dir 下）
 logging:
+  # --- 日志配置 ---
   level: INFO
+  #   ^ 日志级别: DEBUG / INFO / WARNING / ERROR
   log_llm_calls: false
+  #   ^ 是否记录每次 LLM 调用的 prompt 和响应（调试用，会大量输出）
   perf_log_interval: 10
+  #   ^ 性能统计日志间隔（秒）

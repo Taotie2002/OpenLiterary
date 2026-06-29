@@ -3,6 +3,8 @@ import re
 from typing import List, Dict
 from utils.llm_adapter import get_llm_client
 from core.decision_engine import DecisionEngine, DecisionLevel
+from src.config import config
+from src.config import config
 
 
 class LiteraryRewriterAgent:
@@ -157,11 +159,13 @@ class LiteraryRewriterAgent:
         prompt = self._build_prompt(raw_translation, decisions_context, style_guide)
         
         # 润色是决定最终质量的关键，必须使用能力最强的模型
+        model_key, params = config.resolve_task_model("literary_rewrite")
+        model_cfg = config._get_model_config(model_key)
+        model_name = model_cfg.get("model_id") or model_cfg.get("model_name", "qwen/Qwen2.5-7B-Instruct-MLX-4bit")
         final_markdown = self.llm.generate(
-            prompt=prompt, 
-            model_name="qwen/Qwen2.5-7B-Instruct-MLX-4bit", 
-            max_tokens=2048, 
-            temperature=0.6
+            prompt=prompt,
+            model_name=model_name,
+            **params
         )
         
         return final_markdown

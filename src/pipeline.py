@@ -16,6 +16,7 @@ from agents.reference_agent import ReferenceAgent
 from agents.rewriter_agent import LiteraryRewriterAgent
 from agents.critic_agent import CriticAgent
 from agents.judge_agent import JudgeAgent
+from src.config import config
 
 class TranslationPipeline:
     def __init__(self, chapter_id: str):
@@ -39,10 +40,11 @@ class TranslationPipeline:
         self.output_dir = ROOT_DIR / "output" / chapter_id
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
+        sg = config.style_guide
         self.style_guide = {
-            "avg_sentence_length": "较长且富有韵律",
-            "lexicon_preference": "古典、史诗感、冷硬",
-            "author_priority_ratio": 0.7
+            "avg_sentence_length": sg.get("avg_sentence_length", "较长且富有韵律"),
+            "lexicon_preference": sg.get("lexicon_preference", "古典、史诗感、冷硬"),
+            "author_priority_ratio": sg.get("author_priority_ratio", 0.7)
         }
 
     def _save_intermediate(self, chunk_id: str, step: str, data: str | dict):
@@ -61,7 +63,10 @@ class TranslationPipeline:
 
     def _run_raw_translator(self, source_text: str) -> str:
         prompt = f"请将以下科幻小说片段进行直译。要求：字面忠实，不丢失任何细节，不进行文学润色。\n\n【原文】\n{source_text}"
-        return self.llm.generate(prompt, model_name="google/gemma-2-9b-it-mlx-4bit", max_tokens=1024, temperature=0.1)
+        model_key, params = config.resolve_task_model("literal_translation")
+        model_cfg = config._get_model_config(model_key)
+        model_name = model_cfg.get("model_id") or model_cfg.get("model_name", "google/gemma-2-9b-it-mlx-4bit")
+        return self.llm.generate(prompt, model_name=model_name, **params)
 
     def run(self):
         print(f"🚀 [Pipeline] 启动批处理模式处理章节: {self.chapter_id}")
@@ -71,6 +76,10 @@ class TranslationPipeline:
         if not existing_tasks:
             print(f"❌ [Pipeline] 章节 {self.chapter_id} 无任务，请先运行 init 命令。")
             return
+        
+        pipe_cfg = config.pipeline
+        batch_size = pipe_cfg.get("batch_size", 50)
+        poll_interval = pipe_cfg.get("poll_interval", 0.5)
         
         # 阶段顺序定义：按流水线顺序处理，每阶段批量处理
         pipeline_stages = [
@@ -89,7 +98,7 @@ class TranslationPipeline:
             
             for state, handler, stage_name in pipeline_stages:
                 # 批量获取该状态的任务
-                tasks = self.scheduler.get_tasks_by_state(state, batch_size=50)
+                tasks = self.scheduler.get_tasks_by_state(state, batch_size=batch_size)
                 if not tasks:
                     continue
                 
@@ -101,7 +110,7 @@ class TranslationPipeline:
                 print(f"🎉 [Pipeline] 章节 {self.chapter_id} 全部处理完成！")
                 break
             
-            time.sleep(0.5)
+            time.sleep(poll_interval)
 
     def _process_pending_batch(self, tasks):
         chunk_ids = [t['chunk_id'] for t in tasks]
@@ -119,12 +128,13 @@ class TranslationPipeline:
         self.scheduler.batch_update_state(chunk_ids, TaskState.EXTRACTING_TERMS)
 
     def _process_failed_batch(self, tasks):
+        max_retries = config.pipeline.get("max_retries", 3)
         retry_chunk_ids = []
         permanent_fail_ids = []
         for task in tasks:
             chunk_id = task['chunk_id']
             retries = task.get('retries', 0)
-            if retries >= 3:
+            if retries >= max_retries:
                 print(f"❌ [Pipeline] {chunk_id} 重试次数过多，转入 PERMANENTLY_FAILED 终态")
                 permanent_fail_ids.append(chunk_id)
             else:
@@ -134,7 +144,7 @@ class TranslationPipeline:
             self.scheduler.batch_update_state(
                 permanent_fail_ids,
                 TaskState.PERMANENTLY_FAILED,
-                error_msg=f"超过重试上限 (retries>=3)，需人工介入"
+                error_msg=f"超过重试上限 (retries>={max_retries})，需人工介入"
             )
         if retry_chunk_ids:
             self.scheduler.batch_update_state(retry_chunk_ids, TaskState.EXTRACTING_TERMS)
@@ -203,6 +213,7 @@ class TranslationPipeline:
             self.scheduler.batch_update_state(success_ids, TaskState.JUDGING)
 
     def _process_judging_batch(self, tasks):
+        max_retries = config.pipeline.get("max_retries", 3)
         for task in tasks:
             try:
                 chunk_id = task['chunk_id']
@@ -216,7 +227,7 @@ class TranslationPipeline:
                     self._save_intermediate(chunk_id, "final", judge_result.get("final_text", lit_text))
                     self.scheduler.update_task_state(chunk_id, TaskState.COMPLETED)
                     print(f"✅ [Pipeline] {chunk_id} 定稿完成。")
-                elif retries >= 3:
+                elif retries >= max_retries:
                     # 重试已达上限，直接转入终态
                     self.scheduler.update_task_state(chunk_id, TaskState.PERMANENTLY_FAILED, error_msg=judge_result.get("reject_reason"))
                     print(f"❌ [Pipeline] {chunk_id} 连续 {retries+1} 次未通过裁决，转入 PERMANENTLY_FAILED")

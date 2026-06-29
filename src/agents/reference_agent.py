@@ -3,6 +3,8 @@ import re
 from typing import List, Dict, Any
 from utils.llm_adapter import get_llm_client
 from core.decision_engine import DecisionEngine, DecisionLevel
+from src.config import config
+from src.config import config
 
 class ReferenceAgent:
     def __init__(self, decision_engine: DecisionEngine):
@@ -63,11 +65,13 @@ Schema 如下：
         # 1. 调用 LLM
         prompt = self._build_prompt(text_chunk)
         
+        model_key, params = config.resolve_task_model("reference_extraction")
+        model_cfg = config._get_model_config(model_key)
+        model_name = model_cfg.get("model_id") or model_cfg.get("model_name", "qwen/Qwen2.5-7B-Instruct-MLX-4bit")
         raw_output = self.llm.generate(
-            prompt=prompt, 
-            model_name="qwen/Qwen2.5-7B-Instruct-MLX-4bit", 
-            max_tokens=1024, 
-            temperature=0.1
+            prompt=prompt,
+            model_name=model_name,
+            **params
         )
         
         # 2. 解析 JSON

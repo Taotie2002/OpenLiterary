@@ -8,20 +8,7 @@ import os
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any
 
-# 全局极简配置字典（后续可迁移至 config.yaml）
-SYS_CONFIG = {
-    "llm_backend": "mock",  # 可选: "mock" (测试), "openai_api" (LM Studio/vLLM), "mlx" (Apple Silicon)
-    "mlx_models": {
-        "4b_model": "google/gemma-2-9b-it-mlx-4bit",
-        "9b_model": "qwen/Qwen2.5-7B-Instruct-MLX-4bit" 
-    },
-    "openai_api_base": "http://127.0.0.1:1234/v1",
-    "openai_api_key": "lm-studio",
-    "max_retries": 3,
-    "retry_delay": 2,
-    "memory_warning_threshold": 0.8,
-    "auto_unload_on_pressure": True,
-}
+from src.config import config
 
 class LLMAdapter(ABC):
     """大语言模型调用基类"""
@@ -47,11 +34,11 @@ class LLMAdapter(ABC):
     def check_memory_pressure(self) -> bool:
         """检查内存压力"""
         usage = self.get_memory_usage()
-        return usage["percent"] / 100 > SYS_CONFIG.get("memory_warning_threshold", 0.8)
+        return usage["percent"] / 100 > config.get("mlx.memory.warning_threshold", 0.8)
     
     def auto_unload_if_needed(self) -> bool:
         """内存压力时自动卸载模型，返回是否触发了卸载"""
-        if SYS_CONFIG.get("auto_unload_on_pressure", True) and self.check_memory_pressure():
+        if config.get("mlx.memory.auto_unload_on_pressure", True) and self.check_memory_pressure():
             print(f"⚠️ 内存压力过大 ({self.get_memory_usage()['percent']:.1f}%)，自动卸载模型")
             self.unload_model()
             return True
@@ -165,7 +152,7 @@ class OpenAICompatibleAdapter(LLMAdapter):
             "Content-Type": "application/json"
         }
 
-    def generate(self, prompt: str, model_name: str, max_tokens: int = 2048, temperature: float = 0.3) -> str:
+    def generate(self, prompt: str, model_name: str, max_tokens: int = 2048, temperature: float = 0.3, **kwargs) -> str:
         payload = {
             "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
@@ -227,7 +214,7 @@ class MLXNativeAdapter(LLMAdapter):
             self.model, self.tokenizer = self.mlx_load(model_name)
             self.current_model_name = model_name
 
-    def generate(self, prompt: str, model_name: str, max_tokens: int = 2048, temperature: float = 0.3) -> str:
+    def generate(self, prompt: str, model_name: str, max_tokens: int = 2048, temperature: float = 0.3, **kwargs) -> str:
         # 先检查内存，必要时在加载前卸载旧模型，避免无效加载
         if self.current_model_name and self.current_model_name != model_name:
             if self.check_memory_pressure():
@@ -297,17 +284,17 @@ def get_llm_client() -> LLMAdapter:
     """获取当前配置的 LLM 客户端实例"""
     global _client_instance
     if _client_instance is None:
-        if SYS_CONFIG["llm_backend"] == "mock":
+        if config.llm_backend == "mock":
             _client_instance = MockLLMAdapter()
-        elif SYS_CONFIG["llm_backend"] == "mlx":
+        elif config.llm_backend == "mlx":
             _client_instance = MLXNativeAdapter()
-        elif SYS_CONFIG["llm_backend"] == "openai_api":
+        elif config.llm_backend == "openai_api":
             _client_instance = OpenAICompatibleAdapter(
-                SYS_CONFIG["openai_api_base"], 
-                SYS_CONFIG["openai_api_key"],
-                max_retries=SYS_CONFIG.get("max_retries", 3),
-                retry_delay=SYS_CONFIG.get("retry_delay", 2.0)
+                config.get("openai_api.api_base", "http://127.0.0.1:1234/v1"),
+                config.get("openai_api.api_key", "lm-studio"),
+                max_retries=config.get("openai_api.max_retries", 3),
+                retry_delay=config.get("openai_api.retry_delay", 2.0)
             )
         else:
-            raise ValueError(f"不支持的 llm_backend: {SYS_CONFIG['llm_backend']}")
+            raise ValueError(f"不支持的 llm_backend: {config.llm_backend}")
     return _client_instance

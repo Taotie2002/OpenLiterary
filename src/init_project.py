@@ -11,6 +11,7 @@ sys.path.append(str(ROOT_DIR / "src"))
 
 from core.scheduler import TaskScheduler
 from utils.chunker import SmartChunker
+from src.config import config
 
 def initialize_translation_project(chapter_id: str, force: bool = False):
     # 1. 强制打印所有路径信息，确保我们在同一频道
@@ -36,7 +37,11 @@ def initialize_translation_project(chapter_id: str, force: bool = False):
     scheduler = TaskScheduler(db_path=str(db_file))
     
     # 4. 关键：确保 chunks 不为空
-    chunks = SmartChunker(soft_limit=1000).split_markdown(markdown_text)
+    chunker_cfg = config.chunker
+    chunks = SmartChunker(
+        soft_limit=chunker_cfg.get("soft_limit", 1000),
+        hard_limit=chunker_cfg.get("hard_limit", 2500)
+    ).split_markdown(markdown_text)
     if not chunks:
         print("❌ 警告：没有切分出任何 chunk！")
         return
