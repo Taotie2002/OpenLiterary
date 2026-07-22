@@ -14,7 +14,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT_DIR / "src"))
 
-from utils.llm_adapter import get_llm_client, SYS_CONFIG
+from utils.llm_adapter import get_llm_client_for_task, SYS_CONFIG
 
 
 def get_system_memory() -> dict:
@@ -57,7 +57,7 @@ def test_memory_pressure():
     print(f"💻 系统内存: {sys_mem['total_gb']:.1f}GB 总计, {sys_mem['available_gb']:.1f}GB 可用")
     
     # 获取 LLM 客户端
-    client = get_llm_client()
+    client = get_llm_client_for_task("reference_extraction")
     print(f"🤖 当前后端: {SYS_CONFIG['llm_backend']}")
     
     # 测试 1: 基础内存监控

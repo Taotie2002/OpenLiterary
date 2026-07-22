@@ -1,12 +1,13 @@
 import json
 import re
 from typing import Dict, Any
-from utils.llm_adapter import get_llm_client
+from utils.llm_adapter import get_llm_client_for_task, get_role_model_name, get_role_extra_body, robust_json_loads
 from src.config import config
 
 class CriticAgent:
     def __init__(self):
-        self.llm = get_llm_client()
+        self.llm = get_llm_client_for_task("critic_scoring")
+        self.role = config.get_task_role("critic_scoring")
 
     def _build_prompt(self, source_text: str, raw_translation: str, literary_translation: str, style_guide_stats: dict) -> str:
         return f"""你是一位极其严苛的文学编辑与翻译评论家。
@@ -31,7 +32,13 @@ class CriticAgent:
 【待审计的文学润色稿】
 {literary_translation}
 
-请输出纯 JSON，不要包含 Markdown 标记。
+【JSON 输出规则 — 必须严格遵守】
+1. 输出纯 JSON，禁止包含任何 Markdown 标记、代码块、或额外说明文字
+2. 字符串值中的双引号 " 必须转义为 \"
+3. 不得在数组/对象的最后一个元素后加逗号
+4. 布尔值用 true/false（不加引号），数字用纯数字（不加引号）
+5. ⚠️ 如果 JSON 格式错误，你的整份评语将被丢弃，本次审计作废
+
 Schema 要求：
 {{
   "scores": {{
@@ -41,10 +48,11 @@ Schema 要求：
     "voice_consistency": 9,
     "semantic_preservation": 8
   }},
-  "is_flawed": false,
   "critique": "一段尖锐的综合评价",
   "improvement_suggestions": "针对低分项给出具体的修改建议（若无则留空）"
 }}
+
+请严格按上述 Schema 输出唯一一个 JSON 对象。
 """
 
     def process_chunk(self, chunk_id: str, source_text: str, raw_trans: str, lit_trans: str, style_guide: dict) -> Dict[str, Any]:
@@ -52,30 +60,18 @@ Schema 要求：
         prompt = self._build_prompt(source_text, raw_trans, lit_trans, style_guide)
         
         model_key, params = config.resolve_task_model("critic_scoring")
-        model_cfg = config._get_model_config(model_key)
-        model_name = model_cfg.get("model_id") or model_cfg.get("model_name", "qwen/Qwen2.5-7B-Instruct-MLX-4bit")
+        model_name = get_role_model_name(self.role) or model_key
+        extra_body = get_role_extra_body(self.role)
         raw_output = self.llm.generate(
             prompt=prompt,
             model_name=model_name,
-            **params
+            **params,
+            extra_body=extra_body,
         )
         
-        cleaned = re.sub(r'^```json\s*', '', raw_output, flags=re.IGNORECASE)
-        cleaned = re.sub(r'\s*```$', '', cleaned)
-        try:
-            result = json.loads(cleaned)
-        except json.JSONDecodeError as e:
-            print(f"⚠️ Critic Agent 输出异常: {e}")
-            return {"is_flawed": True, "critique": "JSON解析失败", "scores": {}}
+        result = robust_json_loads(raw_output)
+        if not result:
+            print(f"⚠️ Critic Agent 输出异常")
+            return {"critique": "JSON解析失败", "scores": {}}
         
-        # 自动计算 is_flawed：任意维度低于阈值即判定为有缺陷
-        scores = result.get("scores", {})
-        is_flawed = result.get("is_flawed", False)
-        if not is_flawed and scores:
-            for dim, threshold in config.critic_thresholds.items():
-                if dim in scores and scores[dim] < threshold:
-                    is_flawed = True
-                    result["critique"] = f"{result.get('critique', '')} [自动判定: {dim}={scores[dim]} < {threshold}]"
-                    break
-        result["is_flawed"] = is_flawed
         return result

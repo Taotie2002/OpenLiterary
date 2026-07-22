@@ -14,7 +14,7 @@ sys.path.append(str(ROOT_DIR / "src"))
 
 from core.scheduler import TaskScheduler, TaskState
 from core.decision_engine import DecisionEngine
-from utils.llm_adapter import get_llm_client
+from utils.llm_adapter import get_llm_client_for_task
 from agents.reference_agent import ReferenceAgent
 from agents.rewriter_agent import LiteraryRewriterAgent
 from agents.critic_agent import CriticAgent
@@ -24,7 +24,7 @@ from utils.chunker import SmartChunker
 
 class GoldenSetEvaluator:
     def __init__(self, db_path: str = None):
-        self.llm = get_llm_client()
+        self.llm = get_llm_client_for_task("literal_translation")
         shared_db = DecisionEngine(db_path=db_path) if db_path else DecisionEngine()
         self.db = shared_db
         self.ref_agent = ReferenceAgent(shared_db)
@@ -120,9 +120,11 @@ def run_golden_test():
             # 1. Reference Agent - 典故提取
             evaluator.ref_agent.process_chunk(chunk_id, chunk, affected_chunks=[chunk_id])
 
-            # 2. 直译
+            # 2. 直译（使用配置中的模型名，而非角色 key）
+            from src.utils.llm_adapter import get_role_model_name
+            _lit_model_name = get_role_model_name("literal_translator")
             raw_prompt = f"请将以下科幻小说片段进行直译。要求：字面忠实，不丢失任何细节，不进行文学润色。\n\n【原文】\n{chunk}"
-            raw_text = evaluator.llm.generate(raw_prompt, model_name="google/gemma-2-9b-it-mlx-4bit", max_tokens=1024, temperature=0.1)
+            raw_text = evaluator.llm.generate(raw_prompt, model_name=_lit_model_name, max_tokens=1024, temperature=0.1)
 
             # 3. 文学润色
             style_guide = {
@@ -139,14 +141,12 @@ def run_golden_test():
             judge_result = evaluator.judge_agent.process_chunk(chunk_id, chunk, lit_text, critic_report, affected_chunks=[chunk_id])
 
             # 6. 风格坍缩评估
-            final_text = judge_result.get("final_text", lit_text)
-            style_eval = evaluator.evaluate_style_collapse(chunk, final_text)
+            style_eval = evaluator.evaluate_style_collapse(chunk, lit_text)
 
             result = {
                 "chunk_id": chunk_id,
                 "source_length": len(chunk),
                 "critic_scores": critic_report.get("scores", {}),
-                "critic_flawed": critic_report.get("is_flawed", True),
                 "judge_decision": judge_result.get("decision"),
                 "style_collapse_rate": style_eval["style_collapse_rate"],
                 "style_preservation": style_eval["average_preservation"],
@@ -154,7 +154,7 @@ def run_golden_test():
             }
             all_results.append(result)
 
-            print(f"  Critic: flawed={critic_report.get('is_flawed')}, scores={critic_report.get('scores')}")
+            print(f"  Critic: scores={critic_report.get('scores')}")
             print(f"  Judge: {judge_result.get('decision')}")
             print(f"  风格坍缩率: {style_eval['style_collapse_rate']:.2%}")
             print(f"  风格保持度: {style_eval['average_preservation']:.2%}")

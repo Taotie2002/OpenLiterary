@@ -1,15 +1,15 @@
 import json
 import re
-from typing import List, Dict
-from utils.llm_adapter import get_llm_client
+from typing import List, Dict, Optional
+from utils.llm_adapter import get_llm_client_for_task, get_role_model_name, get_role_extra_body
 from core.decision_engine import DecisionEngine, DecisionLevel
-from src.config import config
 from src.config import config
 
 
 class LiteraryRewriterAgent:
     def __init__(self, decision_engine: DecisionEngine):
-        self.llm = get_llm_client()
+        self.llm = get_llm_client_for_task("literary_rewrite")
+        self.role = config.get_task_role("literary_rewrite")
         self.db = decision_engine
 
     def _build_decision_context(self) -> str:
@@ -40,15 +40,105 @@ class LiteraryRewriterAgent:
 
 【排版与脚注协议 (CRITICAL)】
 1. 严禁改变 Markdown 的物理段落结构。
-2. 当遇到需要加注的【典故】时，必须使用 Markdown 原生脚注语法。
-3. 在正文中需要加注的词语后紧跟 `[^数字]`（如：拉米亚[^1]）。
-4. 在你输出的全部正文**最末尾**，空两行，然后列出对应的脚注内容。脚注格式必须为：`[^数字]: 译注：[考据原因]`。
+2. P4 优化：对于卡罗尔《爱丽丝梦游仙境》这类儿童文学，**禁止在润色阶段添加脚注**。
+3. 如遇需要注释的典故，应在首次出现时用文内括号简注（如：渡渡鸟（一种已灭绝的鸟）），而非使用脚注。
+4. 脚注仅限于参考提取阶段（Reference Agent）生成的必要考据注释，润色阶段不得新增。
+
+【人称代词规则】
+1. 严格遵循原文人称代词性别：he/him/his → "他"，she/her → "她"，it/its → "它"。
+2. 注意原文中人物对话和叙述视角的代词指代关系，不得混淆角色性别。
 
 【直译底稿】
 {raw_translation}
 
 请直接输出润色后的 Markdown 文本，不要包含任何多余的开头问候或解释：
 """
+
+    def _build_retry_prompt(
+        self,
+        raw_translation: str,
+        prev_lit_text: str,
+        decisions_context: str,
+        style_guide: str,
+        reject_reason: str,
+        critic_feedback: Optional[str],
+        retry_count: int,
+        all_feedback: Optional[List[Dict]] = None,
+    ) -> str:
+        critic_section = ""
+        if critic_feedback:
+            critic_section = f"\n【Critic 具体改进建议】\n{critic_feedback}\n"
+
+        history_section = ""
+        if all_feedback and len(all_feedback) > 1:
+            lines = []
+            for i, fb in enumerate(all_feedback[:-1]):
+                reason_text = fb.get("reason", "")[:80]
+                tag = "已修复" if fb.get("resolved", False) else "需持续关注"
+                if reason_text.strip():
+                    lines.append(f"  第 {i+1} 轮 ({tag}): {reason_text}")
+            if lines:
+                history_section = (
+                    "\n【过去所有被拒原因 — 需确认全部已解决】\n"
+                    + "\n".join(lines) + "\n"
+                )
+
+        if retry_count <= 2:
+            strategy = (
+                "请在保留上一版优点的基础上**针对性修改**，只动被拒原因相关的段落，"
+                "不要推倒重来。"
+            )
+        elif retry_count <= 4:
+            strategy = (
+                "你可以**重写 1-2 个段落**来系统性修复被拒原因，"
+                "其他部分保持稳定。注意保持整体风格的统一。"
+            )
+        else:
+            strategy = (
+                "本轮允许**基于直译底稿重新润色全部内容**，"
+                "但必须避免自第一轮以来所有被拒原因列出的问题。"
+            )
+
+        return f"""你是一位荣获过星云奖和雨果奖的资深科幻/奇幻文学译者。
+这是第 {retry_count + 1} 次修订。上一版译文因以下原因被终审拒绝。
+
+{decisions_context}
+
+{strategy}
+
+【上一版被拒原因（必须解决）】
+{reject_reason}{critic_section}
+{history_section}
+
+【风格基准 (Style Guide)】
+{style_guide}
+
+【排版与脚注协议 (CRITICAL)】
+1. 严禁改变 Markdown 的物理段落结构。
+2. P4 优化：对于卡罗尔《爱丽丝梦游仙境》这类儿童文学，**禁止在润色阶段添加脚注**。
+3. 如遇需要注释的典故，应在首次出现时用文内括号简注（如：渡渡鸟（一种已灭绝的鸟）），而非使用脚注。
+4. 脚注仅限于参考提取阶段（Reference Agent）生成的必要考据注释，润色阶段不得新增。
+
+【人称代词规则】
+1. 严格遵循原文人称代词性别：he/him/his → "他"，she/her → "她"，it/its → "它"。
+2. 注意原文中人物对话和叙述视角的代词指代关系，不得混淆角色性别。
+
+【直译底稿（语义基准，不可偏离）】
+{raw_translation}
+
+【上一版译文（在此基础上精修，只动被拒原因相关段落）】
+{prev_lit_text}
+
+请直接输出修订后的 Markdown 文本，重点解决被拒原因，其他部分保持稳定：
+"""
+
+    def _calculate_retry_temperature(self, base_temperature: float, retry_count: int) -> float:
+        if retry_count <= 2:
+            return min(base_temperature + retry_count * 0.1, 0.8)
+        elif retry_count <= 4:
+            return min(base_temperature + 0.3, 0.9)
+        else:
+            return min(base_temperature + 0.5, 1.0)
 
     def _infer_author_priority_ratio(self, source_text: str) -> float:
         """
@@ -73,9 +163,15 @@ class LiteraryRewriterAgent:
         allusion_count = sum(source_text.count(m) for m in allusion_markers)
         allusion_density = min(allusion_count / (len(source_text) / 1000), 1.0)  # 每千字典故数
 
-        # 2. 诗歌/韵文特征
-        poetry_markers = ['\n\n', '——', '...', 'beauty is truth', 'truth beauty']
+        # 2. 诗歌/韵文特征（P3 优化：为卡罗尔诗歌添加更多标记）
+        poetry_markers = ['\n\n', '——', '...', 'beauty is truth', 'truth beauty',
+                         'How doth', 'How cheerful', 'I am older', 'Who am I',
+                         'Curiouser', 'said the', 'replied the']
         poetry_score = sum(1 for m in poetry_markers if m in source_text)
+        # 额外检测：换行符密度（诗歌通常有更多换行）
+        newline_density = source_text.count('\n') / max(len(source_text) / 100, 1)
+        if newline_density > 0.5:
+            poetry_score += 1
 
         # 3. 专有名词密度（大写单词、首字母大写）
         proper_nouns = re.findall(r'\b[A-Z][a-z]+\b', source_text)
@@ -148,24 +244,54 @@ class LiteraryRewriterAgent:
         )
         return style_guide
 
-    def process_chunk(self, chunk_id: str, raw_translation: str, style_guide_stats: dict, source_text: str = ""):
-        """执行润色并生成最终排版"""
-        print(f"✍️ [Rewriter Agent] 正在进行文学润色: {chunk_id}...")
-        
-        # 动态构建风格指南
+    def process_chunk(
+        self,
+        chunk_id: str,
+        raw_translation: str,
+        style_guide_stats: dict,
+        source_text: str = "",
+        prev_lit_text: Optional[str] = None,
+        reject_reason: Optional[str] = None,
+        critic_feedback: Optional[str] = None,
+        retry_count: int = 0,
+        all_feedback: Optional[List[Dict]] = None,
+    ):
+        print(f"✍️ [Rewriter Agent] 正在进行文学润色: {chunk_id} (retry={retry_count})...")
+
         style_guide = self._build_style_guide(style_guide_stats, source_text)
-        
         decisions_context = self._build_decision_context()
-        prompt = self._build_prompt(raw_translation, decisions_context, style_guide)
-        
-        # 润色是决定最终质量的关键，必须使用能力最强的模型
+
+        # 使用配置路由：literary_rewrite（先于 temperature 计算，确保 base 从 config 读取）
         model_key, params = config.resolve_task_model("literary_rewrite")
-        model_cfg = config._get_model_config(model_key)
-        model_name = model_cfg.get("model_id") or model_cfg.get("model_name", "qwen/Qwen2.5-7B-Instruct-MLX-4bit")
+        model_name = get_role_model_name(self.role) or model_key
+        base_temp = params.get("temperature", 0.3)
+
+        if retry_count > 0 and prev_lit_text:
+            if not reject_reason:
+                reject_reason = "终审未提供具体拒因，请结合历史反馈与风格基准进行全面审视与精修。"
+            prompt = self._build_retry_prompt(
+                raw_translation=raw_translation,
+                prev_lit_text=prev_lit_text,
+                decisions_context=decisions_context,
+                style_guide=style_guide,
+                reject_reason=reject_reason,
+                critic_feedback=critic_feedback,
+                retry_count=retry_count,
+                all_feedback=all_feedback,
+            )
+            temperature = self._calculate_retry_temperature(base_temp, retry_count)
+        else:
+            prompt = self._build_prompt(raw_translation, decisions_context, style_guide)
+            temperature = base_temp
+
+        params = {**params, "temperature": temperature}
+        extra_body = get_role_extra_body(self.role)
+
         final_markdown = self.llm.generate(
             prompt=prompt,
             model_name=model_name,
-            **params
+            **params,
+            extra_body=extra_body,
         )
-        
+
         return final_markdown

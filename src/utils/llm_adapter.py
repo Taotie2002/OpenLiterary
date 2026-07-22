@@ -1,5 +1,13 @@
+"""DEPRECATED — 模块化副本，未与生产单体脚本同步。
+
+生产入口是 `python3 -m src.translator_agent`（单体脚本 `src/translator_agent.py`）。
+此文件仅保留供历史参考。已知缺陷：
+- `robust_json_loads` Strategy 2 类型不符直接 `return json.loads(...)`，未返回 empty（缺陷 B 未修复）
+"""
 import json
 import gc
+import re
+import threading
 import requests
 import time
 import random
@@ -9,6 +17,69 @@ from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any
 
 from src.config import config
+from json_repair import repair_json as _repair_json
+
+def robust_json_loads(raw_response: str) -> dict:
+    """Robust JSON parser for LLM outputs.
+
+    Handles: <think> blocks, markdown fences, preamble text,
+    trailing text (via raw_decode), trailing commas (via cleanup),
+    and embedded JSON extraction as last resort.
+
+    Returns parsed dict, or empty dict if all attempts fail.
+    """
+    if not raw_response or not raw_response.strip():
+        return {}
+
+    cleaned = raw_response
+    # 1. Strip <think> blocks
+    cleaned = re.sub(r'<think>.*?</think>', '', cleaned, flags=re.DOTALL)
+    # 2. Strip preamble before first { or [
+    cleaned = re.sub(r'^[^{[]*', '', cleaned)
+    # 3. Strip markdown code fences
+    cleaned = re.sub(r'^```json\s*', '', cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r'\s*```$', '', cleaned)
+    cleaned = cleaned.strip()
+
+    if not cleaned:
+        return {}
+
+    # Strategy 1: raw_decode extracts first JSON value, ignores trailing text
+    try:
+        decoder = json.JSONDecoder()
+        result, _ = decoder.raw_decode(cleaned)
+        if isinstance(result, dict):
+            return result
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: clean trailing commas and retry
+    try:
+        fallback = re.sub(r',\s*}', '}', cleaned)
+        fallback = re.sub(r',\s*]', ']', fallback)
+        return json.loads(fallback)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 3: json_repair handles unescaped quotes, missing brackets, single quotes, etc.
+    try:
+        repaired = _repair_json(cleaned)
+        result = json.loads(repaired)
+        if isinstance(result, dict):
+            return result
+    except Exception:
+        pass
+
+    # Strategy 4: extract outermost { ... } block
+    try:
+        brace_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+        if brace_match:
+            return json.loads(brace_match.group())
+    except json.JSONDecodeError:
+        pass
+
+    return {}
+
 
 class LLMAdapter(ABC):
     """大语言模型调用基类"""
@@ -96,9 +167,11 @@ class MockLLMAdapter(LLMAdapter):
         return f"[直译] {source}"
     
     def _mock_literary_rewrite(self, prompt: str) -> str:
-        if "【直译底稿】" in prompt:
+        markers = ["【直译底稿（语义基准，不可偏离）】", "【直译底稿】"]
+        marker = next((m for m in markers if m in prompt), None)
+        if marker:
             # 提取直译底稿，去除后面的指令文本
-            after_marker = prompt.split("【直译底稿】")[-1]
+            after_marker = prompt.split(marker)[-1]
             raw = after_marker.split("请直接输出")[0].strip()
         else:
             raw = ""
@@ -120,7 +193,6 @@ class MockLLMAdapter(LLMAdapter):
                 "semantic_preservation": 8,
                 "readability": 8
             },
-            "is_flawed": False,
             "critique": "译文流畅自然，风格契合度良好，语义保留完整。",
             "improvement_suggestions": ""
         }, ensure_ascii=False)
@@ -128,7 +200,6 @@ class MockLLMAdapter(LLMAdapter):
     def _mock_judge_decision(self) -> str:
         return json.dumps({
             "decision": "PASS",
-            "final_text": "最终定稿文本",
             "reject_reason": "",
             "new_style_rule": {
                 "rule_description": "处理诗歌引用时保持原韵律感",
@@ -142,24 +213,56 @@ class MockLLMAdapter(LLMAdapter):
 
 class OpenAICompatibleAdapter(LLMAdapter):
     """基于 HTTP 的 OpenAI 兼容 API 适配器 (如 LM Studio / vLLM)"""
-    def __init__(self, api_base: str, api_key: str, max_retries: int = 3, retry_delay: float = 2.0):
+    # 类级共享限流：所有实例共用同一个 last_request_time，跨角色生效
+    _last_request_time: float = 0.0
+    _request_lock = threading.Lock()
+
+    def __init__(self, api_base: str, api_key: str, max_retries: int = 3, retry_delay: float = 2.0, request_timeout: int = 300):
         self.api_base = api_base
         self.api_key = api_key
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.request_timeout = request_timeout
+        self.min_request_interval = 1.5
         self.headers = {
-            "Authorization": f"Bearer {self.api_key}", 
+            "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
 
     def generate(self, prompt: str, model_name: str, max_tokens: int = 2048, temperature: float = 0.3, **kwargs) -> str:
+        enable_thinking = kwargs.pop("enable_thinking", False)
+        extra_body = kwargs.pop("extra_body", None) or {}
         payload = {
             "model": model_name,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens,
-            "temperature": temperature
+            "temperature": temperature,
         }
-        
+        # 根据 enable_thinking + provider 生成对应 API 参数
+        api_base = self.api_base.lower()
+        if "minimaxi" in api_base:
+            if enable_thinking:
+                payload["thinking"] = {"type": "adaptive"}
+            else:
+                payload["reasoning_effort"] = "none"
+                payload["thinking"] = {"type": "disabled"}
+        elif "deepseek" in api_base:
+            payload["thinking"] = {"type": "enabled" if enable_thinking else "disabled"}
+        elif "openai" in api_base:
+            if enable_thinking:
+                payload["reasoning_effort"] = "high"
+        # 合并剩余自定义 extra_body（用户覆盖）
+        if extra_body:
+            payload.update(extra_body)
+
+        # 频率限制：类级共享锁，跨角色实例共用同一计时器
+        with self.__class__._request_lock:
+            now = time.time()
+            elapsed = now - self.__class__._last_request_time
+            if elapsed < self.min_request_interval:
+                time.sleep(self.min_request_interval - elapsed)
+            self.__class__._last_request_time = time.time()
+
         last_error = None
         for attempt in range(self.max_retries):
             try:
@@ -167,7 +270,7 @@ class OpenAICompatibleAdapter(LLMAdapter):
                     f"{self.api_base}/chat/completions",
                     headers=self.headers,
                     json=payload,
-                    timeout=300
+                    timeout=self.request_timeout
                 )
                 # 429 是限流（属于 4xx 但应重试），其他 4xx 是客户端错误；5xx 由 raise_for_status 抛出后被外层重试逻辑捕获
                 if 400 <= response.status_code < 500 and response.status_code != 429:
@@ -224,7 +327,17 @@ class MLXNativeAdapter(LLMAdapter):
         # 组装聊天模板
         if hasattr(self.tokenizer, "apply_chat_template"):
             messages = [{"role": "user", "content": prompt}]
-            formatted_prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            enable_thinking = kwargs.get("enable_thinking", False)
+            try:
+                formatted_prompt = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                )
+            except TypeError:
+                # tokenizer 不支持 enable_thinking（如标准 Qwen/Gemma），回退
+                formatted_prompt = self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True,
+                )
         else:
             formatted_prompt = prompt
         
@@ -277,24 +390,52 @@ class MLXNativeAdapter(LLMAdapter):
             
         print("✅ [MLX] Metal 缓存已清空，显存已释放。")
 
-# 单例工厂函数
-_client_instance = None
+# Per-role 客户端缓存：role_key -> LLMAdapter
+_client_instances: dict[str, LLMAdapter] = {}
 
-def get_llm_client() -> LLMAdapter:
-    """获取当前配置的 LLM 客户端实例"""
-    global _client_instance
-    if _client_instance is None:
-        if config.llm_backend == "mock":
-            _client_instance = MockLLMAdapter()
-        elif config.llm_backend == "mlx":
-            _client_instance = MLXNativeAdapter()
-        elif config.llm_backend == "openai_api":
-            _client_instance = OpenAICompatibleAdapter(
-                config.get("openai_api.api_base", "http://127.0.0.1:1234/v1"),
-                config.get("openai_api.api_key", "lm-studio"),
-                max_retries=config.get("openai_api.max_retries", 3),
-                retry_delay=config.get("openai_api.retry_delay", 2.0)
-            )
-        else:
-            raise ValueError(f"不支持的 llm_backend: {config.llm_backend}")
-    return _client_instance
+
+def _build_role_client(role_cfg: Dict[str, Any]) -> LLMAdapter:
+    backend = role_cfg.get("backend", "mock")
+    if backend == "mock":
+        return MockLLMAdapter()
+    if backend == "mlx":
+        return MLXNativeAdapter()
+    if backend in ("openai_api", "ollama", "nim", "mistral", "custom"):
+        section = config.get_section("openai_api")
+        return OpenAICompatibleAdapter(
+            api_base=role_cfg.get("api_base") or section.get("api_base", "http://127.0.0.1:1234/v1"),
+            api_key=role_cfg.get("api_key") or section.get("api_key", "lm-studio"),
+            max_retries=section.get("max_retries", 3),
+            retry_delay=section.get("retry_delay", 2.0),
+            request_timeout=section.get("request_timeout", 300),
+        )
+    raise ValueError(f"不支持的 backend: {backend}")
+
+
+def get_llm_client(role: str) -> LLMAdapter:
+    """按角色返回 LLM 客户端实例（首次按需构建并缓存）。"""
+    if role not in _client_instances:
+        role_cfg = config.get_role_config(role)
+        _client_instances[role] = _build_role_client(role_cfg)
+    return _client_instances[role]
+
+
+def get_llm_client_for_task(task_name: str) -> LLMAdapter:
+    """根据任务名（如 'reference_extraction'）解析出角色并返回客户端。"""
+    return get_llm_client(config.get_task_role(task_name))
+
+
+def get_role_model_name(role: str) -> str:
+    """返回该角色对应的 model 标识（MLX: model_id；HTTP: model_name）。"""
+    cfg = config.get_role_config(role)
+    return cfg.get("model_id") or cfg.get("model_name", "")
+
+
+def get_role_extra_body(role: str) -> Dict[str, Any]:
+    """返回该角色的 extra_body（如思考模式开关）。"""
+    return config.get_role_config(role).get("extra_body") or {}
+
+
+def reset_clients() -> None:
+    """清空客户端缓存（测试 / 切换配置后用）。"""
+    _client_instances.clear()

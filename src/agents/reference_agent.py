@@ -1,14 +1,14 @@
 import json
 import re
 from typing import List, Dict, Any
-from utils.llm_adapter import get_llm_client
+from utils.llm_adapter import get_llm_client_for_task, get_role_model_name, get_role_extra_body, robust_json_loads
 from core.decision_engine import DecisionEngine, DecisionLevel
-from src.config import config
 from src.config import config
 
 class ReferenceAgent:
     def __init__(self, decision_engine: DecisionEngine):
-        self.llm = get_llm_client()
+        self.llm = get_llm_client_for_task("reference_extraction")
+        self.role = config.get_task_role("reference_extraction")
         self.db = decision_engine
         
     def _build_prompt(self, text_chunk: str) -> str:
@@ -45,18 +45,11 @@ Schema 如下：
 """
 
     def _parse_and_clean_json(self, raw_response: str) -> Dict[str, Any]:
-        """防御性 JSON 解析器：处理本地 LLM 可能输出的杂乱字符"""
-        # 尝试剥离模型可能擅自添加的 ```json 标签
-        cleaned = re.sub(r'^```json\s*', '', raw_response, flags=re.IGNORECASE)
-        cleaned = re.sub(r'\s*```$', '', cleaned)
-        
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError as e:
-            # 记录日志，实际生产中这里应抛出异常交由 Scheduler 触发重试
-            print(f"⚠️ JSON 解析失败，模型输出格式违规: {e}")
-            print(f"原始内容预览: {raw_response[:200]}...")
-            return {"references": []}
+        """防御性 JSON 解析器：处理 LLM 可能输出的多种格式违规"""
+        result = robust_json_loads(raw_response)
+        if not result:
+            print(f"⚠️ JSON 解析失败，模型输出格式违规")
+        return result if result else {"references": []}
 
     def process_chunk(self, chunk_id: str, text_chunk: str, affected_chunks: List[str] = None):
         """处理单个文本块，识别典故并自动写入决策引擎"""
@@ -66,12 +59,13 @@ Schema 如下：
         prompt = self._build_prompt(text_chunk)
         
         model_key, params = config.resolve_task_model("reference_extraction")
-        model_cfg = config._get_model_config(model_key)
-        model_name = model_cfg.get("model_id") or model_cfg.get("model_name", "qwen/Qwen2.5-7B-Instruct-MLX-4bit")
+        model_name = get_role_model_name(self.role) or model_key
+        extra_body = get_role_extra_body(self.role)
         raw_output = self.llm.generate(
             prompt=prompt,
             model_name=model_name,
-            **params
+            **params,
+            extra_body=extra_body,
         )
         
         # 2. 解析 JSON

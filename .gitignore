@@ -52,3 +52,10 @@ Thumbs.db
 *.epub
 *.mobi
 *.pdf
+
+# 翻译工作文件/临时文件（不上传到 GitHub，仅保留在本地）
+docs/*.md
+input/README.md
+input/chaos/
+input/golden/
+plan.md

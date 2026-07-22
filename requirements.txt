@@ -19,8 +19,8 @@ threading  # Python 标准库
 # LLM 后端适配器
 # ===========================
 # MLX (Apple Silicon 原生推理) - 可选，仅 macOS ARM64 需要
-# mlx-lm>=0.18.0
-# mlx>=0.18.0
+mlx-lm>=0.18.0
+mlx>=0.18.0
 
 # OpenAI-Compatible API (LM Studio, vLLM, Ollama, 云厂商)
 requests>=2.31.0
