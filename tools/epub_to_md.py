@@ -278,7 +278,7 @@ def main():
         log_info(f"完成！共生成 {len(generated)} 个章节文件")
         log_info("下一步：")
         log_info(f"  1. 检查 {args.output}/ 下的章节文件")
-        log_info(f"  2. 修改 config.yaml 设置 llm_backend 等")
+        log_info(f"  2. 修改 config.yaml 设置 6 个角色的模型 (main.models)")
         log_info(f"  3. 运行翻译管线：")
         for f in generated:
             ch_id = Path(f).stem

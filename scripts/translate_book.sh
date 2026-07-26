@@ -17,6 +17,11 @@
 #   ./scripts/translate_book.sh book.md output --dry-run            # 仅切分+跑流程，不调用 LLM（split 仍执行）
 #   OPENLITERARY__LLM_BACKEND=mock ./scripts/translate_book.sh book.md  # mock 后端跑流程
 
+# bash 5.3.x 在 UTF-8 locale 下，echo -e + ANSI 转义 + 中文字符 + >&2 与 set -euo pipefail
+# 组合会触发变量作用域 bug（约第 5 次循环迭代起 ch_name 等被误判为未绑定）。强制 C locale 修复。
+export LC_ALL=C
+export LANG=C
+
 set -euo pipefail
 
 # ===========================
@@ -264,6 +269,7 @@ run_chapter() {
 run_all_chapters() {
     local chapters=("$@")
     local total=${#chapters[@]}
+    local ch_name
 
     log_info "开始翻译 $total 个章节 (顺序执行)..."
 
@@ -271,7 +277,7 @@ run_all_chapters() {
     local failed_count=0
     local failed_chapters=()
     for ch_file in "${chapters[@]}"; do
-        local ch_name=$(basename "$ch_file" .md)
+        ch_name=$(basename "$ch_file" .md)
         if run_chapter "$ch_file"; then
             log_ok "  章节完成: $ch_name"
         else

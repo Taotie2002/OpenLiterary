@@ -2,208 +2,191 @@
 # OpenLiterary 全局配置
 # =====================================================================
 #
-# 1. 角色级 LLM 配置（models 段，per-role 后端 + 思考模式）
+# 1. 角色级 LLM 配置（main.models 段）
 # ---------------------------------------------------------------------
-# 每个 LLM 角色可独立指定 backend + provider + model + extra_body。
-# 两个角色定义：
-#   literal_translator  - 直译专用（小模型即可，低 temperature）
-#   primary             - 主力模型（参考提取 / 文学润色 / Critic 打分 / 最终裁决）
+# 6 个角色 = 6 个独立模型，本地 MLX 和云端 API 自由混搭。
+# 每个角色必须指定 backend + 模型标识，互不依赖，无 fallback。
+#
+#   reference     - 典故/隐喻考据提取
+#   literal       - 字面直译
+#   rewriter      - 文学润色
+#   critic        - 5 维评分审辩
+#   judge         - 最终裁决
+#   golden        - 黄金测试集评估
 #
 # 支持 backend:
-#   mlx          - Apple Silicon 本地推理 (model_id)
+#   mlx          - Apple Silicon 本地推理 (model_id = 本地目录路径)
 #   openai_api   - 任意 OpenAI 兼容 HTTP API (api_base + api_key + model_name)
+#   mock         - 开发测试，不调用真实 LLM
 #
-# 思考模式 / 供应商特有参数通过 extra_body 透传:
-#   DeepSeek: extra_body: { thinking: true, reasoning_effort: high }
-#   OpenAI o-series: extra_body: { reasoning_effort: "high" }
-#   Gemini: extra_body: { reasoning_effort: "low" }
-#
-# 2. 全局 fallback（llm_backend + mlx/openai_api 段）
+# 2. 临时覆盖（不修改本文件）
 # ---------------------------------------------------------------------
-# 如果 models 段缺失，pipeline 自动回退到下方的全局 llm_backend 配置。
-# 推荐做法：始终使用 models 段。
+# 通过环境变量覆盖任意字段，__ 为嵌套分隔符：
+#   export OPENLITERARY__MAIN__MODELS__CRITIC__MODEL_NAME=mistral-large
+#   export OPENLITERARY__MAIN__MODELS__CRITIC__API_BASE=https://api.mistral.ai/v1
+#   export OPENLITERARY__MAIN__MODELS__CRITIC__API_KEY=$MISTRAL_KEY
 #
-# 3. 临时覆盖（不修改本文件）
-# ---------------------------------------------------------------------
-# 通过环境变量 OPENLITERARY__<路径> 覆盖任意字段，__ 为嵌套分隔符。
-# 路径需复刻 config.yaml 的嵌套结构（角色配置在 main.models.<role> 下）：
-#   export OPENLITERARY__LLM_BACKEND=openai_api
-#   export OPENLITERARY__MAIN__MODELS__PRIMARY__MODEL_NAME=mistral-large
-#   export OPENLITERARY__MAIN__MODELS__PRIMARY__API_BASE=https://api.mistral.ai/v1
-#   export OPENLITERARY__MAIN__MODELS__PRIMARY__API_KEY=$MISTRAL_KEY
-# 注意：OPENLITERARY_<路径> 形式（旧式，路径中用单下划线）也已支持。
-# 另：api_key 等敏感字段推荐用 ${ENV} 占位符写在下方 main.models.<role> 中，
-#     运行时由环境变量注入（如 export DEEPSEEK_API_KEY=...），无需明文落盘。
-#
-# 4. 任务路由（task_routing 段）
-# ---------------------------------------------------------------------
-# 把 6 类任务（reference_extraction / literal_translation / literary_rewrite /
-# critic_scoring / judge_decision / golden_test）映射到 2 个角色 key。
-# params_override 覆盖角色 default_params。
-#
-# 5. 状态机与质量门槛
-# ---------------------------------------------------------------------
-# pipeline.max_retries     - 单 chunk 最多重试次数（默认 3，含首次 1 次 + 重试 3 次 = 4 轮）
-# critic_thresholds        - 5 个评分维度 + 平均分阈值（低于即 is_flawed=True）
-# decision_engine          - 决策回溯策略（术语/典故/风格变动是否触发受影响 chunk 重译）
+# api_key 推荐用 ${ENV} 占位符，运行时从环境变量注入，无需明文落盘。
 # =====================================================================
 
-# ---------- 1. Per-role LLM 配置 ----------
+# ---------- 1. 6 个角色定义（一个角色 = 一个模型） ----------
 main:
   models:
-    literal_translator:
-      backend: openai_api
-      api_base: https://api.deepseek.com
-      api_key: ${DEEPSEEK_API_KEY}
-      model_name: deepseek-v4-flash
-      alias: llm(直译)
-      extra_body: {}
-    primary:
+    # 典故/隐喻考据提取（低温精确）
+    reference:
       backend: openai_api
       api_base: https://api.minimaxi.com/v1
       api_key: ${MINIMAX_API_KEY}
       model_name: MiniMax-M3
-      alias: llm-primary (主力模型)
+      alias: 参考提取 (云端)
       extra_body: {}
 
-# ---------- 2. 全局 fallback 配置（仅在 models 缺失时使用） ----------
-llm_backend: openai_api
-
-# Apple Silicon (M1/M2/M3) 本地推理
-mlx:
-  models:
-    literal_translator:
+    # 字面直译（低温忠实）
+    literal:
       backend: mlx
-      model_id: /Users/taotie/LLM/Qwen2.5-3B
+      model_id: /Users/taotie/LLM/HY-MT1.5-7B-4bit
+      alias: 直译 (本地)
+      extra_body: {}
 
-    primary:
+    # 文学润色（高温创意）
+    rewriter:
       backend: mlx
-      model_id: /Users/taotie/LLM/Mistral_4B
+      model_id: /Users/taotie/LLM/HY-MT1.5-7B-4bit
+      alias: 润色 (本地)
+      extra_body: {}
 
-# OpenAI 兼容 HTTP API（DeepSeek / vLLM / LM Studio 等）
-openai_api:
-  max_retries: 3              # 单次调用失败时的 API 级重试次数
-  retry_delay: 5.0            # 重试基础间隔（指数退避：5s → 10s → 20s）
-  request_timeout: 300        # 单次请求超时（秒）
-  max_concurrent_requests: 4  # 并发请求数
-  models:
-    literal_translator:
+    # 5 维评分审辩（低温一致）
+    critic:
       backend: openai_api
       api_base: https://api.deepseek.com
       api_key: ${DEEPSEEK_API_KEY}
       model_name: deepseek-v4-flash
-      alias: llm(直译)
+      alias: 审辩 (云端)
       extra_body: {}
-    primary:
+
+    # 最终裁决
+    judge:
       backend: openai_api
       api_base: https://api.minimaxi.com/v1
       api_key: ${MINIMAX_API_KEY}
       model_name: MiniMax-M3
-      alias: llm-primary (主力模型)
+      alias: 裁决 (云端)
       extra_body: {}
 
-# ---------- 3. 任务路由 ----------
-# 6 类任务 → 2 个角色 key；params_override 在角色 default_params 之上叠加
+    # 黄金测试集评估
+    golden:
+      backend: mlx
+      model_id: /Users/taotie/LLM/qwen3-0.6b-transcriber-4bit
+      alias: 黄金测试 (本地)
+      extra_body: {}
+
+# ---------- 2. 任务路由（1 对 1 映射，无 fallback） ----------
 task_routing:
-  reference_extraction:        # 典故/隐喻考据
-    model: primary
-    params_override:
+  reference_extraction:        # 典故/隐喻考据 → reference
+    model: reference
+    params:
       temperature: 0.1
       max_tokens: 20000
-      enable_thinking: false
-  literal_translation:         # 字面直译
-    model: literal_translator
-    params_override:
+      max_retries: 3
+      retry_delay: 5.0
+      request_timeout: 300
+
+  literal_translation:         # 字面直译 → literal
+    model: literal
+    params:
       temperature: 0.1
       max_tokens: 20000
-      enable_thinking: false
-  literary_rewrite:            # 文学润色
-    model: literal_translator  # P1 优化：分流至 DeepSeek，平衡 MiniMax 负载
-    params_override:
+      max_retries: 3
+      retry_delay: 5.0
+      request_timeout: 300
+
+  literary_rewrite:            # 文学润色 → rewriter
+    model: rewriter
+    params:
       temperature: 0.6
       max_tokens: 20000
-      enable_thinking: false
-  critic_scoring:              # 5 维评分（低温提高评分一致，降低通过率振荡）
-    model: primary
-    params_override:
+      max_retries: 3
+      retry_delay: 5.0
+      request_timeout: 300
+
+  critic_scoring:              # 5 维评分 → critic
+    model: critic
+    params:
       temperature: 0.1
       max_tokens: 20000
-      enable_thinking: false
-  judge_decision:              # 最终裁决
-    model: primary
-    params_override:
+      max_retries: 3
+      retry_delay: 5.0
+      request_timeout: 300
+
+  judge_decision:              # 最终裁决 → judge
+    model: judge
+    params:
       temperature: 0.3
       max_tokens: 20000
-      enable_thinking: false
-  golden_test:                 # 黄金测试集（与上面 5 类一致，独立列出便于单独调）
-    reference_extraction: primary
-    literal_translation: literal_translator
-    literary_rewrite: primary
-    critic_scoring: primary
-    judge_decision: primary
+      max_retries: 3
+      retry_delay: 5.0
+      request_timeout: 300
 
-# ---------- 4. 流水线调度 ----------
-# 章内串行处理 chunk（无假并发旋钮）；全书跨章也默认串行，避免 Decision DB 写竞态
+  golden_test:                 # 黄金测试集 → golden（独立列出便于单独调）
+    reference_extraction: reference
+    literal_translation: literal
+    literary_rewrite: rewriter
+    critic_scoring: critic
+    judge_decision: judge
+
+# ---------- 3. 流水线调度 ----------
 pipeline:
-  batch_size: 10              # 单批处理任务数
-  max_retries: 3              # 单 chunk API 级失败重试上限（耗尽后进 PERMANENTLY_FAILED）
-  max_quality_retries: 6      # 单 chunk 质量重试上限（Judge 不通过时的重新润色次数，与 max_retries 分离）
-  max_quality_retries_entity: 4  # P1 优化：实体一致性问题的重试上限（低于通用上限，避免死锁）
-  judge_safety_net_avg_min: 5.5  # P0: 安全网阈值——Judge 判 PASS 但 Critic 平均分低于此值时覆盖为 REJECT
-  poll_interval: 0.5          # 状态机轮询间隔（秒）
-  entity_hard_fail: true      # 实体一致性严重问题时强制退回润色至少一轮
-  entity_hard_fail_degradation_threshold: 3  # 降级阈值：质量重试 > 0 时，严重不一致项 > 此值才强制退回
+  batch_size: 10
+  max_retries: 3               # API 级失败重试上限（耗尽后进 PERMANENTLY_FAILED）
+  max_quality_retries: 6       # 质量重试上限（Judge 不通过 → Rewriter）
+  max_quality_retries_entity: 4  # 实体一致性问题重试上限（防死锁）
+  judge_safety_net_avg_min: 5.5  # 安全网：Judge 判 PASS 但 Critic 均分低于此 → 覆盖 REJECT
+  poll_interval: 0.5
+  entity_hard_fail: true
+  entity_hard_fail_degradation_threshold: 3
   early_stop:
-    enabled: true             # 是否启用早期止损
-    max_low_dims: 3           # 低于阈值维度数 ≥ 此值则触发止损
-    low_score_threshold: 4.0  # 什么分数算"低分"
-    apply_only_first_round: true  # 仅首轮质量裁决生效 early_stop
+    enabled: true
+    max_low_dims: 3
+    low_score_threshold: 4.0
+    apply_only_first_round: true
 
-# ---------- 5. 文本切分 ----------
+# ---------- 4. 文本切分 ----------
 chunker:
-  soft_limit: 1000            # 软上限（字符），超过则尝试在场景断点处切分
-  hard_limit: 2500            # 硬上限，超过则强制切分（不保证场景完整性）
-  respect_scene_breaks: true  # 是否优先在 --- / 空行 / 标题 等场景断点处切
+  soft_limit: 500
+  hard_limit: 1200
+  respect_scene_breaks: true
 
-# ---------- 6. 决策回溯引擎 ----------
-# 当 Decision DB 中新增某类决策时，是否回溯重译已完成的受影响 chunk
-# 仅 COMPLETED 状态可被标 DIRTY；JUDGING 等中间态禁止自脏（防死循环）
+# ---------- 5. 决策回溯引擎 ----------
 decision_engine:
   terminology_triggers_backtrack: true
   reference_triggers_backtrack: true
-  # STYLE 默认 false：规则只写入 DB 供后续 chunk 继承，不触发已完成 chunk 重译
   style_triggers_backtrack: false
-  max_affected_chunks_per_decision: 50   # 单次决策最多回溯多少个 chunk
-  backtrack_scope: book                  # book=全书扫描受影响 chunk；chapter=仅当前章
-  context_max_terminology: 40            # 注入 prompt 的术语上限
+  max_affected_chunks_per_decision: 50
+  backtrack_scope: book
+  context_max_terminology: 40
   context_max_reference: 20
   context_max_style: 10
   context_max_entities: 30
 
-# ---------- 7. Critic 评分门槛 ----------
-# P0: 阈值注入 Judge prompt 作为参考（非硬性否决）。
-# P4: 基于 golden test 基线校准（style_compliance 最难达标，容忍度最高）。
-# P2 优化：为卡罗尔风格调整阈值（克制的英式幽默 vs 史诗感）
+# ---------- 6. Critic 评分门槛 ----------
+# 阈值注入 Judge prompt 作为参考（非硬性否决）
 critic_thresholds:
   fluency: 6.5
   readability: 6.5
-  style_compliance: 6.0  # P2 优化：卡罗尔风格更接近"平实自然"，阈值适当放宽
+  style_compliance: 6.0
   voice_consistency: 6.0
   semantic_preservation: 6.5
   average_score_min: 6.5
 
-# ---------- 8. 风格指南 ----------
-# 对齐原作文类：刘易斯·卡罗尔《爱丽丝梦游仙境》为维多利亚儿童文学
-# （平实、克制、英式幽默、童趣），非科幻写实。
-# 现改为：忠实原作文类与句式、术语准确、少做装饰性发明、保留叙事的克制幽默语调。
+# ---------- 7. 风格指南 ----------
 style_guide:
   avg_sentence_length: 适中、口语化，贴近原文句式长度
   lexicon_preference: 平实、克制、英式幽默，避免过度意译、四字格堆砌与装饰性发明
-  author_priority_ratio: 0.7   # 0=译者主导  1=作者主导（动态 _build_style_guide 据此选高作者优先级模式）
-  genre: 儿童文学/维多利亚童话      # 体裁（注入各 Agent prompt）
+  author_priority_ratio: 0.7
+  genre: 儿童文学/维多利亚童话
   work_type: 长篇童话
 
-# ---------- 9. 路径 ----------
+# ---------- 8. 路径 ----------
 paths:
   db_dir: db
   input_dir: input
@@ -213,8 +196,8 @@ paths:
   decision_db: decision_db.sqlite
   workflow_db: workflow.db
 
-# ---------- 10. 日志 ----------
+# ---------- 9. 日志 ----------
 logging:
-  level: INFO                  # DEBUG / INFO / WARNING / ERROR
-  log_llm_calls: false         # 是否打印每个 LLM 调用的完整 prompt/response
-  perf_log_interval: 10        # 每处理 N 个 chunk 打印一次性能统计
+  level: INFO
+  log_llm_calls: false
+  perf_log_interval: 10

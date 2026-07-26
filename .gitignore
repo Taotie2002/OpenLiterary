@@ -17,6 +17,11 @@ env/
 .sisyphus/
 .opencode/
 
+# 密钥/环境变量（绝不上传）
+.env
+.env.local
+.env.*.local
+
 # 数据库 (运行产物, 可从空 db 重建)
 db/*.db
 db/*.sqlite

@@ -170,33 +170,27 @@ except Exception as _cfg_err:
     print(f"[WARN] 加载外部配置失败 ({_cfg_err})，降级到内建默认配置", file=sys.stderr)
 
 if _config is None:
-    # 单文件部署模式：外部配置不可用，使用内建默认配置
     class _BuiltinConfig:
         """单体聚合版内建默认配置（仅在 src.config 不可用时启用）"""
-        llm_backend = "mock"
+        role_models = {
+            "reference": {"backend": "mock", "extra_body": {}},
+            "literal": {"backend": "mock", "extra_body": {}},
+            "rewriter": {"backend": "mock", "extra_body": {}},
+            "critic": {"backend": "mock", "extra_body": {}},
+            "judge": {"backend": "mock", "extra_body": {}},
+            "golden": {"backend": "mock", "extra_body": {}},
+        }
         task_routing = {
-            "reference_extraction": {"model": "primary", "params_override": {}},
-            "literal_translation": {"model": "literal_translator", "params_override": {}},
-            "literary_rewrite": {"model": "primary", "params_override": {}},
-            "critic_scoring": {"model": "primary", "params_override": {"temperature": 0.1}},
-            "judge_decision": {"model": "primary", "params_override": {}},
+            "reference_extraction": {"model": "reference", "params": {"temperature": 0.1, "max_tokens": 20000}},
+            "literal_translation": {"model": "literal", "params": {"temperature": 0.1, "max_tokens": 20000}},
+            "literary_rewrite": {"model": "rewriter", "params": {"temperature": 0.6, "max_tokens": 20000}},
+            "critic_scoring": {"model": "critic", "params": {"temperature": 0.1, "max_tokens": 20000}},
+            "judge_decision": {"model": "judge", "params": {"temperature": 0.3, "max_tokens": 20000}},
         }
-        mlx_models = {
-            "literal_translator": {"model_id": "google/gemma-2-9b-it-mlx-4bit", "default_params": {}},
-            "primary": {"model_id": "qwen/Qwen2.5-7B-Instruct-MLX-4bit", "default_params": {}},
-        }
-        openai_models = {
-            "literal_translator": {"model_name": "gpt-4o-mini", "default_params": {}},
-            "primary": {"model_name": "gpt-4o-mini", "default_params": {}},
-        }
-        mlx_memory = {"warning_threshold": 0.8, "auto_unload_on_pressure": True}
-        openai_api = {"api_base": "http://127.0.0.1:1234/v1", "api_key": "lm-studio",
-                      "max_retries": 3, "retry_delay": 2.0, "request_timeout": 300,
-                      "max_concurrent_requests": 4}
         pipeline = {"batch_size": 50, "max_retries": 3, "max_quality_retries": 6, "judge_safety_net_avg_min": 5.5,
                     "poll_interval": 0.5, "entity_hard_fail": True,
                     "early_stop": {"enabled": True, "max_low_dims": 3, "low_score_threshold": 3.0, "apply_only_first_round": True}}
-        chunker = {"soft_limit": 1000, "hard_limit": 2500}  # P1-3: respect_scene_breaks 死配置删除
+        chunker = {"soft_limit": 1000, "hard_limit": 2500}
         decision_engine = {"terminology_triggers_backtrack": True,
                            "reference_triggers_backtrack": True,
                            "style_triggers_backtrack": False,
@@ -214,52 +208,23 @@ if _config is None:
                        "author_priority_ratio": 0.7,
                        "genre": "儿童文学",
                        "work_type": "长篇童话"}
-        # P1-1: paths 死配置已删除（grep 全文件 0 引用，配置项不生效）
 
         def resolve_task_model(self, task_name: str):
             routing = self.task_routing.get(task_name, {})
             model_key = routing.get("model", "primary")
-            return model_key, routing.get("params_override", {})
-
-        def _get_model_config(self, model_key: str):
-            if self.llm_backend == "mlx":
-                return self.mlx_models.get(model_key, {})
-            if self.llm_backend == "openai_api":
-                # 优先读新格式：openai_api.models.<role>
-                nested = self.openai_api.get("models", {})
-                if nested and model_key in nested:
-                    return nested[model_key]
-                # 兼容旧格式：openai_models.<role>
-            return self.openai_models.get(model_key, {})
+            return model_key, routing.get("params", {})
 
         def get_task_role(self, task_name: str):
             return self.task_routing.get(task_name, {}).get("model", "primary")
 
         def has_role_models(self):
-            # 单文件模式不支持 per-role default_params；请用 task_routing.*.params_override 覆盖
-            return False
-
-        def role_models(self):
-            return {}
+            return True
 
         def get_role_config(self, role: str):
-            legacy = self._get_model_config(role)
-            if self.llm_backend == "mock":
-                return {"backend": "mock", "default_params": {}}
-            if self.llm_backend == "mlx":
-                return {
-                    "backend": "mlx",
-                    "model_id": legacy.get("model_id", "qwen/Qwen2.5-7B-Instruct-MLX-4bit"),
-                    "default_params": legacy.get("default_params", {}),
-                }
-            section = self.openai_api
-            return {
-                "backend": "openai_api",
-                "api_base": section.get("api_base", "http://127.0.0.1:1234/v1"),
-                "api_key": section.get("api_key", "lm-studio"),
-                "model_name": legacy.get("model_name", "deepseek-v4-flash"),
-                "default_params": legacy.get("default_params", {}),
-            }
+            cfg = self.role_models.get(role)
+            if cfg:
+                return cfg
+            return {"backend": "mock", "extra_body": {}}
 
     _config = _BuiltinConfig()
     # P0-2: 降级行为显式化 —— 给出可操作指引；STRICT 模式直接退出便于 CI 捕获
@@ -777,32 +742,17 @@ def _build_role_client(role_cfg: Dict[str, Any]) -> LLMAdapter:
     if backend == "mlx":
         return MLXNativeAdapter()
     if backend in ("openai_api", "ollama", "nim", "mistral", "custom"):
-        section = _config.openai_api if hasattr(_config, "openai_api") else {}
-        # P4-8: 优先读 role_cfg 内的 per-role 超时配置，回退全局 openai_api
         return OpenAICompatibleAdapter(
-            api_base=role_cfg.get("api_base") or section.get("api_base", "http://127.0.0.1:1234/v1"),
-            api_key=role_cfg.get("api_key") or section.get("api_key", "lm-studio"),
-            max_retries=role_cfg.get("max_retries", section.get("max_retries", 3)),
-            retry_delay=role_cfg.get("retry_delay", section.get("retry_delay", 2.0)),
-            request_timeout=role_cfg.get("request_timeout", section.get("request_timeout", 300)),
+            api_base=role_cfg.get("api_base", "http://127.0.0.1:1234/v1"),
+            api_key=role_cfg.get("api_key", "lm-studio"),
+            max_retries=role_cfg.get("max_retries", 3),
+            retry_delay=role_cfg.get("retry_delay", 5.0),
+            request_timeout=role_cfg.get("request_timeout", 300),
         )
     raise ValueError(f"不支持的 backend: {backend}")
 
 
 def get_llm_client(role: str) -> LLMAdapter:
-    """按角色返回 LLM 客户端实例（首次按需构建并缓存）。
-
-    当全局 llm_backend=mock 时强制 mock，并清空可能残留的非 mock 缓存。
-    """
-    if getattr(_config, "llm_backend", None) == "mock":
-        # 避免此前 openai 客户端残留导致 dry-run 仍打真 API
-        stale = [k for k, v in _client_instances.items() if not isinstance(v, MockLLMAdapter)]
-        for k in stale:
-            del _client_instances[k]
-        role_cfg = {"backend": "mock", "default_params": {}, "extra_body": {}}
-        if role not in _client_instances:
-            _client_instances[role] = _build_role_client(role_cfg)
-        return _client_instances[role]
     if role not in _client_instances:
         role_cfg = _config.get_role_config(role)
         _client_instances[role] = _build_role_client(role_cfg)
@@ -1980,15 +1930,8 @@ class LiteraryRewriterAgent:
             specific_edits_section = (
                 "\n【Critic 结构化修改指令（必须逐条处理，不得只改一处）】\n"
                 + "\n".join(edits_lines) + "\n\n"
-                # M 方案：强制逐条回应全部 specific_edits，禁止"只改一处"的打勾式空转
-                "【强制要求】你必须在这一轮中**逐条处理以上全部 "
-                f"{len(specific_edits)} 条修改指令**，不得只挑选其中 1 条。"
-                "输出润色稿之后，另起一行用 ```json 包裹输出每条的处理结果：\n"
-                '```json\n'
-                '[{"index": 1, "status": "resolved|partial|skipped", "reason": "..."}, '
-                '{"index": 2, "status": "resolved|partial|skipped", "reason": "..."}]\n'
-                '```\n'
-                f"共 {len(specific_edits)} 条，每条对应一个 index，缺一不可。\n"
+                f"【强制要求】你必须在这一轮中**逐条处理以上全部 "
+                f"{len(specific_edits)} 条修改指令**，不得只挑选其中 1 条。\n"
             )
 
         history_section = ""
@@ -2279,44 +2222,7 @@ class LiteraryRewriterAgent:
             extra_body=extra_body,
         )
 
-        # 解析自评 JSON（仅 retry 轮）
-        self_review = None
-        clean_text = final_markdown
-        if retry_count > 0 and specific_edits:
-            # P3-3: 使用顶层 re（删除冗余 `import re as _re`）
-            # 匹配末尾的 ```json ... ``` 块
-            m = re.search(r'```json\s*(.+?)\s*```', final_markdown, re.DOTALL)
-            if m:
-                raw_block = m.group(1).strip()
-                # P2-1: 统一走 robust_json_loads，先按 list 解析（自评是数组），失败回退 dict
-                parsed = robust_json_loads(raw_block, expected_type=list)
-                if not parsed:
-                    parsed_dict = robust_json_loads(raw_block, expected_type=dict)
-                    parsed = [parsed_dict] if parsed_dict else None
-                if parsed:
-                    self_review = parsed
-                    clean_text = final_markdown[:m.start()].rstrip()
-                else:
-                    # NDJSON 兜底
-                    try:
-                        ndjson_items = []
-                        for line in raw_block.splitlines():
-                            line = line.strip()
-                            if line:
-                                # P2-1: NDJSON 行用 robust_json_loads 抗畸形
-                                obj = robust_json_loads(line, expected_type=dict)
-                                if obj:
-                                    ndjson_items.append(obj)
-                        if ndjson_items:
-                            self_review = ndjson_items
-                            clean_text = final_markdown[:m.start()].rstrip()
-                    except (json.JSONDecodeError, ValueError, AttributeError, TypeError):
-                        pass
-            if self_review is None:
-                print(f"  ⚠️ [Rewriter] {chunk_id} 自评 JSON 解析失败，降级为无自评模式")
-
-        # 返回 (润色正文, 自评) 元组，由调用方保存到 metadata
-        return clean_text, self_review
+        return final_markdown, None
 
 
 # ----- 6.3 CriticAgent -----
@@ -3684,7 +3590,7 @@ def test_memory_pressure():
     print(f"💻 系统内存: {sys_mem['total_gb']:.1f}GB 总计, {sys_mem['available_gb']:.1f}GB 可用")
 
     client = get_llm_client_for_task("reference_extraction")
-    print(f"🤖 当前后端: {_config.llm_backend}")
+    print(f"🤖 当前后端: per-role config")
 
     print("\n📊 测试 1: 基础内存监控")
     proc_mem = get_process_memory()
