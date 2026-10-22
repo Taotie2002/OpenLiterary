@@ -1,192 +1,450 @@
 # =====================================================================
-# OpenLiterary 全局配置
+# SagaTrans 全局配置
 # =====================================================================
 #
-# 1. 角色级 LLM 配置（main.models 段）
+# 1. 角色级 LLM 配置（models 段，per-role 后端 + 思考模式）
 # ---------------------------------------------------------------------
-# 6 个角色 = 6 个独立模型，本地 MLX 和云端 API 自由混搭。
-# 每个角色必须指定 backend + 模型标识，互不依赖，无 fallback。
-#
-#   reference     - 典故/隐喻考据提取
-#   literal       - 字面直译
-#   rewriter      - 文学润色
-#   critic        - 5 维评分审辩
-#   judge         - 最终裁决
-#   golden        - 黄金测试集评估
+# 每个 LLM 角色可独立指定 backend + provider + model + extra_body。
+# 两个角色定义：
+#   literal_translator  - 直译专用（小模型即可，低 temperature）
+#   primary             - 主力模型（参考提取 / 文学润色 / Critic 打分 / 最终裁决）
 #
 # 支持 backend:
-#   mlx          - Apple Silicon 本地推理 (model_id = 本地目录路径)
+#   mlx          - Apple Silicon 本地推理 (model_id)
 #   openai_api   - 任意 OpenAI 兼容 HTTP API (api_base + api_key + model_name)
-#   mock         - 开发测试，不调用真实 LLM
 #
-# 2. 临时覆盖（不修改本文件）
+# 思考模式 / 供应商特有参数通过 extra_body 透传:
+#   DeepSeek: extra_body: { thinking: true, reasoning_effort: high }
+#   OpenAI o-series: extra_body: { reasoning_effort: "high" }
+#   Gemini: extra_body: { reasoning_effort: "low" }
+#
+# 2. 全局 fallback（llm_backend + mlx/openai_api 段）
 # ---------------------------------------------------------------------
-# 通过环境变量覆盖任意字段，__ 为嵌套分隔符：
-#   export OPENLITERARY__MAIN__MODELS__CRITIC__MODEL_NAME=mistral-large
-#   export OPENLITERARY__MAIN__MODELS__CRITIC__API_BASE=https://api.mistral.ai/v1
-#   export OPENLITERARY__MAIN__MODELS__CRITIC__API_KEY=$MISTRAL_KEY
+# 如果 models 段缺失，pipeline 自动回退到下方的全局 llm_backend 配置。
+# 推荐做法：始终使用 models 段。
 #
-# api_key 推荐用 ${ENV} 占位符，运行时从环境变量注入，无需明文落盘。
+# 3. 临时覆盖（不修改本文件）
+# ---------------------------------------------------------------------
+# 通过环境变量 SAGATRANS__<路径> 覆盖任意字段，__ 为嵌套分隔符。
+# 路径需复刻 config.yaml 的嵌套结构（角色配置在 main.models.<role> 下）：
+#   export SAGATRANS__LLM_BACKEND=openai_api
+#   export SAGATRANS__MAIN__MODELS__PRIMARY__MODEL_NAME=mistral-large
+#   export SAGATRANS__MAIN__MODELS__PRIMARY__API_BASE=https://api.mistral.ai/v1
+#   export SAGATRANS__MAIN__MODELS__PRIMARY__API_KEY=$MISTRAL_KEY
+# 注意：SAGATRANS_<路径> 形式（旧式，路径中用单下划线）也已支持。
+# 另：api_key 等敏感字段推荐用 ${ENV} 占位符写在下方 main.models.<role> 中，
+#     运行时由环境变量注入（如 export DEEPSEEK_API_KEY=...），无需明文落盘。
+#
+# 4. 任务路由（task_routing 段）
+# ---------------------------------------------------------------------
+# 把 6 类任务（reference_extraction / literal_translation / literary_rewrite /
+# critic_scoring / judge_decision / golden_test）映射到 2 个角色 key。
+# params_override 覆盖角色 default_params。
+#
+# 5. 状态机与质量门槛
+# ---------------------------------------------------------------------
+# pipeline.max_retries     - 单 chunk 最多重试次数（默认 3，含首次 1 次 + 重试 3 次 = 4 轮）
+# critic_thresholds        - 6 个评分维度 + 平均分阈值（低于即 is_flawed=True）
+# decision_engine          - 决策回溯策略（术语/典故/风格变动是否触发受影响 chunk 重译）
 # =====================================================================
 
-# ---------- 1. 6 个角色定义（一个角色 = 一个模型） ----------
+# ---------- 1. Per-role LLM 配置 ----------
 main:
   models:
-    # 典故/隐喻考据提取（低温精确）
-    reference:
+    literal_translator:
       backend: openai_api
-      api_base: https://api.minimaxi.com/v1
+      api_base: https://token.ai-hf.cn/v1
+      api_key: ${HEFEI_API_KEY}
+      model_name: Deepseek-V4.1-Flash-1017-SS
+      alias: llm(直译)
+      extra_body: {}
+    primary:
+      backend: openai_api
+      api_base: https://api.minimax.cn/v1
       api_key: ${MINIMAX_API_KEY}
-      model_name: MiniMax-M3
-      alias: 参考提取 (云端)
+      model_name: MiniMax-M3.1-Flash
+      alias: llm-primary (主力模型)
       extra_body: {}
 
-    # 字面直译（低温忠实）
-    literal:
+# ---------- 2. 全局 fallback 配置（仅在 models 缺失时使用） ----------
+llm_backend: openai_api
+
+# Apple Silicon (M1/M2/M3) 本地推理
+mlx:
+  models:
+    literal_translator:
       backend: mlx
-      model_id: /Users/taotie/LLM/HY-MT1.5-7B-4bit
-      alias: 直译 (本地)
-      extra_body: {}
+      model_id: /Users/taotie/LLM/Qwen2.5-3B
 
-    # 文学润色（高温创意）
-    rewriter:
+    primary:
       backend: mlx
-      model_id: /Users/taotie/LLM/HY-MT1.5-7B-4bit
-      alias: 润色 (本地)
-      extra_body: {}
+      model_id: /Users/taotie/LLM/Mistral_4B
 
-    # 5 维评分审辩（低温一致）
-    critic:
+# OpenAI 兼容 HTTP API（DeepSeek / vLLM / LM Studio 等）
+openai_api:
+  max_retries: 3              # 单次调用失败时的 API 级重试次数
+  retry_delay: 5.0            # 重试基础间隔（指数退避：5s → 10s → 20s）
+  request_timeout: 300        # 单次请求超时（秒）
+  max_concurrent_requests: 4  # 并发请求数
+  models:
+    literal_translator:
       backend: openai_api
-      api_base: https://api.deepseek.com
-      api_key: ${DEEPSEEK_API_KEY}
-      model_name: deepseek-v4-flash
-      alias: 审辩 (云端)
+      api_base: https://token.ai-hf.cn/v1
+      api_key: ${HEFEI_API_KEY}
+      model_name: Deepseek-V4.1-Flash-1017-SS
+      alias: llm(直译)
       extra_body: {}
-
-    # 最终裁决
-    judge:
+    primary:
       backend: openai_api
-      api_base: https://api.minimaxi.com/v1
+      api_base: https://api.minimax.cn/v1
       api_key: ${MINIMAX_API_KEY}
-      model_name: MiniMax-M3
-      alias: 裁决 (云端)
+      model_name: MiniMax-M3.1-Flash
+      alias: llm-primary (主力模型)
       extra_body: {}
 
-    # 黄金测试集评估
-    golden:
-      backend: mlx
-      model_id: /Users/taotie/LLM/qwen3-0.6b-transcriber-4bit
-      alias: 黄金测试 (本地)
-      extra_body: {}
-
-# ---------- 2. 任务路由（1 对 1 映射，无 fallback） ----------
+# ---------- 3. 任务路由 ----------
+# 6 类任务 → 2 个角色 key；params_override 在角色 default_params 之上叠加
 task_routing:
-  reference_extraction:        # 典故/隐喻考据 → reference
-    model: reference
-    params:
+  reference_extraction:        # 典故/隐喻考据 (Round 25: 路由至 deepseek-flash，与字面直译同模型；降本)
+    model: literal_translator
+    params_override:
       temperature: 0.1
       max_tokens: 20000
-      max_retries: 3
-      retry_delay: 5.0
-      request_timeout: 300
-
-  literal_translation:         # 字面直译 → literal
-    model: literal
-    params:
+      enable_thinking: true    # Round 117: 推理型任务（典故判定）— thinking 开启
+  reference_confirmation:      # Round 118 P1-3: 两阶段考据 — 召回(DeepSeek)+确认(MiniMax)
+    model: primary
+    params_override:
       temperature: 0.1
       max_tokens: 20000
-      max_retries: 3
-      retry_delay: 5.0
-      request_timeout: 300
-
-  literary_rewrite:            # 文学润色 → rewriter
-    model: rewriter
-    params:
+      enable_thinking: true    # 复核典故出处依赖推理链
+  literal_translation:         # 字面直译
+    model: literal_translator
+    params_override:
+      temperature: 0.1
+      max_tokens: 20000
+      enable_thinking: false   # 直译默认关；困难片段可经难度路由按段开启（P2）
+  literary_rewrite:            # 文学润色
+    model: literal_translator  # P1 优化：分流至 DeepSeek，平衡 MiniMax 负载
+    params_override:
       temperature: 0.6
       max_tokens: 20000
-      max_retries: 3
-      retry_delay: 5.0
-      request_timeout: 300
-
-  critic_scoring:              # 5 维评分 → critic
-    model: critic
-    params:
+      enable_thinking: true    # Round 117: 语感/语域推理收益最大
+  critic_scoring:              # 5 维评分（低温提高评分一致，降低通过率振荡）
+    model: primary
+    params_override:
       temperature: 0.1
       max_tokens: 20000
-      max_retries: 3
-      retry_delay: 5.0
-      request_timeout: 300
-
-  judge_decision:              # 最终裁决 → judge
-    model: judge
-    params:
+      enable_thinking: false   # 评分追求稳定重复性（thinking 待黄金 A/B 后再定）
+  judge_decision:              # 最终裁决
+    model: primary
+    params_override:
       temperature: 0.3
       max_tokens: 20000
-      max_retries: 3
-      retry_delay: 5.0
-      request_timeout: 300
+      enable_thinking: true    # Round 117: 裁决需要推理链（MiniMax adaptive）
+  style_profiling:             # Round 117 P0: 动态风格剖面（作品隔离；thinking 用于文学史判定与风格归纳）
+    model: primary
+    params_override:
+      temperature: 0.2
+      max_tokens: 12000
+      enable_thinking: true
+  editor_review:               # Round 120 L5: 成书级编辑审读（merge 层级五类缺陷; 只报告）
+    model: primary
+    params_override:
+      temperature: 0.2
+      max_tokens: 60000          # M3.1-Flash thinking 很长：20k 预算被推理链吃光导致 parse_error（R11 实测）
+      enable_thinking: true
+  golden_test:                 # 黄金测试集（与上面 5 类一致，独立列出便于单独调）
+    reference_extraction: primary
+    reference_confirmation: primary
+    literal_translation: literal_translator
+    literary_rewrite: primary
+    critic_scoring: primary
+    judge_decision: primary
 
-  golden_test:                 # 黄金测试集 → golden（独立列出便于单独调）
-    reference_extraction: reference
-    literal_translation: literal
-    literary_rewrite: rewriter
-    critic_scoring: critic
-    judge_decision: judge
-
-# ---------- 3. 流水线调度 ----------
+# ---------- 4. 流水线调度 ----------
+# 章内串行处理 chunk（无假并发旋钮）；全书跨章也默认串行，避免 Decision DB 写竞态
 pipeline:
-  batch_size: 10
-  max_retries: 3               # API 级失败重试上限（耗尽后进 PERMANENTLY_FAILED）
-  max_quality_retries: 6       # 质量重试上限（Judge 不通过 → Rewriter）
-  max_quality_retries_entity: 4  # 实体一致性问题重试上限（防死锁）
-  judge_safety_net_avg_min: 5.5  # 安全网：Judge 判 PASS 但 Critic 均分低于此 → 覆盖 REJECT
-  poll_interval: 0.5
-  entity_hard_fail: true
-  entity_hard_fail_degradation_threshold: 3
-  early_stop:
+  batch_size: 10              # 单批处理任务数
+  max_retries: 3              # 单 chunk API 级失败重试上限（耗尽后进 PERMANENTLY_FAILED）
+  max_quality_retries: 5      # Round 118 P1-4（质量优先）: 4→5，给 rewriter 更多修复机会；成本非首要
+  max_quality_retries_entity: 4  # P1 优化：实体一致性问题的重试上限（低于通用上限，避免死锁）
+  judge_safety_net_avg_min: 5.5  # P0: 安全网阈值——Judge 判 PASS 但 Critic 平均分低于此值时覆盖为 REJECT
+  # Round 118 P1-2: REJECT 第二意见 — typesafe verdict 的拒因常只有概率信号，
+  # rewriter 无法执行（ch32 实测 REWRITER_STAGNATED）。REJECT 后触发一次
+  # judge_decision 角色 LLM 复核，把拒因翻译成逐条可执行编辑并入 specific_edits。
+  # 只补指令，不改 decision（绝不弱化 Jev 仲裁）。
+  judge_second_opinion:
     enabled: true
-    max_low_dims: 3
-    low_score_threshold: 4.0
-    apply_only_first_round: true
+    max_edits: 20
+    temperature: 0.2
+  # Round 118 P1-3: 参考提取两阶段 — DeepSeek 高召回初筛 + MiniMax 逐条确认。
+  # 关闭后回退单阶段（召回结果直接采用）。
+  reference_two_stage:
+    enabled: true
+    max_recall_chars: 12000
+  # Round 118 P2-5: 直译难度路由 — 典故密度高/长句多/含引文的片段切到更强模型
+  # （默认 primary/MiniMax）并按段开启 thinking；普通片段仍走 DeepSeek 直译（thinking 关）。
+  difficulty_routing:
+    enabled: true
+    hard_threshold: 2.0
+    hard_role: primary
+    hard_enable_thinking: true
+  # Round 118 P2-8: Jev 配对仲裁 — 早停/兜底定稿时在 top-2 候选稿之间做配对比较,
+  # winner 作为最终稿; 不可用/平票时回退最高 critic 分版本（保持原行为）。
+  pairwise_arbitration:
+    enabled: true
+    min_confidence: 0.6
+    max_candidates: 4
+  # Round 120 L3: 高价值片段双稿仲裁 — verse / pun-dense 片段用 alternate_role
+  # （MiniMax-M3）生成第二稿，pairwise（Jev 配对）→ critic 均分 → 首稿 三级择优；
+  # sidecar: <chunk>_dual_draft_meta.json。Phase 1 A/B 结论（10 chunk，2026-10-15）：
+  # 保留启用（verse/pun 层触发，≤25/章）；Jev pairwise 仲裁为准绳，critic 仅兜底。
+  dual_draft:
+    enabled: true
+    alternate_role: primary
+    max_chunks: 25
+  # Round 118 P2-7: 黄金集 A/B（CLI: golden --ab / golden-gate --ab）—
+  # 直译阶段 DeepSeek/MiniMax × thinking(on/off) 4 组合全流程对比;
+  # 仅 confidence_source=jev 占比 ≥ min_calibrated_ratio 的组合参与推荐/门禁.
+  golden_ab:
+    min_calibrated_ratio: 0.5
+  # Round 118 P2-6: 章节级漂移审计（CLI: drift-audit --chapter ch01 [--jev]）
+  # 统计层离线可用；--jev 时附加相邻窗口的 voice_drift/register_match 配对检查。
+  drift_audit:
+    window: 5
+    trend_threshold: 0.25        # 首窗→末窗指标相对变化超过此值 → 漂移警告
+    sentence_len_tolerance: 0.30 # 全书均值句长与 profile 基线偏差超过此值 → 警告
+  # Round 96: final.json CJK sanity 闸门. 译文 CJK 字符占比低于此值时尝试 fallback 到 literary/raw,
+  # 全部失败则标 sanity_failed=true. 0 表示禁用闸门 (向后兼容).
+  final_cjk_threshold: 0.5
+  # Round 97: CJK 重试耗尽早停. rewriter 反复输出英文 (P3 闸门拦截) 时,
+  # 在 cjk_max_retries 次重试后 fallback 到 raw 翻译稿 (raw 经 P2 闸门保证是中文),
+  # 节省后续 LLM 调用. 0 = 禁用早停 (走原有 max_quality_retries 流程).
+  # Round 118 P1-4（质量优先）: 2→3，CJK 失败会回退 raw（失去文学润色），
+  # 多给一次 rewriter + 停滞换模型的机会再放弃.
+  cjk_max_retries: 3
+  # Round 96 P2: raw 翻译稿必须含中文. ch02 案例中 LLM 返回英文源文, 被喂给 rewriter 连锁失败.
+  # raw CJK < 此值 → FAILED 重试 TRANSLATING_RAW (而不是用英文稿推进 REWRITING_LITERARY).
+  # 0 表示禁用闸门 (向后兼容). 比 final_cjk_threshold 低, 因为 raw 可含较多英文人名/地名.
+  min_raw_cjk_ratio: 0.3
+  # Round 98 P1: 实体违规连续 N 次未修复 → 早停 fallback, 节省 rewriter+critic+judge LLM 调用.
+  # 触发: 最近 N 次 audit 每次都有 ≥1 个 serious 违规 (variant_instead_of_canonical / missing).
+  # 与 CJK 早停并行, 但更激进. Round 118 P1-4（质量优先）: 2→3，
+  # 实体命名是硬约束，先让停滞换模型/多一轮修复再早停.
+  # 0 = 禁用早停 (走原 max_quality_retries_entity=4 流程).
+  entity_stagnation_threshold: 3
+  # Round 101 P1: audit 高分直通 — 首轮评分全 ≥ 阈值 + 无实体违规 + CJK 高 → 直接 COMPLETED, 跳过 judge LLM.
+  # 与 R99 P3 AUDIT_EARLY_STOP 互补: P3 抓评分差, P1 抓评分好. 默认阈值 8.0 (偏宽松).
+  audit_high_pass:
+    enabled: true
+    high_score_threshold: 8.0
+  # Round 98 P2: 非进展 streak. avg_score 连续 N 次单调不增 (含持平) → 早停.
+  # 比 _is_declining_streak (严格递减) 更激进, 抓住「rewriter 不恶化但也不进步」场景.
+  # 1 = 禁用早停 (走原有 max_quality_retries 流程).
+  # Round 118 P1-4（质量优先）: 3→4，非进展早停延后一轮.
+  no_progress_window: 4
+  # Round 118 P1-4: 严格递减 streak 窗口（_is_declining_streak），默认 4（旧硬编码 3）.
+  score_decline_streak: 4
+  poll_interval: 0.5          # 状态机轮询间隔（秒）
+  entity_hard_fail: true      # 实体一致性严重问题时强制退回润色至少一轮
+  entity_hard_fail_degradation_threshold: 3  # 降级阈值：质量重试 > 0 时，严重不一致项 > 此值才强制退回
+  # B3 Round 2: variant discovery 门槛（避免变体误发现导致 entity_hard_fail 死循环）
+  variant_min_occurrence: 2     # 一字之差的候选变体需在同 chunk 内出现 ≥ 此次数才入注册表
+  # Round 105: 默认改为 false。ch32 实测一字之差自动入表把 东西/卡特/警察/伦敦金 等
+  # 普通词登记为人名异体，随后被 consistency 3c 盲目替换改坏正文。默认仅 soft-hint
+  # 供人工复核；确认需要自动入表时再显式置 true（并配合 variant_min_auto_len 护栏）。
+  variant_auto_register: false  # 是否自动写注册表（false = 仅 soft-hint，不污染 registry）
+  # Round 105: 硬长度护栏。canonical 长度 < 此值时，即使 variant_auto_register=true
+  # 也绝不自动入表（短名的一字之差几乎必为普通词：黛西←东西 / 卡洛←卡特）。
+  variant_min_auto_len: 3
+  # Round 105: 译后一致性自动修正开关。ch32 实测 dry_run=False 自动修正把
+  # 某样东西→某样黛西 / 卡特姆勋爵→卡洛姆勋爵（普通词被当人名异体替换）。
+  # 默认 false = 章节末尾仅生成 consistency_diff.md 报告、不落地修改 final.json；
+  # 确认报告无误后显式置 true 才自动修正（CLI `consistency --apply` 不受此开关影响）。
+  consistency_auto_fix: false
+  early_stop:
+    enabled: true             # 是否启用早期止损
+    max_low_dims: 3           # 低于阈值维度数 ≥ 此值则触发止损
+    low_score_threshold: 4.0  # 什么分数算"低分"
+    apply_only_first_round: true  # 仅首轮质量裁决生效 early_stop
+  # Round 106: 是否信任 mock_heuristic 后端的分数/verdict。
+  # Jev API 不可用（如 451 区域封锁）时，critic 回退到 mock 启发式，其分数是确定性
+  # 假分数（entity_consistency=0、literal_residue 极低等），judge 还会直接复用其
+  # _typesafe_verdict，导致整章 PERMANENTLY_FAILED（ch05 实测 7/7 chunk 全挂）。
+  # 默认 false = 不信任：mock 分数不触发 AUDIT_EARLY_STOP / 高分直通，judge 也不复用
+  # 其 verdict（强制 LLM 独立裁决，让真正的质量门生效）。
+  trust_mock_heuristic: false
+  # Round 6: oscillation 早停——连续 retry 译文高度相似说明 LLM 已在"原地打转"
+  # 检测到连续 N 次 retry 间相似度 ≥ 阈值 → 直接 fallback，跳过 AUDITING/JUDGING
+  # 收益：省 LLM 调用（每次 retry ~5-10s + token 成本）+ 译文最终质量与跑满 6 次 retry 等价
+  oscillation_detection:
+    enabled: true             # 是否启用 oscillation 早停
+    similarity_threshold: 0.95  # 相似度 ≥ 此值视为"无实质改进"
+    consecutive_required: 2     # 连续 N 次满足才触发 fallback（避免误杀合法 retry）
+    # Round 12: reject_reason 停滞检测（与 similarity 并行运行）
+    # 现象：连续 retry 间 reject_reason_summary 完全一致 → Rewriter 没在解决问题
+    # 与 similarity 检测互补：similarity 检查 LLM 输出文本相似；stagnation 检查问题清单相似
+    stagnation_detection:
+      enabled: true             # 是否启用 stagnation 早停
+      consecutive_required: 1   # N=1：当前 retry 与前 1 retry reject_reason 一致即触发；N=2：需 3 连一致
+      # Round 16: Jev-aware stagnation 模式
+      # - category（默认）：比较 primitive category 集合，忽略 noul 浮动（Jev 后端唯一有效模式）
+      # - exact：精确字符串匹配（旧 Round 12 行为；Jev 后端下永远不触发）
+      # - substring：宽松包含关系
+      match_mode: category
+      exact_match_only: true    # 兼容旧 key（match_mode 未设置时按此推断）
+  # Round 116: 停滞/振荡换模型（生成端多样性破停滞）
+  # 现象：字节停滞 (REWRITER_STAGNATED) 时同一模型对同一 prompt 反复输出相同文本，
+  # 继续重试只是烧 token。开启后首次停滞不直接 fallback，而是切换到另一角色
+  # （DeepSeek ↔ MiniMax-M3）再试一轮；上限 max_switches 次后仍走原 fallback 路径。
+  # 换模型不占用 quality_retries 计数，通过 sidecar (rewrite_switch) 记录，便于倒查。
+  stagnation_model_switch:
+    enabled: true
+    alternate_role: primary      # 润色默认角色 literal_translator(DeepSeek)，停滞时切换至 primary(MiniMax-M3)
+    max_switches: 1              # 1=只换一次；2=允许在 base/alt 间来回换
+  # Round 7: 译后一致性校正（auto-apply）
+  # 章节 run() 完成后自动跑 run_consistency_check_for_chapter，章节级 scope
+  # 修复 alias_mixed / english_residue / cjk_variant 三类问题（QA_REPORT 162 处）
+  # 与 CLI 子命令 'consistency --apply' 共用核心检测逻辑，行为一致
+  post_consistency:
+    enabled: true             # 章节完成后是否自动跑 consistency apply
+    chapter_scoped: true      # true=仅修当前章节；false=修全部 output/（生产环境慎用）
+  # Round 9: 实体完整性审计（纯诊断，不改译文）
+  # 章节 run() 完成后扫描所有 final.json，对比 source_text 中的 source_names 与 final_text 是否含 canonical/variant
+  # 输出 output/chXX/entity_audit.md：哪些已登记实体被 Rewriter 漏译
+  # 用途：定位 Rewriter prompt 改进点（如 ch32 chunk002 漏译"科德斯（Codders）"）
+  entity_audit:
+    enabled: true             # 是否启用实体完整性审计
+    min_chunk_missing_threshold: 1  # 单 chunk 缺失实体数 ≥ 此值才在报告中列出（过滤噪声）
+  # Round 13: LLM 调用成本报告（每章 run() 末尾自动生成 cost_report.md）
+  # 统计 5 类 task 的调用次数 + 估算 token 数；用于评估 Round 6/12 早停的省钱效果
+  cost_report:
+    enabled: true             # 是否生成 cost_report.md
+  # Round 14: intermediate 文件自动清理（章节完成后）
+  # 保留 canonical literary.json + final.json + rewrite_meta_vN（最后一次）
+  # 删除 literary_v0..vN-1（已被 vN 覆盖） + 早期 rewrite_meta
+  # 节省磁盘空间，让 output/ 目录更干净；legacy ch32 (113 v* 文件) 受益最大
+  intermediate_cleanup:
+    enabled: true             # 是否在 pipeline.run() 末尾自动清理
+    preserve_for_failed: true # PERMANENTLY_FAILED chunk 保留全部中间文件（供人工 inspect）
+    preserve_meta: true       # 保留 rewrite_meta（最后一次的 meta，诊断用）
+  # Round 15: entity_registry source_names 冲突检测（纯诊断）
+  # 检测同一英文 source_name 被登记到多个 canonical 的情况
+  # 这会导致 consistency.py 不知该用哪个译名（如 "Joe" → 绅士乔 / 安东尼·凯德）
+  # 输出 output/chXX/entity_registry_conflicts.md，运维据此手动修复 entity_registry
+  entity_registry_audit:
+    enabled: true             # 是否启用 entity_registry 冲突检测
 
-# ---------- 4. 文本切分 ----------
+# ---------- 5. 文本切分 ----------
 chunker:
-  soft_limit: 500
-  hard_limit: 1200
-  respect_scene_breaks: true
+  soft_limit: 1000            # 软上限（字符），超过则尝试在场景断点处切分
+  hard_limit: 2500            # 硬上限，超过则强制切分（不保证场景完整性）
+  respect_scene_breaks: true  # 是否优先在 --- / 空行 / 标题 等场景断点处切
 
-# ---------- 5. 决策回溯引擎 ----------
+# ---------- 6. 决策回溯引擎 ----------
+# 当 Decision DB 中新增某类决策时，是否回溯重译已完成的受影响 chunk
+# 仅 COMPLETED 状态可被标 DIRTY；JUDGING 等中间态禁止自脏（防死循环）
 decision_engine:
   terminology_triggers_backtrack: true
   reference_triggers_backtrack: true
+  # STYLE 默认 false：规则只写入 DB 供后续 chunk 继承，不触发已完成 chunk 重译
   style_triggers_backtrack: false
-  max_affected_chunks_per_decision: 50
-  backtrack_scope: book
-  context_max_terminology: 40
+  max_affected_chunks_per_decision: 50   # 单次决策最多回溯多少个 chunk
+  backtrack_scope: book                  # book=全书扫描受影响 chunk；chapter=仅当前章
+  context_max_terminology: 40            # 注入 prompt 的术语上限
   context_max_reference: 20
   context_max_style: 10
   context_max_entities: 30
 
-# ---------- 6. Critic 评分门槛 ----------
-# 阈值注入 Judge prompt 作为参考（非硬性否决）
+# ---------- 7. Critic 评分门槛 ----------
+# P0: 阈值注入 Judge prompt 作为参考（非硬性否决）。
+# P4: 基于 golden test 基线校准（style_compliance 最难达标，容忍度最高）。
+# P2 优化：为卡罗尔风格调整阈值（克制的英式幽默 vs 史诗感）
 critic_thresholds:
   fluency: 6.5
   readability: 6.5
-  style_compliance: 6.0
+  style_compliance: 6.0  # P2 优化：卡罗尔风格更接近"平实自然"，阈值适当放宽
   voice_consistency: 6.0
   semantic_preservation: 6.5
+  literal_residue: 6.5   # P4: 新增维度，检测直译残留
   average_score_min: 6.5
 
-# ---------- 7. 风格指南 ----------
+# ---------- 7.5. typesafe-ai (Jev) verdict 阈值 ----------
+# Round 8: 与 critic_thresholds 并列，专用于 Jev System One verdict 合成
+# 字段名与 src/judges/verdict.py::DEFAULT_THRESHOLDS 一一对应
+# 调高 literal_residue/semantic_loss 阈值 → 减少非真实问题的 reject/retry
+# 保留 entity_consistency 严格（0.3）—— 命名一致是 binary 判定，无放宽空间
+typesafe_thresholds:
+  voice_drift_severe_prob: 0.5
+  voice_drift_subtle_prob: 0.7
+  register_mismatch_prob: 0.4
+  entity_consistency_noul: 0.3          # 保持严格：命名一致性是硬约束
+  literal_residue_noul: 0.6             # 0.5 → 0.6：文学翻译容许少量直译痕迹
+  semantic_loss_noul: 0.55              # 0.4 → 0.55：边界值（避免 noul=0.5 噪声触发）
+  style_compliance_min_score: 1.0
+  style_compliance_min_confidence: 0.6
+  low_confidence_threshold: 0.5
+  # Round 95: CJK Choice/Score 置信门槛.
+  # typesafe.ai 官方 models.md / state.md 警告 Jev 在 CJK 上准确率较低.
+  # 对 Choice/Score 答案, 使用比通用 (0.5) 更高的置信门槛 (默认 0.6),
+  # 让边界判断走 skipped_dimensions 而非触发 hard reject.
+  # 关闭 CJK gating: 设 cjk_confidence_gating=false 即回到通用 0.5 门槛.
+  cjk_confidence_gating: true
+  cjk_low_confidence_threshold: 0.6
+  # Round 96 P3: 译文 CJK 比例硬性闸门. 在 critic/judge 阶段直接拦截低 CJK 输出,
+  # 触发 rewriter 重试 (而不是等到 final 才发现). 0 = 禁用 (向后兼容).
+  cjk_hard_threshold: 0.5
+  # Round 60: Noul uncertain zone（typesafe-ai consistency_noul_cookbook 推荐）
+  # 区间内 Noul 视为边界不推导，不参与 hard reject 门控；防止 Jev 在 CJK 上的
+  # 边界概率（noul=0.4~0.6）触发 rewriter 死循环震荡。
+  noul_uncertain_low: 0.3
+  noul_uncertain_high: 0.7
+  # Round 72: per-dimension uncertain zones. entity_consistency 严格 (0.3-0.7),
+  # literal_residue / semantic_loss 放宽到 (0.3-0.8), 抑制 Jev/Mock 边缘噪声.
+  noul_uncertain_zones:
+    entity_consistency: [0.3, 0.7]
+    literal_residue: [0.3, 0.8]
+    semantic_loss: [0.3, 0.75]
+  # Round 118 P1-1: confidence_source 分档（绝不弱化 Jev）。
+  # Jev 是校准概率，按上面阈值原样裁决；openai_compat（LLM 自报伪概率）与
+  # mock_heuristic（确定性启发式）属未校准来源：reject 门槛 +margin、
+  # 置信门控 +margin、Noul 不确定区间上界 +margin（边界噪声走保守跳过）。
+  # 可用 confidence_source_profiles 覆盖代码内默认值（见 verdict.py）。
+  confidence_source_profiles:
+    openai_compat:
+      calibrated: false
+      reject_margin: 0.15
+      confidence_margin: 0.15
+    mock_heuristic:
+      calibrated: false
+      reject_margin: 0.25
+      confidence_margin: 0.20
+
+# ---------- 8. 风格指南 ----------
+# Round 117 P0: 本段只保留「与作品无关」的通用基线；作品特定的体裁/时代/语域/
+# 俚语提示一律由 StyleProfiler 抽样原文动态生成（input/book_profile.json），
+# 运行时经 config.set_runtime_style_guide() 覆盖本段。翻译新书前先运行：
+#   python3 -m src.translator_agent style-profile
 style_guide:
   avg_sentence_length: 适中、口语化，贴近原文句式长度
-  lexicon_preference: 平实、克制、英式幽默，避免过度意译、四字格堆砌与装饰性发明
-  author_priority_ratio: 0.7
-  genre: 儿童文学/维多利亚童话
-  work_type: 长篇童话
+  lexicon_preference: 平实、克制，避免过度意译、四字格堆砌与装饰性发明
+  author_priority_ratio: 0.7   # 0=译者主导  1=作者主导（动态 _build_style_guide 据此选高作者优先级模式）
+  genre: 文学小说               # 体裁兜底（剖面生成后由 profile 覆盖）
+  work_type: 长篇小说            # 作品类型（注入各 Agent prompt）
 
-# ---------- 8. 路径 ----------
+  # ── 通用兜底（无 profile 时使用；有 profile 时被覆盖）──────────────
+  persona: 忠实原著语域的职业文学译者
+  footnote_policy: inline        # none=禁止脚注 | inline=文内括号简注 | markdown_footnote=Markdown脚注
+  register_default: 保持克制、平实、贴近原文的叙事语域
+  translation_hints: []          # 作品特定用词/引用提示（由 profile 生成；此处置空=不注入先验）
+  forbidden_modernisms:          # 禁用词（直译残留或不符合时代语域的表达）
+    - 娘们儿
+    - 卧槽
+    - 开后宫
+    - 老铁
+    - 666
+
+# ---------- 9. 路径 ----------
 paths:
   db_dir: db
   input_dir: input
@@ -196,8 +454,64 @@ paths:
   decision_db: decision_db.sqlite
   workflow_db: workflow.db
 
-# ---------- 9. 日志 ----------
+# ---------- 10. 日志 ----------
 logging:
-  level: INFO
-  log_llm_calls: false
-  perf_log_interval: 10
+  level: INFO                  # DEBUG / INFO / WARNING / ERROR
+  log_llm_calls: false         # 是否打印每个 LLM 调用的完整 prompt/response
+  perf_log_interval: 10        # 每处理 N 个 chunk 打印一次性能统计
+
+# ---------- 11. typesafe-ai System One 后端（T2 重构引入） ----------
+# 该节配置 src/judges/typesafe_backend.py::FallbackBackend 的实例化参数。
+# 字段说明：
+#   enabled               — 是否启用 typesafe 路径（false 时直接走 Mock）
+#   api_base              — 文档用途，typesafe_sdk 内部使用其默认 endpoint；留作未来扩展
+#   api_key               — TYPESAFE_API_KEY，无值时跳过 Jev
+#   model_name            — Jev 模型名（默认 jev-latest，对应 typesafe.ai System One）
+#   fallback_role         — OpenAICompat 降级时使用的角色 key（指向 main.models.<role>）
+#   allow_mock            — Jev 不可达时是否降级到 MockBackend（启发式离线）
+#   allow_openai_fallback — 是否允许降级到 OpenAICompat（默认 false）
+#                           关闭原因：OpenAICompat 不返回校准概率，与 Jev 语义不等价，
+#                           强行 fallback 会让 verdict 失去概率含义（详见 audit A3）。
+#                           仅在 A/B 调试或本地无 Jev 场景下显式开启。
+#   timeout               — 单次 system_one 调用超时（秒）
+typesafe:
+  enabled: true
+  api_base: https://api.typesafe.ai
+  api_key: ${TYPESAFE_API_KEY}
+  model_name: jev-latest
+  fallback_role: primary
+  allow_mock: true
+  # Round 106 P3 引入 OpenAICompat 降级作为容灾路径。Round 116 更正：Jev 当前
+  # 实际可用（1013 全量运行 critic 报告 _backend_path=jev, 387/387），此前的
+  # 451 区域封锁已不成立；fallback 仅在 Jev 超时/不可达时启用。
+  # 注意：fallback_role=primary（MiniMax-M3）按 typesafe schema 评分时 confidence
+  # 为 LLM 自报，与 Jev 校准概率语义不同——下游阈值需按 backend source 区分处理，
+  # 不得混用同一套门槛（详见 Round 116 计划：confidence_source 建模）。
+  allow_openai_fallback: true
+  timeout: 30.0
+
+# =====================================================================
+# 成书样式（Round 119 T5）
+# =====================================================================
+# chapter_titles: 合并层章节标题制式
+#   bilingual - 中文主标题＋原文括注（默认，如 "第一章 掉进兔子洞（Down the Rabbit-Hole）"）
+#   zh        - 仅中文主标题
+#   keep      - 保留 input/<ch>.md 原始 H1（清理 Gutenberg 前缀）
+book:
+  chapter_titles: bilingual
+
+# =====================================================================
+# 韵文通道（Round 119 L1）
+# =====================================================================
+# enabled        — 总开关（false：转换层不标记韵文、init 不写 chunk_tags、
+#                  prompt 不注入韵文协议、gate 跳过 verse_lint；回到旧行为）
+# min_line_ratio — verse_lint 行数对齐下限：译文诗行数 ≥ 源行数 × ratio
+# max_line_chars — 认定「诗行」的最大行长（字符，超长行视为散文行，不计入）
+# refrain_ratio  — 复沓（refrain）保留下限：译文重复数 ≥ 源重复数 × ratio
+# retry_on_fail  — PASS 定稿前 verse_lint 未达标时，是否触发一次定向重写
+verse:
+  enabled: true
+  min_line_ratio: 0.6
+  max_line_chars: 56
+  refrain_ratio: 0.5
+  retry_on_fail: true

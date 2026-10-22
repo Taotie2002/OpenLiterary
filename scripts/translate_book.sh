@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
 # -*- coding: utf-8 -*-
 #
-# OpenLiterary - 一键翻译脚本
+# SagaTrans - 一键翻译脚本
 # 用法:
 #   ./scripts/translate_book.sh <input.{epub,txt,md}> [output_dir] [--force] [--dry-run] [--consistency] [--golden-gate]
 #
 # 临时切换后端/模型（不修改 config.yaml，通过环境变量）：
-#   export OPENLITERARY__LLM_BACKEND=openai_api
-#   export OPENLITERARY__MODELS__PRIMARY__MODEL_NAME=mistral-large
-#   export OPENLITERARY__MODELS__PRIMARY__API_BASE=https://api.mistral.ai/v1
-#   export OPENLITERARY__MODELS__PRIMARY__API_KEY=$MISTRAL_KEY
+#   export SAGATRANS__LLM_BACKEND=openai_api
+#   export SAGATRANS__MAIN__MODELS__PRIMARY__MODEL_NAME=mistral-large
+#   export SAGATRANS__MAIN__MODELS__PRIMARY__API_BASE=https://api.mistral.ai/v1
+#   export SAGATRANS__MAIN__MODELS__PRIMARY__API_KEY=$MISTRAL_KEY
 #   ./scripts/translate_book.sh book.epub
 #
 # 示例:
 #   ./scripts/translate_book.sh book.epub                          # 默认使用 config.yaml
 #   ./scripts/translate_book.sh book.md output --dry-run            # 仅切分+跑流程，不调用 LLM（split 仍执行）
-#   OPENLITERARY__LLM_BACKEND=mock ./scripts/translate_book.sh book.md  # mock 后端跑流程
+#   SAGATRANS__LLM_BACKEND=mock ./scripts/translate_book.sh book.md  # mock 后端跑流程
 
 # bash 5.3.x 在 UTF-8 locale 下，echo -e + ANSI 转义 + 中文字符 + >&2 与 set -euo pipefail
 # 组合会触发变量作用域 bug（约第 5 次循环迭代起 ch_name 等被误判为未绑定）。强制 C locale 修复。
@@ -40,6 +40,10 @@ SKIP_EPUB_CONVERT=false
 RUN_CONSISTENCY=false
 RUN_GOLDEN_GATE=false
 MERGE_ONLY=false
+AUTO_MERGE_ON_FAILURE=false
+YES_MODE=false
+ALLOW_INCOMPLETE=false
+NO_NORMALIZE=false
 CHAPTERS_DIR="input"
 
 # 颜色输出
@@ -70,14 +74,19 @@ usage() {
             -c, --clean              翻译完成后清理中间产物 (raw/literary/critic_report，保留 final.json 和 DB)
   --consistency            翻译+合并后跑 consistency 子命令，输出命名一致性差异报告
   --golden-gate           翻译+合并后跑 golden-gate 质量门禁（参考人工基线，不通过时仅 WARN）
+  --allow-incomplete       放行硬闸：DIRTY 未收敛合并 / lint 未通过 / gate 未通过（默认全硬闸中止）
+  --no-normalize           跳过成书样式规范化（finalize；引号/脚注制式/策略元语）
   --clean-only             独立模式：仅清理中间产物后退出，无需输入文件
+  --merge-only             跳过翻译，直接合并现有 final.json
+  --auto-merge-on-failure  API 耗尽时自动合并已完成章节 (提示确认)
+  --yes, -y                与 --auto-merge-on-failure 配合使用，跳过确认提示
   -h, --help               显示帮助
 
  环境变量 (临时覆盖配置，不修改磁盘 config.yaml；使用 __ 分隔嵌套键):
-  OPENLITERARY__LLM_BACKEND
-  OPENLITERARY__MODELS__<ROLE>__MODEL_NAME
-  OPENLITERARY__MODELS__<ROLE>__API_BASE
-  OPENLITERARY__MODELS__<ROLE>__API_KEY
+  SAGATRANS__LLM_BACKEND
+  SAGATRANS__MAIN__MODELS__<ROLE>__MODEL_NAME
+  SAGATRANS__MAIN__MODELS__<ROLE>__API_BASE
+  SAGATRANS__MAIN__MODELS__<ROLE>__API_KEY
   其中 <ROLE> ∈ literal_translator | primary
 
 示例:
@@ -85,16 +94,22 @@ usage() {
   $0 book.epub
 
   # 临时切到云 API 不改 yaml (Mistral 示例)
-  OPENLITERARY__MODELS__PRIMARY__API_BASE=https://api.mistral.ai/v1 \\
-  OPENLITERARY__MODELS__PRIMARY__API_KEY=\$MISTRAL_KEY \\
-  OPENLITERARY__MODELS__PRIMARY__MODEL_NAME=mistral-large \\
+  SAGATRANS__MAIN__MODELS__PRIMARY__API_BASE=https://api.mistral.ai/v1 \\
+  SAGATRANS__MAIN__MODELS__PRIMARY__API_KEY=\$MISTRAL_KEY \\
+  SAGATRANS__MAIN__MODELS__PRIMARY__MODEL_NAME=mistral-large \\
   $0 book.epub
 
   # 仅测试流程 (不消耗 token)
-  OPENLITERARY__LLM_BACKEND=mock $0 book.md output --dry-run
+  SAGATRANS__LLM_BACKEND=mock $0 book.md output --dry-run
 
   # 独立清理中间产物（无需输入文件）
   $0 --clean-only
+
+  # API 耗尽时自动合并已完成章节 (交互式)
+  $0 book.epub --auto-merge-on-failure
+
+  # API 耗尽时自动合并 (非交互式，跳过确认)
+  $0 book.epub --auto-merge-on-failure --yes
 EOF
 }
 
@@ -112,7 +127,11 @@ parse_args() {
             --consistency) RUN_CONSISTENCY=true; shift ;;
             --merge-only) MERGE_ONLY=true; shift ;;
             --golden-gate) RUN_GOLDEN_GATE=true; shift ;;
+            --allow-incomplete) ALLOW_INCOMPLETE=true; shift ;;
+            --no-normalize) NO_NORMALIZE=true; shift ;;
             --clean-only) CLEAN_ONLY=true; shift ;;
+            --auto-merge-on-failure) AUTO_MERGE_ON_FAILURE=true; shift ;;
+            --yes|-y) YES_MODE=true; shift ;;
             -h|--help) usage; exit 0 ;;
             -*) log_err "未知选项: $1"; usage; exit 1 ;;
             *)
@@ -171,7 +190,7 @@ check_deps() {
     fi
 
     # MLX 后端检查：仅在环境变量明确指定 mlx 时安装
-    local effective_backend="${OPENLITERARY__LLM_BACKEND:-}"
+    local effective_backend="${SAGATRANS__LLM_BACKEND:-}"
     if [[ "$effective_backend" == "mlx" && "$DRY_RUN" != "true" ]]; then
         python3 -c "import mlx_lm, mlx" 2>/dev/null || {
             log_warn "MLX 未安装，尝试安装..."
@@ -184,11 +203,11 @@ check_deps() {
 
 # ===========================
 # 临时覆盖配置（不修改磁盘 config.yaml）
-# 通过 OPENLITERARY_* 环境变量实现：
-#   OPENLITERARY__LLM_BACKEND
-#   OPENLITERARY__MODELS__PRIMARY__MODEL_NAME
-#   OPENLITERARY__MODELS__PRIMARY__API_BASE
-#   OPENLITERARY__MODELS__PRIMARY__API_KEY
+# 通过 SAGATRANS_* 环境变量实现：
+#   SAGATRANS__LLM_BACKEND
+#   SAGATRANS__MAIN__MODELS__PRIMARY__MODEL_NAME
+#   SAGATRANS__MAIN__MODELS__PRIMARY__API_BASE
+#   SAGATRANS__MAIN__MODELS__PRIMARY__API_KEY
 # ===========================
 
 # ===========================
@@ -243,7 +262,7 @@ run_chapter() {
     if [[ "$DRY_RUN" == "true" ]]; then
         log_warn "  [DRY RUN] 跳过实际 LLM 调用"
         # 可以用 mock 后端快速跑完
-        OPENLITERARY__LLM_BACKEND=mock python3 -m src.translator_agent pipeline --chapter "$ch_id"
+        SAGATRANS__LLM_BACKEND=mock python3 -m src.translator_agent pipeline --chapter "$ch_id"
         pipe_rc=$?
     else
         python3 -m src.translator_agent pipeline --chapter "$ch_id"
@@ -264,6 +283,54 @@ run_chapter() {
 }
 
 # ===========================
+# API 耗尽时合并已完成章节
+# ===========================
+prompt_merge_on_failure() {
+    local failed_chapters=("$@")
+    local failed_count=${#failed_chapters[@]}
+
+    log_warn "API 耗尽导致 $failed_count 章翻译失败: ${failed_chapters[*]}"
+
+    # 检查是否有任何 final.json 可供合并
+    local total_final=0
+    for ch_file in "$PROJECT_ROOT/$CHAPTERS_DIR"/ch*.md; do
+        [[ -f "$ch_file" ]] || continue
+        local ch_id=$(basename "$ch_file" .md)
+        local count=$(ls -1 "$PROJECT_ROOT/output/$ch_id"/*_final.json 2>/dev/null | wc -l)
+        total_final=$((total_final + count))
+    done
+
+    if [[ "$total_final" -eq 0 ]]; then
+        log_err "没有任何 final.json 可供合并，无法继续。"
+        return 1
+    fi
+
+    log_info "已产出 $total_final 个 final.json，缺失 $failed_count 章。"
+
+    # --yes 模式：跳过确认
+    if [[ "$YES_MODE" == "true" ]]; then
+        log_info "(--yes) 自动确认合并..."
+    else
+        # 非交互式环境：自动合并
+        if [[ ! -t 0 ]]; then
+            log_warn "检测到非交互式环境，自动合并已完成章节。"
+        else
+            log_info "是否合并已完成的章节？(y/N)"
+            local response=""
+            read -r response || true
+            if [[ ! "$response" =~ ^[Yy]$ ]]; then
+                log_info "用户取消合并，退出。"
+                return 1
+            fi
+        fi
+    fi
+
+    log_info "执行合并..."
+    merge_output "$CHAPTERS_DIR"
+    return $?
+}
+
+# ===========================
 # 并行运行所有章节
 # ===========================
 run_all_chapters() {
@@ -275,7 +342,7 @@ run_all_chapters() {
 
     local done=0
     local failed_count=0
-    local failed_chapters=()
+    FAILED_CHAPTERS=()
     for ch_file in "${chapters[@]}"; do
         ch_name=$(basename "$ch_file" .md)
         if run_chapter "$ch_file"; then
@@ -283,7 +350,7 @@ run_all_chapters() {
         else
             log_warn "  章节失败: $ch_name，继续下一章"
             failed_count=$((failed_count + 1))
-            failed_chapters+=("$ch_name")
+            FAILED_CHAPTERS+=("$ch_name")
         fi
         done=$((done + 1))
         log_info "进度: $done/$total"
@@ -291,7 +358,7 @@ run_all_chapters() {
 
     if [[ "$failed_count" -gt 0 ]]; then
         log_err "章节翻译完成，但有 $failed_count/$total 章失败"
-        log_err "失败章节: ${failed_chapters[*]}"
+        log_err "失败章节: ${FAILED_CHAPTERS[*]}"
         return 1
     fi
     log_ok "所有章节翻译完成"
@@ -369,7 +436,11 @@ except Exception:
         fi
         # 规范章节标题：每章统一生成单一 H1，去除 chunk 内嵌的错位/无 # 标题
         # 经循环 stdout 写出（与 python 共用同一重定向 fd，避免 >> 被 > 覆盖）
-        echo "# $(chapter_title "$ch_id")"
+        # Round 119 T5: 默认双语制式（中文主标题＋原文括注），见 config.book.chapter_titles
+        local ch_head=""
+        ch_head=$(python3 -c "from src.book_lint import chapter_heading; print(chapter_heading('$PROJECT_ROOT', '$ch_id'))" 2>/dev/null) || true
+        [[ -z "$ch_head" ]] && ch_head=$(chapter_title "$ch_id")
+        echo "# $ch_head"
         echo ""
         local chunk_idx=0
         for final_file in "${chunk_files[@]}"; do
@@ -385,12 +456,13 @@ if meta.get("fallback"):
         qa.write(f"## {ch}\n")
         qa.write(f"- 状态: 未通过自动化验收（已 fallback 收录最后一版润色稿）\n")
         qa.write(f"- 原因: {reason}\n\n")
-# 剥离古腾堡标题页残留（仅 ch01 首块携带）
-guten = re.compile(r"^\s*#\s*古腾堡计划|爱丽丝梦游仙境\s*$|^刘易斯·卡罗尔\s*著|千禧年支点版|^\s*目录\s*$")
-text = "\n".join(l for l in text.split("\n") if not guten.match(l.strip()))
-# 剥离 chunk 内嵌章节标题行（含错位/无 # 形式），改由合并层统一生成
-head = re.compile(r"^\s*#?\s*第[一二三四五六七八九十百千零\d]+\s*[章.。]")
-text = "\n".join(l for l in text.split("\n") if not head.match(l.strip()))
+# Round 119 T5: 页眉/版本行残留 + 内嵌章节标题统一走 src.book_lint.postprocess_chunk_text
+try:
+    from src.book_lint import postprocess_chunk_text
+    text = postprocess_chunk_text(text, ch, idx)
+except Exception:
+    head = re.compile(r"^\s*#?\s*第[一二三四五六七八九十百千零\d]+\s*[章.。]")
+    text = "\n".join(l for l in text.split("\n") if not head.match(l.strip()))
 # 脚注按 chunk 加命名空间，消除跨 chunk 同名标签碰撞
 keys = set(re.findall(r"\[\^([^\]]+)\]", text))
 if keys:
@@ -497,17 +569,19 @@ main() {
     fi
 
     log_info "========================================"
-    log_info "OpenLiterary 一键翻译"
+    log_info "SagaTrans 一键翻译"
     log_info "输入: $EPUB_FILE"
     log_info "输出目录: $OUTPUT_DIR"
-    log_info "后端: ${OPENLITERARY__LLM_BACKEND:-config.yaml}"
-    local active_env_overrides=$(env | grep '^OPENLITERARY__' | cut -d= -f1 | tr '\n' ' ' || true)
+    log_info "后端: ${SAGATRANS__LLM_BACKEND:-config.yaml}"
+    local active_env_overrides=$(env | grep '^SAGATRANS__' | cut -d= -f1 | tr '\n' ' ' || true)
     [[ -n "$active_env_overrides" ]] && log_info "运行时 env 覆盖: $active_env_overrides"
     log_info "强制重建: $FORCE_INIT"
     log_info "清空历史: $RESET"
     log_info "Dry-run: $DRY_RUN"
     log_info "清理中间产物: $CLEAN_INTERMEDIATE"
     log_info "一致性校验: $RUN_CONSISTENCY"
+    log_info "允许不完整合并: $ALLOW_INCOMPLETE"
+    log_info "样式规范化: $([[ "$NO_NORMALIZE" == "true" ]] && echo 跳过 || echo 启用)"
     log_info "========================================"
 
     cd "$PROJECT_ROOT"
@@ -527,9 +601,77 @@ main() {
             mapfile -t chapter_files < <(convert_epub)
         fi
 
+        # 1.5 Round 117 P0: 动态风格剖面（作品隔离）— 缺失时生成一次，全章子进程共享
+        local profile_file="$PROJECT_ROOT/input/book_profile.json"
+        if [[ "$DRY_RUN" == "true" ]]; then
+            [[ -f "$profile_file" ]] && log_info "Dry-run: 检测到风格剖面 input/book_profile.json" \
+                || log_info "Dry-run: 跳过风格剖面生成（无 LLM 调用）"
+        elif [[ -f "$profile_file" ]]; then
+            log_info "检测到风格剖面: input/book_profile.json（如需重生成: 删除后重跑或 --force 前先运行 style-profile --force）"
+        else
+            log_info "未找到风格剖面，抽样章节生成 input/book_profile.json ..."
+            if ! python3 -m src.translator_agent style-profile; then
+                log_warn "  style-profile 失败 — 本次使用 config.yaml 中性基线（不注入作品特定先验）"
+            fi
+        fi
+
         # 2. 并行翻译所有章节
         if ! run_all_chapters "${chapter_files[@]}"; then
-            log_err "部分章节翻译失败，继续合并（已产出的章节仍会被收录）"
+            if [[ "$AUTO_MERGE_ON_FAILURE" == "true" ]]; then
+                log_warn "部分章节翻译失败，尝试自动合并已完成章节..."
+                prompt_merge_on_failure "${FAILED_CHAPTERS[@]}"
+                exit $?
+            else
+                log_err "部分章节翻译失败，继续合并（已产出的章节仍会被收录）"
+            fi
+        fi
+    fi
+
+    # 2.5 T2: 全书决策收敛闭环 — 重跑所有 DIRTY 章节；未收敛禁止合并
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "Dry-run: 跳过 consolidate（避免真实 LLM 调用）"
+    else
+        log_info "运行全书决策收敛 (consolidate)..."
+        if python3 -m src.translator_agent consolidate --max-rounds "${SAGATRANS_CONSOLIDATE_MAX_ROUNDS:-3}"; then
+            log_ok "consolidate 收敛（DIRTY=0）"
+        else
+            if [[ "$ALLOW_INCOMPLETE" == "true" ]]; then
+                log_warn "consolidate 未收敛（--allow-incomplete 放行，仍将合并）"
+            else
+                log_err "consolidate 未收敛：存在 DIRTY chunk 未重跑，禁止合并（--allow-incomplete 可强放行）"
+                exit 1
+            fi
+        fi
+        # merge 前置硬闸（双保险）: DIRTY>0 且未显式放行 → 中止
+        local dirty_count
+        dirty_count=$(python3 -c "
+import sqlite3
+try:
+    c = sqlite3.connect('$PROJECT_ROOT/db/workflow.db')
+    print(c.execute(\"SELECT COUNT(*) FROM chunk_tasks WHERE state='DIRTY'\").fetchone()[0])
+except Exception:
+    print(0)
+" 2>/dev/null) || dirty_count=0
+        if [[ "${dirty_count:-0}" -gt 0 ]]; then
+            if [[ "$ALLOW_INCOMPLETE" == "true" ]]; then
+                log_warn "merge 硬闸: DIRTY=${dirty_count}（--allow-incomplete 放行）"
+            else
+                log_err "merge 硬闸: DIRTY=${dirty_count} > 0，中止合并（--allow-incomplete 可强放行）"
+                exit 1
+            fi
+        fi
+    fi
+
+    # 2.6 T5: 成书样式规范化（finalize，作用于 final.json；无 LLM 调用）
+    if [[ "$NO_NORMALIZE" == "true" ]]; then
+        log_warn "跳过样式规范化（--no-normalize）"
+    else
+        log_info "运行成书样式规范化 (finalize)..."
+        if python3 -m src.translator_agent finalize --apply; then
+            log_ok "样式规范化完成（详见 output/finalize_diff.md）"
+        else
+            log_err "finalize 失败"
+            exit 1
         fi
     fi
 
@@ -537,6 +679,28 @@ main() {
     if ! merge_output "$CHAPTERS_DIR"; then
         log_err "翻译产出残缺，流程中止（见上方缺失章节提示）。"
         exit 1
+    fi
+
+    # 3.2 Round 121 L5: 章级注释统一（去重/孤儿改锚/顺编号；无 LLM 调用）
+    log_info "运行章级注释统一 (notes-normalize)..."
+    if python3 -m src.translator_agent notes-normalize --apply; then
+        log_ok "注释统一完成（详见 output/note_policy_diff.md）"
+    else
+        log_err "注释统一失败"
+        exit 1
+    fi
+
+    # 3.5 T5: 成书级 lint（finals + merged 双跑）
+    log_info "运行成书级 lint..."
+    if python3 -m src.translator_agent lint; then
+        log_ok "lint 全绿"
+    else
+        if [[ "$ALLOW_INCOMPLETE" == "true" ]]; then
+            log_warn "lint 未通过（--allow-incomplete 放行；详见 output/book_lint.md）"
+        else
+            log_err "lint 未通过（详见 output/book_lint.md）"
+            exit 1
+        fi
     fi
 
     # 4. 译后命名一致性校验（可选 --consistency）
@@ -563,8 +727,28 @@ main() {
         clean_intermediate
     fi
 
+    # 4.8 T4: 交付门禁 (gate) —— 完成信号不变量化，全绿才打 🎉
+    local gate_ok=true
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "Dry-run: 跳过 gate"
+    else
+        log_info "运行交付门禁 (gate)..."
+        if python3 -m src.translator_agent gate; then
+            log_ok "gate 全绿"
+        else
+            gate_ok=false
+            [[ "$ALLOW_INCOMPLETE" == "true" ]] && log_warn "gate 未通过（--allow-incomplete 放行）"
+        fi
+    fi
+
     log_info "========================================"
-    log_ok "🎉 翻译全流程完成！"
+    if [[ "$gate_ok" == "true" ]]; then
+        log_ok "🎉 翻译全流程完成！"
+    else
+        log_err "⛔ 交付门禁未通过（失败项见上方 gate 清单；报告: output/book_lint.md / input/_conversion_audit.md）"
+        [[ "$ALLOW_INCOMPLETE" == "true" ]] || exit 1
+        log_warn "--allow-incomplete 放行：产出保留，请人工复核失败项"
+    fi
     log_info "最终译文: $PROJECT_ROOT/$OUTPUT_DIR/translated_full.md"
     log_info "Decision DB: $PROJECT_ROOT/db/decision_db.sqlite"
     log_info "========================================"

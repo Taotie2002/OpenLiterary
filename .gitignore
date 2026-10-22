@@ -64,3 +64,22 @@ input/README.md
 input/chaos/
 input/golden/
 plan.md
+
+# 环境变量与本地密钥（绝不入库；.env.example 作为模板可入）
+.env
+.env.*
+!.env.example
+
+# 运行时产物（书级/单次运行，不入库）
+db/chunk_tags.json
+input/book_profile.json
+input/_conversion_audit.md
+input/entity_variants.yaml
+input/verse_manifest.json
+output/*.md
+output/*.json
+docs/baselines/
+
+# 本地工作文档（不入库）
+LESSONS_*.md
+SagaTrans-改进建议方案.md
