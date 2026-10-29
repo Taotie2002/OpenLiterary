@@ -108,6 +108,19 @@ class DecisionEngine:
         except Exception:
             self.conn.execute("ALTER TABLE decision_db ADD COLUMN locked INTEGER DEFAULT 0")
 
+        # Round 130: deferred 回溯队列 — 决策变更先登记，章末合并应用一次
+        # （防"决策翻转→回溯已完成块→重跑再翻转"自激长跑；同一 chunk 幂等合并）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pending_backtrack (
+                chunk_id TEXT PRIMARY KEY,
+                decision_id INTEGER,
+                source_key TEXT,
+                queue_rounds INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         self.conn.commit()
 
         # 种子：将已知中文异体登记进 entity_registry（幂等，仅合并不覆盖）
@@ -149,6 +162,9 @@ class DecisionEngine:
 
         幂等：同一 source_key 且 translation 未变时不触发 backtrack。
         STYLE 默认不回溯（见 style_triggers_backtrack）；即使开启也不得依赖「当前 JUDGING chunk」。
+
+        Round 130: backtrack_mode=deferred（默认）时，变更不再即时标记 DIRTY，
+        而是登记进 pending_backtrack 队列，由 pipeline 在章末（队列清空点）合并应用一次。
         """
         cursor = self.conn.cursor()
         try:
@@ -226,7 +242,11 @@ class DecisionEngine:
                         f"截断为 max_affected_chunks_per_decision={max_affected}"
                     )
                     chunks_to_dirty = sorted(chunks_to_dirty)[:max_affected]
-                self._trigger_backtrack(chunks_to_dirty)
+                backtrack_mode = str(de_cfg.get("backtrack_mode", "deferred") or "deferred").lower()
+                if backtrack_mode == "immediate":
+                    self._trigger_backtrack(chunks_to_dirty)
+                else:
+                    self._queue_backtrack(chunks_to_dirty, decision_id, source)
         except Exception as e:
             print(f"❌ 决策写入失败: {e}")
             raise
@@ -241,6 +261,55 @@ class DecisionEngine:
         except Exception as e:
             # 回溯失败是跨库一致性事件，不应静默吞掉
             raise RuntimeError(f"回溯触发失败，Decision DB 与 Workflow DB 可能不一致: {e}") from e
+
+    def _queue_backtrack(self, chunk_ids: List[str], decision_id: Optional[int], source_key: str):
+        """Round 130 deferred 模式：把受影响 chunk 登记进待回溯队列（幂等合并）。
+
+        队列由 pipeline 在章末合并点经 take_pending_backtracks 取出后统一应用；
+        同一 chunk 多次命中只保留一行并累计 queue_rounds，避免重复重跑。
+        """
+        if not chunk_ids:
+            return
+        cursor = self.conn.cursor()
+        cursor.executemany('''
+            INSERT INTO pending_backtrack (chunk_id, decision_id, source_key, queue_rounds, updated_at)
+            VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
+            ON CONFLICT(chunk_id) DO UPDATE SET
+                decision_id = excluded.decision_id,
+                source_key = excluded.source_key,
+                queue_rounds = COALESCE(queue_rounds, 0) + 1,
+                updated_at = CURRENT_TIMESTAMP
+        ''', [(cid, decision_id, source_key) for cid in chunk_ids])
+        self.conn.commit()
+        print(f"⏳ [Backtrack Queue] 登记 {len(chunk_ids)} 个待回溯 chunk（章末合并应用）: {source_key[:40]}")
+
+    def take_pending_backtracks(self, chunk_ids: List[str]) -> List[Dict[str, Any]]:
+        """取出并删除指定 chunk 的待回溯登记（章末合并应用点调用）。
+
+        Returns: [{"chunk_id", "decision_id", "source_key", "queue_rounds"}, ...]
+        """
+        if not chunk_ids:
+            return []
+        cur = self.conn.cursor()
+        ph = ','.join('?' for _ in chunk_ids)
+        rows = cur.execute(
+            f'SELECT chunk_id, decision_id, source_key, COALESCE(queue_rounds, 0) AS queue_rounds '
+            f'FROM pending_backtrack WHERE chunk_id IN ({ph})',
+            tuple(chunk_ids)).fetchall()
+        if rows:
+            cur.execute(f'DELETE FROM pending_backtrack WHERE chunk_id IN ({ph})', tuple(chunk_ids))
+            self.conn.commit()
+        return [dict(r) for r in rows]
+
+    def count_pending_backtracks(self, chunk_ids: Optional[List[str]] = None) -> int:
+        """统计待回溯登记数（可限定 chunk 列表；None=全库）。"""
+        cur = self.conn.cursor()
+        if chunk_ids:
+            ph = ','.join('?' for _ in chunk_ids)
+            return int(cur.execute(
+                f'SELECT COUNT(*) FROM pending_backtrack WHERE chunk_id IN ({ph})',
+                tuple(chunk_ids)).fetchone()[0])
+        return int(cur.execute('SELECT COUNT(*) FROM pending_backtrack').fetchone()[0])
 
     def get_all_decisions(self):
         """为 Agent 提供 Prompt 上下文（全量；优先用 format_prompt_context）"""

@@ -563,6 +563,8 @@ class FallbackBackend(SystemOneBackend):
         self._mock = MockBackend() if allow_mock else None
         # Round 118 P1-1: 记录本次实际命中的后端（供 verdict confidence_source 分档）
         self.last_backend: str = "unknown"
+        # Round 121: 401 鉴权失败缓存 —— key 修复须重启进程，本轮内不再反复试探 Jev
+        self._jev_auth_dead = False
 
     def evaluate(self, state, questions, *, model=None, timeout=None):
         # 有效 timeout：调用方传入优先，否则用 self.timeout（来自 config.yaml typesafe.timeout）
@@ -575,14 +577,20 @@ class FallbackBackend(SystemOneBackend):
                 return self._mock.evaluate(state, questions, model=model, timeout=eff_timeout)
             raise RuntimeError("typesafe 已禁用 (enabled=false)，且 Mock 未启用")
 
-        # 1. 尝试 Jev（typesafe.ai 原生）
-        if self.primary.api_key:
+        # 1. 尝试 Jev（typesafe.ai 原生）；401 后本轮不再试探（见下方 except）
+        if self.primary.api_key and not self._jev_auth_dead:
             try:
                 answers = self.primary.evaluate(state, questions, model=model, timeout=eff_timeout)
                 self.last_backend = "jev"
                 return answers
             except Exception as e:
-                logger.info(f"Jev 不可用: {type(e).__name__}: {e}")
+                if type(e).__name__ == "TypeSafeAuthenticationError":
+                    # 401 鉴权失败：key 修复须重启进程；本进程内不再试探 Jev（避免每 chunk 白跑+刷屏）
+                    if not self._jev_auth_dead:
+                        logger.warning(f"Jev 鉴权失败（{e}）；本进程内不再尝试 Jev，改走降级链")
+                    self._jev_auth_dead = True
+                else:
+                    logger.info(f"Jev 不可用: {type(e).__name__}: {e}")
                 if not self.allow_openai_fallback:
                     # 默认跳过 OpenAICompat（设计原则：Jev → Mock，不模拟 Jev）
                     # 详见 audit A3；OpenAICompat 不返回校准概率，与 Jev 语义不等价。

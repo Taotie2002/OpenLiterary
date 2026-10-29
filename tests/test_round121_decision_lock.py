@@ -15,6 +15,21 @@ import importlib
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _force_immediate_backtrack_mode():
+    """Round 130: 决策引擎默认已切换 deferred（章末合并）模式；
+    本文件回归的是 immediate 模式的即时回溯语义，显式固定之（含单体镜像树）。"""
+    from src.config import config as _cfg
+    de = _cfg._data.setdefault("decision_engine", {})
+    old = de.get("backtrack_mode")
+    de["backtrack_mode"] = "immediate"
+    yield
+    if old is None:
+        de.pop("backtrack_mode", None)
+    else:
+        de["backtrack_mode"] = old
+
+
 DECISION_LOCK_CASES = [
     ("translator_agent", "src.translator_agent"),
     ("core", "src.core.decision_engine"),

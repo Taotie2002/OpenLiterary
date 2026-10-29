@@ -28,6 +28,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+# Round 130: 本文件直接构造 JevBackend 并 patch httpx2/typesafe_sdk（可选依赖，
+# 缺失时生产自动降级）；无依赖环境应跳过而非失败。
+pytest.importorskip("httpx2", reason="可选依赖 httpx2/socksio 未安装（Jev 代理）")
+pytest.importorskip("typesafe_sdk", reason="可选依赖 typesafe_sdk 未安装（Jev 后端）")
+
 
 class TestJevProxyNormalization:
     def test_socks_scheme_normalized_to_socks5(self):

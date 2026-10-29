@@ -1,18 +1,17 @@
 """
-SagaTrans LLM 适配层（4 个后端实现 + JSON 解析 + 客户端管理）
+SagaTrans LLM 适配层（2 个后端实现 + JSON 解析 + 客户端管理）
 
 源：原整合脚本 §2（LLM 适配层）+ 文件头中的 robust_json_loads，拆分到独立模块。
 
 后端支持：
   - MockLLMAdapter          离线测试 / dry-run
   - OpenAICompatibleAdapter 通用 OpenAI 兼容 HTTP（DeepSeek / MiniMax / vLLM / LM Studio 等）
-  - MLXNativeAdapter        Apple Silicon 本地推理（mlx-lm）
 
 公共 API：
   get_llm_client(role)            按角色获取 LLM 客户端
   get_llm_client_for_task(task)   按任务名路由到角色
   get_role_model_name(role)       获取角色配置中的模型名
-  get_role_extra_body(role)       获取角色配置中的 extra_body
+  get_task_extra_body(task)       获取任务级 extra_body 透传参数
   robust_json_loads(raw)          防御性 JSON 解析
 """
 from __future__ import annotations
@@ -130,6 +129,15 @@ def robust_json_loads(raw_response: str, expected_type: type = dict):
 # ────────────────────────────────────────────────────────────────────
 
 
+class QuotaExhaustedError(RuntimeError):
+    """Round 129: 配额/限流持续耗尽（区别于可重试的瞬时网络/服务端错误）。
+
+    由 OpenAICompatibleAdapter 在 429 连续出现（或 402/403 带配额关键字）时抛出；
+    FallbackRoleAdapter 捕获后把该角色永久降级到 fallback 角色，避免整章翻译
+    卡在单一模型的退避重试里（MiniMax 配额按 5 小时窗重置）。
+    """
+
+
 class LLMAdapter(ABC):
     """大语言模型调用基类"""
     def __init__(self):
@@ -144,7 +152,7 @@ class LLMAdapter(ABC):
 
     @abstractmethod
     def generate(self, prompt: str, model_name: str, max_tokens: int = 2048, temperature: float = 0.3, **kwargs) -> str:
-        """生成接口；**kwargs 用于透传子类特有参数（如 extra_body / enable_thinking）。"""
+        """生成接口；**kwargs 用于透传子类特有参数（如 extra_body / effort）。"""
         pass
 
     @abstractmethod
@@ -156,7 +164,7 @@ class LLMAdapter(ABC):
         """Round 27: 子类在 generate 末尾调用此方法累加真实 token 用量。
 
         OpenAI-compatible API 标准 usage 字段：prompt_tokens / completion_tokens / total_tokens。
-        Mock / MLX 后端按各自实现做估算或 tokenizer encode 真实值。
+        Mock 后端按字符估算；HTTP 后端取服务端返回的真实 usage。
         Round 30: 累加后检查阈值，触发一次性 stderr 告警（idempotent via _warned_thresholds）。
         """
         try:
@@ -210,19 +218,10 @@ class LLMAdapter(ABC):
         }
 
     def check_memory_pressure(self) -> bool:
-        """检查内存压力"""
+        """检查进程内存压力（通用诊断；原 MLX 本地推理专有逻辑已移除）。"""
         usage = self.get_memory_usage()
-        threshold = _config.mlx_memory.get("warning_threshold", 0.8)
+        threshold = 0.8
         return usage["percent"] / 100 > threshold
-
-    def auto_unload_if_needed(self) -> bool:
-        """内存压力时自动卸载模型，返回是否触发了卸载"""
-        auto_unload = _config.mlx_memory.get("auto_unload_on_pressure", True)
-        if auto_unload and self.check_memory_pressure():
-            print(f"⚠️ 内存压力过大 ({self.get_memory_usage()['percent']:.1f}%)，自动卸载模型")
-            self.unload_model()
-            return True
-        return False
 
 
 class MockLLMAdapter(LLMAdapter):
@@ -327,35 +326,28 @@ class MockLLMAdapter(LLMAdapter):
         pass
 
 
-# Round 117: thinking 参数按 provider 归一。
-# - minimax: enabled→adaptive；disabled→reasoning_effort=none + thinking=disabled
-# - deepseek: enabled/disabled 显式下发
-# - openai: enabled→reasoning_effort=high
-# - DeepSeek 代理宿主（自建 OpenAI 兼容代理）: 仅显式开启时下发 thinking=enabled，
-#   关闭时不发参数（保持既有可用行为不变，避免代理不识别字段导致 400）
-_DEEPSEEK_PROXY_HOSTS = ("token.ai-hf.cn",)
-
-
-def build_thinking_params(api_base: str, enable_thinking: bool) -> Dict[str, Any]:
-    base = (api_base or "").lower()
-    if "minimax" in base:
-        if enable_thinking:
-            return {"thinking": {"type": "adaptive"}}
-        return {"reasoning_effort": "none", "thinking": {"type": "disabled"}}
-    if "deepseek" in base:
-        return {"thinking": {"type": "enabled" if enable_thinking else "disabled"}}
-    if "openai" in base:
-        return {"reasoning_effort": "high"} if enable_thinking else {}
-    from urllib.parse import urlparse
-    host = urlparse(api_base).netloc.lower() if api_base else ""
-    if host in _DEEPSEEK_PROXY_HOSTS:
-        return {"thinking": {"type": "enabled"}} if enable_thinking else {}
-    return {}
+# Round 128: effort 档位 → 供应商原生参数（取代 Round 117-126 的 thinking 布尔归一）。
+# - 三家均为 OpenAI 兼容接口，档位统一编码为 `reasoning_effort: <level>`；
+# - minimax：服务端强制 adaptive thinking（R121 实测），档位附加在其上；
+# - effort 为空 = 不下发任何参数（由上游默认决定）；
+# - 合法档位表与校验在 config.resolve_task_model（本函数只负责编码）。
+def build_effort_params(api_base: str, model_name: str, effort: Optional[str]) -> Dict[str, Any]:
+    if not effort:
+        return {}
+    eff = str(effort).strip().lower()
+    payload: Dict[str, Any] = {"reasoning_effort": eff}
+    target = f"{api_base or ''} {model_name or ''}".lower()
+    if "minimax" in target:
+        payload["thinking"] = {"type": "adaptive"}
+    return payload
 
 
 # Round 117b: 内联 think 块提取（用 . 匹配换行；MiniMax adaptive 模式实测会把
 # 推理内联在 content 首位，如 "<think…</think>正文"）
 _INLINE_THINK_RE = re.compile(r'<think(.*?)</think>', re.DOTALL)
+
+# Round 129: 配额耗尽关键字（仅配合 402/403 判定；429 走连续计数）
+_QUOTA_HINT_RE = re.compile(r"quota|insufficient|欠费|额度|余额", re.IGNORECASE)
 
 
 class OpenAICompatibleAdapter(LLMAdapter):
@@ -391,6 +383,8 @@ class OpenAICompatibleAdapter(LLMAdapter):
         # Round 117: thinking 模式审计轨迹（reasoning_content 不混入主输出）
         self.last_reasoning = ""
         self.last_reasoning_only = False
+        # Round 129: 连续 429 计数（配额耗尽判定；成功响应即清零）
+        self._consecutive_429 = 0
         # 初始化该 api_base 的限流器
         limiter_key = self._get_limiter_key(api_base)
         if limiter_key not in self.__class__._rate_limiters:
@@ -423,7 +417,7 @@ class OpenAICompatibleAdapter(LLMAdapter):
         return urlparse(api_base).netloc
 
     def generate(self, prompt: str, model_name: str, max_tokens: int = 2048, temperature: float = 0.3, **kwargs) -> str:
-        enable_thinking = kwargs.pop("enable_thinking", False)
+        effort = kwargs.pop("effort", None)
         extra_body = kwargs.pop("extra_body", None) or {}
         payload = {
             "model": model_name,
@@ -431,8 +425,8 @@ class OpenAICompatibleAdapter(LLMAdapter):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
-        # Round 117: thinking 参数按 provider 归一（含 DeepSeek 代理宿主 opt-in）
-        payload.update(build_thinking_params(self.api_base, enable_thinking))
+        # Round 128: effort 档位按 provider 编码（无档位=不下发；extra_body 仍最后合并）
+        payload.update(build_effort_params(self.api_base, model_name, effort))
         # 合并剩余自定义 extra_body（用户覆盖）
         if extra_body:
             payload.update(extra_body)
@@ -447,7 +441,6 @@ class OpenAICompatibleAdapter(LLMAdapter):
                 time.sleep(limiter["interval"] - elapsed)
             limiter["last"] = time.time()
         last_error = None
-        thinking_stripped = False  # Round 117: 服务端 400 不识别 thinking 字段时剥离重试一次
         for attempt in range(self.max_retries):
             try:
                 response = self._requests.post(
@@ -457,19 +450,44 @@ class OpenAICompatibleAdapter(LLMAdapter):
                     timeout=self.request_timeout,
                     verify=self._verify_ssl,
                 )
+                # Round 117/R121: 服务端 400 不识别 thinking 字段 → 剥离后立即重发一次。
+                # 旧实现用 continue 依赖剩余 attempt 预算：max_retries=1（judge 兜底客户端）
+                # 时会直接耗尽循环，以 "API 调用失败,已重试 1 次: None" 形式误报。
+                if (response.status_code == 400
+                        and any(k in payload for k in ("thinking", "reasoning_effort"))):
+                    _rejected = [k for k in ("thinking", "reasoning_effort") if k in payload]
+                    payload.pop("thinking", None)
+                    payload.pop("reasoning_effort", None)
+                    print(f"⚠️ [OpenAI Adapter] 400: 服务端不识别 {_rejected}"
+                          f"（model={payload.get('model')}）→ 剥离后重试"
+                          f" | body: {response.text[:160]}",
+                          file=sys.stderr, flush=True)
+                    response = self._requests.post(
+                        f"{self.api_base}/chat/completions",
+                        headers=self.headers,
+                        json=payload,
+                        timeout=self.request_timeout,
+                        verify=self._verify_ssl,
+                    )
+                # Round 129: 配额守卫 —— 429 首次按常规重试（瞬时限流），连续两次
+                # （或 402/403 带配额关键字）判定为配额耗尽 → QuotaExhaustedError
+                # （不继续退避空转；由 FallbackRoleAdapter 降级到兜底角色）。
+                if response.status_code == 429 or (
+                    response.status_code in (402, 403)
+                    and _QUOTA_HINT_RE.search(response.text[:400])
+                ):
+                    if response.status_code == 429:
+                        self._consecutive_429 += 1
+                    if response.status_code != 429 or self._consecutive_429 >= 2:
+                        raise QuotaExhaustedError(
+                            f"HTTP {response.status_code} 配额/限流持续耗尽"
+                            f"（model={payload.get('model')}）: {response.text[:160]}"
+                        )
                 # 429 是限流（属于 4xx 但应重试），其他 4xx 是客户端错误；5xx 由 raise_for_status 抛出后被外层重试逻辑捕获
                 if 400 <= response.status_code < 500 and response.status_code != 429:
-                    if (response.status_code == 400 and not thinking_stripped
-                            and any(k in payload for k in ("thinking", "reasoning_effort"))):
-                        # 代理/服务端不识别 thinking 参数：剥离后立即重试一次（保证可用性优先）
-                        thinking_stripped = True
-                        payload.pop("thinking", None)
-                        payload.pop("reasoning_effort", None)
-                        print("⚠️ [OpenAI Adapter] 400: 服务端可能不识别 thinking 参数，剥离后重试",
-                              file=sys.stderr)
-                        continue
                     raise RuntimeError(f"API 客户端错误 {response.status_code}: {response.text[:200]}")
                 response.raise_for_status()
+                self._consecutive_429 = 0
                 resp_json = response.json()
                 message = resp_json["choices"][0]["message"]
                 # Round 27: 解析真实 token usage（OpenAI 兼容 API 标准字段）
@@ -481,8 +499,11 @@ class OpenAICompatibleAdapter(LLMAdapter):
                     )
                 # Round 117: thinking 模式下 reasoning_content 只作审计轨迹，
                 # 不得混入 content（旧行为把推理拼进译文会污染下游产物）。
+                # Round 129: token.ai-hf.cn 网关的字段名是 reasoning（非
+                # reasoning_content），两者都读取，避免推理被落在盲区。
                 content = message.get("content") or ""
-                reasoning = message.get("reasoning_content") or ""
+                reasoning = (message.get("reasoning_content")
+                             or message.get("reasoning") or "")
                 # Round 117b: 部分 provider（如 MiniMax adaptive thinking）把推理内联在
                 # content 里（"<think…</think>正文"）。若 reasoning_content 为空，
                 # 把闭合的 think 块抽出为审计轨迹，正文只保留 think 之后的内容。
@@ -491,11 +512,24 @@ class OpenAICompatibleAdapter(LLMAdapter):
                     if m:
                         reasoning = m.group(1).strip()
                         content = (content[:m.start()] + content[m.end():]).strip()
+                    else:
+                        # 未闭合 think 块（推理被 max_tokens 截断）→ 判定失败，
+                        # 避免把半截推理当正文写入成品。
+                        self.last_reasoning = content.strip()
+                        self.last_reasoning_only = True
+                        raise RuntimeError(
+                            "模型输出为未闭合 think 块（疑推理截断），判定调用失败"
+                        )
                 self.last_reasoning = reasoning
                 if not content.strip() and reasoning:
-                    # 仅有推理无回复：返回推理兜底（标记以便上游觉察）
+                    # Round 129（质量优先）：仅有推理无正文 = 思考吃光 max_tokens。
+                    # 旧行为把推理当译文返回，会把思维链污染进成品；现判定调用失败，
+                    # 触发上层重试/兜底，绝不让 CoT 混入译文。
                     self.last_reasoning_only = True
-                    return reasoning
+                    raise RuntimeError(
+                        f"模型仅输出推理、无正文（reasoning={len(reasoning)} chars）——"
+                        f"疑似 thinking 耗尽 max_tokens，判定调用失败"
+                    )
                 return content
             except RuntimeError:
                 raise
@@ -512,196 +546,121 @@ class OpenAICompatibleAdapter(LLMAdapter):
         pass
 
 
-class MLXNativeAdapter(LLMAdapter):
-    """基于 Apple MLX 的原生本地推理适配器 (专为 M1 统一内存优化)"""
+def _map_effort_for_fallback(effort: str, levels: tuple) -> Optional[str]:
+    """Round 129: 降级时的 effort 跨家映射（就近取更强档）；无法安全映射则不下发。"""
+    eff = str(effort or "").strip().lower()
+    if not eff:
+        return None
+    if not levels:
+        return eff
+    if eff in levels:
+        return eff
+    alias = {"medium": "high", "minimal": "low", "off": "none"}
+    cand = alias.get(eff, eff)
+    return cand if cand in levels else None
 
-    # 类级共享缓存：LRU 顺序字典，最近使用移到末尾
-    # 避免每个角色加载一份同模型副本，节省 2x~3x 内存
-    # 限制最大缓存模型数，防止 16GB 统一内存 OOM
-    _shared_models: "OrderedDict[str, tuple]" = OrderedDict()
-    _cache_lock = threading.Lock()
-    _MAX_CACHED_MODELS = 2  # 可通过配置覆盖
 
-    def __init__(self):
-        try:
-            from mlx_lm import load as _mlx_load
-            from mlx_lm import generate as _mlx_generate
-            from mlx_lm.sample_utils import make_sampler as _make_sampler
-            import mlx.core as _mx
-            self.mlx_load = _mlx_load
-            self.mlx_generate = _mlx_generate
-            self.make_sampler = _make_sampler
-            self.mx = _mx
-        except ImportError:
-            raise RuntimeError("⚠️ 环境中未安装 mlx-lm。请在虚拟环境中执行 `pip install mlx-lm`")
+def _fallback_levels_for(api_base: str, model_name: str) -> tuple:
+    """推断 fallback 目标的合法档位集合（供降级映射用；失败时返回空=原样透传）。"""
+    try:
+        from src.config import EFFORT_LEVELS_BY_PROVIDER, effort_provider_of
+        provider = effort_provider_of(model_name, api_base)
+        return EFFORT_LEVELS_BY_PROVIDER.get(provider, ()) if provider else ()
+    except Exception:
+        return ()
 
-        self.current_model_name = None
-        self.model = None
-        self.tokenizer = None
 
-    def _unload_single_model(self, model, tokenizer, model_name: str):
-        """真正卸载单个模型：解引用 + Metal 缓存清理 + GC"""
-        # 1. 解引用
-        del model
-        del tokenizer
-        # 2. Python GC
-        gc.collect()
-        # 3. Metal 缓存清理（KV Cache、计算图）
-        if hasattr(self.mx.metal, "clear_cache"):
-            self.mx.metal.clear_cache()
-        print(f"🧹 [MLX] 已彻底卸载模型: {model_name}，显存已释放")
+class FallbackRoleAdapter(LLMAdapter):
+    """Round 129: 角色级配额降级包装器（透明替代普通适配器）。
 
-    def _load_model_if_needed(self, model_name: str):
-        """按需加载，LRU 缓存 + 线程安全 + 自动驱逐
+    主角色（如 primary/MiniMax）调用因配额/限流持续耗尽（QuotaExhaustedError）时，
+    进程内永久切换到 fallback 角色（如 secondary/DeepSeek），保证流水线不因单模型
+    配额中断或长时间阻塞；其余错误不触发降级，按原路径处理。
 
-        设计：
-          - 多个 MLXNativeAdapter 实例（每个角色一个）共用同一份 (model, tokenizer)
-          - 首次加载 → 实际 mlx_load；缓存命中 → 直接复用并更新 LRU
-          - 超过 _MAX_CACHED_MODELS 时驱逐最久未使用的模型（真正释放显存）
-        """
-        with self._cache_lock:
-            # 缓存命中：更新 LRU 顺序（移到末尾）
-            if model_name in self._shared_models:
-                self._shared_models.move_to_end(model_name)
-                print(f"♻️  [MLX] 复用共享缓存: {model_name}（LRU 刷新）")
-            else:
-                # 驱逐最旧模型（如果超过限制）
-                while len(self._shared_models) >= self._MAX_CACHED_MODELS:
-                    oldest_name, (old_model, old_tok) = self._shared_models.popitem(last=False)
-                    print(f"🗑️ [MLX] 缓存满，驱逐最旧模型: {oldest_name}")
-                    self._unload_single_model(old_model, old_tok, oldest_name)
+    降级单向（避免失败-回切抖动）；MiniMax 配额按 5 小时窗重置，重启进程即恢复。
+    """
 
-                # 加载新模型
-                print(f"🚀 [MLX] 正在将模型加载至 Apple Silicon 统一内存: {model_name}...")
-                self._shared_models[model_name] = self.mlx_load(model_name)
+    def __init__(
+        self,
+        primary: LLMAdapter,
+        fallback: LLMAdapter,
+        fallback_model_name: str,
+        primary_model_name: str = "",
+        fallback_role: str = "",
+        fallback_levels: tuple = (),
+    ):
+        super().__init__()
+        self._primary = primary
+        self._fallback = fallback
+        self._fallback_model_name = fallback_model_name
+        self._primary_model_name = primary_model_name or "primary"
+        self._fallback_role = fallback_role or "fallback"
+        self._fallback_levels = tuple(fallback_levels or ())
+        self._degraded = False
+        self._role_label = f"quota-fallback({self._primary_model_name})"
+        self.last_reasoning = ""
+        self.last_reasoning_only = False
 
-            # 绑定到当前实例
-            self.model, self.tokenizer = self._shared_models[model_name]
-            self.current_model_name = model_name
+    @property
+    def degraded(self) -> bool:
+        return self._degraded
 
-    def generate(self, prompt: str, model_name: str, max_tokens: int = 2048, temperature: float = 0.3, **kwargs) -> str:
-        # 线程安全的加载/驱逐
-        self._load_model_if_needed(model_name)
+    def _sync_audit(self, adapter: LLMAdapter) -> None:
+        self.last_reasoning = getattr(adapter, "last_reasoning", "")
+        self.last_reasoning_only = getattr(adapter, "last_reasoning_only", False)
 
-        # 组装聊天模板
-        if hasattr(self.tokenizer, "apply_chat_template"):
-            messages = [{"role": "user", "content": prompt}]
-            enable_thinking = kwargs.get("enable_thinking", False)
+    def generate(self, prompt: str, model_name: str, max_tokens: int = 2048,
+                 temperature: float = 0.3, **kwargs) -> str:
+        if not self._degraded:
             try:
-                formatted_prompt = self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True,
-                    enable_thinking=enable_thinking,
+                out = self._primary.generate(
+                    prompt=prompt, model_name=model_name,
+                    max_tokens=max_tokens, temperature=temperature, **kwargs,
                 )
-            except TypeError:
-                # tokenizer 不支持 enable_thinking（如标准 Qwen/Gemma），回退
-                formatted_prompt = self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True,
+                self._sync_audit(self._primary)
+                return out
+            except QuotaExhaustedError as e:
+                self._degraded = True
+                print(
+                    f"⛔ [Quota Fallback] {self._primary_model_name} 配额/限流耗尽 → "
+                    f"永久降级到 {self._fallback_model_name}（role={self._fallback_role}；"
+                    f"配额重置后重启进程恢复主力） | {e}",
+                    file=sys.stderr, flush=True,
                 )
-        else:
-            formatted_prompt = prompt
-
-        # 性能计时
-        start_time = time.time()
-        mem_before = self.get_memory_usage()
-
-        # MLX 生成调用
-        sampler = self.make_sampler(temp=temperature)
-        response = self.mlx_generate(
-            self.model,
-            self.tokenizer,
-            prompt=formatted_prompt,
-            max_tokens=max_tokens,
-            verbose=False,
-            sampler=sampler,
+        kwargs = dict(kwargs)
+        if kwargs.get("effort") and self._fallback_levels:
+            kwargs["effort"] = _map_effort_for_fallback(str(kwargs["effort"]), self._fallback_levels)
+            if kwargs["effort"] is None:
+                kwargs.pop("effort", None)
+        out = self._fallback.generate(
+            prompt=prompt, model_name=self._fallback_model_name,
+            max_tokens=max_tokens, temperature=temperature, **kwargs,
         )
+        self._sync_audit(self._fallback)
+        return out
 
-        # 性能统计
-        elapsed_ms = (time.time() - start_time) * 1000
-        mem_after = self.get_memory_usage()
-
-        # Round 27: tokenizer 真实 token 数（prompt + completion）
-        try:
-            prompt_tokens = len(self.tokenizer.encode(formatted_prompt))
-            completion_tokens = len(self.tokenizer.encode(response))
-        except Exception:
-            prompt_tokens = len(formatted_prompt) // 4
-            completion_tokens = len(response) // 4
-
-        print(f"📊 [MLX Perf] 耗时: {elapsed_ms:.0f}ms, "
-              f"内存: {mem_before['rss_gb']:.2f}GB -> {mem_after['rss_gb']:.2f}GB, "
-              f"约 {completion_tokens} tokens, "
-              f"{completion_tokens / (elapsed_ms/1000):.1f} tok/s")
-
-        # Round 27: 累积 token 用量（与 OpenAI adapter 统一口径）
-        self.record_usage(prompt_tokens, completion_tokens)
-
-        return response
+    def get_cumulative_usage(self) -> Dict[str, int]:
+        a = self._primary.get_cumulative_usage()
+        b = self._fallback.get_cumulative_usage()
+        return {k: int(a.get(k, 0)) + int(b.get(k, 0))
+                for k in ("prompt_tokens", "completion_tokens", "total_tokens", "calls")}
 
     def unload_model(self):
-        """M1 环境下至关重要的显存清理操作
-
-        从共享缓存中真正移除当前模型（若无其他实例引用），释放 Metal 显存。
-        """
-        with self._cache_lock:
-            if self.current_model_name and self.current_model_name in self._shared_models:
-                model, tokenizer = self._shared_models.pop(self.current_model_name)
-                print(f"🧹 [MLX] 从共享缓存移除: {self.current_model_name}")
-                self._unload_single_model(model, tokenizer, self.current_model_name)
-            else:
-                print(f"ℹ️ [MLX] 当前模型 {self.current_model_name} 不在共享缓存中或已被驱逐")
-
-        self.model = None
-        self.tokenizer = None
-        self.current_model_name = None
-
-        # 兜底：再次 GC + Metal 清理
-        gc.collect()
-        if hasattr(self.mx.metal, "clear_cache"):
-            self.mx.metal.clear_cache()
-
-        print("✅ [MLX] Metal 缓存已清空，显存已释放。")
-
-    @classmethod
-    def set_max_cached_models(cls, max_models: int):
-        """运行时调整最大缓存模型数（配置热加载用）。
-
-        用于在内存受限环境（如 16GB M1）下动态收缩 LRU 缓存上限。修改后会
-        立即驱逐多余的最久未使用模型（解引用 + GC + Metal cache 清理）。
-
-        Args:
-            max_models: 新的最大缓存模型数（会被钳制到 ≥ 1）。
-
-        Example:
-            >>> MLXNativeAdapter.set_max_cached_models(1)  # 强制单模型缓存
-        """
-        with cls._cache_lock:
-            cls._MAX_CACHED_MODELS = max(1, max_models)
-            # 如果当前缓存超过新限制，驱逐多余
-            while len(cls._shared_models) > cls._MAX_CACHED_MODELS:
-                oldest_name, (old_model, old_tok) = cls._shared_models.popitem(last=False)
-                print(f"🗑️ [MLX] 配置变更驱逐: {oldest_name}")
-                # 静态清理：del + gc + Metal cache
-                del old_model, old_tok
-                gc.collect()
-                # Metal cache 清理需要 mlx.core 单例，用 try 兜底
-                try:
-                    import mlx.core as mx
-                    if hasattr(mx, 'metal') and hasattr(mx.metal, 'clear_cache'):
-                        mx.metal.clear_cache()
-                except (ImportError, AttributeError):
-                    pass
+        try:
+            self._primary.unload_model()
+        finally:
+            self._fallback.unload_model()
 
 
 # Per-role 客户端缓存：role_key -> LLMAdapter
 _client_instances: dict = {}
 
 
-def _build_role_client(role_cfg: Dict[str, Any]) -> LLMAdapter:
+def _build_single_client(role_cfg: Dict[str, Any]) -> LLMAdapter:
+    """构建单一角色的底层适配器（不含 fallback 包装）。"""
     backend = role_cfg.get("backend", "mock")
     if backend == "mock":
         return MockLLMAdapter()
-    if backend == "mlx":
-        return MLXNativeAdapter()
     if backend in ("openai_api", "ollama", "nim", "mistral", "custom"):
         section = _config.openai_api if hasattr(_config, "openai_api") else {}
         # P4-8: 优先读 role_cfg 内的 per-role 超时配置，回退全局 openai_api
@@ -715,6 +674,35 @@ def _build_role_client(role_cfg: Dict[str, Any]) -> LLMAdapter:
     raise ValueError(f"不支持的 backend: {backend}")
 
 
+def _build_role_client(role_cfg: Dict[str, Any]) -> LLMAdapter:
+    """构建角色客户端；配置了 `fallback_role` 时套配额降级包装器（Round 129）。
+
+    fallback 目标须为普通角色（自身无 fallback_role，避免链式递归）；mock 后端跳过。
+    """
+    client = _build_single_client(role_cfg)
+    fb_role = str(role_cfg.get("fallback_role") or "").strip()
+    if not fb_role:
+        return client
+    try:
+        fb_cfg = _config.get_role_config(fb_role) or {}
+    except Exception as e:
+        print(f"⚠️ [Adapter] fallback 角色 {fb_role} 配置读取失败: {e}", file=sys.stderr)
+        return client
+    if fb_cfg.get("backend", "mock") == "mock" or fb_cfg.get("fallback_role"):
+        return client
+    fb_client = _build_single_client(fb_cfg)
+    return FallbackRoleAdapter(
+        primary=client,
+        fallback=fb_client,
+        fallback_model_name=fb_cfg.get("model_name", ""),
+        primary_model_name=role_cfg.get("model_name", ""),
+        fallback_role=fb_role,
+        fallback_levels=_fallback_levels_for(
+            fb_cfg.get("api_base", ""), fb_cfg.get("model_name", "")
+        ),
+    )
+
+
 def get_llm_client(role: str) -> LLMAdapter:
     """按角色返回 LLM 客户端实例（首次按需构建并缓存）。
 
@@ -725,7 +713,7 @@ def get_llm_client(role: str) -> LLMAdapter:
         stale = [k for k, v in _client_instances.items() if not isinstance(v, MockLLMAdapter)]
         for k in stale:
             del _client_instances[k]
-        role_cfg = {"backend": "mock", "default_params": {}, "extra_body": {}}
+        role_cfg = {"backend": "mock", "default_params": {}}
         if role not in _client_instances:
             _client_instances[role] = _build_role_client(role_cfg)
         return _client_instances[role]
@@ -742,14 +730,20 @@ def get_llm_client_for_task(task_name: str) -> LLMAdapter:
 
 def get_role_model_name(role: str) -> str:
     cfg = _config.get_role_config(role)
-    return cfg.get("model_id") or cfg.get("model_name", "")
+    return cfg.get("model_name", "")
 
 
-def get_role_extra_body(role: str) -> Dict[str, Any]:
-    """读取角色配置中的 extra_body（供应商特有参数）；无则返回空 dict。"""
+def get_task_extra_body(task_name: str) -> Dict[str, Any]:
+    """读取任务级 extra_body（供应商特有透传参数）；无则返回空 dict。
+
+    Round 127: 配置位置从模型级迁到任务级 —— 规范位置
+    `task_routing.<task>.extra_body`；兼容 `params_override.extra_body`。
+    """
     try:
-        cfg = _config.get_role_config(role) or {}
-        body = cfg.get("extra_body") or {}
+        routing = (_config.task_routing or {}).get(task_name, {}) or {}
+        body = routing.get("extra_body")
+        if body is None:
+            body = (routing.get("params_override") or {}).get("extra_body")
         return dict(body) if isinstance(body, dict) else {}
     except Exception:
         return {}

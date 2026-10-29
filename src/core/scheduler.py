@@ -5,6 +5,7 @@ SagaTrans 任务状态机（TaskState + TaskScheduler）
 """
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import threading
@@ -12,6 +13,10 @@ import time
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional
+
+# Round 130: 回溯治理预算读取（config.yaml decision_engine 段）。
+# 模块级 import 仅服务散装树；单体内该名字取头部 _config 适配层（与 DecisionEngine 同模式）。
+from src.config import config as _config
 
 
 # Section 1 — 枚举与类型定义
@@ -129,6 +134,20 @@ class TaskScheduler:
             self.conn.commit()
         except sqlite3.OperationalError:
             pass
+
+        # Round 130: 治理计数列（跨 episode 累计回溯轮数，不随质量计数清零）
+        try:
+            cursor.execute('ALTER TABLE chunk_tasks ADD COLUMN backtrack_rounds INTEGER DEFAULT 0')
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        # Round 133: 重试适配 override 列（no_content 签名 → 降档/换角救稿，按块持久化 JSON）
+        try:
+            cursor.execute('ALTER TABLE chunk_tasks ADD COLUMN retry_effort_overrides TEXT')
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
         
         # 批处理支持索引
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_state ON chunk_tasks(state)')
@@ -174,7 +193,8 @@ class TaskScheduler:
                             state = ?,
                             last_error = NULL,
                             retries = 0,
-                            quality_retries = 0
+                            quality_retries = 0,
+                            retry_effort_overrides = NULL
                     ''', (chunk_id, chapter_id, text, TaskState.PENDING.value, TaskState.PENDING.value))
                 else:
                     cursor.execute('''
@@ -228,17 +248,33 @@ class TaskScheduler:
             ''', (state.value, batch_size))
         return [dict(row) for row in cursor.fetchall()]
 
-    def update_task_state(self, chunk_id: str, new_state: TaskState, error_msg: str = None, quality_retry: bool = False):
-        """更新任务状态（含转移合法性校验）"""
+    def update_task_state(self, chunk_id: str, new_state: TaskState, error_msg: str = None,
+                          quality_retry: bool = False, allow_terminal_restore: bool = False):
+        """更新任务状态（含转移合法性校验）。
+
+        Round 124: allow_terminal_restore — 仅 _restore_dirty_backups 使用的例外：
+        回溯重跑失败、恢复旧 final.json 时, PERMANENTLY_FAILED → COMPLETED 是合法
+        语义（保留之前已合格的译文）。此前该转移被合法性校验静默拒绝 → 状态残留 PF,
+        日志却假报 "已恢复…(COMPLETED)"（ch09 run2 曾出现 8 条）。
+
+        Round 130（审计③）: 返回 bool —— True=已按预期更新；False=被拒绝（非法转移，
+        状态未变），调用方可感知，避免日志与状态脱节。
+        """
         cursor = self.conn.cursor()
         cursor.execute('SELECT state FROM chunk_tasks WHERE chunk_id = ?', (chunk_id,))
         row = cursor.fetchone()
         if row:
             from_state = TaskState(row[0])
             allowed = VALID_TRANSITIONS.get(from_state, [])
-            if new_state not in allowed:
-                print(f"⚠️ [Scheduler] 非法转移 {chunk_id}: {row[0]} -> {new_state.value}")
-                return
+            terminal_restore = (
+                allow_terminal_restore
+                and from_state == TaskState.PERMANENTLY_FAILED
+                and new_state == TaskState.COMPLETED
+            )
+            if new_state not in allowed and not terminal_restore:
+                print(f"⚠️ [Scheduler] 非法转移 {chunk_id}: {row[0]} -> {new_state.value}"
+                      f" (允许: {[s.value for s in allowed]})")
+                return False
         if error_msg and quality_retry:
             cursor.execute('''
                 UPDATE chunk_tasks
@@ -258,6 +294,58 @@ class TaskScheduler:
                 WHERE chunk_id = ?
             ''', (new_state.value, chunk_id))
         self.conn.commit()
+        return True
+
+    # ────────────────────────────────────────────────────────────────
+    # Round 133: 块级重试适配 override（no_content 签名 → 降档/换角救稿）
+    # payload 例: {"sig":"no_content","stage":"TRANSLATING_RAW","role":"primary",
+    #             "effort":"xhigh","used_role":"primary","used_effort":"max",
+    #             "down_delta":1,"rescue_used":false,"escalated":false,"applied_at":...}
+    # 语义: role/effort = 下一次尝试应使用的角色与档位（apply 侧直接读取）。
+    # ────────────────────────────────────────────────────────────────
+    def get_retry_override(self, chunk_id: str) -> Optional[Dict]:
+        """读取块级重试适配 override（JSON；无记录/列缺失/解析失败 → None）。"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                'SELECT retry_effort_overrides FROM chunk_tasks WHERE chunk_id = ?',
+                (chunk_id,))
+            row = cursor.fetchone()
+        except sqlite3.OperationalError:
+            return None
+        if not row or not row[0]:
+            return None
+        try:
+            data = json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def set_retry_override(self, chunk_id: str, payload: Dict) -> bool:
+        """写块级重试适配 override（JSON 序列化）；返回 True=已更新。"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                'UPDATE chunk_tasks SET retry_effort_overrides = ?, '
+                'updated_at = CURRENT_TIMESTAMP WHERE chunk_id = ?',
+                (json.dumps(payload, ensure_ascii=False), chunk_id))
+            self.conn.commit()
+            return cursor.rowcount > 0
+        except sqlite3.OperationalError:
+            return False
+
+    def clear_retry_override(self, chunk_id: str) -> bool:
+        """清空块级重试适配 override。"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                'UPDATE chunk_tasks SET retry_effort_overrides = NULL, '
+                'updated_at = CURRENT_TIMESTAMP WHERE chunk_id = ?',
+                (chunk_id,))
+            self.conn.commit()
+            return cursor.rowcount > 0
+        except sqlite3.OperationalError:
+            return False
 
     def batch_update_state(self, chunk_ids: List[str], new_state: TaskState, error_msgs: Dict[str, str] = None, quality_retry: bool = False, reset_counters: bool = False):
         """批量更新任务状态 - 减少数据库往返开销
@@ -268,9 +356,13 @@ class TaskScheduler:
             error_msgs: 可选，按 chunk_id 分错误信息 {chunk_id: error_msg}
             quality_retry: 是否为质量重试（True=增 quality_retries，False=增 retries）
             reset_counters: 是否重置 retries 和 quality_retries 为 0（用于 DIRTY 回溯后重新计数）
+
+        Returns (Round 130, 审计③):
+            List[str] — 实际被更新的 chunk_id 列表（非法转移/不存在的 chunk 会被跳过，
+            不再无声无息；调用方可据此感知拒绝情况）。
         """
         if not chunk_ids:
-            return
+            return []
         cursor = self.conn.cursor()
         placeholders = ','.join('?' for _ in chunk_ids)
 
@@ -294,7 +386,7 @@ class TaskScheduler:
             valid_ids.append(cid)
 
         if not valid_ids:
-            return
+            return []
 
         # 逐条执行以保留各自的 error_msg
         for cid in valid_ids:
@@ -324,6 +416,7 @@ class TaskScheduler:
                     WHERE chunk_id = ?
                 ''', (new_state.value, cid))
         self.conn.commit()
+        return valid_ids
 
     def get_all_tasks_by_chapter(self, chapter_id: str) -> List[Dict]:
         """获取章节所有任务"""
@@ -338,31 +431,61 @@ class TaskScheduler:
         row = cursor.fetchone()
         return dict(row) if row else None
 
-    def trigger_backtrack(self, chunk_ids: List[str]):
+    def trigger_backtrack(self, chunk_ids: List[str]) -> Dict[str, List[str]]:
         """回溯引擎：仅将已定稿(COMPLETED)的数据块标记为 DIRTY 重跑。
 
         与 VALID_TRANSITIONS 对齐：只允许 COMPLETED -> DIRTY。
         禁止对 JUDGING/AUDITING 等中间态打 DIRTY（否则会阻断 COMPLETED 并可能死循环）。
         尚未产出译文的 PENDING / EXTRACTING_TERMS 等也不回溯——后续阶段会自然读到新决策。
+
+        Round 130 治理预算（防"回溯→重跑→再回溯"自激长跑）：
+        单块累计回溯轮数 backtrack_rounds（跨 episode 持久，不随质量计数清零）达到
+        decision_engine.max_backtrack_rounds_per_chunk 即冻结，不再标记 DIRTY。
+        0 = 不限制（旧行为，向后兼容）。
+
+        Returns:
+            {"dirty": [...], "over_cap": [...], "skipped_state": [...]}
         """
         if not chunk_ids:
-            return
+            return {"dirty": [], "over_cap": [], "skipped_state": []}
+        de_cfg = getattr(_config, "decision_engine", {}) or {}
+        try:
+            cap = int(de_cfg.get("max_backtrack_rounds_per_chunk", 2) or 0)
+        except (TypeError, ValueError):
+            cap = 2
         cursor = self.conn.cursor()
         placeholders = ','.join('?' for _ in chunk_ids)
-        # 仅 COMPLETED 可进入 DIRTY，与 VALID_TRANSITIONS[COMPLETED] 一致
         cursor.execute(f'''
-            UPDATE chunk_tasks
-            SET state = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE chunk_id IN ({placeholders})
-            AND state = ?
-        ''', (TaskState.DIRTY.value,) + tuple(chunk_ids) + (TaskState.COMPLETED.value,))
+            SELECT chunk_id, state, COALESCE(backtrack_rounds, 0)
+            FROM chunk_tasks WHERE chunk_id IN ({placeholders})
+        ''', tuple(chunk_ids))
+        dirty: List[str] = []
+        over_cap: List[str] = []
+        skipped_state: List[str] = []
+        for cid, state, rounds in cursor.fetchall():
+            if state != TaskState.COMPLETED.value:
+                skipped_state.append(cid)
+                continue
+            if cap > 0 and int(rounds or 0) >= cap:
+                over_cap.append(cid)
+                continue
+            dirty.append(cid)
+        if dirty:
+            ph2 = ','.join('?' for _ in dirty)
+            cursor.execute(f'''
+                UPDATE chunk_tasks
+                SET state = ?, backtrack_rounds = COALESCE(backtrack_rounds, 0) + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chunk_id IN ({ph2})
+            ''', (TaskState.DIRTY.value,) + tuple(dirty))
         self.conn.commit()
-        updated = cursor.rowcount
-        skipped = len(chunk_ids) - updated
-        msg = f"🔄 已触发 {updated} 个数据块的回溯重构（标记 DIRTY）"
-        if skipped > 0:
-            msg += f"（跳过 {skipped} 个非 COMPLETED 状态）"
+        msg = f"🔄 已触发 {len(dirty)} 个数据块的回溯重构（标记 DIRTY）"
+        if skipped_state:
+            msg += f"（跳过 {len(skipped_state)} 个非 COMPLETED 状态）"
+        if over_cap:
+            msg += f"（治理冻结 {len(over_cap)} 个超单块预算）"
         print(msg + "。")
+        return {"dirty": dirty, "over_cap": over_cap, "skipped_state": skipped_state}
 
     def find_chunks_containing(
         self,

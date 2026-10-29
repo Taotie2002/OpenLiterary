@@ -2,157 +2,146 @@
 # SagaTrans 全局配置
 # =====================================================================
 #
-# 1. 角色级 LLM 配置（models 段，per-role 后端 + 思考模式）
-# ---------------------------------------------------------------------
-# 每个 LLM 角色可独立指定 backend + provider + model + extra_body。
-# 两个角色定义：
-#   literal_translator  - 直译专用（小模型即可，低 temperature）
-#   primary             - 主力模型（参考提取 / 文学润色 / Critic 打分 / 最终裁决）
+# 结构总览（按节号自上而下；每节的唯一职责见下）：
+#   1. models         模型定义 —— 唯一事实源。每个角色一块，集中写
+#                     api_base / api_key / model_name / thinking(Effort)。
+#   2. llm_backend    全局后端开关（openai_api | mock）。
+#   3. openai_api     HTTP 传输层全局参数（重试/超时/并发）—— 不再定义模型。
+#   4. task_routing   任务 → 模型 + 参数覆盖（temperature / max_tokens / thinking）。
+#   5+. pipeline / chunker / critic_thresholds / style_guide / … 状态机与质量门槛。
 #
-# 支持 backend:
-#   mlx          - Apple Silicon 本地推理 (model_id)
-#   openai_api   - 任意 OpenAI 兼容 HTTP API (api_base + api_key + model_name)
+# 角色与分工（models 的 key）：
+#   literal_translator  直译 / 典故考据召回            (Qwen3.8-Flash-Next-SS, 自建网关)
+#   primary             最终裁决 / 风格剖面 / 成书审读   (MiniMax-M3.1-Flash)
+#   secondary           文学润色 / 审计评分 / 典故确认   (Deepseek-V4.1-Flash-1017-SS, 自建网关)
 #
-# 思考模式 / 供应商特有参数通过 extra_body 透传:
-#   DeepSeek: extra_body: { thinking: true, reasoning_effort: high }
-#   OpenAI o-series: extra_body: { reasoning_effort: "high" }
-#   Gemini: extra_body: { reasoning_effort: "low" }
+# Effort（思考档位）约定：
+#   - 档位是任务级配置：task_routing.<task>.effort；只写需要的任务，不写=不下发参数。
+#   - 合法档位（各家文档口径 + 2026-10 实测，resolve 时按 provider 校验）：
+#       MiniMax: low / medium / high / xhigh / max（服务端强制 adaptive，无 none 档）
+#       DeepSeek: none / low / high / xhigh / max（none=显式关闭思考）
+#       Qwen:    none / low / medium / xhigh（none=显式关闭思考）
+#   - 适配层编码：统一 reasoning_effort: <level>；MiniMax 另附 thinking=adaptive。
+#   - ⚠️ 关闭思考统一写 none（effort: none 或 "none"）；裸 off 会被 YAML 当布尔
+#     false，代码兼容归一为 none 并校验（MiniMax 无 none 档会直接报错）。
+#   - 其它供应商特有透传参数写任务级 `task_routing.<task>.extra_body`（最后合并、同名覆盖）。
 #
-# 2. 全局 fallback（llm_backend + mlx/openai_api 段）
-# ---------------------------------------------------------------------
-# 如果 models 段缺失，pipeline 自动回退到下方的全局 llm_backend 配置。
-# 推荐做法：始终使用 models 段。
+# 配额韧性（Round 129）：
+#   - models.primary 配置 fallback_role: secondary —— MiniMax 配额/限流持续耗尽
+#     （429 连续 / 配额类 402-403）时，primary 角色自动永久降级到 secondary
+#     （DeepSeek），流水线不因配额中断或长时间空转；配额 5 小时窗重置后重启进程恢复。
+#   - 降级为进程内单向，避免失败-回切抖动；触发时 stderr 打 [Quota Fallback] 日志。
 #
-# 3. 临时覆盖（不修改本文件）
-# ---------------------------------------------------------------------
-# 通过环境变量 SAGATRANS__<路径> 覆盖任意字段，__ 为嵌套分隔符。
-# 路径需复刻 config.yaml 的嵌套结构（角色配置在 main.models.<role> 下）：
+# 临时覆盖（不修改本文件）：环境变量 SAGATRANS__<路径>，__ 为层级分隔符。
 #   export SAGATRANS__LLM_BACKEND=openai_api
-#   export SAGATRANS__MAIN__MODELS__PRIMARY__MODEL_NAME=mistral-large
-#   export SAGATRANS__MAIN__MODELS__PRIMARY__API_BASE=https://api.mistral.ai/v1
-#   export SAGATRANS__MAIN__MODELS__PRIMARY__API_KEY=$MISTRAL_KEY
-# 注意：SAGATRANS_<路径> 形式（旧式，路径中用单下划线）也已支持。
-# 另：api_key 等敏感字段推荐用 ${ENV} 占位符写在下方 main.models.<role> 中，
-#     运行时由环境变量注入（如 export DEEPSEEK_API_KEY=...），无需明文落盘。
+#   export SAGATRANS__MODELS__PRIMARY__MODEL_NAME=mistral-large
+#   export SAGATRANS__MODELS__PRIMARY__API_BASE=https://api.example.com/v1
+#   export SAGATRANS__MODELS__PRIMARY__API_KEY=$MISTRAL_KEY
+#   （旧路径 SAGATRANS__MAIN__MODELS__… 仍兼容；单下划线旧式写法亦支持）
 #
-# 4. 任务路由（task_routing 段）
-# ---------------------------------------------------------------------
-# 把 6 类任务（reference_extraction / literal_translation / literary_rewrite /
-# critic_scoring / judge_decision / golden_test）映射到 2 个角色 key。
-# params_override 覆盖角色 default_params。
-#
-# 5. 状态机与质量门槛
-# ---------------------------------------------------------------------
-# pipeline.max_retries     - 单 chunk 最多重试次数（默认 3，含首次 1 次 + 重试 3 次 = 4 轮）
-# critic_thresholds        - 6 个评分维度 + 平均分阈值（低于即 is_flawed=True）
-# decision_engine          - 决策回溯策略（术语/典故/风格变动是否触发受影响 chunk 重译）
+# 敏感字段用 ${ENV} 占位符，运行时从 .env / shell 环境注入（.env 不入库）。
+# 说明：本地推理（MLX）支持已移除，models 全部为 OpenAI 兼容 HTTP 后端。
 # =====================================================================
 
-# ---------- 1. Per-role LLM 配置 ----------
-main:
-  models:
-    literal_translator:
-      backend: openai_api
-      api_base: https://token.ai-hf.cn/v1
-      api_key: ${HEFEI_API_KEY}
-      model_name: Deepseek-V4.1-Flash-1017-SS
-      alias: llm(直译)
-      extra_body: {}
-    primary:
-      backend: openai_api
-      api_base: https://api.minimax.cn/v1
-      api_key: ${MINIMAX_API_KEY}
-      model_name: MiniMax-M3.1-Flash
-      alias: llm-primary (主力模型)
-      extra_body: {}
+# ---------- 1. 模型定义（唯一事实源） ----------
+# 每个角色一块：连接（api_base/api_key）+ 模型名（Effort 档位在 task_routing，见第 4 节）。
+# 不要在其它段落重复模型定义（旧 main.models / openai_api.models 双落点已废弃）。
+# extra_body / effort 均为任务级配置，见第 4 节 task_routing。
+models:
+  literal_translator:
+    alias: "llm(直译)"
+    # 自建Qwen网关（非阿里官方 ）
+    api_base: https://token.ai-hf.cn/v1
+    api_key: ${QWEN_API_KEY}
+    model_name: Qwen3.8-Flash-Next-SS
 
-# ---------- 2. 全局 fallback 配置（仅在 models 缺失时使用） ----------
+  primary:
+    alias: "llm-primary (主力模型)"
+    api_base: https://api.minimax.cn/v1
+    api_key: ${MINIMAX_API_KEY}
+    model_name: MiniMax-M3.1-Flash
+    # Round 129 配额韧性：MiniMax 配额耗尽时 primary 角色调用自动降级到该角色
+    fallback_role: secondary
+    
+  secondary:
+    alias: "llm-secondary (审计/确认)"
+    # 自建Deepseek网关（非官方 ）
+    api_base: https://token.ai-hf.cn/v1
+    api_key: ${DEEPSEEK_API_KEY}
+    model_name: Deepseek-V4.1-Flash-1017-SS
+
+# ---------- 2. 全局后端开关 ----------
+# openai_api = 正常跑量（models 全部为 OpenAI 兼容 HTTP 接口）
+# mock       = dry-run / 回归测试（强制所有角色走 MockLLMAdapter）
 llm_backend: openai_api
 
-# Apple Silicon (M1/M2/M3) 本地推理
-mlx:
-  models:
-    literal_translator:
-      backend: mlx
-      model_id: /Users/taotie/LLM/Qwen2.5-3B
-
-    primary:
-      backend: mlx
-      model_id: /Users/taotie/LLM/Mistral_4B
-
-# OpenAI 兼容 HTTP API（DeepSeek / vLLM / LM Studio 等）
+# ---------- 3. HTTP 传输层全局参数（不含模型定义） ----------
 openai_api:
   max_retries: 3              # 单次调用失败时的 API 级重试次数
   retry_delay: 5.0            # 重试基础间隔（指数退避：5s → 10s → 20s）
   request_timeout: 300        # 单次请求超时（秒）
   max_concurrent_requests: 4  # 并发请求数
-  models:
-    literal_translator:
-      backend: openai_api
-      api_base: https://token.ai-hf.cn/v1
-      api_key: ${HEFEI_API_KEY}
-      model_name: Deepseek-V4.1-Flash-1017-SS
-      alias: llm(直译)
-      extra_body: {}
-    primary:
-      backend: openai_api
-      api_base: https://api.minimax.cn/v1
-      api_key: ${MINIMAX_API_KEY}
-      model_name: MiniMax-M3.1-Flash
-      alias: llm-primary (主力模型)
-      extra_body: {}
 
-# ---------- 3. 任务路由 ----------
-# 6 类任务 → 2 个角色 key；params_override 在角色 default_params 之上叠加
+# ---------- 4. 任务路由 ----------
+# 任务 → 模型（models 的 key）+ 参数覆盖；params_override 覆盖模型级默认值。
+# effort（可选，任务级）：思考档位（合法值见文件头 Effort 约定；缺省=不下发参数）。
+#   规范位置：task 下的 `effort:`（params_override.effort 为兼容位置，规范位置优先）。
+# extra_body（可选，任务级）：其它供应商特有透传参数，直接并入请求体、
+#   优先于适配层归一参数（同名覆盖）；不在 models 段配置。
+#   示例：critic_scoring: {model: secondary, extra_body: {thinking_budget: 4096}, params_override: {temperature: 0.1}}
 task_routing:
-  reference_extraction:        # 典故/隐喻考据 (Round 25: 路由至 deepseek-flash，与字面直译同模型；降本)
+  reference_extraction:        # 典故/隐喻考据（复用直译模型，已并档）
     model: literal_translator
+    effort: "none"             # Round 132（网关 300s 硬顶）：Qwen low 档实测推理失控——78k 字符烧光 20k 预算
+                               # → 正文空 / 205s+，负载稍高即撞 300s 读超时；关闭思考后四连测 19.5-24.5s 稳定
+                               # 出 JSON，召回量不低于低档位（chunk000：10 典故/9 实体 vs 低档 9/4）
     params_override:
       temperature: 0.1
       max_tokens: 20000
-      enable_thinking: true    # Round 117: 推理型任务（典故判定）— thinking 开启
-  reference_confirmation:      # Round 118 P1-3: 两阶段考据 — 召回(DeepSeek)+确认(MiniMax)
-    model: primary
+  reference_confirmation:      # 两阶段考据 — 召回(Qwen) + 确认(DeepSeek)
+    model: secondary
+    effort: low                # Round 132：max 档实测超 300s 被网关掐断连接（非流式），low 档 62.6s 稳定出
+                               # 正文（推理 18.5k 字符，删误报/补漏仍有效）；需更深核验可选 xhigh（实测 163s）
     params_override:
       temperature: 0.1
-      max_tokens: 20000
-      enable_thinking: true    # 复核典故出处依赖推理链
+      max_tokens: 60000        # DeepSeek max 推理链实测 67518 chars 吃光 20k 预算（Dune 首跑 chunk002→003）；对齐 style_profiling/editor_review 预算
   literal_translation:         # 字面直译
     model: literal_translator
+    effort: "none"             # Qwen 档位：直译不需要思考 → 显式关闭（Round 129）
     params_override:
       temperature: 0.1
       max_tokens: 20000
-      enable_thinking: false   # 直译默认关；困难片段可经难度路由按段开启（P2）
+      # 困难片段由难度路由切到 primary/MiniMax 并按段加档（见 pipeline.difficulty_routing）
   literary_rewrite:            # 文学润色
-    model: literal_translator  # P1 优化：分流至 DeepSeek，平衡 MiniMax 负载
+    model: secondary
+    effort: max                # DeepSeek 档位：大任务实测 max 稳定出正文（推理约 4k 字符，20.8s）
     params_override:
       temperature: 0.6
       max_tokens: 20000
-      enable_thinking: true    # Round 117: 语感/语域推理收益最大
-  critic_scoring:              # 5 维评分（低温提高评分一致，降低通过率振荡）
-    model: primary
+  critic_scoring:              # 5 维评分（低温提高评分一致性，降低通过率振荡）
+    model: secondary           # Jev 可用时 critic 仍优先走 Jev
+    effort: "none"             # DeepSeek 档位：结构化评分不需要推理 → 显式关闭（Round 129）
     params_override:
       temperature: 0.1
       max_tokens: 20000
-      enable_thinking: false   # 评分追求稳定重复性（thinking 待黄金 A/B 后再定）
   judge_decision:              # 最终裁决
     model: primary
+    effort: max                # MiniMax 档位：最终裁决质量优先
     params_override:
       temperature: 0.3
       max_tokens: 20000
-      enable_thinking: true    # Round 117: 裁决需要推理链（MiniMax adaptive）
-  style_profiling:             # Round 117 P0: 动态风格剖面（作品隔离；thinking 用于文学史判定与风格归纳）
+  style_profiling:             # 动态风格剖面（作品隔离；需要文学史判定与风格归纳）
     model: primary
+    effort: max                # MiniMax 档位：需要文学史判定 → 开到最高（每书一次，配额友好）
     params_override:
       temperature: 0.2
-      max_tokens: 12000
-      enable_thinking: true
-  editor_review:               # Round 120 L5: 成书级编辑审读（merge 层级五类缺陷; 只报告）
+      max_tokens: 60000        # M3.1-Flash thinking 很长：12k 预算被推理链吃光（Dune 首跑实测 reasoning=40679 chars 无正文）；对齐 editor_review 先例
+  editor_review:               # 成书级编辑审读（merge 层级五类缺陷；只报告）
     model: primary
+    effort: max                # MiniMax 档位：成书级审读质量优先
     params_override:
       temperature: 0.2
-      max_tokens: 60000          # M3.1-Flash thinking 很长：20k 预算被推理链吃光导致 parse_error（R11 实测）
-      enable_thinking: true
+      max_tokens: 60000        # M3.1-Flash thinking 很长：20k 预算会被推理链吃光（实测）
   golden_test:                 # 黄金测试集（与上面 5 类一致，独立列出便于单独调）
     reference_extraction: primary
     reference_confirmation: primary
@@ -182,13 +171,33 @@ pipeline:
   reference_two_stage:
     enabled: true
     max_recall_chars: 12000
-  # Round 118 P2-5: 直译难度路由 — 典故密度高/长句多/含引文的片段切到更强模型
-  # （默认 primary/MiniMax）并按段开启 thinking；普通片段仍走 DeepSeek 直译（thinking 关）。
+  # Round 118 P2-5 / Round 128: 直译难度路由 — 典故密度高/长句多/含引文的片段切到更强模型
+  # （默认 primary/MiniMax）并按段加档 effort；普通片段仍走任务默认（不下发档位）。
   difficulty_routing:
     enabled: true
     hard_threshold: 2.0
     hard_role: primary
-    hard_enable_thinking: true
+    hard_effort: max             # MiniMax 档位（low/medium/high/xhigh/max）
+  # Round 133: 重试适配 — 「仅推理无正文」(no_content) 签名驱动自动降档/换角色救稿。
+  # 背景：ch01 通宵跑实测 7 块 PERMANENTLY_FAILED 全部是 effort=max 思考链（5-7 万字符）
+  # 吃光 max_tokens、正文为空；同参数重试必然复现（复现率约 100%）。命中签名后：
+  #   第 1..N 次重试自动降一档（max→xhigh→high→…，按 provider 合法档位表）；
+  #   重试预算耗尽仍未成功 → 换角色再试最后 1 次（RAW 救稿 → secondary；不烧 MiniMax 配额）；
+  #   降档后若因质量不合格重进润色 → 升档补偿 1 次（防死循环）。
+  # 只对命中签名的块生效，正常块零影响；override 按块持久化到 workflow.db。
+  retry_adaptation:
+    enabled: true
+    downgrade_on_signature: ["no_content"]
+    fallback_role_switch: true   # 重试预算耗尽仍未成功 → 换角色救稿 1 次
+    minimax_protect: true        # 换角救稿优先 secondary；RAW 救稿不选 primary
+    quality_escalate_back: true  # 降档后质量重进润色 → 升档补偿 1 次
+  # Round 133: 模型档位探测结果（L1）— tools/probe_llm_efforts.py 写盘；
+  # pipeline 启动只读该文件（缺失/过期静默跳过，绝不在流程中自动探测以免烧配额）。
+  # 用途：重试降档阶梯按实测 accepted 档位过滤；探测结果带时间戳，ttl_days 到期后忽略。
+  model_probe:
+    path: db/model_capabilities.json
+    ttl_days: 7
+    tiny_max_tokens: 16
   # Round 118 P2-8: Jev 配对仲裁 — 早停/兜底定稿时在 top-2 候选稿之间做配对比较,
   # winner 作为最终稿; 不可用/平票时回退最高 critic 分版本（保持原行为）。
   pairwise_arbitration:
@@ -202,6 +211,7 @@ pipeline:
   dual_draft:
     enabled: true
     alternate_role: primary
+    alternate_effort: max        # Round 129: 第二稿（MiniMax）加到最高档
     max_chunks: 25
   # Round 118 P2-7: 黄金集 A/B（CLI: golden --ab / golden-gate --ab）—
   # 直译阶段 DeepSeek/MiniMax × thinking(on/off) 4 组合全流程对比;
@@ -300,7 +310,8 @@ pipeline:
   # 换模型不占用 quality_retries 计数，通过 sidecar (rewrite_switch) 记录，便于倒查。
   stagnation_model_switch:
     enabled: true
-    alternate_role: primary      # 润色默认角色 literal_translator(DeepSeek)，停滞时切换至 primary(MiniMax-M3)
+    alternate_role: primary      # 润色默认角色 secondary(DeepSeek)，停滞时切换至 primary(MiniMax-M3)
+    alternate_effort: max        # Round 129: 切到 MiniMax 时加到最高档（救稿路径，质量优先）
     max_switches: 1              # 1=只换一次；2=允许在 base/alt 间来回换
   # Round 7: 译后一致性校正（auto-apply）
   # 章节 run() 完成后自动跑 run_consistency_check_for_chapter，章节级 scope
@@ -320,6 +331,11 @@ pipeline:
   # 统计 5 类 task 的调用次数 + 估算 token 数；用于评估 Round 6/12 早停的省钱效果
   cost_report:
     enabled: true             # 是否生成 cost_report.md
+  # Round 130: 回溯重跑版本择优 — 重跑新版本 critic 均分低于备份版本时保留旧版
+  # （防"重跑用更差版本覆盖已通过版本"；旧版来自 _process_dirty_batch 的 final_backup + critic_report_backup）
+  version_merit:
+    enabled: true             # 是否启用版本择优
+    tolerance: 0.0            # 新版本均分 ≥ 旧版均分 - tolerance 才允许替换；0=只要更低就保留旧版
   # Round 14: intermediate 文件自动清理（章节完成后）
   # 保留 canonical literary.json + final.json + rewrite_meta_vN（最后一次）
   # 删除 literary_v0..vN-1（已被 vN 覆盖） + 早期 rewrite_meta
@@ -341,6 +357,37 @@ chunker:
   hard_limit: 2500            # 硬上限，超过则强制切分（不保证场景完整性）
   respect_scene_breaks: true  # 是否优先在 --- / 空行 / 标题 等场景断点处切
 
+# ---------- 5.5 切分后预处理（input_prep） ----------
+# 切分 EPUB 时自动执行：① 非正文文档（前页/目录/索引）改写到 _skip/，不参与翻译；
+# ② 修复源文件中字间断裂型文本伪影。使「传 epub + --reset」直接产出干净 input/。
+input_prep:
+  enabled: true
+  skip_dir: _skip
+  # 命中这些标题（H1，忽略大小写/空白差异）的文档判为前页/索引 → _skip/，不翻译
+  skip_titles:
+    - "Cover Page"
+    - "Title Page"
+    - "Copyright Page"
+    - "Dedication"
+    - "Contents"
+    - "Index"
+    - "Document Outline"
+  # 文本伪影修复表：[旧, 新]，按顺序全局替换（Why Nations Fail 实测 13 处）
+  repairs:
+    - ["SO CLOSE AND YE T SO DIFFERENT", "SO CLOSE AND YET SO DIFFERENT"]
+    - ["PROS PERITY", "PROSPERITY"]
+    - ["A ND IT WORKS", "AND IT WORKS"]
+    - ["TURNI NG", "TURNING"]
+    - ["BAR RIERS", "BARRIERS"]
+    - ["D EVELOPMENT", "DEVELOPMENT"]
+    - ["EIGHTEENTH - CENTURY", "EIGHTEENTH-CENTURY"]
+    - ["MID - NINETEENTH CENTURY", "MID-NINETEENTH-CENTURY"]
+    - ["DRIFTIN\n\nG APART", "DRIFTING APART"]
+    - ["VIRTUO US", "VIRTUOUS"]
+    - ["VICIOU S", "VICIOUS"]
+    - ["T HE MOLD", "THE MOLD"]
+    - ["UNDERSTANDING PROS\n\nPERITY AND POVERTY", "UNDERSTANDING PROSPERITY AND POVERTY"]
+
 # ---------- 6. 决策回溯引擎 ----------
 # 当 Decision DB 中新增某类决策时，是否回溯重译已完成的受影响 chunk
 # 仅 COMPLETED 状态可被标 DIRTY；JUDGING 等中间态禁止自脏（防死循环）
@@ -351,6 +398,12 @@ decision_engine:
   style_triggers_backtrack: false
   max_affected_chunks_per_decision: 50   # 单次决策最多回溯多少个 chunk
   backtrack_scope: book                  # book=全书扫描受影响 chunk；chapter=仅当前章
+  # Round 130: 回溯模式与治理预算（防"决策翻转→回溯已完成块→重跑再翻转"自激长跑）
+  #   immediate=决策变更立即把受影响已完成块标 DIRTY（旧行为；翻转率高时不收敛）
+  #   deferred =变更先登记 pending_backtrack 队列，pipeline 在队列清空点合并应用一次（默认）
+  backtrack_mode: deferred
+  max_backtrack_sweeps_per_chapter: 1    # deferred: 每章每次运行最多合并回溯 N 轮；0=不合并（登记保留到下次运行）
+  max_backtrack_rounds_per_chunk: 2      # 治理计数: 单块累计被回溯重跑上限（跨 episode，两种模式通用）；0=不限制
   context_max_terminology: 40            # 注入 prompt 的术语上限
   context_max_reference: 20
   context_max_style: 10
@@ -358,12 +411,15 @@ decision_engine:
 
 # ---------- 7. Critic 评分门槛 ----------
 # P0: 阈值注入 Judge prompt 作为参考（非硬性否决）。
-# P4: 基于 golden test 基线校准（style_compliance 最难达标，容忍度最高）。
-# P2 优化：为卡罗尔风格调整阈值（克制的英式幽默 vs 史诗感）
+# 本块为「通用默认」下限（保守值），不含任何作品的专属调参。
+# 按书覆盖（作品无关原则，Round 130）：写进 input/book_profile.json 的可选
+#   "critic_thresholds" 块（只列需要覆盖的维度，0-10 数值）。
+# 运行时读取顺序：book_profile 覆盖 > 本块默认
+#   （见 src/config.py::Config.critic_thresholds_for_book）。
 critic_thresholds:
   fluency: 6.5
   readability: 6.5
-  style_compliance: 6.0  # P2 优化：卡罗尔风格更接近"平实自然"，阈值适当放宽
+  style_compliance: 6.0
   voice_consistency: 6.0
   semantic_preservation: 6.5
   literal_residue: 6.5   # P4: 新增维度，检测直译残留
@@ -467,7 +523,7 @@ logging:
 #   api_base              — 文档用途，typesafe_sdk 内部使用其默认 endpoint；留作未来扩展
 #   api_key               — TYPESAFE_API_KEY，无值时跳过 Jev
 #   model_name            — Jev 模型名（默认 jev-latest，对应 typesafe.ai System One）
-#   fallback_role         — OpenAICompat 降级时使用的角色 key（指向 main.models.<role>）
+#   fallback_role         — OpenAICompat 降级时使用的角色 key（指向顶层 models.<role>）
 #   allow_mock            — Jev 不可达时是否降级到 MockBackend（启发式离线）
 #   allow_openai_fallback — 是否允许降级到 OpenAICompat（默认 false）
 #                           关闭原因：OpenAICompat 不返回校准概率，与 Jev 语义不等价，
@@ -487,6 +543,8 @@ typesafe:
   # 注意：fallback_role=primary（MiniMax-M3）按 typesafe schema 评分时 confidence
   # 为 LLM 自报，与 Jev 校准概率语义不同——下游阈值需按 backend source 区分处理，
   # 不得混用同一套门槛（详见 Round 116 计划：confidence_source 建模）。
+  # Round 125: OpenAICompatBackend 实际取 `critic_scoring` 路由的 client
+  # （现为 secondary/Qwen）; 本键 `fallback_role` 仅作历史兼容, 不再决定该路径模型。
   allow_openai_fallback: true
   timeout: 30.0
 

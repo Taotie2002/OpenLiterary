@@ -16,7 +16,8 @@ StyleProfiler — 动态风格剖面生成器 (Round 117 P0)
 剖面 JSON schema（schema_version=1）：
   genre / era / region / persona / register_default / footnote_policy /
   forbidden_modernisms / translation_hints / pun_watchlist / chapter_register_map /
-  evidence_quotes / work_guess / confidence / source / samples_used
+  evidence_quotes / critic_thresholds（可选——按书覆盖 critic 评分阈值，0-10 数值） /
+  work_guess / confidence / source / samples_used
 
 LLM 失败时回退 heuristic_profile()：中性默认 + confidence=0 + source=fallback，
 保证管线仍可运行且不注入任何作品特定先验。
@@ -320,6 +321,18 @@ def normalize_profile(data: Dict[str, Any]) -> Dict[str, Any]:
         "year": str(wg_raw.get("year") or "").strip() if isinstance(wg_raw, dict) else "",
     }
 
+    def _thresholds(key: str) -> Dict[str, float]:
+        """可选评分阈值覆盖块（Round 130 审计④：值随剖面落盘、
+        load_profile 的重归一不再吞掉它；仅接受 0-10 数值，其他丢弃）。"""
+        blk = data.get(key)
+        out: Dict[str, float] = {}
+        if isinstance(blk, dict):
+            for k, v in blk.items():
+                if (isinstance(v, (int, float)) and not isinstance(v, bool)
+                        and 0.0 <= float(v) <= 10.0):
+                    out[str(k)] = float(v)
+        return out
+
     prof = {
         "schema_version": PROFILE_VERSION,
         "source": src,
@@ -335,6 +348,7 @@ def normalize_profile(data: Dict[str, Any]) -> Dict[str, Any]:
         "pun_watchlist": _pun_list("pun_watchlist"),
         "chapter_register_map": cmap,
         "evidence_quotes": _str_list("evidence_quotes", cap=12),
+        "critic_thresholds": _thresholds("critic_thresholds"),
         "work_guess": work_guess,
         "samples_used": [str(s) for s in (data.get("samples_used") or [])] if isinstance(data.get("samples_used"), list) else [],
         "generated_at": _now(),
@@ -426,6 +440,7 @@ def heuristic_profile(
         "pun_watchlist": [],
         "chapter_register_map": {},
         "evidence_quotes": [],
+        "critic_thresholds": {},
         "work_guess": {"recognized": False, "title": "", "author": "", "year": ""},
         "samples_used": [s["chapter_id"] for s in (samples or [])],
         "note": note,
@@ -466,7 +481,6 @@ def default_style_profiler_generate(prompt: str) -> str:
     from src.utils.llm_adapter import (
         get_llm_client_for_task,
         get_role_model_name,
-        get_role_extra_body,
     )
 
     cfg = get_config()
@@ -474,8 +488,7 @@ def default_style_profiler_generate(prompt: str) -> str:
     role = cfg.get_task_role("style_profiling")
     llm = get_llm_client_for_task("style_profiling")
     model_name = get_role_model_name(role) or model_key
-    extra_body = get_role_extra_body(role)
-    return llm.generate(prompt, model_name=model_name, extra_body=extra_body, **params)
+    return llm.generate(prompt, model_name=model_name, **params)
 
 
 def build_profile(

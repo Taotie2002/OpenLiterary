@@ -26,10 +26,10 @@ from src.utils.llm_adapter import (
     get_llm_client_for_task,
     get_llm_client,
     get_role_model_name,
-    get_role_extra_body,
     robust_json_loads,
+    _map_effort_for_fallback,
 )
-from src.utils.text_match import entity_source_name_in_text
+from src.utils.text_match import entity_source_name_in_text, entity_source_name_spans
 from src.agents.reference_agent import ReferenceAgent
 from src.agents.rewriter_agent import LiteraryRewriterAgent
 from src.agents.critic_agent import CriticAgent
@@ -788,6 +788,7 @@ class TranslationPipeline:
         return {
             "enabled": bool(cfg.get("enabled", False)),
             "alternate_role": cfg.get("alternate_role") or "primary",
+            "alternate_effort": cfg.get("alternate_effort"),
             "base_role": cfg.get("base_role") or "",
             "max_chunks": max_chunks,
         }
@@ -914,6 +915,7 @@ class TranslationPipeline:
                 skipped_dimensions=skipped_dimensions,
                 verse_note=self._verse_note_for(chunk_id, source_text),
                 model_role=alt_role,
+                model_effort=cfg.get("alternate_effort"),
             )
         except TypeError:
             return draft_a
@@ -990,23 +992,40 @@ class TranslationPipeline:
         role = self.literal_role
         llm = self.llm
         params = dict(params)
-        # Round 118 P2-5: 难度路由 — 高难度片段切到更强模型（默认 primary/MiniMax）
-        # 并按段开启 thinking；普通片段仍走 literal_translator（DeepSeek, thinking 关）。
+        # Round 118 P2-5 / Round 128: 难度路由 — 高难度片段切到更强模型（默认 primary/MiniMax）
+        # 并按段加档 effort（hard_effort）；普通片段仍走任务默认（不下发档位）。
         dcfg = _config.pipeline.get("difficulty_routing", {}) or {}
         if dcfg.get("enabled", True):
             difficulty = self._chunk_difficulty(source_text)
             if difficulty >= float(dcfg.get("hard_threshold", 2.0)):
                 role = dcfg.get("hard_role", "primary")
                 llm = self._get_role_llm(role)
-                params["enable_thinking"] = bool(dcfg.get("hard_enable_thinking", True))
+                hard_effort = str(dcfg.get("hard_effort") or "").strip().lower()
+                if hard_effort:
+                    params["effort"] = hard_effort
                 print(
                     f"🧩 [Pipeline] 难度路由: difficulty={difficulty:.2f} ≥ "
                     f"{float(dcfg.get('hard_threshold', 2.0)):.1f} → role={role} "
-                    f"(thinking={params['enable_thinking']})"
+                    f"(effort={hard_effort or 'default'})"
+                )
+        # Round 133: no_content 重试适配 override（降档/换角救稿）优先于难度路由结果
+        if chunk_id:
+            ov = self._get_retry_override(chunk_id)
+            if ov and ov.get("sig") == "no_content" and ov.get("stage") == "TRANSLATING_RAW":
+                ov_role = str(ov.get("role") or "")
+                if ov_role and ov_role != role:
+                    role = ov_role
+                    llm = self._get_role_llm(role)
+                ov_eff = ov.get("effort")
+                if ov_eff:
+                    params["effort"] = str(ov_eff).strip().lower()
+                print(
+                    f"🔻 [Pipeline] {chunk_id} 重试适配生效: role={role} "
+                    f"effort={params.get('effort') or 'default'}"
                 )
         model_name = get_role_model_name(role) or model_key
-        extra_body = get_role_extra_body(role)
-        return llm.generate(prompt, model_name=model_name, extra_body=extra_body, **params)
+        self._note_last_call(chunk_id, "TRANSLATING_RAW", role, params.get("effort"), model_name)
+        return llm.generate(prompt, model_name=model_name, **params)
 
     def _get_role_llm(self, role: str):
         """按角色缓存 LLM 客户端（难度路由切模型时复用，避免重复构造）。"""
@@ -1201,6 +1220,9 @@ class TranslationPipeline:
             (TaskState.JUDGING, self._process_judging_batch, "最终裁决"),
         ]
 
+        # Round 130: deferred 回溯的章级合并预算计数（本次运行内累计）
+        self._backtrack_sweeps_done = 0
+
         while True:
             any_progress = False
 
@@ -1212,6 +1234,16 @@ class TranslationPipeline:
                 print(f"📦 [Batch] {stage_name} 阶段: 处理 {len(tasks)} 个任务")
                 handler(tasks)
                 any_progress = True
+
+            if not any_progress:
+                # Round 130: deferred 回溯在队列清空点（章末）合并应用一次；
+                # 治理预算（章级轮数 + 单块轮数）保证不收敛循环无法再出现。
+                # immediate 模式下此调用为 no-op（决策变更已即时标 DIRTY）。
+                try:
+                    if self._consolidate_deferred_backtracks():
+                        any_progress = True
+                except Exception as e:
+                    print(f"⚠️ [Pipeline] 章末合并回溯异常（不影响主流程）: {e}")
 
             if not any_progress:
                 # 仅表示队列已清空，不代表产出完整；最终是否成功由 _verify_final_outputs 决定
@@ -1354,8 +1386,8 @@ class TranslationPipeline:
         lines.append("| **合计** | **" + str(total) + "** | **~" + format(total_tokens, ",") + "** | 100% |\n\n")
         lines.append("- Round 6 oscillation + Round 12 stagnation + Round 36 字节停滞 + Round 73 pre-rewriter 短路 早停链 已显著减少 literary_rewriting / critic_scoring / judge_decision 调用次数\n")
 
-        # Round 27: 真实 token 累计（按 role；OpenAI-compatible API 直接解析 usage；MLX 用 tokenizer.encode；
-        #              Mock 估算 len//4）。注意：同 role 多 task 共享 adapter 时的累计会合并显示
+        # Round 27: 真实 token 累计（按 role；OpenAI-compatible API 直接解析 usage；Mock 估算 len//4）。
+        #              注意：同 role 多 task 共享 adapter 时的累计会合并显示
         try:
             from src.utils.llm_adapter import get_llm_client
             seen_roles = set()
@@ -1721,6 +1753,7 @@ class TranslationPipeline:
             PRICING = {
                 # role → (input ¥/M tokens, output ¥/M tokens)
                 "primary": (0.8, 2.0),                # MiniMax-M3
+                "secondary": (0.4, 1.2),              # Round 125: Qwen-flash（估算）
                 "literal_translator": (0.1, 0.2),     # deepseek-flash
                 "mock": (0.0, 0.0),                   # mock 后端无花费
                 "jev": (0.5, 1.5),                    # Jev (typesafe_sdk) — 估算
@@ -1834,7 +1867,7 @@ class TranslationPipeline:
                 summary["real_tokens_by_role"] = None
             # Round 39: estimated cost
             try:
-                PRICING = {"primary": (0.8, 2.0), "literal_translator": (0.1, 0.2), "mock": (0.0, 0.0), "jev": (0.5, 1.5)}
+                PRICING = {"primary": (0.8, 2.0), "secondary": (0.4, 1.2), "literal_translator": (0.1, 0.2), "mock": (0.0, 0.0), "jev": (0.5, 1.5)}
                 total_cost = 0.0
                 cost_by_role = {}
                 for role, u in (summary.get("real_tokens_by_role") or {}).items():
@@ -2173,10 +2206,18 @@ class TranslationPipeline:
                 # Round 106: 过滤无效 source_name（动词短语/关系代词/泛称，如 "I could"/
                 # "his wife"/"the fellow"），避免 reference agent 误登记的脏指称导致
                 # 审计误报"漏译"（ch05 实测 女主人公 因 "I could" 被误判 missing）。
-                matched_sources = [
+                # Round 133b: 别名吞并抑制（与 _check_entity_consistency 同语义）—
+                # 剔除被其它实体更长别名吞并的伪命中（chunk071 "Mother"⊂"Reverend Mother"）。
+                valid_sns = [
                     sn for sn in source_names
                     if sn and self._is_valid_entity_source_name(sn)
-                    and entity_source_name_in_text(sn, source_text)
+                ]
+                effective_sns, _swallowed = self._partition_swallowed_source_names(
+                    source_text, canonical, valid_sns,
+                )
+                matched_sources = [
+                    sn for sn in effective_sns
+                    if entity_source_name_in_text(sn, source_text)
                 ]
                 if not matched_sources:
                     continue
@@ -2266,9 +2307,12 @@ class TranslationPipeline:
                 continue
             # COMPLETED 但无 final.json → 重置为 DIRTY 重跑 (合法转移, 不增计数)
             try:
-                self.scheduler.update_task_state(chunk_id, TaskState.DIRTY)
-                recovered.append(chunk_id)
-                print(f"♻️ [Pipeline] {chunk_id} 状态为 COMPLETED 但 final.json 缺失，重置为 DIRTY 重跑")
+                # Round 130（审计③）: 感知返回值 —— 拒绝时不得假报已恢复
+                if self.scheduler.update_task_state(chunk_id, TaskState.DIRTY):
+                    recovered.append(chunk_id)
+                    print(f"♻️ [Pipeline] {chunk_id} 状态为 COMPLETED 但 final.json 缺失，重置为 DIRTY 重跑")
+                else:
+                    print(f"⚠️ [Pipeline] {chunk_id} 重置 DIRTY 被拒绝（非法转移），跳过（状态未变）")
             except Exception as e:
                 print(f"⚠️ [Pipeline] {chunk_id} 恢复失败: {e}")
         return recovered
@@ -2277,7 +2321,9 @@ class TranslationPipeline:
         """Round 107 P7: 恢复回溯重跑失败的 final_backup.json.
 
         回溯重跑 (COMPLETED→DIRTY) 时 final.json 被重命名为 final_backup.json.
-        若重跑成功, 新 final.json 会写入 (backup 保留但无用).
+        若重跑成功, 新 final.json 会写入; Round 130 版本择优在此裁决:
+        新版 critic 均分低于旧版时保留旧版（备份版覆盖回 final.json）,
+        新版至少不差时删除无用 backup.
         若重跑失败 (PERMANENTLY_FAILED), final.json 不存在, 恢复 backup:
         - final_backup.json → final.json
         - 状态 PERMANENTLY_FAILED → COMPLETED (保留之前的合格译文)
@@ -2287,25 +2333,87 @@ class TranslationPipeline:
             chunk_id = backup.stem.replace("_final_backup", "")
             final_path = self.output_dir / f"{chunk_id}_final.json"
             if final_path.exists():
-                # 重跑成功, 新 final.json 已写入, 删除无用 backup
+                # 重跑成功, 新 final.json 已写入.
+                # Round 130: 版本择优 — 新版 critic 均分低于旧版(超出 tolerance)时
+                # 用备份版覆盖 final.json（保留更优旧版），返回 True。
+                if self._apply_version_merit(chunk_id, backup, final_path):
+                    continue
+                # 新版至少不差 → 清理无用 backup（含 critic 备份）
                 try:
                     backup.unlink()
                 except OSError:
                     pass
+                self._cleanup_critic_backup(chunk_id)
                 continue
             # 重跑失败, 恢复 backup
             try:
                 backup.rename(final_path)
-                # 状态恢复: PERMANENTLY_FAILED → COMPLETED
+                # 状态恢复: PERMANENTLY_FAILED → COMPLETED (Round 124: 显式放行的终态恢复)
+                # Round 130（审计③）: 感知返回值，拒绝时不再假报 COMPLETED
                 try:
-                    self.scheduler.update_task_state(chunk_id, TaskState.COMPLETED)
-                except Exception:
-                    pass
+                    _state_ok = self.scheduler.update_task_state(
+                        chunk_id, TaskState.COMPLETED, allow_terminal_restore=True)
+                except Exception as _st_exc:
+                    _state_ok = False
+                    print(f"  ⚠️ {chunk_id} 状态恢复异常: {_st_exc}")
                 restored.append(chunk_id)
-                print(f"♻️ [Pipeline] {chunk_id} 回溯重跑失败, 已恢复之前的 final.json (COMPLETED)")
+                if _state_ok:
+                    print(f"♻️ [Pipeline] {chunk_id} 回溯重跑失败, 已恢复之前的 final.json (COMPLETED)")
+                else:
+                    print(f"⚠️ [Pipeline] {chunk_id} 已恢复 final.json，但状态恢复被拒绝（状态未变，请人工核查 chunk 状态）")
             except OSError as e:
                 print(f"  ⚠️ 恢复 {chunk_id} backup 失败: {e}")
         return restored
+
+    def _cleanup_critic_backup(self, chunk_id: str) -> None:
+        """Round 130: 清理已裁决的 *_critic_report_backup.json（防止残留堆积）。"""
+        cb = self.output_dir / f"{chunk_id}_critic_report_backup.json"
+        if cb.exists():
+            try:
+                cb.unlink()
+            except OSError as e:
+                print(f"  ⚠️ 清理 {cb.name} 失败: {e}")
+
+    def _apply_version_merit(self, chunk_id: str, backup: Path, final_path: Path) -> bool:
+        """Round 130 版本择优: 对比备份版与新版 critic 均分, 决定是否保留旧版.
+
+        新版均分 < 旧版均分 - tolerance → 用备份版覆盖 final.json（旧版更优），
+        并把备份 critic 报告归位为 critic_report.json；返回 True。
+        其余情况返回 False（调用方按"无用 backup"清理）。
+        旧版/新版评分缺失（无 critic 文件，如 legacy chunk）时不做裁决。
+        """
+        vm_cfg = _config.pipeline.get("version_merit", {}) or {}
+        if not vm_cfg.get("enabled", True):
+            return False
+        critic_new = self.output_dir / f"{chunk_id}_critic_report.json"
+        critic_old = self.output_dir / f"{chunk_id}_critic_report_backup.json"
+        old_score = self._critic_avg_from_file(critic_old)
+        new_score = self._critic_avg_from_file(critic_new)
+        if old_score <= 0 or new_score <= 0:
+            return False
+        try:
+            tolerance = float(vm_cfg.get("tolerance", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            tolerance = 0.0
+        if new_score >= old_score - tolerance:
+            return False
+        try:
+            final_path.write_text(backup.read_text(encoding="utf-8"), encoding="utf-8")
+            backup.unlink()
+            if critic_old.exists():
+                critic_old.replace(critic_new)  # 旧版评分归位, 保持 final 与评分一致
+        except OSError as e:
+            print(f"  ⚠️ [Version Merit] {chunk_id} 恢复旧版本失败: {e}")
+            return False
+        print(f"🛡️ [Version Merit] {chunk_id} 新版均分 {new_score:.2f} < 旧版 {old_score:.2f}，保留旧版")
+        return True
+
+    def _critic_avg_from_file(self, path: Path) -> float:
+        """读取 critic_report json 的数值维度均分; 缺失/损坏返回 0.0。"""
+        try:
+            return self._compute_avg_score(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return 0.0
 
     def _verify_final_outputs(self, expected_count: int, strict: bool = True) -> bool:
         """校验本章 final.json 实际落盘是否匹配任务。
@@ -2401,7 +2509,18 @@ class TranslationPipeline:
                     print(f"  💾 已备份 final.json → final_backup.json (重跑失败可恢复)")
                 except OSError as e:
                     print(f"  ⚠️ 备份 final.json 失败: {e}")
-            for step in ["raw", "literary", "critic_report"]:
+            # Round 130: critic_report 保留为 *_critic_report_backup.json，
+            # 供章末"版本择优"（_apply_version_merit）对比新旧评分。
+            critic_path = self.output_dir / f"{chunk_id}_critic_report.json"
+            critic_backup = self.output_dir / f"{chunk_id}_critic_report_backup.json"
+            if critic_path.exists():
+                try:
+                    if critic_backup.exists():
+                        critic_backup.unlink()
+                    critic_path.rename(critic_backup)
+                except OSError as e:
+                    print(f"  ⚠️ 备份 critic_report 失败: {e}")
+            for step in ["raw", "literary"]:
                 intermediate = self.output_dir / f"{chunk_id}_{step}.json"
                 if intermediate.exists():
                     try:
@@ -2417,6 +2536,325 @@ class TranslationPipeline:
                         print(f"  ⚠️ 清理失败 {f}: {e}")
         chunk_ids = [t['chunk_id'] for t in tasks]
         self.scheduler.batch_update_state(chunk_ids, TaskState.EXTRACTING_TERMS, reset_counters=True)
+
+    def _consolidate_deferred_backtracks(self) -> bool:
+        """Round 130: 章末合并式回溯（decision_engine.backtrack_mode=deferred）。
+
+        在批处理循环"队列清空"点调用：把 decision_engine 登记的本章待回溯 chunk
+        合并应用一次（标记 DIRTY → 主循环继续重跑这些块）。
+
+        治理预算（防自激循环）：
+          - 章级：每章每次运行最多应用 max_backtrack_sweeps_per_chapter 轮（默认 1）；
+            预算用尽后仅冻结（队列登记保留至下一次运行，打印告警）。
+          - 单块：累计回溯轮数上限由 scheduler.trigger_backtrack 执行（超限冻结，
+            并写出 backtrack_frozen.md 明细）。
+
+        Returns:
+            True 表示有 chunk 被标记 DIRTY（调用方应继续主循环）。
+        """
+        de_cfg = _config.decision_engine or {}
+        mode = str(de_cfg.get("backtrack_mode", "deferred") or "deferred").lower()
+        if mode == "immediate":
+            return False
+        if not getattr(self, "decision_engine", None):
+            return False
+        try:
+            max_sweeps = int(de_cfg.get("max_backtrack_sweeps_per_chapter", 1) or 0)
+        except (TypeError, ValueError):
+            max_sweeps = 1
+        sweeps_done = int(getattr(self, "_backtrack_sweeps_done", 0) or 0)
+        task_ids = [t["chunk_id"] for t in self.scheduler.get_all_tasks_by_chapter(self.chapter_id)]
+        if sweeps_done >= max_sweeps:
+            pending = self.decision_engine.count_pending_backtracks(task_ids)
+            if pending:
+                print(f"🧊 [Backtrack] 本章合并预算已用尽（{max_sweeps} 轮），"
+                      f"冻结 {pending} 项待回溯登记（保留至下次运行）")
+            return False
+        entries = self.decision_engine.take_pending_backtracks(task_ids)
+        if not entries:
+            return False
+        stats = self.scheduler.trigger_backtrack([e["chunk_id"] for e in entries])
+        self._backtrack_sweeps_done = sweeps_done + 1
+        dirty = stats.get("dirty", []) if isinstance(stats, dict) else []
+        over_cap = stats.get("over_cap", []) if isinstance(stats, dict) else []
+        print(f"🧩 [Backtrack] 章末合并回溯：登记 {len(entries)} 个 → 标记 DIRTY {len(dirty)} 个"
+              + (f"，治理冻结 {len(over_cap)} 个（超单块预算）" if over_cap else ""))
+        if over_cap:
+            self._write_backtrack_frozen_report(over_cap, entries)
+        return bool(dirty)
+
+    def _write_backtrack_frozen_report(self, frozen_ids: List[str], entries: List[Dict]) -> None:
+        """把治理冻结的 chunk 写入 output/<chapter>/backtrack_frozen.md（诊断用）。"""
+        try:
+            meta = {e["chunk_id"]: e for e in entries if isinstance(e, dict)}
+            lines = ["# 回溯治理冻结记录 (Round 130)\n\n",
+                     "- 冻结原因：单块累计回溯轮数达到 max_backtrack_rounds_per_chunk\n\n"]
+            for cid in frozen_ids:
+                e = meta.get(cid, {})
+                lines.append(f"- `{cid}` ← source_key={e.get('source_key', '?')} "
+                             f"(queue_rounds={e.get('queue_rounds', '?')})\n")
+            path = self.output_dir / "backtrack_frozen.md"
+            path.write_text("".join(lines), encoding="utf-8")
+            print(f"  📄 冻结明细: {path}")
+        except OSError as e:
+            print(f"  ⚠️ 写 backtrack_frozen.md 失败: {e}")
+
+    # ────────────────────────────────────────────────────────────────
+    # Round 133: 重试适配 — 「仅推理无正文」(no_content) 签名驱动的
+    # 自动降档（max→xhigh→high→…）与换角色救稿（重试预算耗尽后最后 1 次）。
+    # 背景：ch01 通宵跑实测 7 块 PERMANENTLY_FAILED 全部为 effort=max 思考链
+    # （5-7 万字符）吃光 max_tokens、正文为空；同参数重试必然复现。
+    # 只对命中签名的块生效（override 按块持久化），正常块零影响。
+    # ────────────────────────────────────────────────────────────────
+    _NO_CONTENT_MARKERS = ("无正文", "未闭合 think 块", "reasoning_only")
+
+    @classmethod
+    def _is_no_content_signature(cls, err_text) -> bool:
+        """判定异常文本是否为「仅推理无正文」签名（thinking 耗尽 max_tokens）。"""
+        text = str(err_text or "")
+        return any(m in text for m in cls._NO_CONTENT_MARKERS)
+
+    @staticmethod
+    def _effort_levels_table() -> Dict[str, tuple]:
+        """provider → 合法 effort 档位表（优先 src.config 单一事实源；单体兜底内置副本）。"""
+        try:
+            from src.config import EFFORT_LEVELS_BY_PROVIDER as _tbl
+            return dict(_tbl)
+        except Exception:
+            return {
+                "minimax": ("low", "medium", "high", "xhigh", "max"),
+                "deepseek": ("none", "low", "high", "xhigh", "max"),
+                "qwen": ("none", "low", "medium", "xhigh"),
+            }
+
+    @classmethod
+    def _provider_of_role(cls, role: str) -> Optional[str]:
+        """按角色配置的 model_name/api_base 推断 effort provider；未知返回 None。"""
+        try:
+            role_models = getattr(_config, "role_models", None)
+            if callable(role_models):
+                role_models = role_models()
+            if isinstance(role_models, dict) and role_models and role not in role_models:
+                return None  # 未定义角色：不用 legacy 兜底模型猜 provider
+        except Exception:
+            pass
+        try:
+            role_cfg = _config.get_role_config(role) or {}
+        except Exception:
+            return None
+        target = f"{role_cfg.get('model_name', '')} {role_cfg.get('api_base', '')}".lower()
+        for provider in cls._effort_levels_table():
+            if provider in target:
+                return provider
+        return None
+
+    def _retry_adapt_cfg(self) -> Dict[str, Any]:
+        cfg = dict(_config.pipeline.get("retry_adaptation", {}) or {})
+        cfg.setdefault("enabled", True)
+        cfg.setdefault("downgrade_on_signature", ["no_content"])
+        cfg.setdefault("fallback_role_switch", True)
+        cfg.setdefault("minimax_protect", True)
+        cfg.setdefault("quality_escalate_back", True)
+        return cfg
+
+    def _load_model_capabilities(self) -> Dict[str, Any]:
+        """读取 L1 档位探测结果（db/model_capabilities.json）；缺失/过期 → 空 dict。"""
+        try:
+            probe_cfg = dict(_config.pipeline.get("model_probe", {}) or {})
+        except Exception:
+            probe_cfg = {}
+        rel = str(probe_cfg.get("path") or "db/model_capabilities.json")
+        path = Path(rel)
+        if not path.is_absolute():
+            root = getattr(self, "_root_dir", None) or Path.cwd()
+            path = Path(root) / rel
+        try:
+            if not path.exists():
+                return {}
+            ttl_days = float(probe_cfg.get("ttl_days", 7) or 7)
+            if ttl_days > 0 and (time.time() - path.stat().st_mtime) > ttl_days * 86400:
+                return {}
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _effort_ladder_for_role(self, role: str) -> tuple:
+        """角色可用档位阶梯：provider 全档位 → 探测文件 accepted 过滤（有则用）。"""
+        provider = self._provider_of_role(role)
+        if not provider:
+            return ()
+        ladder = tuple(self._effort_levels_table().get(provider) or ())
+        caps = self._load_model_capabilities()
+        rec = dict((caps.get("models") or {}).get(role) or {})
+        levels_rec = dict(rec.get("levels") or {})
+        if rec.get("provider") == provider and levels_rec:
+            accepted = [lv for lv in ladder if (levels_rec.get(lv) or {}).get("accepted")]
+            if accepted:
+                return tuple(accepted)
+        return ladder
+
+    def _downgrade_one_step(self, role: str, effort) -> Optional[str]:
+        """按 provider 档位表降一档；降无可降/档位未知 → None。"""
+        ladder = self._effort_ladder_for_role(role)
+        eff = str(effort or "").strip().lower()
+        if not ladder or not eff or eff not in ladder:
+            return None
+        i = ladder.index(eff)
+        return ladder[i - 1] if i > 0 else None
+
+    def _escalate_one_step(self, role: str, effort) -> Optional[str]:
+        ladder = self._effort_ladder_for_role(role)
+        eff = str(effort or "").strip().lower()
+        if not ladder or not eff or eff not in ladder:
+            return None
+        i = ladder.index(eff)
+        return ladder[i + 1] if i + 1 < len(ladder) else None
+
+    def _get_retry_override(self, chunk_id: str) -> Dict[str, Any]:
+        try:
+            return dict(self.scheduler.get_retry_override(chunk_id) or {})
+        except Exception:
+            return {}
+
+    def _set_retry_override(self, chunk_id: str, payload: Dict[str, Any]) -> bool:
+        try:
+            return bool(self.scheduler.set_retry_override(chunk_id, payload))
+        except Exception:
+            return False
+
+    def _task_default_effort(self, task_name: str) -> Optional[str]:
+        try:
+            _, params = _config.resolve_task_model(task_name)
+            eff = params.get("effort")
+            return str(eff).strip().lower() if eff else None
+        except Exception:
+            return None
+
+    def _note_last_call(self, chunk_id: str, stage: str, role: str, effort, model_name: str = "") -> None:
+        """记录块最近一次 LLM 调用的 (stage, role, effort)，供 no_content 签名记录使用。"""
+        if not chunk_id:
+            return
+        cache = getattr(self, "_last_call_info", None)
+        if cache is None:
+            cache = {}
+            self._last_call_info = cache
+        cache[chunk_id] = {
+            "stage": stage,
+            "role": role or "",
+            "effort": (str(effort).strip().lower() if effort else None),
+            "model_name": model_name or "",
+        }
+
+    def _record_no_content_signal(self, chunk_id: str, stage: str) -> None:
+        """命中「仅推理无正文」签名 → 持久化降档 override（下次重试自动降一档）。"""
+        cfg = self._retry_adapt_cfg()
+        if not cfg.get("enabled", True):
+            return
+        sigs = {str(s).strip().lower() for s in (cfg.get("downgrade_on_signature") or ["no_content"])}
+        if "no_content" not in sigs:
+            return
+        info = (getattr(self, "_last_call_info", {}) or {}).get(chunk_id) or {}
+        used_role = info.get("role") or ""
+        used_eff = info.get("effort")
+        prev = self._get_retry_override(chunk_id)
+        next_eff = self._downgrade_one_step(used_role, used_eff) if used_eff else None
+        if next_eff is None and prev.get("effort"):
+            next_eff = prev.get("effort")  # 已降无可降：保留现有 override
+        delta = int(prev.get("down_delta", 0) or 0) + (
+            1 if (next_eff and next_eff != prev.get("effort")) else 0)
+        payload = {
+            "sig": "no_content",
+            "stage": stage,
+            "role": prev.get("role") or used_role,
+            "effort": next_eff,
+            "used_role": used_role,
+            "used_effort": used_eff,
+            "down_delta": delta,
+            "rescue_used": bool(prev.get("rescue_used")),
+            "escalated": bool(prev.get("escalated")),
+            "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        if self._set_retry_override(chunk_id, payload):
+            if next_eff:
+                print(f"🔻 [Pipeline] {chunk_id} no_content 签名 → 下次重试降档 "
+                      f"{used_eff or 'default'}→{next_eff} (role={payload['role'] or '?'})")
+            else:
+                print(f"🔻 [Pipeline] {chunk_id} no_content 签名（{used_eff or 'default'} 已无更低档）")
+
+    def _rescue_role_for(self, stage: str, failing_role: str) -> Optional[str]:
+        """换角色救稿目标选择（fallback_role_switch）。
+
+        RAW 救稿默认 secondary/literal_translator（minimax_protect 时不选 primary）；
+        REWRITE 救稿排除失败角色，protect 时优先 secondary。
+        """
+        cfg = self._retry_adapt_cfg()
+        protect = bool(cfg.get("minimax_protect", True))
+        if stage == "TRANSLATING_RAW":
+            cands = ["secondary", "literal_translator"]
+            if not protect:
+                cands.append("primary")
+        else:
+            if protect and failing_role != "secondary":
+                cands = ["secondary", "literal_translator", "primary"]
+            else:
+                cands = ["primary", "secondary", "literal_translator"]
+        cands = [r for r in cands if r and r != failing_role]
+        return cands[0] if cands else None
+
+    def _rescue_effort_for(self, target_role: str, prev_effort) -> Optional[str]:
+        """救稿档位：跨家映射到目标 role 合法档位后，再降一档（避免同档复现 no_content）。"""
+        ladder = self._effort_ladder_for_role(target_role)
+        eff = str(prev_effort or "").strip().lower()
+        if not ladder or not eff:
+            return None
+        mapped = _map_effort_for_fallback(eff, ladder)
+        if mapped is None:
+            return None
+        i = ladder.index(mapped)
+        return ladder[i - 1] if i > 0 else ladder[i]
+
+    def _maybe_rescue_no_content(self, task) -> Optional[str]:
+        """重试预算耗尽的救稿决策。
+
+        返回 recovery stage value（已写入换角色 override，调用方把任务放回该阶段再试 1 次）；
+        返回 None 表示放弃救稿（照旧转 PERMANENTLY_FAILED）。
+        """
+        cfg = self._retry_adapt_cfg()
+        if not cfg.get("enabled", True) or not cfg.get("fallback_role_switch", True):
+            return None
+        last_error = task.get("last_error", "") or ""
+        if not self._is_no_content_signature(last_error):
+            return None
+        chunk_id = task.get("chunk_id", "")
+        ov = self._get_retry_override(chunk_id)
+        if ov.get("rescue_used"):
+            return None
+        stage = ov.get("stage") or self._get_recovery_stage(last_error).value
+        failing_role = ov.get("used_role") or ov.get("role") or ""
+        rescue_role = self._rescue_role_for(stage, failing_role)
+        if not rescue_role:
+            return None
+        prev_eff = ov.get("used_effort") or ov.get("effort")
+        rescue_eff = self._rescue_effort_for(rescue_role, prev_eff)
+        payload = dict(ov)
+        payload.update({
+            "sig": "no_content",
+            "stage": stage,
+            "role": rescue_role,
+            "effort": rescue_eff,
+            "used_role": failing_role,
+            "used_effort": prev_eff,
+            "rescue_used": True,
+            "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+        if not self._set_retry_override(chunk_id, payload):
+            # fail-safe：override 落盘失败则放弃救稿（否则 rescue_used 无法持久化 → 无限重入）
+            print(f"⚠️ [Pipeline] {chunk_id} 救稿 override 落盘失败，放弃换角色（转 PF）")
+            return None
+        print(f"🆘 [Pipeline] {chunk_id} no_content 重试耗尽 → 换角色救稿: "
+              f"{failing_role or '?'}@{prev_eff or 'default'} → {rescue_role}@{rescue_eff or 'default'}")
+        return stage
 
     def _get_recovery_stage(self, last_error: str) -> TaskState:
         if not last_error:
@@ -2473,6 +2911,12 @@ class TranslationPipeline:
             chunk_id = task['chunk_id']
             retries = task.get('retries', 0)
             if retries >= max_retries:
+                # Round 133: no_content 签名 + 预算耗尽 → 换角色救稿一次（默认开启）
+                rescue_stage = self._maybe_rescue_no_content(task)
+                if rescue_stage:
+                    stage_state = self._get_recovery_stage(f"[{rescue_stage}]")
+                    retry_by_stage.setdefault(stage_state, []).append(chunk_id)
+                    continue
                 print(f"❌ [Pipeline] {chunk_id} 重试次数过多，转入 PERMANENTLY_FAILED 终态")
                 self._try_fallback_final(chunk_id)
                 permanent_fail_ids.append(chunk_id)
@@ -2547,6 +2991,8 @@ class TranslationPipeline:
                 success_ids.append(chunk_id)
             except Exception as e:
                 print(f"❌ [Pipeline] {task['chunk_id']} 直译异常: {e}")
+                if self._is_no_content_signature(e):
+                    self._record_no_content_signal(task['chunk_id'], "TRANSLATING_RAW")
                 self.scheduler.update_task_state(task['chunk_id'], TaskState.FAILED, error_msg=f"[TRANSLATING_RAW] {e}")
         if success_ids:
             self.scheduler.batch_update_state(success_ids, TaskState.REWRITING_LITERARY)
@@ -2677,6 +3123,42 @@ class TranslationPipeline:
                         chunk_id, sw_base_role, sw_alt_role, sw_cfg.get("max_switches", 1)
                     )
                     model_role = sw_state.get("current_role") or sw_base_role
+                # Round 129: 换到 alternate（更强模型）时加档 effort
+                model_effort = (sw_cfg.get("alternate_effort") if model_role != sw_base_role else None)
+                # Round 133: no_content 重试适配 override（降档/换角救稿）优先于停滞换档；
+                # 降档后若因质量重进润色（quality_retries≥1）→ 升档补偿一次（防死循环）。
+                ov = self._get_retry_override(chunk_id)
+                if ov and ov.get("sig") == "no_content" and ov.get("stage") == "REWRITING_LITERARY":
+                    if ov.get("role"):
+                        model_role = ov["role"]
+                    if ov.get("effort"):
+                        model_effort = str(ov["effort"]).strip().lower()
+                    raccfg = self._retry_adapt_cfg()
+                    if (raccfg.get("quality_escalate_back", True)
+                            and not ov.get("escalated")
+                            and model_effort
+                            and quality_retries >= 1
+                            and int(ov.get("down_delta", 0) or 0) > 0):
+                        up_eff = self._escalate_one_step(model_role, model_effort)
+                        if up_eff and up_eff != model_effort:
+                            print(
+                                f"🔼 [Pipeline] {chunk_id} 降档后质量重进润色 → 升档补偿一次 "
+                                f"{model_effort}→{up_eff} (role={model_role})"
+                            )
+                            model_effort = up_eff
+                            ov["escalated"] = True
+                            ov["effort"] = up_eff
+                            self._set_retry_override(chunk_id, ov)
+                    if model_effort:
+                        print(
+                            f"🔻 [Pipeline] {chunk_id} 重试适配生效: role={model_role} "
+                            f"effort={model_effort}"
+                        )
+                self._note_last_call(
+                    chunk_id, "REWRITING_LITERARY", model_role,
+                    model_effort or self._task_default_effort("literary_rewrite"),
+                    get_role_model_name(model_role),
+                )
                 raw_result = self.rewriter_agent.process_chunk(
                     chunk_id, raw_text, self.style_guide, source_text,
                     prev_lit_text=prev_lit_text,
@@ -2692,6 +3174,7 @@ class TranslationPipeline:
                     skipped_dimensions=skipped_dimensions,  # Round 64
                     verse_note=self._verse_note_for(chunk_id, source_text),  # Round 119 L1
                     model_role=model_role,  # Round 116: 停滞换模型
+                    model_effort=model_effort,  # Round 129: 换模型加档
                 )
                 # process_chunk 返回 (lit_text, self_review) 元组
                 if isinstance(raw_result, tuple):
@@ -2916,6 +3399,8 @@ class TranslationPipeline:
                 import traceback
                 traceback.print_exc()
                 print(f"❌ [Pipeline] {task['chunk_id']} 润色异常: {e}")
+                if self._is_no_content_signature(e):
+                    self._record_no_content_signal(task['chunk_id'], "REWRITING_LITERARY")
                 self.scheduler.update_task_state(task['chunk_id'], TaskState.FAILED, error_msg=f"[REWRITING_LITERARY] {e}")
         if success_ids:
             self.scheduler.batch_update_state(success_ids, TaskState.AUDITING)
@@ -3195,6 +3680,81 @@ class TranslationPipeline:
                 start = idx + 1
         return None
 
+    def _get_sibling_canonicals(self) -> Dict[str, Set[str]]:
+        """Round 71/133b: 全 registry 的 source_name → {canonical} 映射（含 pending 行）。
+
+        lazy-init + 按审计批次缓存（_process_auditing_batch 入口重置 _sibling_canonicals_cache）。
+        兼容测试桩：测试用 __new__ 构造的实例也可用（hasattr 兜底）。
+        """
+        if not hasattr(self, "_sibling_canonicals_cache") or \
+                self._sibling_canonicals_cache is None:
+            try:
+                self._sibling_canonicals_cache = get_sibling_canonicals_by_source(
+                    self.decision_engine.conn
+                )
+            except Exception:
+                self._sibling_canonicals_cache = {}
+        return self._sibling_canonicals_cache or {}
+
+    def _partition_swallowed_source_names(
+        self, source_text: str, canonical: str, valid_sns: List[str],
+    ) -> Tuple[List[str], Set[str]]:
+        """Round 133b: 别名吞并抑制 — 剔除"被其它实体更长别名吞并"的伪命中。
+
+        chunk071 根因: entity_registry 里 "Mother" 被同时登记给 杰西卡/杰西卡夫人，
+        而 chunk071 原文中 "Mother" 唯一出现于 "Reverend Mother"（盖乌斯·海伦·莫希阿姆
+        的别名）内部 → Round 114 词边界防护放行（"Mother" 是合法词）→ 杰西卡夫人被
+        判"原文在场但译文缺失" → rewriter 收到不可执行指令（"Reverend Mother" 那处
+        必须出现「杰西卡夫人」）→ 改坏正文 → NO_PROGRESS_STREAK → PERMANENTLY_FAILED。
+
+        判定: 别名 a 的所有命中 span 都被某"更长注册别名 b"(len(b) > len(a), a 是 b 的
+        子串, b 归属某 canonical ≠ 当前 canonical) 的命中 span 包含 → a 为伪命中, 剔除;
+        只要一处未被吞并即保留（真在场）。
+
+        Returns:
+            (effective, swallowed): effective=真在场别名（按原顺序）;
+            swallowed=出现在原文但被吞并的别名集合。
+        """
+        if not valid_sns:
+            return [], set()
+        siblings = self._get_sibling_canonicals()
+        own_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
+        coverer_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
+
+        effective: List[str] = []
+        swallowed: Set[str] = set()
+        for sn in valid_sns:
+            if not sn:
+                continue
+            if sn not in own_spans_cache:
+                own_spans_cache[sn] = entity_source_name_spans(sn, source_text)
+            spans = own_spans_cache[sn]
+            if not spans:
+                continue
+            # 候选覆盖别名: 更长 + 包含 sn + 归属于≥1 个其它 canonical
+            coverers = [
+                other for other in siblings.keys()
+                if len(other) > len(sn) and sn in other
+                and any(oc != canonical for oc in (siblings.get(other) or set()))
+                and self._is_valid_entity_source_name(other)
+            ]
+            fully_swallowed = False
+            if coverers:
+                cov_spans: List[Tuple[int, int]] = []
+                for other in coverers:
+                    if other not in coverer_spans_cache:
+                        coverer_spans_cache[other] = entity_source_name_spans(other, source_text)
+                    cov_spans.extend(coverer_spans_cache[other])
+                fully_swallowed = all(
+                    any(cs <= s and e <= ce for (cs, ce) in cov_spans)
+                    for (s, e) in spans
+                )
+            if fully_swallowed:
+                swallowed.add(sn)
+            else:
+                effective.append(sn)
+        return effective, swallowed
+
     def _check_entity_consistency(self, chunk_id: str, lit_text: str, source_text: str) -> List[Dict]:
         """实体一致性核查：检查译文中实体译名是否与 entity_registry 一致
 
@@ -3215,13 +3775,7 @@ class TranslationPipeline:
         # 则视为 rewriter 用了别名译名, 不报 "missing". variant_instead_of_canonical
         # 不受影响 (variant 是真问题, sibling 命中不影响 variant 路径).
         # 缓存: 单次审计内多次调用 _check_entity_consistency 时复用同一份.
-        if not hasattr(self, "_sibling_canonicals_cache") or \
-                self._sibling_canonicals_cache is None:
-            try:
-                self._sibling_canonicals_cache = get_sibling_canonicals_by_source(self.decision_engine.conn)
-            except Exception:
-                self._sibling_canonicals_cache = {}
-        sibling_canonicals = self._sibling_canonicals_cache or {}
+        sibling_canonicals = self._get_sibling_canonicals()
 
         inconsistencies = []
         for row in entities:
@@ -3242,9 +3796,14 @@ class TranslationPipeline:
             # quality_retries 无限增长。修前 ch32 quality_retries=112+ 死循环。
             # ch06: 过滤非实体 source_name（sir/his eyelids 等），避免误判"实体出场"
             valid_source_names = [sn for sn in source_names if self._is_valid_entity_source_name(sn)]
+            # Round 133b: 别名吞并抑制 — 剔除被其它实体更长别名吞并的伪命中
+            # （chunk071 "Mother"⊂"Reverend Mother" 根因, 详见 _partition_swallowed_source_names）
+            effective_source_names, _swallowed = self._partition_swallowed_source_names(
+                source_text, canonical, valid_source_names,
+            )
             appears_in_source = any(
                 (sn and entity_source_name_in_text(sn, source_text))
-                for sn in valid_source_names
+                for sn in effective_source_names
             )
             if not appears_in_source:
                 continue
@@ -3295,7 +3854,7 @@ class TranslationPipeline:
                 near_variant = self._find_near_variant(canonical, lit_text)
                 if near_variant:
                     matched_source = None
-                    for sn in valid_source_names:
+                    for sn in effective_source_names:
                         if entity_source_name_in_text(sn, source_text):
                             matched_source = sn
                             break
@@ -3311,7 +3870,7 @@ class TranslationPipeline:
                 # 只有原文中确实出现了该实体时才报 missing
                 # 避免"全书角色本章未出场"的假阳性
                 matched_source = None
-                for sn in valid_source_names:
+                for sn in effective_source_names:
                     if entity_source_name_in_text(sn, source_text):
                         matched_source = sn
                         break
@@ -3382,11 +3941,18 @@ class TranslationPipeline:
             if not self._is_enforceable_canonical(canonical, source_names):
                 continue
             valid_sns = [sn for sn in source_names if self._is_valid_entity_source_name(sn)]
+            # Round 133b: 别名吞并抑制 — swallowed 别名不注入/不当在场证据
+            # （chunk071 "Mother"→杰西卡夫人 污染 prompt 根因）
+            effective_sns, swallowed_sns = self._partition_swallowed_source_names(
+                source_text, canonical, valid_sns,
+            )
             # 只取本章出现的实体
-            if not any((sn and entity_source_name_in_text(sn, source_text)) for sn in valid_sns):
+            if not any((sn and entity_source_name_in_text(sn, source_text)) for sn in effective_sns):
                 continue
             # 把每个匹配的 source_name 都映射到 canonical（修前 bug: 只取第一个）
             for sn in valid_sns:
+                if sn in swallowed_sns:
+                    continue
                 if sn and sn not in out:
                     out[sn] = canonical
         # 缓存结果 (同一 source_text 在 chapter 内稳定)
@@ -3426,9 +3992,15 @@ class TranslationPipeline:
             if not self._is_enforceable_canonical(canonical, source_names):
                 continue
             valid_sns = [sn for sn in source_names if self._is_valid_entity_source_name(sn)]
-            if not any((sn and entity_source_name_in_text(sn, source_text)) for sn in valid_sns):
+            # Round 133b: 别名吞并抑制（与 _build_entity_registry_for_rewriter 同语义）
+            effective_sns, swallowed_sns = self._partition_swallowed_source_names(
+                source_text, canonical, valid_sns,
+            )
+            if not any((sn and entity_source_name_in_text(sn, source_text)) for sn in effective_sns):
                 continue
             for sn in valid_sns:
+                if sn in swallowed_sns:
+                    continue
                 if sn and sn not in out:
                     out[sn] = list(variant_names) if variant_names else []
         # Round 99 P1: 缓存 variants 结果
@@ -3848,7 +4420,7 @@ class TranslationPipeline:
 
     def _fallback_to_rewriter(self, chunk_id, lit_text, critic_report, judge_result):
         scores = critic_report.get("scores", {})
-        thresholds = _config.critic_thresholds
+        thresholds = _config.critic_thresholds_for_book()
         low_dims = [k for k, v in scores.items()
                     if isinstance(v, (int, float)) and v < thresholds.get(k, 7.0)]
         specific_edits = critic_report.get("specific_edits", [])[:20]
@@ -3906,6 +4478,19 @@ class TranslationPipeline:
                 quality_retries = task.get('quality_retries', 0)
                 lit_text = self._load_intermediate(chunk_id, "literary")
                 critic_report = self._load_intermediate(chunk_id, "critic_report")
+
+                # Round 123: mock_heuristic 是 Jev/critic LLM 不可用时的兜底假分数,
+                # 不得触发 judging 阶段 EARLY_STOP — 与 audit 阶段 R106 护栏
+                # (_mock_untrusted_p99) 同语义。根因: ch09 chunk013/044 critic
+                # 连续 429 回退 mock 后, 假分数 readability=2.5/fluency=2.5/
+                # literal_residue=0.0 (3 维<4.0) 被 EARLY_STOP 秒杀成
+                # PERMANENTLY_FAILED, 而同一份 mock 分数在 audit 阶段是放行的。
+                # 未显式 trust mock 时跳过 EARLY_STOP, 交由 rewriter 正常轮次。
+                mock_untrusted_judging = (
+                    isinstance(critic_report, dict)
+                    and not _config.pipeline.get("trust_mock_heuristic", False)
+                    and critic_report.get("_backend_path") == "mock_heuristic"
+                )
 
                 # 加载 Rewriter 自评（如果有）
                 self_review = None
@@ -4072,7 +4657,7 @@ class TranslationPipeline:
                     # O 方案：安全网放行——若各维度已接近阈值（仅差 1-2 分），
                     # 不再整章 PERMANENTLY_FAILED 丢失译文，改为带告警定稿。
                     scores = critic_report.get("scores", {}) if isinstance(critic_report, dict) else {}
-                    thresholds = _config.critic_thresholds or {}
+                    thresholds = _config.critic_thresholds_for_book()
                     numeric = [v for v in scores.values() if isinstance(v, (int, float))]
                     avg_score = (sum(numeric) / len(numeric)) if numeric else 0.0
                     safety_net_min = float(_config.pipeline.get("judge_safety_net_avg_min", 5.5))
@@ -4120,7 +4705,11 @@ class TranslationPipeline:
                         1 for v in scores.values()
                         if isinstance(v, (int, float)) and v < early_stop_threshold
                     )
-                    if very_low_count >= early_stop_max_low:
+                    if very_low_count >= early_stop_max_low and mock_untrusted_judging:
+                        # Round 123: mock 假分数不可信 — 不早停, 落回 rewriter 正常轮次
+                        # (与 audit 阶段 R106 护栏同语义, 见上方 mock_untrusted_judging)
+                        print(f"🛡️ [Pipeline] {chunk_id} EARLY_STOP 拦截: critic 后端 mock_heuristic（假分数不可信），转 rewriter 正常重试")
+                    elif very_low_count >= early_stop_max_low:
                         stop_reason = (
                             f"EARLY_STOP: {very_low_count}项低于{early_stop_threshold}分"
                             f"（{scores}），放弃重试"
@@ -4340,6 +4929,8 @@ def run_final_gate(
     ③ QA_REPORT：无 fallback 章节条目（## 段）
     ④ T5 lint（finals + merged）全绿
     ⑤ T1 转换审计报告结论为 "✅ 通过"
+    ⑥ L1 韵文对齐（verse_lint，门禁内联自动运行）
+    ⑦ L2 双关核销（pun_audit，门禁内联自动运行；Round 130 起无需手动补跑）
     任一为红 → ok=False（translate_book.sh 以非零退出中止 / ⛔）。
     """
     root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
@@ -4480,8 +5071,25 @@ def run_final_gate(
         _watch = (_prof or {}).get("pun_watchlist") or []
         if _watch:
             _pun_json = out_root / "pun_audit.json"
+            # Round 130（外部审计②）: 门禁内联自动运行 pun_audit（纯静态、无 LLM 调用），
+            # 消除"必须手动先跑 scripts/pun_audit.py，否则 gate ⑦ 必红"的顺序耦合。
+            _pun_script = root / "scripts" / "pun_audit.py"
+            if _pun_script.exists():
+                import subprocess as _subprocess
+                try:
+                    _pun_proc = _subprocess.run(
+                        [sys.executable, str(_pun_script),
+                         "--project-root", str(root), "--no-fail"],
+                        cwd=str(root), capture_output=True, text=True, timeout=120)
+                    if _pun_proc.returncode != 0:
+                        warnings.append(
+                            f"⑦ pun_audit 自动执行异常(rc={_pun_proc.returncode}): "
+                            f"{(_pun_proc.stderr or _pun_proc.stdout or '').strip()[:200]}")
+                except Exception as _pun_run_exc:
+                    failures.append(
+                        f"⑦ pun_audit 自动执行失败: {type(_pun_run_exc).__name__}: {_pun_run_exc}")
             if not _pun_json.exists():
-                failures.append("⑦ pun_audit 未运行（缺 output/pun_audit.json，先跑 scripts/pun_audit.py）")
+                failures.append("⑦ pun_audit 未运行（缺 output/pun_audit.json；自动补跑不可用，请手动跑 scripts/pun_audit.py）")
             else:
                 _pun_report = json.loads(_pun_json.read_text(encoding="utf-8"))
                 _pun_sum = _pun_report.get("summary") or {}

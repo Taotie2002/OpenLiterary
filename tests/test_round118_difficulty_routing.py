@@ -1,8 +1,8 @@
-"""Round 118 P2-5: 直译难度路由测试.
+"""Round 118 P2-5 / Round 128: 直译难度路由测试.
 
   - 难度启发式: 典故密度 + 长句占比 + 引文特征;
-  - difficulty >= hard_threshold -> primary（MiniMax）+ thinking 开;
-  - 普通片段 -> literal_translator（DeepSeek）+ thinking 关（配置原样）.
+  - difficulty >= hard_threshold -> primary（MiniMax）+ effort 加档（hard_effort）;
+  - 普通片段 -> literal_translator 任务默认（Round 129 起 effort=none，显式关闭思考）.
 """
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ class TestConfig:
         cfg = _config.pipeline["difficulty_routing"]
         assert cfg["enabled"] is True
         assert cfg["hard_role"] == "primary"
-        assert cfg["hard_enable_thinking"] is True
+        assert cfg["hard_effort"] == "max"
         assert float(cfg["hard_threshold"]) <= 2.0
 
 
@@ -113,7 +113,7 @@ class TestDifficultyScore:
 
 
 class TestRouting:
-    def test_hard_chunk_uses_primary_and_thinking(self, monkeypatch):
+    def test_hard_chunk_uses_primary_and_effort(self, monkeypatch):
         import src.utils.llm_adapter as la
         from src.pipeline import TranslationPipeline
 
@@ -124,10 +124,10 @@ class TestRouting:
         assert len(hard_client.calls) == 1
         assert p.llm.calls == []
         call = hard_client.calls[0]
-        assert call["enable_thinking"] is True
+        assert call["effort"] == "max"
         assert call["model_name"]  # primary 角色模型（MiniMax-M3）
 
-    def test_easy_chunk_uses_literal_and_no_thinking(self, monkeypatch):
+    def test_easy_chunk_uses_literal_and_thinking_off(self, monkeypatch):
         import src.utils.llm_adapter as la
         from src.pipeline import TranslationPipeline
 
@@ -137,7 +137,8 @@ class TestRouting:
         p._run_raw_translator(EASY_TEXT)
         assert len(p.llm.calls) == 1
         assert hard_client.calls == []
-        assert p.llm.calls[0].get("enable_thinking") is False
+        # Round 129: 普通片段走直译任务默认 —— 显式关闭思考（none），不再依赖服务端默认
+        assert p.llm.calls[0].get("effort") == "none"
 
     def test_monolith_mirror(self, monkeypatch):
         import src.utils.llm_adapter as la
@@ -148,4 +149,4 @@ class TestRouting:
         p = _make_pipeline(ta.TranslationPipeline, refs=["wild-cat", "morganatic"])
         p._run_raw_translator(HARD_TEXT)
         assert len(hard_client.calls) == 1
-        assert hard_client.calls[0]["enable_thinking"] is True
+        assert hard_client.calls[0]["effort"] == "max"

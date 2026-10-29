@@ -21,18 +21,17 @@ from src.agents.judge_agent import JudgeAgent
 from src.utils.chunker import SmartChunker
 from src.utils.llm_adapter import (
     get_llm_client,
-    get_role_extra_body,
     get_role_model_name,
 )
 
 
-# Round 118 P2-7: 黄金集 A/B — 直译阶段「模型 × thinking」四组合.
+# Round 118 P2-7 / Round 128: 黄金集 A/B — 直译阶段「模型 × effort」四组合.
 # 重写阶段跟随 task_routing（本轮不切换），衡量的是“直译×重写”全流程结果。
 GOLDEN_AB_MATRIX: List[Dict[str, Any]] = [
-    {"name": "deepseek_lit_off", "role": "literal_translator", "enable_thinking": False},
-    {"name": "deepseek_lit_on", "role": "literal_translator", "enable_thinking": True},
-    {"name": "minimax_lit_off", "role": "primary", "enable_thinking": False},
-    {"name": "minimax_lit_on", "role": "primary", "enable_thinking": True},
+    {"name": "literal_effort_none", "role": "literal_translator", "effort": None},
+    {"name": "literal_effort_xhigh", "role": "literal_translator", "effort": "xhigh"},
+    {"name": "primary_effort_none", "role": "primary", "effort": None},
+    {"name": "primary_effort_max", "role": "primary", "effort": "max"},
 ]
 
 
@@ -126,8 +125,8 @@ def run_golden_test(
 ):
     """运行黄金测试集（需要 input/golden/hyperion_5k.md）.
 
-    Round 118 P2-7: ab_override={"name","role","enable_thinking"} 时按 A/B 组合
-    覆盖直译阶段的模型与 thinking；report_path 可指定本轮报告输出路径
+    Round 118 P2-7 / Round 128: ab_override={"name","role","effort"} 时按 A/B 组合
+    覆盖直译阶段的模型与 effort 档位；report_path 可指定本轮报告输出路径
     （默认 output/golden_test_report.json）。
     """
     ab = dict(ab_override or {})
@@ -163,7 +162,7 @@ def run_golden_test(
     if ab:
         print(
             f"🧪 A/B 组合: {ab.get('name')} "
-            f"(role={literal_role}, thinking={bool(ab.get('enable_thinking'))})"
+            f"(role={literal_role}, effort={ab.get('effort') or 'none'})"
         )
     all_results = []
 
@@ -183,14 +182,17 @@ def run_golden_test(
                 f"请将以下{genre}片段进行直译。要求：字面忠实，不丢失任何细节，不进行文学润色。\n\n"
                 f"{gloss}\n\n【原文】\n{chunk}"
             )
-            # 使用配置路由 literal_translation（A/B 时按组合覆盖 role + thinking）
+            # 使用配置路由 literal_translation（A/B 时按组合覆盖 role + effort）
             model_key, params = _config.resolve_task_model("literal_translation")
             params = dict(params)
             if ab:
-                params["enable_thinking"] = bool(ab.get("enable_thinking", False))
+                ab_effort = ab.get("effort")
+                if ab_effort:
+                    params["effort"] = str(ab_effort).strip().lower()
+                else:
+                    params.pop("effort", None)
             model_name = get_role_model_name(literal_role) or model_key
-            extra_body = get_role_extra_body(literal_role)
-            raw_text = evaluator.llm.generate(raw_prompt, model_name=model_name, extra_body=extra_body, **params)
+            raw_text = evaluator.llm.generate(raw_prompt, model_name=model_name, **params)
 
             raw_result = evaluator.rewriter_agent.process_chunk(chunk_id, raw_text, style_guide, chunk)
             lit_text, _ = raw_result if isinstance(raw_result, tuple) else (raw_result, None)
@@ -210,7 +212,7 @@ def run_golden_test(
                 "judge_backend": judge_result.get("_backend_path"),
                 "confidence_source": _extract_confidence_source(judge_result),
                 "literal_role": literal_role,
-                "literal_thinking": bool(params.get("enable_thinking", False)),
+                "literal_effort": params.get("effort"),
                 "ab": ab.get("name") if ab else None,
                 "style_collapse_rate": style_eval["style_collapse_rate"],
                 "style_preservation": style_eval["average_preservation"],
@@ -381,7 +383,7 @@ def run_golden_ab(
     matrix: Optional[List[Dict[str, Any]]] = None,
     report_path: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Round 118 P2-7: 黄金集 A/B — 直译模型(DeepSeek/MiniMax)×thinking(on/off) 对比.
+    """Round 118 P2-7 / Round 128: 黄金集 A/B — 直译模型 × effort 档位对比.
 
     每个组合跑完整 直译→重写→critic→judge 流程（重写阶段按 task_routing 定，
     A/B 只切直译阶段），统计 pass_rate / critic 均分 / 风格保持度，并按
@@ -397,7 +399,7 @@ def run_golden_ab(
     for idx, combo in enumerate(matrix):
         name = str(combo.get("name") or f"combo_{idx}")
         print("\n" + "=" * 60)
-        print(f"🧪 Golden A/B 组合 [{name}]: role={combo.get('role')}, thinking={combo.get('enable_thinking')}")
+        print(f"🧪 Golden A/B 组合 [{name}]: role={combo.get('role')}, effort={combo.get('effort') or 'none'}")
         print("=" * 60)
         results = run_golden_test(
             ab_override=combo,

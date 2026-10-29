@@ -12,7 +12,7 @@
 
 目录：
   Section 1 — 枚举与类型定义        (TaskState, DecisionLevel)
-  Section 2 — LLM 适配层            (LLMAdapter, MockLLMAdapter, OpenAICompatibleAdapter, MLXNativeAdapter, get_llm_client)
+  Section 2 — LLM 适配层            (LLMAdapter, MockLLMAdapter, OpenAICompatibleAdapter, get_llm_client)
   Section 3 — Scheduler 任务调度器   (TaskScheduler)
   Section 4 — Decision Engine 决策引擎 (DecisionEngine)
   Section 5 — SmartChunker 文本切分器 (SmartChunker)
@@ -85,15 +85,6 @@ except ImportError:
     _epub_lib = None
     BeautifulSoup = None
 
-# MLX (可选，仅 macOS ARM64 需要)
-try:
-    from mlx_lm import load as _mlx_load
-    from mlx_lm import generate as _mlx_generate
-    from mlx_lm.sample_utils import make_sampler as _make_sampler
-    import mlx.core as mx
-except ImportError:
-    _mlx_load = _mlx_generate = _make_sampler = mx = None
-
 def print_banner():
     """横幅输出到 stderr，避免污染 stdout（stdout 留给机器可解析的输出，如章节路径）"""
     print(r"""
@@ -150,22 +141,19 @@ if _config is None:
             "literary_rewrite": {"model": "primary", "params_override": {}},
             "critic_scoring": {"model": "primary", "params_override": {"temperature": 0.1}},
             "judge_decision": {"model": "primary", "params_override": {}},
-            "style_profiling": {"model": "primary", "params_override": {}},
         }
-        mlx_models = {
-            "literal_translator": {"model_id": "google/gemma-2-9b-it-mlx-4bit", "default_params": {}},
-            "primary": {"model_id": "qwen/Qwen2.5-7B-Instruct-MLX-4bit", "default_params": {}},
+        # Round 126: 模型定义集中于此（唯一事实源）；本地 mlx 支持已移除。
+        models = {
+            "literal_translator": {"model_name": "deepseek-v4-flash", "thinking": False},
+            "primary": {"model_name": "MiniMax-M3.1-Flash", "thinking": True},
+            "secondary": {"model_name": "Qwen3.8-Flash-Next-SS", "thinking": False},
         }
-        openai_models = {
-            "literal_translator": {"model_name": "gpt-4o-mini", "default_params": {}},
-            "primary": {"model_name": "gpt-4o-mini", "default_params": {}},
-        }
-        mlx_memory = {"warning_threshold": 0.8, "auto_unload_on_pressure": True}
         openai_api = {"api_base": "http://127.0.0.1:1234/v1", "api_key": "lm-studio",
                       "max_retries": 3, "retry_delay": 2.0, "request_timeout": 300,
                       "max_concurrent_requests": 4}
         pipeline = {"batch_size": 50, "max_retries": 3, "max_quality_retries": 6, "judge_safety_net_avg_min": 5.5,
                     "poll_interval": 0.5, "entity_hard_fail": True,
+                    "version_merit": {"enabled": True, "tolerance": 0.0},
                     "early_stop": {"enabled": True, "max_low_dims": 3, "low_score_threshold": 3.0, "apply_only_first_round": True}}
         chunker = {"soft_limit": 1000, "hard_limit": 2500}
         decision_engine = {"terminology_triggers_backtrack": True,
@@ -173,6 +161,9 @@ if _config is None:
                            "style_triggers_backtrack": False,
                            "max_affected_chunks_per_decision": 50,
                            "backtrack_scope": "book",
+                           "backtrack_mode": "deferred",
+                           "max_backtrack_sweeps_per_chapter": 1,
+                           "max_backtrack_rounds_per_chunk": 2,
                            "context_max_terminology": 40,
                            "context_max_reference": 20,
                            "context_max_style": 10,
@@ -181,64 +172,97 @@ if _config is None:
                             "voice_consistency": 7.0, "semantic_preservation": 7.0,
                             "literal_residue": 7.0,
                             "average_score_min": 7.0}
-        style_guide = {"avg_sentence_length": "适中、口语化",
-                       "lexicon_preference": "平实、克制",
-                       "author_priority_ratio": 0.7,
-                       "genre": "文学小说",
-                       "work_type": "长篇小说",
-                       "persona": "忠实原著语域的职业文学译者",
-                       "footnote_policy": "inline",
-                       "register_default": "保持克制、平实、贴近原文的叙事语域",
-                       "forbidden_modernisms": [],
-                       "translation_hints": []}
-        entity_variants = {}
 
-        def set_runtime_style_guide(self, guide):
-            # 单文件降级模式：直接替换类级 dict（无外部 Config 的覆盖层语义）
-            if guide:
-                self.style_guide = dict(guide)
+        def critic_thresholds_for_book(self, project_root=None):
+            """通用默认 + book_profile 可选覆盖（与 src/config.py::Config 方法同语义；
+            单文件部署兜底不读缓存，直接合并）。"""
+            merged = dict(self.critic_thresholds or {})
+            try:
+                root = Path(project_root) if project_root else Path.cwd()
+                pp = root / "input" / "book_profile.json"
+                if pp.exists():
+                    data = json.loads(pp.read_text(encoding="utf-8"))
+                    blk = data.get("critic_thresholds") if isinstance(data, dict) else None
+                    if isinstance(blk, dict):
+                        for k, v in blk.items():
+                            if (isinstance(v, (int, float)) and not isinstance(v, bool)
+                                    and 0.0 <= float(v) <= 10.0):
+                                merged[str(k)] = float(v)
+            except Exception:
+                pass
+            return merged
+        style_guide = {"avg_sentence_length": "适中、口语化",
+                       "lexicon_preference": "平实、克制、英式幽默",
+                       "author_priority_ratio": 0.7,
+                       "genre": "儿童文学",
+                       "work_type": "长篇童话"}
 
         def resolve_task_model(self, task_name):
-            routing = self.task_routing.get(task_name, {})
-            model_key = routing.get("model", "primary")
-            return model_key, routing.get("params_override", {})
-
-        def _get_model_config(self, model_key):
-            if self.llm_backend == "mlx":
-                return self.mlx_models.get(model_key, {})
-            if self.llm_backend == "openai_api":
-                nested = self.openai_api.get("models", {})
-                if nested and model_key in nested:
-                    return nested[model_key]
-            return self.openai_models.get(model_key, {})
+            EFFORT_LEVELS_BY_PROVIDER = {
+                "minimax": ("low", "medium", "high", "xhigh", "max"),
+                "deepseek": ("none", "low", "high", "xhigh", "max"),
+                "qwen": ("none", "low", "medium", "xhigh"),
+            }
+            model_key = self.get_task_role(task_name)
+            role_cfg = self.models.get(model_key, {}) or {}
+            params = dict(role_cfg.get("default_params", {}) or {})
+            if "thinking" in role_cfg or "thinking" in params:
+                raise ValueError(f"{task_name}: `thinking` 已废弃（Round 128）——改用任务级 effort")
+            routing = dict(self.task_routing.get(task_name, {}) or {})
+            override = dict(routing.get("params_override", {}) or {})
+            if "thinking" in override:
+                raise ValueError(f"{task_name}: `thinking` 已废弃（Round 128）——改用任务级 effort")
+            nested_effort = override.pop("effort", None)
+            merged = {**params, **override}
+            merged.pop("effort", None)
+            effort = routing.get("effort")
+            if effort is None:
+                effort = nested_effort
+            if effort is not None:
+                if isinstance(effort, bool):  # YAML 1.1: 裸 off/on/no/yes 会被解析为布尔
+                    if effort is True:
+                        raise ValueError(
+                            f"{task_name}: effort 为布尔 true（应出自裸 on/yes）——"
+                            f"需要思考请写具体档位；关闭思考写 none"
+                        )
+                    effort = "none"
+                effort = str(effort).strip().lower()
+                target = f"{role_cfg.get('model_name', '')} {role_cfg.get('api_base', '')}".lower()
+                for provider, levels in EFFORT_LEVELS_BY_PROVIDER.items():
+                    if provider in target:
+                        if effort not in levels:
+                            raise ValueError(
+                                f"{task_name}: effort '{effort}' 对 {provider} 非法；"
+                                f"合法档位: {'/'.join(levels)}"
+                            )
+                        break
+                merged["effort"] = effort
+            nested_extra = merged.pop("extra_body", None)
+            task_extra = routing.get("extra_body")
+            if task_extra is None:
+                task_extra = nested_extra
+            merged["extra_body"] = dict(task_extra) if isinstance(task_extra, dict) else {}
+            return model_key, merged
 
         def get_task_role(self, task_name):
             return self.task_routing.get(task_name, {}).get("model", "primary")
 
         def has_role_models(self):
-            return False
+            return bool(self.models)
 
         def role_models(self):
-            return {}
+            return self.models
 
         def get_role_config(self, role):
-            legacy = self._get_model_config(role)
             if self.llm_backend == "mock":
                 return {"backend": "mock", "default_params": {}}
-            if self.llm_backend == "mlx":
-                return {
-                    "backend": "mlx",
-                    "model_id": legacy.get("model_id", "qwen/Qwen2.5-7B-Instruct-MLX-4bit"),
-                    "default_params": legacy.get("default_params", {}),
-                }
+            cfg = dict(self.models.get(role, {}) or {})
             section = self.openai_api
-            return {
-                "backend": "openai_api",
-                "api_base": section.get("api_base", "http://127.0.0.1:1234/v1"),
-                "api_key": section.get("api_key", "lm-studio"),
-                "model_name": legacy.get("model_name", "deepseek-v4-flash"),
-                "default_params": legacy.get("default_params", {}),
-            }
+            cfg.setdefault("backend", "openai_api")
+            cfg.setdefault("api_base", section.get("api_base", "http://127.0.0.1:1234/v1"))
+            cfg.setdefault("api_key", section.get("api_key", "lm-studio"))
+            cfg.setdefault("model_name", "deepseek-v4-flash")
+            return cfg
 
     _config = _BuiltinConfig()
     if os.environ.get("SAGATRANS__STRICT") == "1":
@@ -367,6 +391,16 @@ def robust_json_loads(raw_response: str, expected_type: type = dict):
 _client_instances: dict = {}
 
 
+class QuotaExhaustedError(RuntimeError):
+    """Round 129: 配额/限流持续耗尽（区别于可重试的瞬时网络/服务端错误）。
+
+    由 OpenAICompatibleAdapter 在 429 连续出现（或 402/403 带配额关键字）时抛出；
+    FallbackRoleAdapter 捕获后把该角色永久降级到 fallback 角色，避免整章翻译
+    卡在单一模型的退避重试里（MiniMax 配额按 5 小时窗重置）。
+    """
+
+
+
 class LLMAdapter(ABC):
     """大语言模型调用基类"""
     def __init__(self):
@@ -381,7 +415,7 @@ class LLMAdapter(ABC):
 
     @abstractmethod
     def generate(self, prompt: str, model_name: str, max_tokens: int = 2048, temperature: float = 0.3, **kwargs) -> str:
-        """生成接口；**kwargs 用于透传子类特有参数（如 extra_body / enable_thinking）。"""
+        """生成接口；**kwargs 用于透传子类特有参数（如 extra_body / effort）。"""
         pass
 
     @abstractmethod
@@ -393,7 +427,7 @@ class LLMAdapter(ABC):
         """Round 27: 子类在 generate 末尾调用此方法累加真实 token 用量。
 
         OpenAI-compatible API 标准 usage 字段：prompt_tokens / completion_tokens / total_tokens。
-        Mock / MLX 后端按各自实现做估算或 tokenizer encode 真实值。
+        Mock 后端按字符估算；HTTP 后端取服务端返回的真实 usage。
         Round 30: 累加后检查阈值，触发一次性 stderr 告警（idempotent via _warned_thresholds）。
         """
         try:
@@ -447,19 +481,10 @@ class LLMAdapter(ABC):
         }
 
     def check_memory_pressure(self) -> bool:
-        """检查内存压力"""
+        """检查进程内存压力（通用诊断；原 MLX 本地推理专有逻辑已移除）。"""
         usage = self.get_memory_usage()
-        threshold = _config.mlx_memory.get("warning_threshold", 0.8)
+        threshold = 0.8
         return usage["percent"] / 100 > threshold
-
-    def auto_unload_if_needed(self) -> bool:
-        """内存压力时自动卸载模型，返回是否触发了卸载"""
-        auto_unload = _config.mlx_memory.get("auto_unload_on_pressure", True)
-        if auto_unload and self.check_memory_pressure():
-            print(f"⚠️ 内存压力过大 ({self.get_memory_usage()['percent']:.1f}%)，自动卸载模型")
-            self.unload_model()
-            return True
-        return False
 
 
 
@@ -566,36 +591,6 @@ class MockLLMAdapter(LLMAdapter):
 
 
 
-# Round 117: thinking 参数按 provider 归一（与 src/utils/llm_adapter.py 同步）。
-# - minimax: enabled→adaptive；disabled→reasoning_effort=none + thinking=disabled
-# - deepseek: enabled/disabled 显式下发
-# - openai: enabled→reasoning_effort=high
-# - DeepSeek 代理宿主: 仅显式开启时下发 thinking=enabled（关闭时不发参数，保持现有行为）
-_DEEPSEEK_PROXY_HOSTS = ("token.ai-hf.cn",)
-
-
-def build_thinking_params(api_base: str, enable_thinking: bool) -> Dict[str, Any]:
-    base = (api_base or "").lower()
-    if "minimax" in base:
-        if enable_thinking:
-            return {"thinking": {"type": "adaptive"}}
-        return {"reasoning_effort": "none", "thinking": {"type": "disabled"}}
-    if "deepseek" in base:
-        return {"thinking": {"type": "enabled" if enable_thinking else "disabled"}}
-    if "openai" in base:
-        return {"reasoning_effort": "high"} if enable_thinking else {}
-    from urllib.parse import urlparse
-    host = urlparse(api_base).netloc.lower() if api_base else ""
-    if host in _DEEPSEEK_PROXY_HOSTS:
-        return {"thinking": {"type": "enabled"}} if enable_thinking else {}
-    return {}
-
-
-# Round 117b: 内联 think 块提取（用 . 匹配换行；MiniMax adaptive 模式实测会把
-# 推理内联在 content 首位，如 "<think…</think>正文"）
-_INLINE_THINK_RE = re.compile(r'<think(.*?)</think>', re.DOTALL)
-
-
 class OpenAICompatibleAdapter(LLMAdapter):
     """基于 HTTP 的 OpenAI 兼容 API 适配器 (如 LM Studio / vLLM)"""
     # 类级：按 api_base 分组的限流器，同一服务商共享限流
@@ -629,6 +624,8 @@ class OpenAICompatibleAdapter(LLMAdapter):
         # Round 117: thinking 模式审计轨迹（reasoning_content 不混入主输出）
         self.last_reasoning = ""
         self.last_reasoning_only = False
+        # Round 129: 连续 429 计数（配额耗尽判定；成功响应即清零）
+        self._consecutive_429 = 0
         # 初始化该 api_base 的限流器
         limiter_key = self._get_limiter_key(api_base)
         if limiter_key not in self.__class__._rate_limiters:
@@ -661,7 +658,7 @@ class OpenAICompatibleAdapter(LLMAdapter):
         return urlparse(api_base).netloc
 
     def generate(self, prompt: str, model_name: str, max_tokens: int = 2048, temperature: float = 0.3, **kwargs) -> str:
-        enable_thinking = kwargs.pop("enable_thinking", False)
+        effort = kwargs.pop("effort", None)
         extra_body = kwargs.pop("extra_body", None) or {}
         payload = {
             "model": model_name,
@@ -669,8 +666,8 @@ class OpenAICompatibleAdapter(LLMAdapter):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
-        # Round 117: thinking 参数按 provider 归一（含 DeepSeek 代理宿主 opt-in）
-        payload.update(build_thinking_params(self.api_base, enable_thinking))
+        # Round 128: effort 档位按 provider 编码（无档位=不下发；extra_body 仍最后合并）
+        payload.update(build_effort_params(self.api_base, model_name, effort))
         # 合并剩余自定义 extra_body（用户覆盖）
         if extra_body:
             payload.update(extra_body)
@@ -685,7 +682,6 @@ class OpenAICompatibleAdapter(LLMAdapter):
                 time.sleep(limiter["interval"] - elapsed)
             limiter["last"] = time.time()
         last_error = None
-        thinking_stripped = False  # Round 117: 服务端 400 不识别 thinking 字段时剥离重试一次
         for attempt in range(self.max_retries):
             try:
                 response = self._requests.post(
@@ -695,19 +691,44 @@ class OpenAICompatibleAdapter(LLMAdapter):
                     timeout=self.request_timeout,
                     verify=self._verify_ssl,
                 )
+                # Round 117/R121: 服务端 400 不识别 thinking 字段 → 剥离后立即重发一次。
+                # 旧实现用 continue 依赖剩余 attempt 预算：max_retries=1（judge 兜底客户端）
+                # 时会直接耗尽循环，以 "API 调用失败,已重试 1 次: None" 形式误报。
+                if (response.status_code == 400
+                        and any(k in payload for k in ("thinking", "reasoning_effort"))):
+                    _rejected = [k for k in ("thinking", "reasoning_effort") if k in payload]
+                    payload.pop("thinking", None)
+                    payload.pop("reasoning_effort", None)
+                    print(f"⚠️ [OpenAI Adapter] 400: 服务端不识别 {_rejected}"
+                          f"（model={payload.get('model')}）→ 剥离后重试"
+                          f" | body: {response.text[:160]}",
+                          file=sys.stderr, flush=True)
+                    response = self._requests.post(
+                        f"{self.api_base}/chat/completions",
+                        headers=self.headers,
+                        json=payload,
+                        timeout=self.request_timeout,
+                        verify=self._verify_ssl,
+                    )
+                # Round 129: 配额守卫 —— 429 首次按常规重试（瞬时限流），连续两次
+                # （或 402/403 带配额关键字）判定为配额耗尽 → QuotaExhaustedError
+                # （不继续退避空转；由 FallbackRoleAdapter 降级到兜底角色）。
+                if response.status_code == 429 or (
+                    response.status_code in (402, 403)
+                    and _QUOTA_HINT_RE.search(response.text[:400])
+                ):
+                    if response.status_code == 429:
+                        self._consecutive_429 += 1
+                    if response.status_code != 429 or self._consecutive_429 >= 2:
+                        raise QuotaExhaustedError(
+                            f"HTTP {response.status_code} 配额/限流持续耗尽"
+                            f"（model={payload.get('model')}）: {response.text[:160]}"
+                        )
                 # 429 是限流（属于 4xx 但应重试），其他 4xx 是客户端错误；5xx 由 raise_for_status 抛出后被外层重试逻辑捕获
                 if 400 <= response.status_code < 500 and response.status_code != 429:
-                    if (response.status_code == 400 and not thinking_stripped
-                            and any(k in payload for k in ("thinking", "reasoning_effort"))):
-                        # 代理/服务端不识别 thinking 参数：剥离后立即重试一次（保证可用性优先）
-                        thinking_stripped = True
-                        payload.pop("thinking", None)
-                        payload.pop("reasoning_effort", None)
-                        print("⚠️ [OpenAI Adapter] 400: 服务端可能不识别 thinking 参数，剥离后重试",
-                              file=sys.stderr)
-                        continue
                     raise RuntimeError(f"API 客户端错误 {response.status_code}: {response.text[:200]}")
                 response.raise_for_status()
+                self._consecutive_429 = 0
                 resp_json = response.json()
                 message = resp_json["choices"][0]["message"]
                 # Round 27: 解析真实 token usage（OpenAI 兼容 API 标准字段）
@@ -719,8 +740,11 @@ class OpenAICompatibleAdapter(LLMAdapter):
                     )
                 # Round 117: thinking 模式下 reasoning_content 只作审计轨迹，
                 # 不得混入 content（旧行为把推理拼进译文会污染下游产物）。
+                # Round 129: token.ai-hf.cn 网关的字段名是 reasoning（非
+                # reasoning_content），两者都读取，避免推理被落在盲区。
                 content = message.get("content") or ""
-                reasoning = message.get("reasoning_content") or ""
+                reasoning = (message.get("reasoning_content")
+                             or message.get("reasoning") or "")
                 # Round 117b: 部分 provider（如 MiniMax adaptive thinking）把推理内联在
                 # content 里（"<think…</think>正文"）。若 reasoning_content 为空，
                 # 把闭合的 think 块抽出为审计轨迹，正文只保留 think 之后的内容。
@@ -729,11 +753,24 @@ class OpenAICompatibleAdapter(LLMAdapter):
                     if m:
                         reasoning = m.group(1).strip()
                         content = (content[:m.start()] + content[m.end():]).strip()
+                    else:
+                        # 未闭合 think 块（推理被 max_tokens 截断）→ 判定失败，
+                        # 避免把半截推理当正文写入成品。
+                        self.last_reasoning = content.strip()
+                        self.last_reasoning_only = True
+                        raise RuntimeError(
+                            "模型输出为未闭合 think 块（疑推理截断），判定调用失败"
+                        )
                 self.last_reasoning = reasoning
                 if not content.strip() and reasoning:
-                    # 仅有推理无回复：返回推理兜底（标记以便上游觉察）
+                    # Round 129（质量优先）：仅有推理无正文 = 思考吃光 max_tokens。
+                    # 旧行为把推理当译文返回，会把思维链污染进成品；现判定调用失败，
+                    # 触发上层重试/兜底，绝不让 CoT 混入译文。
                     self.last_reasoning_only = True
-                    return reasoning
+                    raise RuntimeError(
+                        f"模型仅输出推理、无正文（reasoning={len(reasoning)} chars）——"
+                        f"疑似 thinking 耗尽 max_tokens，判定调用失败"
+                    )
                 return content
             except RuntimeError:
                 raise
@@ -751,193 +788,118 @@ class OpenAICompatibleAdapter(LLMAdapter):
 
 
 
-class MLXNativeAdapter(LLMAdapter):
-    """基于 Apple MLX 的原生本地推理适配器 (专为 M1 统一内存优化)"""
+class FallbackRoleAdapter(LLMAdapter):
+    """Round 129: 角色级配额降级包装器（透明替代普通适配器）。
 
-    # 类级共享缓存：LRU 顺序字典，最近使用移到末尾
-    # 避免每个角色加载一份同模型副本，节省 2x~3x 内存
-    # 限制最大缓存模型数，防止 16GB 统一内存 OOM
-    _shared_models: "OrderedDict[str, tuple]" = OrderedDict()
-    _cache_lock = threading.Lock()
-    _MAX_CACHED_MODELS = 2  # 可通过配置覆盖
+    主角色（如 primary/MiniMax）调用因配额/限流持续耗尽（QuotaExhaustedError）时，
+    进程内永久切换到 fallback 角色（如 secondary/DeepSeek），保证流水线不因单模型
+    配额中断或长时间阻塞；其余错误不触发降级，按原路径处理。
 
-    def __init__(self):
-        try:
-            from mlx_lm import load as _mlx_load
-            from mlx_lm import generate as _mlx_generate
-            from mlx_lm.sample_utils import make_sampler as _make_sampler
-            import mlx.core as _mx
-            self.mlx_load = _mlx_load
-            self.mlx_generate = _mlx_generate
-            self.make_sampler = _make_sampler
-            self.mx = _mx
-        except ImportError:
-            raise RuntimeError("⚠️ 环境中未安装 mlx-lm。请在虚拟环境中执行 `pip install mlx-lm`")
+    降级单向（避免失败-回切抖动）；MiniMax 配额按 5 小时窗重置，重启进程即恢复。
+    """
 
-        self.current_model_name = None
-        self.model = None
-        self.tokenizer = None
+    def __init__(
+        self,
+        primary: LLMAdapter,
+        fallback: LLMAdapter,
+        fallback_model_name: str,
+        primary_model_name: str = "",
+        fallback_role: str = "",
+        fallback_levels: tuple = (),
+    ):
+        super().__init__()
+        self._primary = primary
+        self._fallback = fallback
+        self._fallback_model_name = fallback_model_name
+        self._primary_model_name = primary_model_name or "primary"
+        self._fallback_role = fallback_role or "fallback"
+        self._fallback_levels = tuple(fallback_levels or ())
+        self._degraded = False
+        self._role_label = f"quota-fallback({self._primary_model_name})"
+        self.last_reasoning = ""
+        self.last_reasoning_only = False
 
-    def _unload_single_model(self, model, tokenizer, model_name: str):
-        """真正卸载单个模型：解引用 + Metal 缓存清理 + GC"""
-        # 1. 解引用
-        del model
-        del tokenizer
-        # 2. Python GC
-        gc.collect()
-        # 3. Metal 缓存清理（KV Cache、计算图）
-        if hasattr(self.mx.metal, "clear_cache"):
-            self.mx.metal.clear_cache()
-        print(f"🧹 [MLX] 已彻底卸载模型: {model_name}，显存已释放")
+    @property
+    def degraded(self) -> bool:
+        return self._degraded
 
-    def _load_model_if_needed(self, model_name: str):
-        """按需加载，LRU 缓存 + 线程安全 + 自动驱逐
+    def _sync_audit(self, adapter: LLMAdapter) -> None:
+        self.last_reasoning = getattr(adapter, "last_reasoning", "")
+        self.last_reasoning_only = getattr(adapter, "last_reasoning_only", False)
 
-        设计：
-          - 多个 MLXNativeAdapter 实例（每个角色一个）共用同一份 (model, tokenizer)
-          - 首次加载 → 实际 mlx_load；缓存命中 → 直接复用并更新 LRU
-          - 超过 _MAX_CACHED_MODELS 时驱逐最久未使用的模型（真正释放显存）
-        """
-        with self._cache_lock:
-            # 缓存命中：更新 LRU 顺序（移到末尾）
-            if model_name in self._shared_models:
-                self._shared_models.move_to_end(model_name)
-                print(f"♻️  [MLX] 复用共享缓存: {model_name}（LRU 刷新）")
-            else:
-                # 驱逐最旧模型（如果超过限制）
-                while len(self._shared_models) >= self._MAX_CACHED_MODELS:
-                    oldest_name, (old_model, old_tok) = self._shared_models.popitem(last=False)
-                    print(f"🗑️ [MLX] 缓存满，驱逐最旧模型: {oldest_name}")
-                    self._unload_single_model(old_model, old_tok, oldest_name)
-
-                # 加载新模型
-                print(f"🚀 [MLX] 正在将模型加载至 Apple Silicon 统一内存: {model_name}...")
-                self._shared_models[model_name] = self.mlx_load(model_name)
-
-            # 绑定到当前实例
-            self.model, self.tokenizer = self._shared_models[model_name]
-            self.current_model_name = model_name
-
-    def generate(self, prompt: str, model_name: str, max_tokens: int = 2048, temperature: float = 0.3, **kwargs) -> str:
-        # 线程安全的加载/驱逐
-        self._load_model_if_needed(model_name)
-
-        # 组装聊天模板
-        if hasattr(self.tokenizer, "apply_chat_template"):
-            messages = [{"role": "user", "content": prompt}]
-            enable_thinking = kwargs.get("enable_thinking", False)
+    def generate(self, prompt: str, model_name: str, max_tokens: int = 2048,
+                 temperature: float = 0.3, **kwargs) -> str:
+        if not self._degraded:
             try:
-                formatted_prompt = self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True,
-                    enable_thinking=enable_thinking,
+                out = self._primary.generate(
+                    prompt=prompt, model_name=model_name,
+                    max_tokens=max_tokens, temperature=temperature, **kwargs,
                 )
-            except TypeError:
-                # tokenizer 不支持 enable_thinking（如标准 Qwen/Gemma），回退
-                formatted_prompt = self.tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=True,
+                self._sync_audit(self._primary)
+                return out
+            except QuotaExhaustedError as e:
+                self._degraded = True
+                print(
+                    f"⛔ [Quota Fallback] {self._primary_model_name} 配额/限流耗尽 → "
+                    f"永久降级到 {self._fallback_model_name}（role={self._fallback_role}；"
+                    f"配额重置后重启进程恢复主力） | {e}",
+                    file=sys.stderr, flush=True,
                 )
-        else:
-            formatted_prompt = prompt
-
-        # 性能计时
-        start_time = time.time()
-        mem_before = self.get_memory_usage()
-
-        # MLX 生成调用
-        sampler = self.make_sampler(temp=temperature)
-        response = self.mlx_generate(
-            self.model,
-            self.tokenizer,
-            prompt=formatted_prompt,
-            max_tokens=max_tokens,
-            verbose=False,
-            sampler=sampler,
+        kwargs = dict(kwargs)
+        if kwargs.get("effort") and self._fallback_levels:
+            kwargs["effort"] = _map_effort_for_fallback(str(kwargs["effort"]), self._fallback_levels)
+            if kwargs["effort"] is None:
+                kwargs.pop("effort", None)
+        out = self._fallback.generate(
+            prompt=prompt, model_name=self._fallback_model_name,
+            max_tokens=max_tokens, temperature=temperature, **kwargs,
         )
+        self._sync_audit(self._fallback)
+        return out
 
-        # 性能统计
-        elapsed_ms = (time.time() - start_time) * 1000
-        mem_after = self.get_memory_usage()
-
-        # Round 27: tokenizer 真实 token 数（prompt + completion）
-        try:
-            prompt_tokens = len(self.tokenizer.encode(formatted_prompt))
-            completion_tokens = len(self.tokenizer.encode(response))
-        except Exception:
-            prompt_tokens = len(formatted_prompt) // 4
-            completion_tokens = len(response) // 4
-
-        print(f"📊 [MLX Perf] 耗时: {elapsed_ms:.0f}ms, "
-              f"内存: {mem_before['rss_gb']:.2f}GB -> {mem_after['rss_gb']:.2f}GB, "
-              f"约 {completion_tokens} tokens, "
-              f"{completion_tokens / (elapsed_ms/1000):.1f} tok/s")
-
-        # Round 27: 累积 token 用量（与 OpenAI adapter 统一口径）
-        self.record_usage(prompt_tokens, completion_tokens)
-
-        return response
+    def get_cumulative_usage(self) -> Dict[str, int]:
+        a = self._primary.get_cumulative_usage()
+        b = self._fallback.get_cumulative_usage()
+        return {k: int(a.get(k, 0)) + int(b.get(k, 0))
+                for k in ("prompt_tokens", "completion_tokens", "total_tokens", "calls")}
 
     def unload_model(self):
-        """M1 环境下至关重要的显存清理操作
-
-        从共享缓存中真正移除当前模型（若无其他实例引用），释放 Metal 显存。
-        """
-        with self._cache_lock:
-            if self.current_model_name and self.current_model_name in self._shared_models:
-                model, tokenizer = self._shared_models.pop(self.current_model_name)
-                print(f"🧹 [MLX] 从共享缓存移除: {self.current_model_name}")
-                self._unload_single_model(model, tokenizer, self.current_model_name)
-            else:
-                print(f"ℹ️ [MLX] 当前模型 {self.current_model_name} 不在共享缓存中或已被驱逐")
-
-        self.model = None
-        self.tokenizer = None
-        self.current_model_name = None
-
-        # 兜底：再次 GC + Metal 清理
-        gc.collect()
-        if hasattr(self.mx.metal, "clear_cache"):
-            self.mx.metal.clear_cache()
-
-        print("✅ [MLX] Metal 缓存已清空，显存已释放。")
-
-    @classmethod
-    def set_max_cached_models(cls, max_models: int):
-        """运行时调整最大缓存模型数（配置热加载用）。
-
-        用于在内存受限环境（如 16GB M1）下动态收缩 LRU 缓存上限。修改后会
-        立即驱逐多余的最久未使用模型（解引用 + GC + Metal cache 清理）。
-
-        Args:
-            max_models: 新的最大缓存模型数（会被钳制到 ≥ 1）。
-
-        Example:
-            >>> MLXNativeAdapter.set_max_cached_models(1)  # 强制单模型缓存
-        """
-        with cls._cache_lock:
-            cls._MAX_CACHED_MODELS = max(1, max_models)
-            # 如果当前缓存超过新限制，驱逐多余
-            while len(cls._shared_models) > cls._MAX_CACHED_MODELS:
-                oldest_name, (old_model, old_tok) = cls._shared_models.popitem(last=False)
-                print(f"🗑️ [MLX] 配置变更驱逐: {oldest_name}")
-                # 静态清理：del + gc + Metal cache
-                del old_model, old_tok
-                gc.collect()
-                # Metal cache 清理需要 mlx.core 单例，用 try 兜底
-                try:
-                    import mlx.core as mx
-                    if hasattr(mx, 'metal') and hasattr(mx.metal, 'clear_cache'):
-                        mx.metal.clear_cache()
-                except (ImportError, AttributeError):
-                    pass
+        try:
+            self._primary.unload_model()
+        finally:
+            self._fallback.unload_model()
 
 
 
-def _build_role_client(role_cfg: Dict[str, Any]) -> LLMAdapter:
+def _map_effort_for_fallback(effort: str, levels: tuple) -> Optional[str]:
+    """Round 129: 降级时的 effort 跨家映射（就近取更强档）；无法安全映射则不下发。"""
+    eff = str(effort or "").strip().lower()
+    if not eff:
+        return None
+    if not levels:
+        return eff
+    if eff in levels:
+        return eff
+    alias = {"medium": "high", "minimal": "low", "off": "none"}
+    cand = alias.get(eff, eff)
+    return cand if cand in levels else None
+
+
+def _fallback_levels_for(api_base: str, model_name: str) -> tuple:
+    """推断 fallback 目标的合法档位集合（供降级映射用；失败时返回空=原样透传）。"""
+    try:
+        from src.config import EFFORT_LEVELS_BY_PROVIDER, effort_provider_of
+        provider = effort_provider_of(model_name, api_base)
+        return EFFORT_LEVELS_BY_PROVIDER.get(provider, ()) if provider else ()
+    except Exception:
+        return ()
+
+
+def _build_single_client(role_cfg: Dict[str, Any]) -> LLMAdapter:
+    """构建单一角色的底层适配器（不含 fallback 包装）。"""
     backend = role_cfg.get("backend", "mock")
     if backend == "mock":
         return MockLLMAdapter()
-    if backend == "mlx":
-        return MLXNativeAdapter()
     if backend in ("openai_api", "ollama", "nim", "mistral", "custom"):
         section = _config.openai_api if hasattr(_config, "openai_api") else {}
         # P4-8: 优先读 role_cfg 内的 per-role 超时配置，回退全局 openai_api
@@ -951,6 +913,35 @@ def _build_role_client(role_cfg: Dict[str, Any]) -> LLMAdapter:
     raise ValueError(f"不支持的 backend: {backend}")
 
 
+def _build_role_client(role_cfg: Dict[str, Any]) -> LLMAdapter:
+    """构建角色客户端；配置了 `fallback_role` 时套配额降级包装器（Round 129）。
+
+    fallback 目标须为普通角色（自身无 fallback_role，避免链式递归）；mock 后端跳过。
+    """
+    client = _build_single_client(role_cfg)
+    fb_role = str(role_cfg.get("fallback_role") or "").strip()
+    if not fb_role:
+        return client
+    try:
+        fb_cfg = _config.get_role_config(fb_role) or {}
+    except Exception as e:
+        print(f"⚠️ [Adapter] fallback 角色 {fb_role} 配置读取失败: {e}", file=sys.stderr)
+        return client
+    if fb_cfg.get("backend", "mock") == "mock" or fb_cfg.get("fallback_role"):
+        return client
+    fb_client = _build_single_client(fb_cfg)
+    return FallbackRoleAdapter(
+        primary=client,
+        fallback=fb_client,
+        fallback_model_name=fb_cfg.get("model_name", ""),
+        primary_model_name=role_cfg.get("model_name", ""),
+        fallback_role=fb_role,
+        fallback_levels=_fallback_levels_for(
+            fb_cfg.get("api_base", ""), fb_cfg.get("model_name", "")
+        ),
+    )
+
+
 def get_llm_client(role: str) -> LLMAdapter:
     """按角色返回 LLM 客户端实例（首次按需构建并缓存）。
 
@@ -961,7 +952,7 @@ def get_llm_client(role: str) -> LLMAdapter:
         stale = [k for k, v in _client_instances.items() if not isinstance(v, MockLLMAdapter)]
         for k in stale:
             del _client_instances[k]
-        role_cfg = {"backend": "mock", "default_params": {}, "extra_body": {}}
+        role_cfg = {"backend": "mock", "default_params": {}}
         if role not in _client_instances:
             _client_instances[role] = _build_role_client(role_cfg)
         return _client_instances[role]
@@ -978,14 +969,20 @@ def get_llm_client_for_task(task_name: str) -> LLMAdapter:
 
 def get_role_model_name(role: str) -> str:
     cfg = _config.get_role_config(role)
-    return cfg.get("model_id") or cfg.get("model_name", "")
+    return cfg.get("model_name", "")
 
 
-def get_role_extra_body(role: str) -> Dict[str, Any]:
-    """读取角色配置中的 extra_body（供应商特有参数）；无则返回空 dict。"""
+def get_task_extra_body(task_name: str) -> Dict[str, Any]:
+    """读取任务级 extra_body（供应商特有透传参数）；无则返回空 dict。
+
+    Round 127: 配置位置从模型级迁到任务级 —— 规范位置
+    `task_routing.<task>.extra_body`；兼容 `params_override.extra_body`。
+    """
     try:
-        cfg = _config.get_role_config(role) or {}
-        body = cfg.get("extra_body") or {}
+        routing = (_config.task_routing or {}).get(task_name, {}) or {}
+        body = routing.get("extra_body")
+        if body is None:
+            body = (routing.get("params_override") or {}).get("extra_body")
         return dict(body) if isinstance(body, dict) else {}
     except Exception:
         return {}
@@ -1011,35 +1008,6 @@ VALID_TRANSITIONS = {
     TaskState.JUDGING:          [TaskState.COMPLETED, TaskState.REWRITING_LITERARY, TaskState.FAILED, TaskState.PERMANENTLY_FAILED],
     TaskState.COMPLETED:        [TaskState.DIRTY],
 }
-
-# T3：回溯触发精度 — 词边界精筛正则。
-# （双落点镜像：src/core/scheduler.py 同函数逐字一致，tests/test_round119_mirror_parity.py 守）
-def _source_term_pattern(source_text: str):
-    """构造「词边界」精筛正则（回溯触发精度）。
-
-    - 仅字母参与边界（(?<![A-Za-z])/(?![A-Za-z])），避免 "well" 命中
-      "dwelling"/"farewell" 之类子串；数字/CJK 不设边界（保护 "1984"、
-      中文短语）。
-    - 连字符与空白视作可互换分隔（变形容差：tea-party ≈ tea party）。
-    - 大小写不敏感（源文大小写与决策条目常不一致）。
-    - 大小写敏感：决策条目按原文摘录，大小写即语义（"Time" 不应命中
-      任意小写 time；小写子串型伪匹配已由字母边界拦截）。唯一放宽：
-      小写首字母词容忍句首大写（"please your Majesty" ≈ "Please ..."），
-      仅放宽首字符、词内其余字符仍严格。
-    返回 None 表示归一后为空。
-    """
-    norm = re.sub(r'\s+', ' ', (source_text or '').strip())
-    raw_parts = [p for p in re.split(r'[\s\-]+', norm) if p]
-    if not raw_parts:
-        return None
-    parts = [re.escape(p) for p in raw_parts]
-    head = raw_parts[0][:1]
-    if head.isalpha() and head.islower():
-        parts[0] = (f'[{re.escape(head)}{re.escape(head.upper())}]'
-                    f'{re.escape(raw_parts[0][1:])}')
-    body = r'[\s\-]+'.join(parts)
-    return re.compile(rf'(?<![A-Za-z]){body}(?![A-Za-z])')
-
 
 
 class TaskScheduler:
@@ -1079,6 +1047,20 @@ class TaskScheduler:
         # 存量数据库兼容迁移
         try:
             cursor.execute('ALTER TABLE chunk_tasks ADD COLUMN quality_retries INTEGER DEFAULT 0')
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        # Round 130: 治理计数列（跨 episode 累计回溯轮数，不随质量计数清零）
+        try:
+            cursor.execute('ALTER TABLE chunk_tasks ADD COLUMN backtrack_rounds INTEGER DEFAULT 0')
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+        # Round 133: 重试适配 override 列（no_content 签名 → 降档/换角救稿，按块持久化 JSON）
+        try:
+            cursor.execute('ALTER TABLE chunk_tasks ADD COLUMN retry_effort_overrides TEXT')
             self.conn.commit()
         except sqlite3.OperationalError:
             pass
@@ -1127,7 +1109,8 @@ class TaskScheduler:
                             state = ?,
                             last_error = NULL,
                             retries = 0,
-                            quality_retries = 0
+                            quality_retries = 0,
+                            retry_effort_overrides = NULL
                     ''', (chunk_id, chapter_id, text, TaskState.PENDING.value, TaskState.PENDING.value))
                 else:
                     cursor.execute('''
@@ -1181,17 +1164,33 @@ class TaskScheduler:
             ''', (state.value, batch_size))
         return [dict(row) for row in cursor.fetchall()]
 
-    def update_task_state(self, chunk_id: str, new_state: TaskState, error_msg: str = None, quality_retry: bool = False):
-        """更新任务状态（含转移合法性校验）"""
+    def update_task_state(self, chunk_id: str, new_state: TaskState, error_msg: str = None,
+                          quality_retry: bool = False, allow_terminal_restore: bool = False):
+        """更新任务状态（含转移合法性校验）。
+
+        Round 124: allow_terminal_restore — 仅 _restore_dirty_backups 使用的例外：
+        回溯重跑失败、恢复旧 final.json 时, PERMANENTLY_FAILED → COMPLETED 是合法
+        语义（保留之前已合格的译文）。此前该转移被合法性校验静默拒绝 → 状态残留 PF,
+        日志却假报 "已恢复…(COMPLETED)"（ch09 run2 曾出现 8 条）。
+
+        Round 130（审计③）: 返回 bool —— True=已按预期更新；False=被拒绝（非法转移，
+        状态未变），调用方可感知，避免日志与状态脱节。
+        """
         cursor = self.conn.cursor()
         cursor.execute('SELECT state FROM chunk_tasks WHERE chunk_id = ?', (chunk_id,))
         row = cursor.fetchone()
         if row:
             from_state = TaskState(row[0])
             allowed = VALID_TRANSITIONS.get(from_state, [])
-            if new_state not in allowed:
-                print(f"⚠️ [Scheduler] 非法转移 {chunk_id}: {row[0]} -> {new_state.value}")
-                return
+            terminal_restore = (
+                allow_terminal_restore
+                and from_state == TaskState.PERMANENTLY_FAILED
+                and new_state == TaskState.COMPLETED
+            )
+            if new_state not in allowed and not terminal_restore:
+                print(f"⚠️ [Scheduler] 非法转移 {chunk_id}: {row[0]} -> {new_state.value}"
+                      f" (允许: {[s.value for s in allowed]})")
+                return False
         if error_msg and quality_retry:
             cursor.execute('''
                 UPDATE chunk_tasks
@@ -1211,6 +1210,58 @@ class TaskScheduler:
                 WHERE chunk_id = ?
             ''', (new_state.value, chunk_id))
         self.conn.commit()
+        return True
+
+    # ────────────────────────────────────────────────────────────────
+    # Round 133: 块级重试适配 override（no_content 签名 → 降档/换角救稿）
+    # payload 例: {"sig":"no_content","stage":"TRANSLATING_RAW","role":"primary",
+    #             "effort":"xhigh","used_role":"primary","used_effort":"max",
+    #             "down_delta":1,"rescue_used":false,"escalated":false,"applied_at":...}
+    # 语义: role/effort = 下一次尝试应使用的角色与档位（apply 侧直接读取）。
+    # ────────────────────────────────────────────────────────────────
+    def get_retry_override(self, chunk_id: str) -> Optional[Dict]:
+        """读取块级重试适配 override（JSON；无记录/列缺失/解析失败 → None）。"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                'SELECT retry_effort_overrides FROM chunk_tasks WHERE chunk_id = ?',
+                (chunk_id,))
+            row = cursor.fetchone()
+        except sqlite3.OperationalError:
+            return None
+        if not row or not row[0]:
+            return None
+        try:
+            data = json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def set_retry_override(self, chunk_id: str, payload: Dict) -> bool:
+        """写块级重试适配 override（JSON 序列化）；返回 True=已更新。"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                'UPDATE chunk_tasks SET retry_effort_overrides = ?, '
+                'updated_at = CURRENT_TIMESTAMP WHERE chunk_id = ?',
+                (json.dumps(payload, ensure_ascii=False), chunk_id))
+            self.conn.commit()
+            return cursor.rowcount > 0
+        except sqlite3.OperationalError:
+            return False
+
+    def clear_retry_override(self, chunk_id: str) -> bool:
+        """清空块级重试适配 override。"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                'UPDATE chunk_tasks SET retry_effort_overrides = NULL, '
+                'updated_at = CURRENT_TIMESTAMP WHERE chunk_id = ?',
+                (chunk_id,))
+            self.conn.commit()
+            return cursor.rowcount > 0
+        except sqlite3.OperationalError:
+            return False
 
     def batch_update_state(self, chunk_ids: List[str], new_state: TaskState, error_msgs: Dict[str, str] = None, quality_retry: bool = False, reset_counters: bool = False):
         """批量更新任务状态 - 减少数据库往返开销
@@ -1221,9 +1272,13 @@ class TaskScheduler:
             error_msgs: 可选，按 chunk_id 分错误信息 {chunk_id: error_msg}
             quality_retry: 是否为质量重试（True=增 quality_retries，False=增 retries）
             reset_counters: 是否重置 retries 和 quality_retries 为 0（用于 DIRTY 回溯后重新计数）
+
+        Returns (Round 130, 审计③):
+            List[str] — 实际被更新的 chunk_id 列表（非法转移/不存在的 chunk 会被跳过，
+            不再无声无息；调用方可据此感知拒绝情况）。
         """
         if not chunk_ids:
-            return
+            return []
         cursor = self.conn.cursor()
         placeholders = ','.join('?' for _ in chunk_ids)
 
@@ -1247,7 +1302,7 @@ class TaskScheduler:
             valid_ids.append(cid)
 
         if not valid_ids:
-            return
+            return []
 
         # 逐条执行以保留各自的 error_msg
         for cid in valid_ids:
@@ -1277,6 +1332,7 @@ class TaskScheduler:
                     WHERE chunk_id = ?
                 ''', (new_state.value, cid))
         self.conn.commit()
+        return valid_ids
 
     def get_all_tasks_by_chapter(self, chapter_id: str) -> List[Dict]:
         """获取章节所有任务"""
@@ -1291,31 +1347,61 @@ class TaskScheduler:
         row = cursor.fetchone()
         return dict(row) if row else None
 
-    def trigger_backtrack(self, chunk_ids: List[str]):
+    def trigger_backtrack(self, chunk_ids: List[str]) -> Dict[str, List[str]]:
         """回溯引擎：仅将已定稿(COMPLETED)的数据块标记为 DIRTY 重跑。
 
         与 VALID_TRANSITIONS 对齐：只允许 COMPLETED -> DIRTY。
         禁止对 JUDGING/AUDITING 等中间态打 DIRTY（否则会阻断 COMPLETED 并可能死循环）。
         尚未产出译文的 PENDING / EXTRACTING_TERMS 等也不回溯——后续阶段会自然读到新决策。
+
+        Round 130 治理预算（防"回溯→重跑→再回溯"自激长跑）：
+        单块累计回溯轮数 backtrack_rounds（跨 episode 持久，不随质量计数清零）达到
+        decision_engine.max_backtrack_rounds_per_chunk 即冻结，不再标记 DIRTY。
+        0 = 不限制（旧行为，向后兼容）。
+
+        Returns:
+            {"dirty": [...], "over_cap": [...], "skipped_state": [...]}
         """
         if not chunk_ids:
-            return
+            return {"dirty": [], "over_cap": [], "skipped_state": []}
+        de_cfg = getattr(_config, "decision_engine", {}) or {}
+        try:
+            cap = int(de_cfg.get("max_backtrack_rounds_per_chunk", 2) or 0)
+        except (TypeError, ValueError):
+            cap = 2
         cursor = self.conn.cursor()
         placeholders = ','.join('?' for _ in chunk_ids)
-        # 仅 COMPLETED 可进入 DIRTY，与 VALID_TRANSITIONS[COMPLETED] 一致
         cursor.execute(f'''
-            UPDATE chunk_tasks
-            SET state = ?, updated_at = CURRENT_TIMESTAMP
-            WHERE chunk_id IN ({placeholders})
-            AND state = ?
-        ''', (TaskState.DIRTY.value,) + tuple(chunk_ids) + (TaskState.COMPLETED.value,))
+            SELECT chunk_id, state, COALESCE(backtrack_rounds, 0)
+            FROM chunk_tasks WHERE chunk_id IN ({placeholders})
+        ''', tuple(chunk_ids))
+        dirty: List[str] = []
+        over_cap: List[str] = []
+        skipped_state: List[str] = []
+        for cid, state, rounds in cursor.fetchall():
+            if state != TaskState.COMPLETED.value:
+                skipped_state.append(cid)
+                continue
+            if cap > 0 and int(rounds or 0) >= cap:
+                over_cap.append(cid)
+                continue
+            dirty.append(cid)
+        if dirty:
+            ph2 = ','.join('?' for _ in dirty)
+            cursor.execute(f'''
+                UPDATE chunk_tasks
+                SET state = ?, backtrack_rounds = COALESCE(backtrack_rounds, 0) + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chunk_id IN ({ph2})
+            ''', (TaskState.DIRTY.value,) + tuple(dirty))
         self.conn.commit()
-        updated = cursor.rowcount
-        skipped = len(chunk_ids) - updated
-        msg = f"🔄 已触发 {updated} 个数据块的回溯重构（标记 DIRTY）"
-        if skipped > 0:
-            msg += f"（跳过 {skipped} 个非 COMPLETED 状态）"
+        msg = f"🔄 已触发 {len(dirty)} 个数据块的回溯重构（标记 DIRTY）"
+        if skipped_state:
+            msg += f"（跳过 {len(skipped_state)} 个非 COMPLETED 状态）"
+        if over_cap:
+            msg += f"（治理冻结 {len(over_cap)} 个超单块预算）"
         print(msg + "。")
+        return {"dirty": dirty, "over_cap": over_cap, "skipped_state": skipped_state}
 
     def find_chunks_containing(
         self,
@@ -1398,10 +1484,7 @@ class TaskScheduler:
 # Section 4 — Decision Engine 决策引擎
 # ────────────────────────────────────────────────────────────────────
 
-# P1-4: 作品特定实体异体种子已从代码外移 — 默认空。
-# 读取顺序：config.yaml `entity_variants` 段优先（可为空/可覆盖）；为空时回退
-# per-work 作品资源文件 input/entity_variants.yaml（可选）。
-SEED_ENTITY_VARIANTS: Dict[str, List[str]] = {}
+
 
 
 class DecisionEngine:
@@ -1483,6 +1566,19 @@ class DecisionEngine:
         except Exception:
             self.conn.execute("ALTER TABLE decision_db ADD COLUMN locked INTEGER DEFAULT 0")
 
+        # Round 130: deferred 回溯队列 — 决策变更先登记，章末合并应用一次
+        # （防"决策翻转→回溯已完成块→重跑再翻转"自激长跑；同一 chunk 幂等合并）
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS pending_backtrack (
+                chunk_id TEXT PRIMARY KEY,
+                decision_id INTEGER,
+                source_key TEXT,
+                queue_rounds INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         self.conn.commit()
 
         # 种子：将已知中文异体登记进 entity_registry（幂等，仅合并不覆盖）
@@ -1524,6 +1620,9 @@ class DecisionEngine:
 
         幂等：同一 source_key 且 translation 未变时不触发 backtrack。
         STYLE 默认不回溯（见 style_triggers_backtrack）；即使开启也不得依赖「当前 JUDGING chunk」。
+
+        Round 130: backtrack_mode=deferred（默认）时，变更不再即时标记 DIRTY，
+        而是登记进 pending_backtrack 队列，由 pipeline 在章末（队列清空点）合并应用一次。
         """
         cursor = self.conn.cursor()
         try:
@@ -1601,7 +1700,11 @@ class DecisionEngine:
                         f"截断为 max_affected_chunks_per_decision={max_affected}"
                     )
                     chunks_to_dirty = sorted(chunks_to_dirty)[:max_affected]
-                self._trigger_backtrack(chunks_to_dirty)
+                backtrack_mode = str(de_cfg.get("backtrack_mode", "deferred") or "deferred").lower()
+                if backtrack_mode == "immediate":
+                    self._trigger_backtrack(chunks_to_dirty)
+                else:
+                    self._queue_backtrack(chunks_to_dirty, decision_id, source)
         except Exception as e:
             print(f"❌ 决策写入失败: {e}")
             raise
@@ -1616,6 +1719,55 @@ class DecisionEngine:
         except Exception as e:
             # 回溯失败是跨库一致性事件，不应静默吞掉
             raise RuntimeError(f"回溯触发失败，Decision DB 与 Workflow DB 可能不一致: {e}") from e
+
+    def _queue_backtrack(self, chunk_ids: List[str], decision_id: Optional[int], source_key: str):
+        """Round 130 deferred 模式：把受影响 chunk 登记进待回溯队列（幂等合并）。
+
+        队列由 pipeline 在章末合并点经 take_pending_backtracks 取出后统一应用；
+        同一 chunk 多次命中只保留一行并累计 queue_rounds，避免重复重跑。
+        """
+        if not chunk_ids:
+            return
+        cursor = self.conn.cursor()
+        cursor.executemany('''
+            INSERT INTO pending_backtrack (chunk_id, decision_id, source_key, queue_rounds, updated_at)
+            VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
+            ON CONFLICT(chunk_id) DO UPDATE SET
+                decision_id = excluded.decision_id,
+                source_key = excluded.source_key,
+                queue_rounds = COALESCE(queue_rounds, 0) + 1,
+                updated_at = CURRENT_TIMESTAMP
+        ''', [(cid, decision_id, source_key) for cid in chunk_ids])
+        self.conn.commit()
+        print(f"⏳ [Backtrack Queue] 登记 {len(chunk_ids)} 个待回溯 chunk（章末合并应用）: {source_key[:40]}")
+
+    def take_pending_backtracks(self, chunk_ids: List[str]) -> List[Dict[str, Any]]:
+        """取出并删除指定 chunk 的待回溯登记（章末合并应用点调用）。
+
+        Returns: [{"chunk_id", "decision_id", "source_key", "queue_rounds"}, ...]
+        """
+        if not chunk_ids:
+            return []
+        cur = self.conn.cursor()
+        ph = ','.join('?' for _ in chunk_ids)
+        rows = cur.execute(
+            f'SELECT chunk_id, decision_id, source_key, COALESCE(queue_rounds, 0) AS queue_rounds '
+            f'FROM pending_backtrack WHERE chunk_id IN ({ph})',
+            tuple(chunk_ids)).fetchall()
+        if rows:
+            cur.execute(f'DELETE FROM pending_backtrack WHERE chunk_id IN ({ph})', tuple(chunk_ids))
+            self.conn.commit()
+        return [dict(r) for r in rows]
+
+    def count_pending_backtracks(self, chunk_ids: Optional[List[str]] = None) -> int:
+        """统计待回溯登记数（可限定 chunk 列表；None=全库）。"""
+        cur = self.conn.cursor()
+        if chunk_ids:
+            ph = ','.join('?' for _ in chunk_ids)
+            return int(cur.execute(
+                f'SELECT COUNT(*) FROM pending_backtrack WHERE chunk_id IN ({ph})',
+                tuple(chunk_ids)).fetchone()[0])
+        return int(cur.execute('SELECT COUNT(*) FROM pending_backtrack').fetchone()[0])
 
     def get_all_decisions(self):
         """为 Agent 提供 Prompt 上下文（全量；优先用 format_prompt_context）"""
@@ -1816,127 +1968,6 @@ def detect_cross_person_conflicts(conn) -> Dict[str, List[str]]:
     return {sn: sorted(cs) for sn, cs in siblings.items() if len(cs) >= 2}
 
 
-_CONF_ORDER = {"high": 0, "medium": 1, "low": 2}
-
-
-def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
-    """Round 105 P2-2: 归一 entity_registry 中「同人多规范名」冲突（镜像 src/core/decision_engine.py）。
-
-    按共享专名 source_name（含大写字母）聚类，每簇选 winner（confidence → 去括注
-    base 长度 → 更早 created_at → 字典序），其余 pending_review=0 成员降级为 1。
-    dry_run=True 仅返回计划。
-    """
-    import json as _json
-    import re as _re_u
-
-    cursor = conn.cursor()
-    cursor.execute(
-        "SELECT id, canonical_name, source_names, confidence, created_at, pending_review "
-        "FROM entity_registry"
-    )
-    rows = cursor.fetchall()
-
-    canon_srcs: Dict[str, set] = {}
-    meta: Dict[str, dict] = {}
-    for rid, canon, srcs_json, conf, created, pending in rows:
-        try:
-            srcs = _json.loads(srcs_json) if srcs_json else []
-        except (ValueError, TypeError):
-            srcs = []
-        specific = {
-            s for s in srcs
-            if isinstance(s, str) and s and any(ch.isupper() for ch in s)
-        }
-        canon_srcs.setdefault(canon, set()).update(specific)
-        meta[canon] = {
-            "id": rid, "confidence": conf or "low",
-            "created": created or "", "pending": pending or 0,
-        }
-
-    parent = {c: c for c in canon_srcs}
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    canons = list(canon_srcs)
-    for i in range(len(canons)):
-        for j in range(i + 1, len(canons)):
-            if canon_srcs[canons[i]] & canon_srcs[canons[j]]:
-                union(canons[i], canons[j])
-
-    clusters: Dict[str, list] = {}
-    for c in canons:
-        clusters.setdefault(find(c), []).append(c)
-
-    def _base_len(c):
-        return len(_re_u.sub(r"（[^）]*）|\([^)]*\)", "", c).strip())
-
-    plan: Dict[str, Dict] = {}
-    for root, members in clusters.items():
-        if len(members) < 2:
-            continue
-        def _key(c):
-            m = meta[c]
-            return (
-                _CONF_ORDER.get(m["confidence"], 3),
-                -_base_len(c),
-                m["created"],
-                c,
-            )
-        members_sorted = sorted(members, key=_key)
-        winner = members_sorted[0]
-        demoted = [c for c in members_sorted[1:] if meta[c]["pending"] == 0]
-        if not demoted:
-            continue
-        plan[" / ".join(sorted(members))] = {"winner": winner, "demoted": demoted}
-        if not dry_run:
-            for c in demoted:
-                cursor.execute(
-                    "UPDATE entity_registry SET pending_review = 1, "
-                    "review_reason = 'Round105 unify: 同人多规范名降级 (winner=' || ? || ')' "
-                    "WHERE id = ? AND pending_review = 0",
-                    (winner, meta[c]["id"]),
-                )
-    if not dry_run:
-        conn.commit()
-    return plan
-
-
-def load_entity_variant_seeds() -> Dict[str, List[str]]:
-    """P1-4 读取器：config 段优先，为空回退 per-work 资源文件（缺失 = 无种子）。"""
-    try:
-        cfg_variants = getattr(_config, "entity_variants", None)
-    except Exception:
-        cfg_variants = None
-    if not (isinstance(cfg_variants, dict) and cfg_variants):
-        try:
-            from src.config import get_config as _get_cfg
-            cfg_variants = getattr(_get_cfg(), "entity_variants", None)
-        except Exception:
-            cfg_variants = None
-    if isinstance(cfg_variants, dict) and cfg_variants:
-        return cfg_variants
-    try:
-        from pathlib import Path
-        import yaml as _yaml
-        seed_path = Path("input/entity_variants.yaml")
-        if seed_path.exists():
-            data = _yaml.safe_load(seed_path.read_text(encoding="utf-8")) or {}
-            if isinstance(data, dict):
-                return {str(k): list(v or []) for k, v in data.items()}
-    except Exception:
-        pass
-    return {}
-
-
 def seed_entity_variants(conn, variants: Optional[Dict[str, List[str]]] = None):
     """将 per-work 实体异体种子合并进 entity_registry.variant_names（幂等，不覆盖既有异体）。
 
@@ -2132,24 +2163,6 @@ def case_insensitive_find(name: str, haystack: Optional[str]) -> Optional[str]:
 _text_match_case_insensitive_find = case_insensitive_find
 
 
-def entity_source_name_in_text(source_name: Optional[str], source_text: Optional[str]) -> bool:
-    """Round 114: source_name 是否以"词/短语边界"形式出现在原文中（而非裸子串）。
-
-    ch30 chunk000 根因: 实体 "伯特"←"Bert" 因原文 "Bertillon measurements" 含子串
-    "Bert" 被误判"实体在场" → 实体核查要求译文出现「伯特」→ 不可满足 → 实体硬失败
-    → rewriter 停滞 → PERMANENTLY_FAILED。同类: "Europe"⊂"European"、
-    "Herzoslovakia"⊂"Herzoslovakian"、"drawing-room"⊂"drawing-rooms"。
-
-    用 Unicode 字母 lookaround（而非 \\b）：兼容以标点结尾的短语（"Mr."/"H. I."）；
-    所有格/连字符形式（"Bert's"/"Bert—"）仍视为在场。大小写敏感（英文原文与登记表
-    形式一致）。与散装 src/utils/text_match.py 同步。
-    """
-    if not source_name or not source_text:
-        return False
-    pattern = r"(?<![^\W\d_])" + re.escape(source_name) + r"(?![^\W\d_])"
-    return re.search(pattern, source_text) is not None
-
-
 
 
 
@@ -2292,7 +2305,6 @@ Schema 如下：
             print(f"⚠️ [Reference Agent] 两阶段确认不可用（保留召回结果）: {e}", file=sys.stderr)
             return None
         model_name = get_role_model_name(role) or model_key
-        extra_body = get_role_extra_body(role)
         max_chars = int(cfg.get("max_recall_chars", 12000))
         recall_json = json.dumps(recall_data, ensure_ascii=False, indent=2)[:max_chars]
         prompt = f"""你是资深文学考据复核员（第二意见）。另一位考据员已对片段做「高召回」初筛，你的任务是复核并定稿。
@@ -2318,7 +2330,6 @@ Schema 如下：
                 prompt=prompt,
                 model_name=model_name,
                 **params,
-                extra_body=extra_body,
             )
         except Exception as e:
             print(
@@ -2351,13 +2362,11 @@ Schema 如下：
         prompt = self._build_prompt(text_chunk)
         model_key, params = _config.resolve_task_model("reference_extraction")
         model_name = get_role_model_name(self.role) or model_key
-        extra_body = get_role_extra_body(self.role)
 
         raw_output = self.llm.generate(
             prompt=prompt,
             model_name=model_name,
             **params,
-            extra_body=extra_body,
         )
 
         # 2. 解析 JSON
@@ -3223,6 +3232,7 @@ class LiteraryRewriterAgent:
         skipped_dimensions: Optional[List[str]] = None,
         verse_note: Optional[str] = None,  # Round 119 L1 韵文协议
         model_role: Optional[str] = None,  # Round 116: 停滞换模型覆盖角色
+        model_effort: Optional[str] = None,  # Round 129: 换模型时覆盖 effort（如 primary→max）
     ):
         print(f"✍️ [Rewriter Agent] 正在进行文学润色: {chunk_id} (retry={retry_count})...")
 
@@ -3231,7 +3241,8 @@ class LiteraryRewriterAgent:
         # N 方案：章节级 register 目标，作为 retry 的方向锚点
         register_target = self._infer_register_target(source_text) if source_text else ""
 
-        # Round 116: 停滞换模型 — 本次调用可覆盖角色（客户端/模型名/extra_body 随之切换）
+        # Round 116: 停滞换模型 — 本次调用可覆盖角色（客户端/模型名随之切换；
+        # Round 127: extra_body 为任务级配置，不随角色变化）
         llm = self.llm
         role = self.role
         if model_role and model_role != role:
@@ -3240,6 +3251,9 @@ class LiteraryRewriterAgent:
 
         # 使用配置路由：literary_rewrite（先于 temperature 计算，确保 base 从 config 读取）
         model_key, params = _config.resolve_task_model("literary_rewrite")
+        # Round 129: 停滞换模型/双稿第二稿切到更强模型时，按调用方要求加档
+        if model_effort:
+            params["effort"] = str(model_effort).strip().lower()
         model_name = get_role_model_name(role) or model_key
         base_temp = params.get("temperature", 0.3)
 
@@ -3275,13 +3289,11 @@ class LiteraryRewriterAgent:
 
         # 覆盖 temperature（用计算后的值替换 params 中的配置值）
         params = {**params, "temperature": temperature}
-        extra_body = get_role_extra_body(role)
 
         final_markdown = llm.generate(
             prompt=prompt,
             model_name=model_name,
             **params,
-            extra_body=extra_body,
         )
 
         # 解析自评 JSON（仅 retry 轮）
@@ -3462,29 +3474,14 @@ Schema 要求：
             try:
                 if isinstance(backend, FallbackBackend):
                     # 探测：哪个 backend 能用（A6 修复：异常不再静默吞，分类记录）
-                    if backend.primary.api_key:
-                        def _classify_backend_error(exc: Exception) -> Dict[str, Any]:
-                            msg = str(exc).lower()
-                            err_str = repr(exc).lower()
-                            combined = f"{msg} {err_str}"
-                            if any(k in combined for k in ("429", "rate limit", "rate_limit", "quota", "too many requests")):
-                                return {"category": "rate_limit", "retryable": True, "msg": str(exc)[:200], "action": "wait or upgrade quota"}
-                            if any(k in combined for k in ("timeout", "timed out", "connection reset", "connection aborted")):
-                                return {"category": "timeout", "retryable": True, "msg": str(exc)[:200], "action": "increase timeout or retry"}
-                            if any(k in combined for k in ("json", "decode", "parse", "invalid response", "malformed")):
-                                return {"category": "parse", "retryable": False, "msg": str(exc)[:200], "action": "check response format"}
-                            if any(k in combined for k in ("401", "403", "unauthorized", "forbidden", "api key", "invalid api","authentication")):
-                                return {"category": "auth", "retryable": False, "msg": str(exc)[:200], "action": "check TYPESAFE_API_KEY"}
-                            if any(k in combined for k in ("500", "502", "503", "504", "internal server", "bad gateway", "service unavailable")):
-                                return {"category": "server", "retryable": True, "msg": str(exc)[:200], "action": "check typesafe status page"}
-                            if any(k in combined for k in ("connection", "dns", "network", "unreachable", "ssl", "certificate")):
-                                return {"category": "network", "retryable": True, "msg": str(exc)[:200], "action": "check DNS/firewall/cert"}
-                            return {"category": "unknown", "retryable": True, "msg": str(exc)[:200], "action": "inspect stack trace"}
+                    if backend.primary.api_key and not getattr(backend, "_jev_auth_dead", False):
                         try:
                             answers = backend.primary.evaluate(state, questions, timeout=backend.timeout)
                             backend_path = "jev"
                         except Exception as e_jev:
                             backend_diagnostics["jev"] = _classify_backend_error(e_jev)
+                            if type(e_jev).__name__ == "TypeSafeAuthenticationError":
+                                backend._jev_auth_dead = True
                     if not answers and backend.allow_openai_fallback:
                         try:
                             answers = backend.fallback.evaluate(state, questions, timeout=backend.timeout)
@@ -3570,7 +3567,9 @@ Schema 要求：
         except Exception as e:
             # A6: 把异常分类后写入 stderr + 不再静默吞
             diag = _classify_backend_error(e)
-            print(f"⚠️ [Jev] typesafe 路径失败 [{diag["category"]}]: {diag["msg"]} → {diag["action"]}", file=sys.stderr)
+            # Round 130: 内层引号用单引号——f-string 内嵌套同类引号需 PEP 701（3.12+），
+            # README 声明支持 >=3.10，此处曾致 3.10 生产解释器全库 SyntaxError。
+            print(f"⚠️ [Jev] typesafe 路径失败 [{diag['category']}]: {diag['msg']} → {diag['action']}", file=sys.stderr)
 
         # ───── 旧 LLM 路径（fallback） ─────
         print(f"🧐 [Critic Agent] 正在对 {chunk_id} 进行多维度文学审计...")
@@ -3578,13 +3577,11 @@ Schema 要求：
 
         model_key, params = _config.resolve_task_model("critic_scoring")
         model_name = get_role_model_name(self.role) or model_key
-        extra_body = get_role_extra_body(self.role)
 
         raw_output = self.llm.generate(
             prompt=prompt,
             model_name=model_name,
             **params,
-            extra_body=extra_body,
         )
 
         result = robust_json_loads(raw_output)
@@ -3682,12 +3679,11 @@ class JudgeAgent:
 3. 最多 {max_edits} 条；不要输出 JSON 以外的任何文字。"""
         model_key, params = _config.resolve_task_model("judge_decision")
         model_name = get_role_model_name(self.role) or model_key
-        extra_body = get_role_extra_body(self.role)
         params = dict(params)
         params["temperature"] = float(cfg.get("temperature", 0.2))
         try:
             raw = self.llm.generate(
-                prompt=prompt, model_name=model_name, **params, extra_body=extra_body,
+                prompt=prompt, model_name=model_name, **params,
             )
             data = robust_json_loads(raw)
             if not isinstance(data, dict):
@@ -3725,7 +3721,7 @@ class JudgeAgent:
 
     def _build_prompt(self, source_text: str, lit_trans: str, critic_report: dict, rewriter_self_review: Optional[list] = None, verse_note: Optional[str] = None) -> str:
         # P0: 将 critic_thresholds 注入为参考阈值（非硬性否决条件）
-        thresholds = _config.critic_thresholds
+        thresholds = _config.critic_thresholds_for_book()
         thresholds_lines = "\n".join(
             f"  - {dim}: 参考阈值 {v}"
             for dim, v in thresholds.items() if dim != "average_score_min"
@@ -3892,13 +3888,11 @@ reject_reason 中说明具体位置与改法。
 
         model_key, params = _config.resolve_task_model("judge_decision")
         model_name = get_role_model_name(self.role) or model_key
-        extra_body = get_role_extra_body(self.role)
 
         raw_output = self.llm.generate(
             prompt=prompt,
             model_name=model_name,
             **params,
-            extra_body=extra_body,
         )
 
         result = robust_json_loads(raw_output)
@@ -4053,21 +4047,24 @@ class TranslationPipeline:
 
     # Round 92: 最佳文学稿追踪 + fallback 选择
     # Round 100 P2: 实例方法 (非 staticmethod), 因为需要访问 self._avg_score_cache
-    # Round 103 P7: 改为 classmethod, 兼容测试
+    # Round 103 P1: 改为 classmethod, 兼容测试
     # `TranslationPipeline._compute_avg_score(cr)` (无 self) 调用.
     # 实例方法 `self._compute_avg_score(cr)` 也工作 (Python 自动传 cls=self).
     #
-    # Round 103 P3 (src/pipeline.py): 删除 Round 100 P2 的 id() 缓存. 原设计假设
-    # id() 在 critic_report 生命周期内稳定, 但 CPython dict GC 后可复用 id() —
-    # 实测导致 test_round93_score_decline_early_termination::test_zero_filtered_at_update_time
-    # 出现 [7.0, 7.0] 而非 [7.0, 6.0]. avg 计算本身 O(6) sum/len, 微秒级,
-    # 不值得为 correctness 引入风险. 这里同步移除 id() 缓存.
+    # Round 103 P3: 删除 Round 100 P2 的 id() 缓存. 原设计假设 id() 在
+    # critic_report 生命周期内稳定, 但 CPython 在 dict 被 GC 后可复用 id() —
+    # 实测导致测试 test_zero_filtered_at_update_time 出现 [7.0, 7.0] 而非
+    # [7.0, 6.0] 的 bug. avg 计算本身是 O(6) sum/len, 微秒级, 不值得为它
+    # 引入 id() 缓存的 correctness risk.
+    #
+    # 如未来确有性能需求, 用 weakref.WeakKeyDictionary 替代 (但 dict 不
+    # 支持 weakref, 须包装或换用 @dataclass(frozen=True) CriticReport 类).
 
     @classmethod
     def _compute_avg_score(cls, critic_report: dict) -> float:
         """从 critic_report 提取所有数值维度 score 的算术平均. 无 scores 返回 0.0.
 
-        Round 92: 引入. Round 100 P2: 加 id() 缓存 (Round 103 P7 移除).
+        Round 92: 引入. Round 100 P2: 加 id() 缓存 (Round 103 P3 移除).
         """
         if not isinstance(critic_report, dict):
             return 0.0
@@ -4180,6 +4177,9 @@ class TranslationPipeline:
             self._intermediate_cache.clear()
         if hasattr(self, '_narrative_memory_cache') and self._narrative_memory_cache is not None:
             self._narrative_memory_cache.clear()
+        # Round 103 P3: 删除 _avg_score_cache 实例字段 (Round 100 P2 引入)
+        # 在 _reset_per_run_cache 中清理. 现 _compute_avg_score 不再缓存, 无需清理.
+        # 保留 hasattr 检查向后兼容 (若未来重新引入缓存).
         if hasattr(self, '_avg_score_cache') and self._avg_score_cache is not None:
             self._avg_score_cache.clear()
         # Round 102 P1: cjk_ratio 缓存是模块级 (非实例字段), 跨 chapter 累积无意义, 同步清空.
@@ -4681,6 +4681,7 @@ class TranslationPipeline:
         return {
             "enabled": bool(cfg.get("enabled", False)),
             "alternate_role": cfg.get("alternate_role") or "primary",
+            "alternate_effort": cfg.get("alternate_effort"),
             "base_role": cfg.get("base_role") or "",
             "max_chunks": max_chunks,
         }
@@ -4807,6 +4808,7 @@ class TranslationPipeline:
                 skipped_dimensions=skipped_dimensions,
                 verse_note=self._verse_note_for(chunk_id, source_text),
                 model_role=alt_role,
+                model_effort=cfg.get("alternate_effort"),
             )
         except TypeError:
             return draft_a
@@ -4883,23 +4885,40 @@ class TranslationPipeline:
         role = self.literal_role
         llm = self.llm
         params = dict(params)
-        # Round 118 P2-5: 难度路由 — 高难度片段切到更强模型（默认 primary/MiniMax）
-        # 并按段开启 thinking；普通片段仍走 literal_translator（DeepSeek, thinking 关）。
+        # Round 118 P2-5 / Round 128: 难度路由 — 高难度片段切到更强模型（默认 primary/MiniMax）
+        # 并按段加档 effort（hard_effort）；普通片段仍走任务默认（不下发档位）。
         dcfg = _config.pipeline.get("difficulty_routing", {}) or {}
         if dcfg.get("enabled", True):
             difficulty = self._chunk_difficulty(source_text)
             if difficulty >= float(dcfg.get("hard_threshold", 2.0)):
                 role = dcfg.get("hard_role", "primary")
                 llm = self._get_role_llm(role)
-                params["enable_thinking"] = bool(dcfg.get("hard_enable_thinking", True))
+                hard_effort = str(dcfg.get("hard_effort") or "").strip().lower()
+                if hard_effort:
+                    params["effort"] = hard_effort
                 print(
                     f"🧩 [Pipeline] 难度路由: difficulty={difficulty:.2f} ≥ "
                     f"{float(dcfg.get('hard_threshold', 2.0)):.1f} → role={role} "
-                    f"(thinking={params['enable_thinking']})"
+                    f"(effort={hard_effort or 'default'})"
+                )
+        # Round 133: no_content 重试适配 override（降档/换角救稿）优先于难度路由结果
+        if chunk_id:
+            ov = self._get_retry_override(chunk_id)
+            if ov and ov.get("sig") == "no_content" and ov.get("stage") == "TRANSLATING_RAW":
+                ov_role = str(ov.get("role") or "")
+                if ov_role and ov_role != role:
+                    role = ov_role
+                    llm = self._get_role_llm(role)
+                ov_eff = ov.get("effort")
+                if ov_eff:
+                    params["effort"] = str(ov_eff).strip().lower()
+                print(
+                    f"🔻 [Pipeline] {chunk_id} 重试适配生效: role={role} "
+                    f"effort={params.get('effort') or 'default'}"
                 )
         model_name = get_role_model_name(role) or model_key
-        extra_body = get_role_extra_body(role)
-        return llm.generate(prompt, model_name=model_name, extra_body=extra_body, **params)
+        self._note_last_call(chunk_id, "TRANSLATING_RAW", role, params.get("effort"), model_name)
+        return llm.generate(prompt, model_name=model_name, **params)
 
     def _get_role_llm(self, role: str):
         """按角色缓存 LLM 客户端（难度路由切模型时复用，避免重复构造）。"""
@@ -4983,7 +5002,7 @@ class TranslationPipeline:
     # Round 34: thin shim — delegates to src.utils.text_match.case_insensitive_find
     @staticmethod
     def _case_insensitive_find(name: str, haystack: "str | None") -> "str | None":
-        return _text_match_case_insensitive_find(name, haystack)
+        return case_insensitive_find(name, haystack)
     def _memory_path(self) -> Path:
         return self.output_dir / "_memory.jsonl"
 
@@ -5094,6 +5113,9 @@ class TranslationPipeline:
             (TaskState.JUDGING, self._process_judging_batch, "最终裁决"),
         ]
 
+        # Round 130: deferred 回溯的章级合并预算计数（本次运行内累计）
+        self._backtrack_sweeps_done = 0
+
         while True:
             any_progress = False
 
@@ -5105,6 +5127,16 @@ class TranslationPipeline:
                 print(f"📦 [Batch] {stage_name} 阶段: 处理 {len(tasks)} 个任务")
                 handler(tasks)
                 any_progress = True
+
+            if not any_progress:
+                # Round 130: deferred 回溯在队列清空点（章末）合并应用一次；
+                # 治理预算（章级轮数 + 单块轮数）保证不收敛循环无法再出现。
+                # immediate 模式下此调用为 no-op（决策变更已即时标 DIRTY）。
+                try:
+                    if self._consolidate_deferred_backtracks():
+                        any_progress = True
+                except Exception as e:
+                    print(f"⚠️ [Pipeline] 章末合并回溯异常（不影响主流程）: {e}")
 
             if not any_progress:
                 # 仅表示队列已清空，不代表产出完整；最终是否成功由 _verify_final_outputs 决定
@@ -5197,8 +5229,7 @@ class TranslationPipeline:
                            False=扫描整个 output/（CI/全量审计用，会修改所有章节）
         """
         from src.consistency import run_consistency_check_for_chapter, run_consistency_check
-        # Round 105: 默认仅报告，不自动改正文
-        auto_fix = bool(_config.pipeline.get("consistency_auto_fix", False))
+        auto_fix = bool(_config.pipeline.get('consistency_auto_fix', False))
         dry_run = not auto_fix
         if chapter_scoped:
             n = run_consistency_check_for_chapter(self.chapter_id, dry_run=dry_run)
@@ -5248,8 +5279,8 @@ class TranslationPipeline:
         lines.append("| **合计** | **" + str(total) + "** | **~" + format(total_tokens, ",") + "** | 100% |\n\n")
         lines.append("- Round 6 oscillation + Round 12 stagnation + Round 36 字节停滞 + Round 73 pre-rewriter 短路 早停链 已显著减少 literary_rewriting / critic_scoring / judge_decision 调用次数\n")
 
-        # Round 27: 真实 token 累计（按 role；OpenAI-compatible API 直接解析 usage；MLX 用 tokenizer.encode；
-        #              Mock 估算 len//4）。注意：同 role 多 task 共享 adapter 时的累计会合并显示
+        # Round 27: 真实 token 累计（按 role；OpenAI-compatible API 直接解析 usage；Mock 估算 len//4）。
+        #              注意：同 role 多 task 共享 adapter 时的累计会合并显示
         try:
             from src.utils.llm_adapter import get_llm_client
             seen_roles = set()
@@ -5615,6 +5646,7 @@ class TranslationPipeline:
             PRICING = {
                 # role → (input ¥/M tokens, output ¥/M tokens)
                 "primary": (0.8, 2.0),                # MiniMax-M3
+                "secondary": (0.4, 1.2),              # Round 125: Qwen-flash（估算）
                 "literal_translator": (0.1, 0.2),     # deepseek-flash
                 "mock": (0.0, 0.0),                   # mock 后端无花费
                 "jev": (0.5, 1.5),                    # Jev (typesafe_sdk) — 估算
@@ -5728,7 +5760,7 @@ class TranslationPipeline:
                 summary["real_tokens_by_role"] = None
             # Round 39: estimated cost
             try:
-                PRICING = {"primary": (0.8, 2.0), "literal_translator": (0.1, 0.2), "mock": (0.0, 0.0), "jev": (0.5, 1.5)}
+                PRICING = {"primary": (0.8, 2.0), "secondary": (0.4, 1.2), "literal_translator": (0.1, 0.2), "mock": (0.0, 0.0), "jev": (0.5, 1.5)}
                 total_cost = 0.0
                 cost_by_role = {}
                 for role, u in (summary.get("real_tokens_by_role") or {}).items():
@@ -6067,10 +6099,18 @@ class TranslationPipeline:
                 # Round 106: 过滤无效 source_name（动词短语/关系代词/泛称，如 "I could"/
                 # "his wife"/"the fellow"），避免 reference agent 误登记的脏指称导致
                 # 审计误报"漏译"（ch05 实测 女主人公 因 "I could" 被误判 missing）。
-                matched_sources = [
+                # Round 133b: 别名吞并抑制（与 _check_entity_consistency 同语义）—
+                # 剔除被其它实体更长别名吞并的伪命中（chunk071 "Mother"⊂"Reverend Mother"）。
+                valid_sns = [
                     sn for sn in source_names
                     if sn and self._is_valid_entity_source_name(sn)
-                    and entity_source_name_in_text(sn, source_text)
+                ]
+                effective_sns, _swallowed = self._partition_swallowed_source_names(
+                    source_text, canonical, valid_sns,
+                )
+                matched_sources = [
+                    sn for sn in effective_sns
+                    if entity_source_name_in_text(sn, source_text)
                 ]
                 if not matched_sources:
                     continue
@@ -6160,9 +6200,12 @@ class TranslationPipeline:
                 continue
             # COMPLETED 但无 final.json → 重置为 DIRTY 重跑 (合法转移, 不增计数)
             try:
-                self.scheduler.update_task_state(chunk_id, TaskState.DIRTY)
-                recovered.append(chunk_id)
-                print(f"♻️ [Pipeline] {chunk_id} 状态为 COMPLETED 但 final.json 缺失，重置为 DIRTY 重跑")
+                # Round 130（审计③）: 感知返回值 —— 拒绝时不得假报已恢复
+                if self.scheduler.update_task_state(chunk_id, TaskState.DIRTY):
+                    recovered.append(chunk_id)
+                    print(f"♻️ [Pipeline] {chunk_id} 状态为 COMPLETED 但 final.json 缺失，重置为 DIRTY 重跑")
+                else:
+                    print(f"⚠️ [Pipeline] {chunk_id} 重置 DIRTY 被拒绝（非法转移），跳过（状态未变）")
             except Exception as e:
                 print(f"⚠️ [Pipeline] {chunk_id} 恢复失败: {e}")
         return recovered
@@ -6171,7 +6214,9 @@ class TranslationPipeline:
         """Round 107 P7: 恢复回溯重跑失败的 final_backup.json.
 
         回溯重跑 (COMPLETED→DIRTY) 时 final.json 被重命名为 final_backup.json.
-        若重跑成功, 新 final.json 会写入 (backup 保留但无用).
+        若重跑成功, 新 final.json 会写入; Round 130 版本择优在此裁决:
+        新版 critic 均分低于旧版时保留旧版（备份版覆盖回 final.json）,
+        新版至少不差时删除无用 backup.
         若重跑失败 (PERMANENTLY_FAILED), final.json 不存在, 恢复 backup:
         - final_backup.json → final.json
         - 状态 PERMANENTLY_FAILED → COMPLETED (保留之前的合格译文)
@@ -6181,25 +6226,87 @@ class TranslationPipeline:
             chunk_id = backup.stem.replace("_final_backup", "")
             final_path = self.output_dir / f"{chunk_id}_final.json"
             if final_path.exists():
-                # 重跑成功, 新 final.json 已写入, 删除无用 backup
+                # 重跑成功, 新 final.json 已写入.
+                # Round 130: 版本择优 — 新版 critic 均分低于旧版(超出 tolerance)时
+                # 用备份版覆盖 final.json（保留更优旧版），返回 True。
+                if self._apply_version_merit(chunk_id, backup, final_path):
+                    continue
+                # 新版至少不差 → 清理无用 backup（含 critic 备份）
                 try:
                     backup.unlink()
                 except OSError:
                     pass
+                self._cleanup_critic_backup(chunk_id)
                 continue
             # 重跑失败, 恢复 backup
             try:
                 backup.rename(final_path)
-                # 状态恢复: PERMANENTLY_FAILED → COMPLETED
+                # 状态恢复: PERMANENTLY_FAILED → COMPLETED (Round 124: 显式放行的终态恢复)
+                # Round 130（审计③）: 感知返回值，拒绝时不再假报 COMPLETED
                 try:
-                    self.scheduler.update_task_state(chunk_id, TaskState.COMPLETED)
-                except Exception:
-                    pass
+                    _state_ok = self.scheduler.update_task_state(
+                        chunk_id, TaskState.COMPLETED, allow_terminal_restore=True)
+                except Exception as _st_exc:
+                    _state_ok = False
+                    print(f"  ⚠️ {chunk_id} 状态恢复异常: {_st_exc}")
                 restored.append(chunk_id)
-                print(f"♻️ [Pipeline] {chunk_id} 回溯重跑失败, 已恢复之前的 final.json (COMPLETED)")
+                if _state_ok:
+                    print(f"♻️ [Pipeline] {chunk_id} 回溯重跑失败, 已恢复之前的 final.json (COMPLETED)")
+                else:
+                    print(f"⚠️ [Pipeline] {chunk_id} 已恢复 final.json，但状态恢复被拒绝（状态未变，请人工核查 chunk 状态）")
             except OSError as e:
                 print(f"  ⚠️ 恢复 {chunk_id} backup 失败: {e}")
         return restored
+
+    def _cleanup_critic_backup(self, chunk_id: str) -> None:
+        """Round 130: 清理已裁决的 *_critic_report_backup.json（防止残留堆积）。"""
+        cb = self.output_dir / f"{chunk_id}_critic_report_backup.json"
+        if cb.exists():
+            try:
+                cb.unlink()
+            except OSError as e:
+                print(f"  ⚠️ 清理 {cb.name} 失败: {e}")
+
+    def _apply_version_merit(self, chunk_id: str, backup: Path, final_path: Path) -> bool:
+        """Round 130 版本择优: 对比备份版与新版 critic 均分, 决定是否保留旧版.
+
+        新版均分 < 旧版均分 - tolerance → 用备份版覆盖 final.json（旧版更优），
+        并把备份 critic 报告归位为 critic_report.json；返回 True。
+        其余情况返回 False（调用方按"无用 backup"清理）。
+        旧版/新版评分缺失（无 critic 文件，如 legacy chunk）时不做裁决。
+        """
+        vm_cfg = _config.pipeline.get("version_merit", {}) or {}
+        if not vm_cfg.get("enabled", True):
+            return False
+        critic_new = self.output_dir / f"{chunk_id}_critic_report.json"
+        critic_old = self.output_dir / f"{chunk_id}_critic_report_backup.json"
+        old_score = self._critic_avg_from_file(critic_old)
+        new_score = self._critic_avg_from_file(critic_new)
+        if old_score <= 0 or new_score <= 0:
+            return False
+        try:
+            tolerance = float(vm_cfg.get("tolerance", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            tolerance = 0.0
+        if new_score >= old_score - tolerance:
+            return False
+        try:
+            final_path.write_text(backup.read_text(encoding="utf-8"), encoding="utf-8")
+            backup.unlink()
+            if critic_old.exists():
+                critic_old.replace(critic_new)  # 旧版评分归位, 保持 final 与评分一致
+        except OSError as e:
+            print(f"  ⚠️ [Version Merit] {chunk_id} 恢复旧版本失败: {e}")
+            return False
+        print(f"🛡️ [Version Merit] {chunk_id} 新版均分 {new_score:.2f} < 旧版 {old_score:.2f}，保留旧版")
+        return True
+
+    def _critic_avg_from_file(self, path: Path) -> float:
+        """读取 critic_report json 的数值维度均分; 缺失/损坏返回 0.0。"""
+        try:
+            return self._compute_avg_score(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return 0.0
 
     def _verify_final_outputs(self, expected_count: int, strict: bool = True) -> bool:
         """校验本章 final.json 实际落盘是否匹配任务。
@@ -6295,7 +6402,18 @@ class TranslationPipeline:
                     print(f"  💾 已备份 final.json → final_backup.json (重跑失败可恢复)")
                 except OSError as e:
                     print(f"  ⚠️ 备份 final.json 失败: {e}")
-            for step in ["raw", "literary", "critic_report"]:
+            # Round 130: critic_report 保留为 *_critic_report_backup.json，
+            # 供章末"版本择优"（_apply_version_merit）对比新旧评分。
+            critic_path = self.output_dir / f"{chunk_id}_critic_report.json"
+            critic_backup = self.output_dir / f"{chunk_id}_critic_report_backup.json"
+            if critic_path.exists():
+                try:
+                    if critic_backup.exists():
+                        critic_backup.unlink()
+                    critic_path.rename(critic_backup)
+                except OSError as e:
+                    print(f"  ⚠️ 备份 critic_report 失败: {e}")
+            for step in ["raw", "literary"]:
                 intermediate = self.output_dir / f"{chunk_id}_{step}.json"
                 if intermediate.exists():
                     try:
@@ -6311,6 +6429,325 @@ class TranslationPipeline:
                         print(f"  ⚠️ 清理失败 {f}: {e}")
         chunk_ids = [t['chunk_id'] for t in tasks]
         self.scheduler.batch_update_state(chunk_ids, TaskState.EXTRACTING_TERMS, reset_counters=True)
+
+    def _consolidate_deferred_backtracks(self) -> bool:
+        """Round 130: 章末合并式回溯（decision_engine.backtrack_mode=deferred）。
+
+        在批处理循环"队列清空"点调用：把 decision_engine 登记的本章待回溯 chunk
+        合并应用一次（标记 DIRTY → 主循环继续重跑这些块）。
+
+        治理预算（防自激循环）：
+          - 章级：每章每次运行最多应用 max_backtrack_sweeps_per_chapter 轮（默认 1）；
+            预算用尽后仅冻结（队列登记保留至下一次运行，打印告警）。
+          - 单块：累计回溯轮数上限由 scheduler.trigger_backtrack 执行（超限冻结，
+            并写出 backtrack_frozen.md 明细）。
+
+        Returns:
+            True 表示有 chunk 被标记 DIRTY（调用方应继续主循环）。
+        """
+        de_cfg = _config.decision_engine or {}
+        mode = str(de_cfg.get("backtrack_mode", "deferred") or "deferred").lower()
+        if mode == "immediate":
+            return False
+        if not getattr(self, "decision_engine", None):
+            return False
+        try:
+            max_sweeps = int(de_cfg.get("max_backtrack_sweeps_per_chapter", 1) or 0)
+        except (TypeError, ValueError):
+            max_sweeps = 1
+        sweeps_done = int(getattr(self, "_backtrack_sweeps_done", 0) or 0)
+        task_ids = [t["chunk_id"] for t in self.scheduler.get_all_tasks_by_chapter(self.chapter_id)]
+        if sweeps_done >= max_sweeps:
+            pending = self.decision_engine.count_pending_backtracks(task_ids)
+            if pending:
+                print(f"🧊 [Backtrack] 本章合并预算已用尽（{max_sweeps} 轮），"
+                      f"冻结 {pending} 项待回溯登记（保留至下次运行）")
+            return False
+        entries = self.decision_engine.take_pending_backtracks(task_ids)
+        if not entries:
+            return False
+        stats = self.scheduler.trigger_backtrack([e["chunk_id"] for e in entries])
+        self._backtrack_sweeps_done = sweeps_done + 1
+        dirty = stats.get("dirty", []) if isinstance(stats, dict) else []
+        over_cap = stats.get("over_cap", []) if isinstance(stats, dict) else []
+        print(f"🧩 [Backtrack] 章末合并回溯：登记 {len(entries)} 个 → 标记 DIRTY {len(dirty)} 个"
+              + (f"，治理冻结 {len(over_cap)} 个（超单块预算）" if over_cap else ""))
+        if over_cap:
+            self._write_backtrack_frozen_report(over_cap, entries)
+        return bool(dirty)
+
+    def _write_backtrack_frozen_report(self, frozen_ids: List[str], entries: List[Dict]) -> None:
+        """把治理冻结的 chunk 写入 output/<chapter>/backtrack_frozen.md（诊断用）。"""
+        try:
+            meta = {e["chunk_id"]: e for e in entries if isinstance(e, dict)}
+            lines = ["# 回溯治理冻结记录 (Round 130)\n\n",
+                     "- 冻结原因：单块累计回溯轮数达到 max_backtrack_rounds_per_chunk\n\n"]
+            for cid in frozen_ids:
+                e = meta.get(cid, {})
+                lines.append(f"- `{cid}` ← source_key={e.get('source_key', '?')} "
+                             f"(queue_rounds={e.get('queue_rounds', '?')})\n")
+            path = self.output_dir / "backtrack_frozen.md"
+            path.write_text("".join(lines), encoding="utf-8")
+            print(f"  📄 冻结明细: {path}")
+        except OSError as e:
+            print(f"  ⚠️ 写 backtrack_frozen.md 失败: {e}")
+
+    # ────────────────────────────────────────────────────────────────
+    # Round 133: 重试适配 — 「仅推理无正文」(no_content) 签名驱动的
+    # 自动降档（max→xhigh→high→…）与换角色救稿（重试预算耗尽后最后 1 次）。
+    # 背景：ch01 通宵跑实测 7 块 PERMANENTLY_FAILED 全部为 effort=max 思考链
+    # （5-7 万字符）吃光 max_tokens、正文为空；同参数重试必然复现。
+    # 只对命中签名的块生效（override 按块持久化），正常块零影响。
+    # ────────────────────────────────────────────────────────────────
+    _NO_CONTENT_MARKERS = ("无正文", "未闭合 think 块", "reasoning_only")
+
+    @classmethod
+    def _is_no_content_signature(cls, err_text) -> bool:
+        """判定异常文本是否为「仅推理无正文」签名（thinking 耗尽 max_tokens）。"""
+        text = str(err_text or "")
+        return any(m in text for m in cls._NO_CONTENT_MARKERS)
+
+    @staticmethod
+    def _effort_levels_table() -> Dict[str, tuple]:
+        """provider → 合法 effort 档位表（优先 src.config 单一事实源；单体兜底内置副本）。"""
+        try:
+            from src.config import EFFORT_LEVELS_BY_PROVIDER as _tbl
+            return dict(_tbl)
+        except Exception:
+            return {
+                "minimax": ("low", "medium", "high", "xhigh", "max"),
+                "deepseek": ("none", "low", "high", "xhigh", "max"),
+                "qwen": ("none", "low", "medium", "xhigh"),
+            }
+
+    @classmethod
+    def _provider_of_role(cls, role: str) -> Optional[str]:
+        """按角色配置的 model_name/api_base 推断 effort provider；未知返回 None。"""
+        try:
+            role_models = getattr(_config, "role_models", None)
+            if callable(role_models):
+                role_models = role_models()
+            if isinstance(role_models, dict) and role_models and role not in role_models:
+                return None  # 未定义角色：不用 legacy 兜底模型猜 provider
+        except Exception:
+            pass
+        try:
+            role_cfg = _config.get_role_config(role) or {}
+        except Exception:
+            return None
+        target = f"{role_cfg.get('model_name', '')} {role_cfg.get('api_base', '')}".lower()
+        for provider in cls._effort_levels_table():
+            if provider in target:
+                return provider
+        return None
+
+    def _retry_adapt_cfg(self) -> Dict[str, Any]:
+        cfg = dict(_config.pipeline.get("retry_adaptation", {}) or {})
+        cfg.setdefault("enabled", True)
+        cfg.setdefault("downgrade_on_signature", ["no_content"])
+        cfg.setdefault("fallback_role_switch", True)
+        cfg.setdefault("minimax_protect", True)
+        cfg.setdefault("quality_escalate_back", True)
+        return cfg
+
+    def _load_model_capabilities(self) -> Dict[str, Any]:
+        """读取 L1 档位探测结果（db/model_capabilities.json）；缺失/过期 → 空 dict。"""
+        try:
+            probe_cfg = dict(_config.pipeline.get("model_probe", {}) or {})
+        except Exception:
+            probe_cfg = {}
+        rel = str(probe_cfg.get("path") or "db/model_capabilities.json")
+        path = Path(rel)
+        if not path.is_absolute():
+            root = getattr(self, "_root_dir", None) or Path.cwd()
+            path = Path(root) / rel
+        try:
+            if not path.exists():
+                return {}
+            ttl_days = float(probe_cfg.get("ttl_days", 7) or 7)
+            if ttl_days > 0 and (time.time() - path.stat().st_mtime) > ttl_days * 86400:
+                return {}
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _effort_ladder_for_role(self, role: str) -> tuple:
+        """角色可用档位阶梯：provider 全档位 → 探测文件 accepted 过滤（有则用）。"""
+        provider = self._provider_of_role(role)
+        if not provider:
+            return ()
+        ladder = tuple(self._effort_levels_table().get(provider) or ())
+        caps = self._load_model_capabilities()
+        rec = dict((caps.get("models") or {}).get(role) or {})
+        levels_rec = dict(rec.get("levels") or {})
+        if rec.get("provider") == provider and levels_rec:
+            accepted = [lv for lv in ladder if (levels_rec.get(lv) or {}).get("accepted")]
+            if accepted:
+                return tuple(accepted)
+        return ladder
+
+    def _downgrade_one_step(self, role: str, effort) -> Optional[str]:
+        """按 provider 档位表降一档；降无可降/档位未知 → None。"""
+        ladder = self._effort_ladder_for_role(role)
+        eff = str(effort or "").strip().lower()
+        if not ladder or not eff or eff not in ladder:
+            return None
+        i = ladder.index(eff)
+        return ladder[i - 1] if i > 0 else None
+
+    def _escalate_one_step(self, role: str, effort) -> Optional[str]:
+        ladder = self._effort_ladder_for_role(role)
+        eff = str(effort or "").strip().lower()
+        if not ladder or not eff or eff not in ladder:
+            return None
+        i = ladder.index(eff)
+        return ladder[i + 1] if i + 1 < len(ladder) else None
+
+    def _get_retry_override(self, chunk_id: str) -> Dict[str, Any]:
+        try:
+            return dict(self.scheduler.get_retry_override(chunk_id) or {})
+        except Exception:
+            return {}
+
+    def _set_retry_override(self, chunk_id: str, payload: Dict[str, Any]) -> bool:
+        try:
+            return bool(self.scheduler.set_retry_override(chunk_id, payload))
+        except Exception:
+            return False
+
+    def _task_default_effort(self, task_name: str) -> Optional[str]:
+        try:
+            _, params = _config.resolve_task_model(task_name)
+            eff = params.get("effort")
+            return str(eff).strip().lower() if eff else None
+        except Exception:
+            return None
+
+    def _note_last_call(self, chunk_id: str, stage: str, role: str, effort, model_name: str = "") -> None:
+        """记录块最近一次 LLM 调用的 (stage, role, effort)，供 no_content 签名记录使用。"""
+        if not chunk_id:
+            return
+        cache = getattr(self, "_last_call_info", None)
+        if cache is None:
+            cache = {}
+            self._last_call_info = cache
+        cache[chunk_id] = {
+            "stage": stage,
+            "role": role or "",
+            "effort": (str(effort).strip().lower() if effort else None),
+            "model_name": model_name or "",
+        }
+
+    def _record_no_content_signal(self, chunk_id: str, stage: str) -> None:
+        """命中「仅推理无正文」签名 → 持久化降档 override（下次重试自动降一档）。"""
+        cfg = self._retry_adapt_cfg()
+        if not cfg.get("enabled", True):
+            return
+        sigs = {str(s).strip().lower() for s in (cfg.get("downgrade_on_signature") or ["no_content"])}
+        if "no_content" not in sigs:
+            return
+        info = (getattr(self, "_last_call_info", {}) or {}).get(chunk_id) or {}
+        used_role = info.get("role") or ""
+        used_eff = info.get("effort")
+        prev = self._get_retry_override(chunk_id)
+        next_eff = self._downgrade_one_step(used_role, used_eff) if used_eff else None
+        if next_eff is None and prev.get("effort"):
+            next_eff = prev.get("effort")  # 已降无可降：保留现有 override
+        delta = int(prev.get("down_delta", 0) or 0) + (
+            1 if (next_eff and next_eff != prev.get("effort")) else 0)
+        payload = {
+            "sig": "no_content",
+            "stage": stage,
+            "role": prev.get("role") or used_role,
+            "effort": next_eff,
+            "used_role": used_role,
+            "used_effort": used_eff,
+            "down_delta": delta,
+            "rescue_used": bool(prev.get("rescue_used")),
+            "escalated": bool(prev.get("escalated")),
+            "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        if self._set_retry_override(chunk_id, payload):
+            if next_eff:
+                print(f"🔻 [Pipeline] {chunk_id} no_content 签名 → 下次重试降档 "
+                      f"{used_eff or 'default'}→{next_eff} (role={payload['role'] or '?'})")
+            else:
+                print(f"🔻 [Pipeline] {chunk_id} no_content 签名（{used_eff or 'default'} 已无更低档）")
+
+    def _rescue_role_for(self, stage: str, failing_role: str) -> Optional[str]:
+        """换角色救稿目标选择（fallback_role_switch）。
+
+        RAW 救稿默认 secondary/literal_translator（minimax_protect 时不选 primary）；
+        REWRITE 救稿排除失败角色，protect 时优先 secondary。
+        """
+        cfg = self._retry_adapt_cfg()
+        protect = bool(cfg.get("minimax_protect", True))
+        if stage == "TRANSLATING_RAW":
+            cands = ["secondary", "literal_translator"]
+            if not protect:
+                cands.append("primary")
+        else:
+            if protect and failing_role != "secondary":
+                cands = ["secondary", "literal_translator", "primary"]
+            else:
+                cands = ["primary", "secondary", "literal_translator"]
+        cands = [r for r in cands if r and r != failing_role]
+        return cands[0] if cands else None
+
+    def _rescue_effort_for(self, target_role: str, prev_effort) -> Optional[str]:
+        """救稿档位：跨家映射到目标 role 合法档位后，再降一档（避免同档复现 no_content）。"""
+        ladder = self._effort_ladder_for_role(target_role)
+        eff = str(prev_effort or "").strip().lower()
+        if not ladder or not eff:
+            return None
+        mapped = _map_effort_for_fallback(eff, ladder)
+        if mapped is None:
+            return None
+        i = ladder.index(mapped)
+        return ladder[i - 1] if i > 0 else ladder[i]
+
+    def _maybe_rescue_no_content(self, task) -> Optional[str]:
+        """重试预算耗尽的救稿决策。
+
+        返回 recovery stage value（已写入换角色 override，调用方把任务放回该阶段再试 1 次）；
+        返回 None 表示放弃救稿（照旧转 PERMANENTLY_FAILED）。
+        """
+        cfg = self._retry_adapt_cfg()
+        if not cfg.get("enabled", True) or not cfg.get("fallback_role_switch", True):
+            return None
+        last_error = task.get("last_error", "") or ""
+        if not self._is_no_content_signature(last_error):
+            return None
+        chunk_id = task.get("chunk_id", "")
+        ov = self._get_retry_override(chunk_id)
+        if ov.get("rescue_used"):
+            return None
+        stage = ov.get("stage") or self._get_recovery_stage(last_error).value
+        failing_role = ov.get("used_role") or ov.get("role") or ""
+        rescue_role = self._rescue_role_for(stage, failing_role)
+        if not rescue_role:
+            return None
+        prev_eff = ov.get("used_effort") or ov.get("effort")
+        rescue_eff = self._rescue_effort_for(rescue_role, prev_eff)
+        payload = dict(ov)
+        payload.update({
+            "sig": "no_content",
+            "stage": stage,
+            "role": rescue_role,
+            "effort": rescue_eff,
+            "used_role": failing_role,
+            "used_effort": prev_eff,
+            "rescue_used": True,
+            "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+        if not self._set_retry_override(chunk_id, payload):
+            # fail-safe：override 落盘失败则放弃救稿（否则 rescue_used 无法持久化 → 无限重入）
+            print(f"⚠️ [Pipeline] {chunk_id} 救稿 override 落盘失败，放弃换角色（转 PF）")
+            return None
+        print(f"🆘 [Pipeline] {chunk_id} no_content 重试耗尽 → 换角色救稿: "
+              f"{failing_role or '?'}@{prev_eff or 'default'} → {rescue_role}@{rescue_eff or 'default'}")
+        return stage
 
     def _get_recovery_stage(self, last_error: str) -> TaskState:
         if not last_error:
@@ -6367,6 +6804,12 @@ class TranslationPipeline:
             chunk_id = task['chunk_id']
             retries = task.get('retries', 0)
             if retries >= max_retries:
+                # Round 133: no_content 签名 + 预算耗尽 → 换角色救稿一次（默认开启）
+                rescue_stage = self._maybe_rescue_no_content(task)
+                if rescue_stage:
+                    stage_state = self._get_recovery_stage(f"[{rescue_stage}]")
+                    retry_by_stage.setdefault(stage_state, []).append(chunk_id)
+                    continue
                 print(f"❌ [Pipeline] {chunk_id} 重试次数过多，转入 PERMANENTLY_FAILED 终态")
                 self._try_fallback_final(chunk_id)
                 permanent_fail_ids.append(chunk_id)
@@ -6441,6 +6884,8 @@ class TranslationPipeline:
                 success_ids.append(chunk_id)
             except Exception as e:
                 print(f"❌ [Pipeline] {task['chunk_id']} 直译异常: {e}")
+                if self._is_no_content_signature(e):
+                    self._record_no_content_signal(task['chunk_id'], "TRANSLATING_RAW")
                 self.scheduler.update_task_state(task['chunk_id'], TaskState.FAILED, error_msg=f"[TRANSLATING_RAW] {e}")
         if success_ids:
             self.scheduler.batch_update_state(success_ids, TaskState.REWRITING_LITERARY)
@@ -6571,6 +7016,42 @@ class TranslationPipeline:
                         chunk_id, sw_base_role, sw_alt_role, sw_cfg.get("max_switches", 1)
                     )
                     model_role = sw_state.get("current_role") or sw_base_role
+                # Round 129: 换到 alternate（更强模型）时加档 effort
+                model_effort = (sw_cfg.get("alternate_effort") if model_role != sw_base_role else None)
+                # Round 133: no_content 重试适配 override（降档/换角救稿）优先于停滞换档；
+                # 降档后若因质量重进润色（quality_retries≥1）→ 升档补偿一次（防死循环）。
+                ov = self._get_retry_override(chunk_id)
+                if ov and ov.get("sig") == "no_content" and ov.get("stage") == "REWRITING_LITERARY":
+                    if ov.get("role"):
+                        model_role = ov["role"]
+                    if ov.get("effort"):
+                        model_effort = str(ov["effort"]).strip().lower()
+                    raccfg = self._retry_adapt_cfg()
+                    if (raccfg.get("quality_escalate_back", True)
+                            and not ov.get("escalated")
+                            and model_effort
+                            and quality_retries >= 1
+                            and int(ov.get("down_delta", 0) or 0) > 0):
+                        up_eff = self._escalate_one_step(model_role, model_effort)
+                        if up_eff and up_eff != model_effort:
+                            print(
+                                f"🔼 [Pipeline] {chunk_id} 降档后质量重进润色 → 升档补偿一次 "
+                                f"{model_effort}→{up_eff} (role={model_role})"
+                            )
+                            model_effort = up_eff
+                            ov["escalated"] = True
+                            ov["effort"] = up_eff
+                            self._set_retry_override(chunk_id, ov)
+                    if model_effort:
+                        print(
+                            f"🔻 [Pipeline] {chunk_id} 重试适配生效: role={model_role} "
+                            f"effort={model_effort}"
+                        )
+                self._note_last_call(
+                    chunk_id, "REWRITING_LITERARY", model_role,
+                    model_effort or self._task_default_effort("literary_rewrite"),
+                    get_role_model_name(model_role),
+                )
                 raw_result = self.rewriter_agent.process_chunk(
                     chunk_id, raw_text, self.style_guide, source_text,
                     prev_lit_text=prev_lit_text,
@@ -6586,6 +7067,7 @@ class TranslationPipeline:
                     skipped_dimensions=skipped_dimensions,  # Round 64
                     verse_note=self._verse_note_for(chunk_id, source_text),  # Round 119 L1
                     model_role=model_role,  # Round 116: 停滞换模型
+                    model_effort=model_effort,  # Round 129: 换模型加档
                 )
                 # process_chunk 返回 (lit_text, self_review) 元组
                 if isinstance(raw_result, tuple):
@@ -6810,6 +7292,8 @@ class TranslationPipeline:
                 import traceback
                 traceback.print_exc()
                 print(f"❌ [Pipeline] {task['chunk_id']} 润色异常: {e}")
+                if self._is_no_content_signature(e):
+                    self._record_no_content_signal(task['chunk_id'], "REWRITING_LITERARY")
                 self.scheduler.update_task_state(task['chunk_id'], TaskState.FAILED, error_msg=f"[REWRITING_LITERARY] {e}")
         if success_ids:
             self.scheduler.batch_update_state(success_ids, TaskState.AUDITING)
@@ -6873,9 +7357,7 @@ class TranslationPipeline:
         return prefix in lit_text or suffix in lit_text
 
     # ch06 倒查：reference agent 把非实体短语登记为 source_name（sir/his eyelids/
-    # the support/a sharp command），导致实体一致性核查误报 missing → 硬失败死循环
-    # （chunk003 因 "sir"、chunk015 因 "his eyelids" 被判 missing 而 PERMANENTLY_FAILED）。
-    # 护栏：过滤明显非实体指称（泛称/称谓 + 所有格+身体部位/抽象词）。
+    # the support/a sharp command），导致实体一致性核查误报 missing → 硬失败死循环。
     _NON_ENTITY_SOURCE_NAMES = {
         "sir", "madam", "mister", "miss", "mr", "mrs", "ms",
         "the man", "the woman", "the fellow", "the other",
@@ -7091,6 +7573,81 @@ class TranslationPipeline:
                 start = idx + 1
         return None
 
+    def _get_sibling_canonicals(self) -> Dict[str, Set[str]]:
+        """Round 71/133b: 全 registry 的 source_name → {canonical} 映射（含 pending 行）。
+
+        lazy-init + 按审计批次缓存（_process_auditing_batch 入口重置 _sibling_canonicals_cache）。
+        兼容测试桩：测试用 __new__ 构造的实例也可用（hasattr 兜底）。
+        """
+        if not hasattr(self, "_sibling_canonicals_cache") or \
+                self._sibling_canonicals_cache is None:
+            try:
+                self._sibling_canonicals_cache = get_sibling_canonicals_by_source(
+                    self.decision_engine.conn
+                )
+            except Exception:
+                self._sibling_canonicals_cache = {}
+        return self._sibling_canonicals_cache or {}
+
+    def _partition_swallowed_source_names(
+        self, source_text: str, canonical: str, valid_sns: List[str],
+    ) -> Tuple[List[str], Set[str]]:
+        """Round 133b: 别名吞并抑制 — 剔除"被其它实体更长别名吞并"的伪命中。
+
+        chunk071 根因: entity_registry 里 "Mother" 被同时登记给 杰西卡/杰西卡夫人，
+        而 chunk071 原文中 "Mother" 唯一出现于 "Reverend Mother"（盖乌斯·海伦·莫希阿姆
+        的别名）内部 → Round 114 词边界防护放行（"Mother" 是合法词）→ 杰西卡夫人被
+        判"原文在场但译文缺失" → rewriter 收到不可执行指令（"Reverend Mother" 那处
+        必须出现「杰西卡夫人」）→ 改坏正文 → NO_PROGRESS_STREAK → PERMANENTLY_FAILED。
+
+        判定: 别名 a 的所有命中 span 都被某"更长注册别名 b"(len(b) > len(a), a 是 b 的
+        子串, b 归属某 canonical ≠ 当前 canonical) 的命中 span 包含 → a 为伪命中, 剔除;
+        只要一处未被吞并即保留（真在场）。
+
+        Returns:
+            (effective, swallowed): effective=真在场别名（按原顺序）;
+            swallowed=出现在原文但被吞并的别名集合。
+        """
+        if not valid_sns:
+            return [], set()
+        siblings = self._get_sibling_canonicals()
+        own_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
+        coverer_spans_cache: Dict[str, List[Tuple[int, int]]] = {}
+
+        effective: List[str] = []
+        swallowed: Set[str] = set()
+        for sn in valid_sns:
+            if not sn:
+                continue
+            if sn not in own_spans_cache:
+                own_spans_cache[sn] = entity_source_name_spans(sn, source_text)
+            spans = own_spans_cache[sn]
+            if not spans:
+                continue
+            # 候选覆盖别名: 更长 + 包含 sn + 归属于≥1 个其它 canonical
+            coverers = [
+                other for other in siblings.keys()
+                if len(other) > len(sn) and sn in other
+                and any(oc != canonical for oc in (siblings.get(other) or set()))
+                and self._is_valid_entity_source_name(other)
+            ]
+            fully_swallowed = False
+            if coverers:
+                cov_spans: List[Tuple[int, int]] = []
+                for other in coverers:
+                    if other not in coverer_spans_cache:
+                        coverer_spans_cache[other] = entity_source_name_spans(other, source_text)
+                    cov_spans.extend(coverer_spans_cache[other])
+                fully_swallowed = all(
+                    any(cs <= s and e <= ce for (cs, ce) in cov_spans)
+                    for (s, e) in spans
+                )
+            if fully_swallowed:
+                swallowed.add(sn)
+            else:
+                effective.append(sn)
+        return effective, swallowed
+
     def _check_entity_consistency(self, chunk_id: str, lit_text: str, source_text: str) -> List[Dict]:
         """实体一致性核查：检查译文中实体译名是否与 entity_registry 一致
 
@@ -7111,13 +7668,7 @@ class TranslationPipeline:
         # 则视为 rewriter 用了别名译名, 不报 "missing". variant_instead_of_canonical
         # 不受影响 (variant 是真问题, sibling 命中不影响 variant 路径).
         # 缓存: 单次审计内多次调用 _check_entity_consistency 时复用同一份.
-        if not hasattr(self, "_sibling_canonicals_cache") or \
-                self._sibling_canonicals_cache is None:
-            try:
-                self._sibling_canonicals_cache = get_sibling_canonicals_by_source(self.decision_engine.conn)
-            except Exception:
-                self._sibling_canonicals_cache = {}
-        sibling_canonicals = self._sibling_canonicals_cache or {}
+        sibling_canonicals = self._get_sibling_canonicals()
 
         inconsistencies = []
         for row in entities:
@@ -7138,9 +7689,14 @@ class TranslationPipeline:
             # quality_retries 无限增长。修前 ch32 quality_retries=112+ 死循环。
             # ch06: 过滤非实体 source_name（sir/his eyelids 等），避免误判"实体出场"
             valid_source_names = [sn for sn in source_names if self._is_valid_entity_source_name(sn)]
+            # Round 133b: 别名吞并抑制 — 剔除被其它实体更长别名吞并的伪命中
+            # （chunk071 "Mother"⊂"Reverend Mother" 根因, 详见 _partition_swallowed_source_names）
+            effective_source_names, _swallowed = self._partition_swallowed_source_names(
+                source_text, canonical, valid_source_names,
+            )
             appears_in_source = any(
                 (sn and entity_source_name_in_text(sn, source_text))
-                for sn in valid_source_names
+                for sn in effective_source_names
             )
             if not appears_in_source:
                 continue
@@ -7191,7 +7747,7 @@ class TranslationPipeline:
                 near_variant = self._find_near_variant(canonical, lit_text)
                 if near_variant:
                     matched_source = None
-                    for sn in valid_source_names:
+                    for sn in effective_source_names:
                         if entity_source_name_in_text(sn, source_text):
                             matched_source = sn
                             break
@@ -7204,10 +7760,10 @@ class TranslationPipeline:
                         "chunk_id": chunk_id,
                     })
             if not all_violations and not near_variant and not self._canonical_present_in_text(canonical, lit_text):
-                # 只有原文中确实出现了该实体、且译文中连规范名的显著部分都没有时才报 missing
+                # 只有原文中确实出现了该实体时才报 missing
                 # 避免"全书角色本章未出场"的假阳性
                 matched_source = None
-                for sn in valid_source_names:
+                for sn in effective_source_names:
                     if entity_source_name_in_text(sn, source_text):
                         matched_source = sn
                         break
@@ -7278,11 +7834,18 @@ class TranslationPipeline:
             if not self._is_enforceable_canonical(canonical, source_names):
                 continue
             valid_sns = [sn for sn in source_names if self._is_valid_entity_source_name(sn)]
+            # Round 133b: 别名吞并抑制 — swallowed 别名不注入/不当在场证据
+            # （chunk071 "Mother"→杰西卡夫人 污染 prompt 根因）
+            effective_sns, swallowed_sns = self._partition_swallowed_source_names(
+                source_text, canonical, valid_sns,
+            )
             # 只取本章出现的实体
-            if not any((sn and entity_source_name_in_text(sn, source_text)) for sn in valid_sns):
+            if not any((sn and entity_source_name_in_text(sn, source_text)) for sn in effective_sns):
                 continue
             # 把每个匹配的 source_name 都映射到 canonical（修前 bug: 只取第一个）
             for sn in valid_sns:
+                if sn in swallowed_sns:
+                    continue
                 if sn and sn not in out:
                     out[sn] = canonical
         # 缓存结果 (同一 source_text 在 chapter 内稳定)
@@ -7322,9 +7885,15 @@ class TranslationPipeline:
             if not self._is_enforceable_canonical(canonical, source_names):
                 continue
             valid_sns = [sn for sn in source_names if self._is_valid_entity_source_name(sn)]
-            if not any((sn and entity_source_name_in_text(sn, source_text)) for sn in valid_sns):
+            # Round 133b: 别名吞并抑制（与 _build_entity_registry_for_rewriter 同语义）
+            effective_sns, swallowed_sns = self._partition_swallowed_source_names(
+                source_text, canonical, valid_sns,
+            )
+            if not any((sn and entity_source_name_in_text(sn, source_text)) for sn in effective_sns):
                 continue
             for sn in valid_sns:
+                if sn in swallowed_sns:
+                    continue
                 if sn and sn not in out:
                     out[sn] = list(variant_names) if variant_names else []
         # Round 99 P1: 缓存 variants 结果
@@ -7744,7 +8313,7 @@ class TranslationPipeline:
 
     def _fallback_to_rewriter(self, chunk_id, lit_text, critic_report, judge_result):
         scores = critic_report.get("scores", {})
-        thresholds = _config.critic_thresholds
+        thresholds = _config.critic_thresholds_for_book()
         low_dims = [k for k, v in scores.items()
                     if isinstance(v, (int, float)) and v < thresholds.get(k, 7.0)]
         specific_edits = critic_report.get("specific_edits", [])[:20]
@@ -7802,6 +8371,19 @@ class TranslationPipeline:
                 quality_retries = task.get('quality_retries', 0)
                 lit_text = self._load_intermediate(chunk_id, "literary")
                 critic_report = self._load_intermediate(chunk_id, "critic_report")
+
+                # Round 123: mock_heuristic 是 Jev/critic LLM 不可用时的兜底假分数,
+                # 不得触发 judging 阶段 EARLY_STOP — 与 audit 阶段 R106 护栏
+                # (_mock_untrusted_p99) 同语义。根因: ch09 chunk013/044 critic
+                # 连续 429 回退 mock 后, 假分数 readability=2.5/fluency=2.5/
+                # literal_residue=0.0 (3 维<4.0) 被 EARLY_STOP 秒杀成
+                # PERMANENTLY_FAILED, 而同一份 mock 分数在 audit 阶段是放行的。
+                # 未显式 trust mock 时跳过 EARLY_STOP, 交由 rewriter 正常轮次。
+                mock_untrusted_judging = (
+                    isinstance(critic_report, dict)
+                    and not _config.pipeline.get("trust_mock_heuristic", False)
+                    and critic_report.get("_backend_path") == "mock_heuristic"
+                )
 
                 # 加载 Rewriter 自评（如果有）
                 self_review = None
@@ -7968,7 +8550,7 @@ class TranslationPipeline:
                     # O 方案：安全网放行——若各维度已接近阈值（仅差 1-2 分），
                     # 不再整章 PERMANENTLY_FAILED 丢失译文，改为带告警定稿。
                     scores = critic_report.get("scores", {}) if isinstance(critic_report, dict) else {}
-                    thresholds = _config.critic_thresholds or {}
+                    thresholds = _config.critic_thresholds_for_book()
                     numeric = [v for v in scores.values() if isinstance(v, (int, float))]
                     avg_score = (sum(numeric) / len(numeric)) if numeric else 0.0
                     safety_net_min = float(_config.pipeline.get("judge_safety_net_avg_min", 5.5))
@@ -8016,7 +8598,11 @@ class TranslationPipeline:
                         1 for v in scores.values()
                         if isinstance(v, (int, float)) and v < early_stop_threshold
                     )
-                    if very_low_count >= early_stop_max_low:
+                    if very_low_count >= early_stop_max_low and mock_untrusted_judging:
+                        # Round 123: mock 假分数不可信 — 不早停, 落回 rewriter 正常轮次
+                        # (与 audit 阶段 R106 护栏同语义, 见上方 mock_untrusted_judging)
+                        print(f"🛡️ [Pipeline] {chunk_id} EARLY_STOP 拦截: critic 后端 mock_heuristic（假分数不可信），转 rewriter 正常重试")
+                    elif very_low_count >= early_stop_max_low:
                         stop_reason = (
                             f"EARLY_STOP: {very_low_count}项低于{early_stop_threshold}分"
                             f"（{scores}），放弃重试"
@@ -8051,13 +8637,11 @@ class TranslationPipeline:
 # Section 8 — 测试工具
 # ────────────────────────────────────────────────────────────────────
 
-# Round 118 P2-7: 黄金集 A/B — 直译阶段「模型 × thinking」四组合.
-# 重写阶段跟随 task_routing（本轮不切换），衡量的是“直译×重写”全流程结果。
 GOLDEN_AB_MATRIX: List[Dict[str, Any]] = [
-    {"name": "deepseek_lit_off", "role": "literal_translator", "enable_thinking": False},
-    {"name": "deepseek_lit_on", "role": "literal_translator", "enable_thinking": True},
-    {"name": "minimax_lit_off", "role": "primary", "enable_thinking": False},
-    {"name": "minimax_lit_on", "role": "primary", "enable_thinking": True},
+    {"name": "literal_effort_none", "role": "literal_translator", "effort": None},
+    {"name": "literal_effort_xhigh", "role": "literal_translator", "effort": "xhigh"},
+    {"name": "primary_effort_none", "role": "primary", "effort": None},
+    {"name": "primary_effort_max", "role": "primary", "effort": "max"},
 ]
 
 
@@ -8152,8 +8736,8 @@ def run_golden_test(
 ):
     """运行黄金测试集（需要 input/golden/hyperion_5k.md）.
 
-    Round 118 P2-7: ab_override={"name","role","enable_thinking"} 时按 A/B 组合
-    覆盖直译阶段的模型与 thinking；report_path 可指定本轮报告输出路径
+    Round 118 P2-7 / Round 128: ab_override={"name","role","effort"} 时按 A/B 组合
+    覆盖直译阶段的模型与 effort 档位；report_path 可指定本轮报告输出路径
     （默认 output/golden_test_report.json）。
     """
     ab = dict(ab_override or {})
@@ -8189,7 +8773,7 @@ def run_golden_test(
     if ab:
         print(
             f"🧪 A/B 组合: {ab.get('name')} "
-            f"(role={literal_role}, thinking={bool(ab.get('enable_thinking'))})"
+            f"(role={literal_role}, effort={ab.get('effort') or 'none'})"
         )
     all_results = []
 
@@ -8209,14 +8793,17 @@ def run_golden_test(
                 f"请将以下{genre}片段进行直译。要求：字面忠实，不丢失任何细节，不进行文学润色。\n\n"
                 f"{gloss}\n\n【原文】\n{chunk}"
             )
-            # 使用配置路由 literal_translation（A/B 时按组合覆盖 role + thinking）
+            # 使用配置路由 literal_translation（A/B 时按组合覆盖 role + effort）
             model_key, params = _config.resolve_task_model("literal_translation")
             params = dict(params)
             if ab:
-                params["enable_thinking"] = bool(ab.get("enable_thinking", False))
+                ab_effort = ab.get("effort")
+                if ab_effort:
+                    params["effort"] = str(ab_effort).strip().lower()
+                else:
+                    params.pop("effort", None)
             model_name = get_role_model_name(literal_role) or model_key
-            extra_body = get_role_extra_body(literal_role)
-            raw_text = evaluator.llm.generate(raw_prompt, model_name=model_name, extra_body=extra_body, **params)
+            raw_text = evaluator.llm.generate(raw_prompt, model_name=model_name, **params)
 
             raw_result = evaluator.rewriter_agent.process_chunk(chunk_id, raw_text, style_guide, chunk)
             lit_text, _ = raw_result if isinstance(raw_result, tuple) else (raw_result, None)
@@ -8236,7 +8823,7 @@ def run_golden_test(
                 "judge_backend": judge_result.get("_backend_path"),
                 "confidence_source": _extract_confidence_source(judge_result),
                 "literal_role": literal_role,
-                "literal_thinking": bool(params.get("enable_thinking", False)),
+                "literal_effort": params.get("effort"),
                 "ab": ab.get("name") if ab else None,
                 "style_collapse_rate": style_eval["style_collapse_rate"],
                 "style_preservation": style_eval["average_preservation"],
@@ -8407,7 +8994,7 @@ def run_golden_ab(
     matrix: Optional[List[Dict[str, Any]]] = None,
     report_path: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Round 118 P2-7: 黄金集 A/B — 直译模型(DeepSeek/MiniMax)×thinking(on/off) 对比.
+    """Round 118 P2-7 / Round 128: 黄金集 A/B — 直译模型 × effort 档位对比.
 
     每个组合跑完整 直译→重写→critic→judge 流程（重写阶段按 task_routing 定，
     A/B 只切直译阶段），统计 pass_rate / critic 均分 / 风格保持度，并按
@@ -8423,7 +9010,7 @@ def run_golden_ab(
     for idx, combo in enumerate(matrix):
         name = str(combo.get("name") or f"combo_{idx}")
         print("\n" + "=" * 60)
-        print(f"🧪 Golden A/B 组合 [{name}]: role={combo.get('role')}, thinking={combo.get('enable_thinking')}")
+        print(f"🧪 Golden A/B 组合 [{name}]: role={combo.get('role')}, effort={combo.get('effort') or 'none'}")
         print("=" * 60)
         results = run_golden_test(
             ab_override=combo,
@@ -8780,1704 +9367,6 @@ def debug_db():
     conn.close()
 
 
-def consolidate_dirty_chapters(
-    project_root=None,
-    max_rounds: int = 3,
-    pipeline_factory=None,
-    db_path=None,
-    output_dir=None,
-) -> dict:
-    """T2: 全书决策收敛闭环 — 重跑所有含 DIRTY chunk 的章节直到收敛。
-
-    D2/D3 根因: 章节串行执行时，已结束章节上的回溯标记（DIRTY）没有
-    消费点，全书跑完后 merge 会把"回溯前"陈旧 final 收录进成书。
-    本函数在全书写完之后统一收口: 扫描 workflow.db 的 DIRTY chunk →
-    按章序重跑该章管线（DIRTY 阶段在阶段表首位）→ 重扫；循环到
-    DIRTY=0 或 max_rounds。每个重跑 chunk 的旧/新 final 文本差异写入
-    output/consolidation_diff.md（旧稿在重跑前采样，不依赖 backup 存活）。
-
-    Returns:
-        {
-          "converged": bool,     # 最终 DIRTY=0
-          "rounds": int,         # 实际执行轮数（无 DIRTY 时为 0）
-          "rerun": [...],        # 重跑过的 chunk（按发生顺序）
-          "remaining": {...},    # 未收敛残留 {chapter: [chunk_id]}
-          "diff_path": str|None,
-        }
-    """
-    import difflib
-    from datetime import datetime
-
-    rounds_cap = max(1, int(max_rounds))
-    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
-    db_file = Path(db_path) if db_path else root / "db" / "workflow.db"
-    out_root = Path(output_dir) if output_dir else root / "output"
-
-    result = {"converged": True, "rounds": 0, "rerun": [], "remaining": {}, "diff_path": None}
-    if not db_file.exists():
-        print(f"⚠️ [Consolidate] workflow.db 不存在（{db_file}），跳过收敛检查")
-        return result
-
-    if pipeline_factory is None:
-        pipeline_factory = lambda ch: TranslationPipeline(chapter_id=ch)
-
-    scheduler = TaskScheduler(db_path=str(db_file))
-
-    def _dirty_rows():
-        cursor = scheduler.conn.execute(
-            "SELECT chapter_id, chunk_id FROM chunk_tasks WHERE state = ? "
-            "ORDER BY chapter_id ASC, chunk_id ASC",
-            (TaskState.DIRTY.value,),
-        )
-        return [tuple(row) for row in cursor.fetchall()]
-
-    def _read_final_text(chapter_id, chunk_id):
-        path = out_root / chapter_id / f"{chunk_id}_final.json"
-        if not path.exists():
-            return None
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-        return data.get("text", "") if isinstance(data, dict) else str(data)
-
-    diff_records = []
-    while result["rounds"] < rounds_cap:
-        rows = _dirty_rows()
-        if not rows:
-            break
-        result["rounds"] += 1
-        round_no = result["rounds"]
-        by_chapter = {}
-        for chapter_id, chunk_id in rows:
-            by_chapter.setdefault(chapter_id, []).append(chunk_id)
-        print(f"🔁 [Consolidate] 第 {round_no}/{rounds_cap} 轮: "
-              f"{len(rows)} 个 DIRTY chunk, {len(by_chapter)} 章待收敛")
-        for chapter_id in sorted(by_chapter):
-            chunk_ids = by_chapter[chapter_id]
-            pre_texts = {cid: _read_final_text(chapter_id, cid) for cid in chunk_ids}
-            try:
-                ok = bool(pipeline_factory(chapter_id).run())
-            except Exception as exc:
-                ok = False
-                print(f"  ⚠️ [Consolidate] 章节 {chapter_id} 重跑异常: {exc}")
-            if not ok:
-                print(f"  ⚠️ [Consolidate] 章节 {chapter_id} 重跑未完全通过（fallback 已兜底的可能）")
-            for cid in chunk_ids:
-                diff_records.append({
-                    "round": round_no,
-                    "chapter": chapter_id,
-                    "chunk": cid,
-                    "old": pre_texts.get(cid),
-                    "new": _read_final_text(chapter_id, cid),
-                })
-                result["rerun"].append(cid)
-
-    remaining_rows = _dirty_rows()
-    result["converged"] = len(remaining_rows) == 0
-    for chapter_id, chunk_id in remaining_rows:
-        result["remaining"].setdefault(chapter_id, []).append(chunk_id)
-
-    lines = [
-        "# 全书决策收敛报告 (consolidation_diff)",
-        "",
-        f"- 生成时间: {datetime.now().isoformat(timespec='seconds')}",
-        f"- 轮次: {result['rounds']} / max_rounds={rounds_cap}",
-        f"- 重跑 chunk: {len(result['rerun'])} 个",
-        f"- 最终状态: {'✅ 收敛 (DIRTY=0)' if result['converged'] else '❌ 未收敛'}",
-        "",
-    ]
-    if result["remaining"]:
-        lines.append("## 未收敛残留")
-        lines.append("")
-        for chapter_id in sorted(result["remaining"]):
-            lines.append(f"- {chapter_id}: {', '.join(result['remaining'][chapter_id])}")
-        lines.append("")
-    if not diff_records:
-        lines.append("（本次扫描 DIRTY=0，无重跑）")
-        lines.append("")
-    else:
-        lines.append("## 重跑明细")
-        lines.append("")
-        for rec in diff_records:
-            lines.append(f"### [{rec['chapter']}/{rec['chunk']}] (轮 {rec['round']})")
-            old_text, new_text = rec["old"], rec["new"]
-            if old_text is None and new_text is None:
-                lines.append("- 旧/新 final 均缺失（重跑失败且无 backup 可恢复）")
-            elif old_text is None:
-                lines.append(f"- 无旧稿对照；新稿 {len(new_text)} 字")
-            elif new_text is None:
-                lines.append(f"- 重跑无新稿（已回滚旧稿）；旧稿 {len(old_text)} 字")
-            elif old_text == new_text:
-                lines.append(f"- 文本无变化（仅决策核销）；{len(new_text)} 字")
-            else:
-                lines.append(f"- 文本变化: {len(old_text)} 字 → {len(new_text)} 字 "
-                             f"(Δ{len(new_text) - len(old_text):+d})")
-                old_lines = old_text.splitlines()
-                new_lines = new_text.splitlines()
-                preview = []
-                for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old_lines, new_lines).get_opcodes():
-                    if tag == "equal":
-                        continue
-                    for ln in old_lines[i1:i2][:3]:
-                        preview.append("- " + ln[:80])
-                    for ln in new_lines[j1:j2][:3]:
-                        preview.append("+ " + ln[:80])
-                    if len(preview) >= 8:
-                        break
-                lines.append("- 差异预览:")
-                lines.append("")
-                lines.append("```diff")
-                lines.extend(preview[:8])
-                lines.append("```")
-            lines.append("")
-    lines.append("---")
-    lines.append("*由 consolidate 子命令自动生成*")
-    lines.append("")
-
-    diff_path = out_root / "consolidation_diff.md"
-    try:
-        out_root.mkdir(parents=True, exist_ok=True)
-        diff_path.write_text("\n".join(lines), encoding="utf-8")
-        result["diff_path"] = str(diff_path)
-    except OSError as exc:
-        print(f"⚠️ [Consolidate] 报告写入失败: {exc}")
-
-    if result["converged"]:
-        print(f"✅ [Consolidate] 收敛完成: DIRTY=0 "
-              f"(重跑 {len(result['rerun'])} chunk, {result['rounds']} 轮)")
-    else:
-        total_left = sum(len(v) for v in result["remaining"].values())
-        print(f"❌ [Consolidate] 未收敛: 仍余 {total_left} 个 DIRTY chunk"
-              f"（max_rounds={rounds_cap} 已用尽）")
-        for chapter_id in sorted(result["remaining"]):
-            print(f"   {chapter_id}: {', '.join(result['remaining'][chapter_id])}")
-    return result
-
-
-# ───── 成书样式单源化 + lint（Round 119 T5）— 镜像 src/book_lint.py ─────
-# 事实源：src/book_lint.py；本块为逐字镜像（函数级一致性由
-# tests/test_round119_mirror_parity.py 守护；docstring/future-import 除外）。
-import json
-import re
-from pathlib import Path
-
-_SUPER = "¹²³⁴⁵⁶⁷⁸⁹"
-
-# 注释区块标题行（"**脚注：**" / "**【脚注】**" / "**脚注（…策略）**" /
-# "**脚注**（典故保留并加注）：" 等）。仅匹配"整行即标题"的形态。
-_FOOTNOTE_HEADER_RE = re.compile(
-    r'^\s*\*{0,2}\s*【?脚注】?\s*\*{0,2}'
-    r'(?:\s*[（(][^）)\n]{0,48}[）)])?'
-    r'\s*\*{0,2}\s*[：:]?\s*\*{0,2}\s*$'
-)
-_SUP_DEF_RE = re.compile(r'^\s*([¹²³⁴⁵⁶⁷⁸⁹]+)\s+(\S.*)$')
-_MD_DEF_RE = re.compile(r'^\s*\[\^([^\]]+)\]:\s?(.*)$')
-_NUM_DEF_RE = re.compile(r'^\s*(\d+)\.\s+(\S.*)$')
-_NUM_DEF_START_RE = re.compile(r'^[“”‘’「『（【*\u4e00-\u9fffA-Za-z]')
-_SUP_REF_RE = re.compile(r'[¹²³⁴⁵⁶⁷⁸⁹]+')
-_MD_REF_RE = re.compile(r'\[\^([^\]]+)\](?!:)')
-
-# 策略元语禁用表（T5/D5）
-_META_TOKENS = ["保留与加注策略", "保留并加注", "策略池", "RETAIN_AND_ANNOTATE",
-                "加注策略", "保留音译", "按约束", "直译自"]
-
-# merge 前处理：页眉/版本行（对齐真实字符串，含中英两制式）
-_FRONTMATTER_LINE_RE = re.compile(
-    r'^\s*#?\s*(?:The Project Gutenberg eBook\b.*|THE MILLENNIUM FULCRUM EDITION\b.*'
-    r'|古腾堡计划.*|千[禧年]*年支点版.*|目录|Contents)\s*$')
-_CHAPTER_HEAD_RE = re.compile(r'^\s*#?\s*第[一二三四五六七八九十百千零〇\d]+\s*[章.。．]')
-
-# merged 页眉残留（lint）
-_FRONTMATTER_RESIDUE_RES = [
-    ("Gutenberg 英文残留", re.compile(r'The Project Gutenberg eBook')),
-    ("Gutenberg 中文残留", re.compile(r'古腾堡')),
-    ("版本行残留", re.compile(r'MILLENNIUM FULCRUM|千[禧年]*年支点版')),
-    ("标题粘连残留", re.compile(r'ofAlice')),
-    ("章节标题缺空格", re.compile(r'CHAPTER\s+[IVXLCDM]+\.(?=[A-Z])')),
-]
-# 悬空承诺（D9 类，先报不修）
-_DANGLING_RE = re.compile(r'[：:]\s*——\s*$')
-
-
-def sup_run_to_int(run: str) -> int:
-    """上标数字串 → 整数（"¹²" → 12）。"""
-    return int(''.join(str(_SUPER.index(c) + 1) for c in run))
-
-
-def _scan_lines(text: str):
-    """一次扫描：行分类 + 注释定义 + 引用集合。
-
-    Returns:
-        (items, defs, refs)
-        items: [('header', None) | ('def', def_dict) | ('body', line)]
-        defs:  [{'style': 'sup'|'md'|'num', 'id': str, 'content': str}]
-        refs:  set[str]（正文中的 [^id] 与上标引用，统一为字符串 id）
-    """
-    items = []
-    defs = []
-    header_seen = False
-    for line in text.split('\n'):
-        if _FOOTNOTE_HEADER_RE.match(line):
-            header_seen = True
-            items.append(('header', None))
-            continue
-        m = _SUP_DEF_RE.match(line)
-        if m:
-            d = {'style': 'sup', 'id': str(sup_run_to_int(m.group(1))), 'content': m.group(2)}
-            defs.append(d)
-            items.append(('def', d))
-            continue
-        m = _MD_DEF_RE.match(line)
-        if m:
-            d = {'style': 'md', 'id': m.group(1), 'content': m.group(2)}
-            defs.append(d)
-            items.append(('def', d))
-            continue
-        if header_seen:
-            m = _NUM_DEF_RE.match(line)
-            if m and _NUM_DEF_START_RE.match(m.group(2)):
-                d = {'style': 'num', 'id': m.group(1), 'content': m.group(2)}
-                defs.append(d)
-                items.append(('def', d))
-                continue
-        items.append(('body', line))
-    body_text = '\n'.join(p for k, p in items if k == 'body')
-    refs = set()
-    for mm in _SUP_REF_RE.finditer(body_text):
-        refs.add(str(sup_run_to_int(mm.group(0))))
-    for mm in _MD_REF_RE.finditer(body_text):
-        refs.add(mm.group(1))
-    return items, defs, refs
-
-
-def normalize_final_style(text: str):
-    """T5 规范化 pass（幂等）。Returns: (new_text, changes dict)。"""
-    changes = {"headers_removed": 0, "sup_defs_converted": 0, "md_defs_kept": 0,
-               "orphans_relocated": 0, "cjk_quotes": 0, "straight_quotes": 0}
-    items, defs, refs = _scan_lines(text)
-    out = []
-    relocated = []
-    for kind, payload in items:
-        if kind == 'header':
-            changes["headers_removed"] += 1
-            continue
-        if kind == 'def':
-            d = payload
-            if d['style'] == 'num':
-                relocated.append(d['content'])
-                continue
-            if d['id'] in refs:
-                out.append("[^" + str(d['id']) + "]: " + d['content'])
-                if d['style'] == 'sup':
-                    changes["sup_defs_converted"] += 1
-                else:
-                    changes["md_defs_kept"] += 1
-            else:
-                relocated.append(d['content'])
-            continue
-        line = payload
-        line = _SUP_REF_RE.sub(lambda m: "[^" + str(sup_run_to_int(m.group(0))) + "]", line)
-        out.append(line)
-    if relocated:
-        changes["orphans_relocated"] = len(relocated)
-        while out and out[-1].strip() == '':
-            out.pop()
-        if out and out[-1].strip() == '---':
-            out.pop()
-        out.append('')
-        for content in relocated:
-            out.append('> **译者注：** ' + content)
-    t = '\n'.join(out)
-    if '「' in t or '」' in t:
-        changes["cjk_quotes"] += t.count('「') + t.count('」')
-        t = t.replace('「', '“').replace('」', '”')
-    if '『' in t or '』' in t:
-        changes["cjk_quotes"] += t.count('『') + t.count('』')
-        t = t.replace('『', '‘').replace('』', '’')
-    if '"' in t:
-        changes["straight_quotes"] = t.count('"')
-        parts = t.split('"')
-        rebuilt = parts[0]
-        for k, p in enumerate(parts[1:]):
-            rebuilt += ('“' if k % 2 == 0 else '”') + p
-        t = rebuilt
-    return t, changes
-
-
-def _find_finals(out_root: Path):
-    return sorted(out_root.glob("ch*/*_final.json"))
-
-
-def finalize_outputs(project_root=None, output_dir=None, apply: bool = False) -> dict:
-    """对全部 final.json 执行 normalize（默认 dry-run），写 output/finalize_diff.md。"""
-    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
-    out_root = Path(output_dir) if output_dir else root / "output"
-    finals = _find_finals(out_root)
-    stats = {"files": len(finals), "changed": 0, "headers_removed": 0,
-             "sup_defs_converted": 0, "md_defs_kept": 0, "orphans_relocated": 0,
-             "cjk_quotes": 0, "straight_quotes": 0}
-    details = []
-    for fp in finals:
-        try:
-            data = json.loads(fp.read_text(encoding="utf-8"))
-        except Exception:
-            print(f"  ⚠️ [Finalize] 跳过损坏 JSON: {fp}")
-            continue
-        text = data.get("text", "") if isinstance(data, dict) else str(data)
-        new_text, ch = normalize_final_style(text)
-        if new_text == text:
-            continue
-        stats["changed"] += 1
-        for k in ("headers_removed", "sup_defs_converted", "md_defs_kept",
-                  "orphans_relocated", "cjk_quotes", "straight_quotes"):
-            stats[k] += ch[k]
-        details.append((str(fp.relative_to(root)), ch))
-        if apply and isinstance(data, dict):
-            data["text"] = new_text
-            meta = data.get("metadata", {})
-            if not isinstance(meta, dict):
-                meta = {}
-            meta["style_normalized"] = True
-            data["metadata"] = meta
-            fp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    lines = ["# 成书样式规范化报告 (finalize_diff)", ""]
-    lines.append(f"- 模式: {'APPLY (已写入)' if apply else 'DRY RUN (仅报告)'}")
-    lines.append(f"- 扫描 final.json: {stats['files']} 个；需要变更: {stats['changed']} 个")
-    lines.append(f"- 注释标题行清除: {stats['headers_removed']}；上标定义转 [^n]: {stats['sup_defs_converted']}")
-    lines.append(f"- 悬空定义转译者注: {stats['orphans_relocated']}；「」引号: {stats['cjk_quotes']}；直引号: {stats['straight_quotes']}")
-    lines.append("")
-    if details:
-        lines.append("## 明细")
-        lines.append("")
-        for path, ch in details:
-            lines.append(f"- `{path}`: " + ", ".join(f"{k}={v}" for k, v in ch.items() if v))
-    else:
-        lines.append("（无需变更，样式已统一）")
-    lines.append("")
-    lines.append("---")
-    lines.append("*由 finalize 子命令自动生成*")
-    lines.append("")
-    out_root.mkdir(parents=True, exist_ok=True)
-    report_path = out_root / "finalize_diff.md"
-    report_path.write_text("\n".join(lines), encoding="utf-8")
-    return {"stats": stats, "report": str(report_path), "applied": bool(apply)}
-
-
-def _def_key(content: str) -> str:
-    m = re.match(r'^\s*\*\*(.+?)\*\*', content)
-    if m:
-        return m.group(1).strip()
-    m = re.match(r'^\s*[“「](.+?)[”」]', content)
-    if m:
-        return m.group(1).strip()
-    return content.strip()[:12]
-
-
-def _audit_text(text: str) -> dict:
-    """单文本 lint 审计（返回 problems 与统计）。"""
-    problems = []
-    straight = text.count('"')
-    if straight:
-        problems.append(f"直引号 {straight} 处")
-    cjk_q = sum(text.count(c) for c in '「」『』')
-    if cjk_q:
-        problems.append(f"「」/『』引号 {cjk_q} 处")
-    items, defs, refs = _scan_lines(text)
-    sup_defs = [d for d in defs if d['style'] == 'sup']
-    if sup_defs:
-        problems.append(f"上标脚注定义 {len(sup_defs)} 行（未转 [^n]）")
-    def_ids = {d['id'] for d in defs}
-    orphans = [d for d in defs if d['id'] not in refs]
-    if orphans:
-        problems.append(f"悬空脚注定义 {len(orphans)} 条: {[d['id'] for d in orphans]}")
-    dangling_refs = sorted(refs - def_ids)
-    meta = sum(text.count(t) for t in _META_TOKENS)
-    if meta:
-        problems.append(f"策略元语 {meta} 处")
-    keys = {}
-    dups = []
-    for d in defs:
-        k = _def_key(d['content'])
-        if k in keys and keys[k] != d['content']:
-            dups.append(k)
-        keys[k] = d['content']
-    if dups:
-        problems.append(f"同键重复注释: {dups}")
-    return {"problems": problems, "defs": defs, "orphan_count": len(orphans),
-            "dangling_refs": dangling_refs, "meta_count": meta}
-
-
-def lint_texts(items) -> dict:
-    """items: [(label, text), ...] → {'ok': bool, 'failures': [...], 'warnings': [...]}"""
-    failures = []
-    warnings = []
-    for label, text in items:
-        a = _audit_text(text)
-        for p in a["problems"]:
-            failures.append(f"{label}: {p}")
-        if a["dangling_refs"]:
-            warnings.append(f"{label}: 无定义引用 {a['dangling_refs']}")
-    return {"ok": not failures, "failures": failures, "warnings": warnings}
-
-
-def _chapter_dup_notes(entries) -> list:
-    """entries: [(label, text)]（同章）。返回重复注 failures/warnings。"""
-    failures, warnings = [], []
-    seen = {}
-    for label, text in entries:
-        _items, defs, _refs = _scan_lines(text)
-        for d in defs:
-            k = _def_key(d['content'])
-            if not k:
-                continue
-            if k in seen:
-                prev_label, prev_content = seen[k]
-                if prev_content == d['content']:
-                    failures.append(f"重复注（同键同文）: {k} @ {prev_label} / {label}")
-                else:
-                    import difflib as _dl
-                    r = _dl.SequenceMatcher(None, prev_content, d['content']).ratio()
-                    if r >= 0.8:
-                        failures.append(f"重复注（同键近似 r={r:.2f}）: {k} @ {prev_label} / {label}")
-                    else:
-                        warnings.append(f"同键不同注: {k} @ {prev_label} / {label}")
-            else:
-                seen[k] = (label, d['content'])
-    return failures, warnings
-
-
-def _book_style_config() -> dict:
-    try:
-        from src.config import config as _cfg
-        data = _cfg.get("book", {}) if hasattr(_cfg, "get") else {}
-        if data:
-            return data
-    except Exception:
-        pass
-    try:
-        from src.config import get_config as _get_config
-        return _get_config().get("book", {}) or {}
-    except Exception:
-        return {}
-
-
-def lint_book(project_root=None, output_dir=None, merged_path=None) -> dict:
-    """成书级 lint：finals（逐 chunk）+ merged（整书）双跑；写 output/book_lint.md。"""
-    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
-    out_root = Path(output_dir) if output_dir else root / "output"
-    merged = Path(merged_path) if merged_path else out_root / "translated_full.md"
-    failures, warnings = [], []
-    stats = {"finals": 0}
-
-    by_chapter = {}
-    for fp in _find_finals(out_root):
-        try:
-            data = json.loads(fp.read_text(encoding="utf-8"))
-        except Exception:
-            failures.append(f"{fp.name}: JSON 解析失败")
-            continue
-        text = data.get("text", "") if isinstance(data, dict) else str(data)
-        label = f"{fp.parent.name}/{fp.name}"
-        stats["finals"] += 1
-        by_chapter.setdefault(fp.parent.name, []).append((label, text))
-        a = _audit_text(text)
-        for p in a["problems"]:
-            failures.append(f"{label}: {p}")
-        if a["dangling_refs"]:
-            warnings.append(f"{label}: 无定义引用 {a['dangling_refs']}")
-    for ch, entries in sorted(by_chapter.items()):
-        df, dw = _chapter_dup_notes(entries)
-        failures.extend(f"{ch}: {x}" for x in df)
-        warnings.extend(f"{ch}: {x}" for x in dw)
-
-    if merged.exists():
-        mtext = merged.read_text(encoding="utf-8")
-        for name, pat in _FRONTMATTER_RESIDUE_RES:
-            n = len(pat.findall(mtext))
-            if n:
-                failures.append(f"merged: {name} {n} 处")
-        style = str(_book_style_config().get("chapter_titles", "bilingual"))
-        headings = [ln.strip() for ln in mtext.split('\n') if ln.startswith('# ')]
-        stats["headings"] = len(headings)
-        if style in ("bilingual", "zh"):
-            for h in headings[1:]:
-                if not re.match(r'^#\s*第[一二三四五六七八九十百千零〇\d]+\s*章', h):
-                    failures.append(f"merged: 章节标题不符合制式({style}): {h[:40]}")
-        for h in headings:
-            for name, pat in _FRONTMATTER_RESIDUE_RES:
-                if pat.search(h):
-                    failures.append(f"merged: 标题含残留（{name}）: {h[:40]}")
-        dangling = [ln.strip()[:60] for ln in mtext.split('\n') if _DANGLING_RE.search(ln)]
-        for d in dangling:
-            warnings.append(f"merged: 疑似悬空承诺: {d}")
-        a = _audit_text(mtext)
-        for p in a["problems"]:
-            failures.append(f"merged: {p}")
-        machine_ids = _MACHINE_FN_ID_RE.findall(mtext)
-        if machine_ids:
-            failures.append(
-                f"merged: 机器脚注 id 残留 {len(machine_ids)} 处（应先跑 notes-normalize）")
-        for label, body in _split_h1_sections(mtext):
-            dups = _chapter_note_dupes(body)
-            for d in dups[:5]:
-                failures.append(f"merged/{label}: {d}")
-            if len(dups) > 5:
-                failures.append(f"merged/{label}: 另有 {len(dups) - 5} 组重复注未列出")
-    else:
-        warnings.append("merged 未生成（translated_full.md 缺失），跳过整书级检查")
-
-    result = {"ok": not failures, "failures": failures, "warnings": warnings, "stats": stats}
-    lines = ["# 成书 lint 报告 (book_lint)", ""]
-    lines.append(f"- 结论: {'✅ 全绿' if result['ok'] else '❌ 未通过'}")
-    lines.append(f"- 扫描 final.json: {stats['finals']} 个")
-    lines.append("")
-    if failures:
-        lines.append(f"## 失败项 ({len(failures)})")
-        lines.append("")
-        for f in failures:
-            lines.append(f"- {f}")
-        lines.append("")
-    if warnings:
-        lines.append(f"## 警告项 ({len(warnings)})")
-        lines.append("")
-        for w in warnings:
-            lines.append(f"- {w}")
-        lines.append("")
-    lines.append("---")
-    lines.append("*由 lint 子命令自动生成*")
-    lines.append("")
-    out_root.mkdir(parents=True, exist_ok=True)
-    (out_root / "book_lint.md").write_text("\n".join(lines), encoding="utf-8")
-    return result
-
-
-def postprocess_chunk_text(text: str, chapter_id: str, chunk_idx: int) -> str:
-    """merge 前处理：剥离页眉/版本行残留 + chunk 内嵌章节标题行。"""
-    out = []
-    for line in text.split('\n'):
-        s = line.strip()
-        if _FRONTMATTER_LINE_RE.match(s):
-            continue
-        if _CHAPTER_HEAD_RE.match(s):
-            continue
-        out.append(line)
-    return '\n'.join(out)
-
-
-def chapter_heading(project_root, chapter_id: str, style: str = None) -> str:
-    """merge 层章节标题。默认 config.book.chapter_titles（bilingual）。
-
-    bilingual: "第一章 掉进兔子洞（Down the Rabbit-Hole）"
-    zh:        "第一章 掉进兔子洞"
-    keep:      input/<ch>.md 原始 H1（清理 Gutenberg 前缀）
-    """
-    root = Path(project_root)
-    if style is None:
-        style = str(_book_style_config().get("chapter_titles", "bilingual"))
-    orig = ""
-    md = root / "input" / f"{chapter_id}.md"
-    if md.exists():
-        for line in md.read_text(encoding="utf-8").split('\n')[:10]:
-            s = line.strip()
-            if s.startswith('# '):
-                orig = s[2:].strip()
-                break
-    orig_clean = re.sub(r'^The Project Gutenberg eBook of\s*', '', orig)
-    zh = ""
-    out_dir = root / "output" / chapter_id
-    firsts = sorted(out_dir.glob("*_final.json"))
-    if firsts:
-        try:
-            data = json.loads(firsts[0].read_text(encoding="utf-8"))
-            text = data.get("text", "") if isinstance(data, dict) else str(data)
-        except Exception:
-            text = ""
-        for line in text.split('\n')[:20]:
-            m = re.match(r'^#?\s*(第[一二三四五六七八九十百千零〇\d]+\s*[章.。．]\s*\S.*)$', line.strip())
-            if m and len(m.group(1)) <= 60:
-                zh = m.group(1).strip().rstrip('。．.')
-                zh = re.sub(r'\[\^[^\]]+\]', '', zh)
-                break
-    if style == "keep":
-        return orig_clean or chapter_id
-    if style == "zh":
-        return zh or orig_clean or chapter_id
-    orig_short = re.sub(r'^CHAPTER\s+[IVXLCDM]+\.\s*', '', orig_clean)
-    if zh and orig_short and orig_short not in zh:
-        return f"{zh}（{orig_short}）"
-    return zh or orig_short or chapter_id
-def _note_norm(content: str) -> str:
-    """注释内容归一化（去重比较用）：剥 markdown/标签/空白。"""
-    t = re.sub(r'[*`>]', '', content)
-    t = re.sub(r'^\s*\[\^[^\]]+\]:\s*', '', t)
-    t = _NOTE_LABEL_RE.sub('', t)
-    return re.sub(r'\s+', '', t)
-
-def _note_key(content: str) -> str:
-    """注释主键：粗体词条 / 引号词条 / 归一化前 12 字。"""
-    m = re.match(r'^\s*\*\*(.+?)\*\*', content)
-    if m:
-        return m.group(1).strip()
-    m = re.match(r'^\s*[“「『](.+?)[”」』]', content)
-    if m:
-        return m.group(1).strip()
-    return _note_norm(content)[:12]
-
-def _note_is_dup(a: str, b: str) -> bool:
-    """内容级重复判定（保守，校准值见上方注释）。"""
-    import difflib
-    na, nb = _note_norm(a), _note_norm(b)
-    if not na or not nb or min(len(na), len(nb)) < 30:
-        return False
-    r = difflib.SequenceMatcher(None, na, nb).ratio()
-    if r >= _NOTE_DUP_RATIO_HARD:
-        return True
-    if r < _NOTE_DUP_RATIO:
-        return False
-    la = {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", a)} - _NOTE_ANCHOR_STOP
-    lb = {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", b)} - _NOTE_ANCHOR_STOP
-    if la & lb:
-        return True
-    ca, cb = set(), set()
-    for run in re.findall(r'[\u4e00-\u9fff]{3,}', na):
-        ca.update(run[i:i + 4] for i in range(len(run) - 3))
-    for run in re.findall(r'[\u4e00-\u9fff]{3,}', nb):
-        cb.update(run[i:i + 4] for i in range(len(run) - 3))
-    return len(ca & cb) >= 4
-
-def _note_terms(content: str) -> list:
-    """孤儿注改锚候选词（长词优先，只从词条头部提取）。"""
-    cands = []
-    m = re.match(r'^\s*\*\*([^*]{1,40})\*\*', content)
-    if m:
-        cands.append(m.group(1))
-    for m in _QUOTED_TERM_RE.finditer(content):
-        cands.append(m.group(1))
-    m = re.match(r'^\s*([^：:]{2,24})[：:]', content)
-    if m:
-        cands.append(m.group(1))
-    seen, out = set(), []
-    for t in cands:
-        t = re.sub(r'^\s*\[[^\]]*\]\s*', '', t).strip(' *“”"「」『』\u3000')
-        pieces = [t, t.split('（')[0], t.split('(')[0]]
-        pieces += re.findall(r'[\u4e00-\u9fff]{2,}', t)
-        pieces += re.findall(r"[A-Za-z][A-Za-z'-]{3,}", t)
-        for p in pieces:
-            p = p.strip(' *“”"「」『』：「:」（()）')
-            if len(p) >= 2 and p not in seen:
-                seen.add(p)
-                out.append(p)
-    out.sort(key=len, reverse=True)
-    return out
-
-def _note_candidates(text: str):
-    """注释单元扫描。→ (blocks, units)；blocks 含字符偏移，units 含 kind/id/content。"""
-    raw_blocks = [{'start': m.start(), 'end': m.end(), 'seg': m.group(0)}
-                  for m in re.finditer(r'(?m)(?:^[ \t]*\S.*(?:\n|$))+', text)]
-    blocks = []
-    for _b in raw_blocks:
-        _ls = _b['seg'].split('\n')
-        _body_ls = [l for l in _ls if l.strip()]
-        if (len(_body_ls) > 1
-                and all(_TR_BLOCK_RE.match(l) for l in _body_ls)):
-            _pos = _b['start']
-            for _l in _ls:
-                if _l.strip():
-                    blocks.append({'start': _pos, 'end': _pos + len(_l), 'seg': _l})
-                _pos += len(_l) + 1
-        else:
-            blocks.append(_b)
-    units = []
-    prev = None
-    for bi, b in enumerate(blocks):
-        seg = b['seg']
-        first = seg.split('\n', 1)[0]
-        m_md = _MD_DEF_RE.match(first)
-        m_tr = _TR_BLOCK_RE.match(first)
-        m_title = _NOTE_TITLE_RE.match(first)
-        m_br = _BRACKET_DEF_RE.match(first)
-        m_pa = _PAREN_DEF_RE.match(first)
-        if m_md:
-            u = {'kind': 'md', 'id': m_md.group(1), 'content': m_md.group(2), 'block': bi}
-        elif m_tr:
-            rest = [re.sub(r'^\s*>\s?', '', l) for l in seg.split('\n')[1:]]
-            u = {'kind': 'tr', 'id': None,
-                 'content': ' '.join([m_tr.group(1)] + rest).strip(), 'block': bi}
-        elif m_title and len(seg.rstrip('\n').split('\n')) == 1:
-            u = {'kind': 'title', 'id': None, 'content': m_title.group(1), 'block': bi,
-                 'title_end': bool(_NOTE_TITLE_END_RE.match(first))}
-        elif (m_br or m_pa) and prev in ('sep', 'num', 'title'):
-            g = m_br or m_pa
-            u = {'kind': 'num', 'id': g.group(1), 'content': g.group(2), 'block': bi}
-        elif _SEP_LINE_RE.match(first):
-            u = {'kind': 'sep', 'id': None, 'content': '', 'block': bi}
-        elif (_BOLD_LEAD_RE.match(first) and len(seg.strip()) <= 800):
-            u = {'kind': 'para', 'id': None, 'content': seg.strip(), 'block': bi}
-        else:
-            u = {'kind': 'body', 'id': None, 'content': seg, 'block': bi}
-        units.append(u)
-        prev = u['kind']
-    return blocks, units
-
-def _group_title_units(units) -> None:
-    """标题块打组：title 及紧随其后的连续 num 单元。"""
-    i, n = 0, len(units)
-    while i < n:
-        if units[i]['kind'] == 'title':
-            j = i + 1
-            while j < n and units[j]['kind'] == 'num':
-                j += 1
-            if j - i > 1:
-                for k in range(i, j):
-                    units[k]['group'] = i
-            i = j
-        else:
-            i += 1
-
-def _split_h1_sections(text: str):
-    """按 H1 切章 → [(章标题, 正文)]（前置段标题为 '(前置)'）。"""
-    parts = re.split(r'(?m)^(# .*)$', text)
-    out = [('(前置)', parts[0])]
-    for k in range(1, len(parts), 2):
-        out.append((parts[k].strip(), parts[k + 1] if k + 1 < len(parts) else ''))
-    return out
-
-def normalize_chapter_notes(text: str, start_num: int = 1):
-    """章级注释统一：去重 → 孤儿改锚/章末归位 → 顺序重编号（幂等）。
-
-    Returns: (new_text, changes: dict, next_num: int)
-    """
-    blocks, units = _note_candidates(text)
-    _group_title_units(units)
-    changes = {"merged_dups": 0, "orphans_attached": 0, "md_relocated": 0,
-               "num_relocated": 0, "title_blocks_moved": 0, "renumbered": 0,
-               "title_shells_dropped": 0,
-               "machine_ids": len(_MACHINE_FN_ID_RE.findall(text))}
-
-    # 1) 去重（标题块/分隔行/正文豁免）
-    cand = [u for u in units if u['kind'] in ('md', 'num', 'tr', 'para')
-            and 'group' not in u]
-    parent = list(range(len(cand)))
-
-    def _root(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    for i in range(len(cand)):
-        for j in range(i + 1, len(cand)):
-            if _note_is_dup(cand[i]['content'], cand[j]['content']):
-                ri, rj = _root(i), _root(j)
-                if ri != rj:
-                    parent[rj] = ri
-    clusters = {}
-    for i in range(len(cand)):
-        clusters.setdefault(_root(i), []).append(i)
-    dropped = set()
-    remap = {}
-
-    def _rank(u):
-        score = 2 if u['kind'] == 'md' else (1 if u['kind'] == 'num' else 0)
-        return (score, len(_note_norm(u['content'])))
-
-    for members in clusters.values():
-        if len(members) < 2:
-            continue
-        members = sorted(members, key=lambda i: _rank(cand[i]), reverse=True)
-        surv = cand[members[0]]
-        for mi in members[1:]:
-            u = cand[mi]
-            dropped.add(u['block'])
-            changes["merged_dups"] += 1
-            if (u['kind'] == 'md' and surv['kind'] == 'md'
-                    and u['id'] != surv['id']):
-                remap[u['id']] = surv['id']
-
-    # 2) 保留区（去重删除块置空以稳定偏移）内统计引用
-    kept = text
-    for bi in dropped:
-        b = blocks[bi]
-        kept = kept[:b['start']] + (' ' * (b['end'] - b['start'])) + kept[b['end']:]
-    body_spans = [(u['block'], blocks[u['block']]) for u in units
-                  if u['kind'] == 'body' and u['block'] not in dropped]
-
-    def _count_refs(uid, md=True):
-        pat = (re.compile(r'\[\^' + re.escape(uid) + r'\](?!:)') if md
-               else re.compile(r'[\[［]' + re.escape(uid) + r'[\]］](?!\s*[:：])'))
-        cnt, pos = 0, None
-        for bi, b in body_spans:
-            seg = kept[b['start']:b['end']]
-            for m in pat.finditer(seg):
-                cnt += 1
-                if pos is None:
-                    pos = b['start'] + m.start()
-        return cnt, pos
-
-    ref_info = {}
-    for u in cand:
-        if u['kind'] in ('md', 'num') and u['block'] not in dropped:
-            ref_info[u['block']] = _count_refs(u['id'], md=(u['kind'] == 'md'))
-    for old, new in remap.items():
-        for u in cand:
-            if u['kind'] == 'md' and u['id'] == new and u['block'] in ref_info:
-                c, p = _count_refs(old, md=True)
-                cc, pp = ref_info[u['block']]
-                ref_info[u['block']] = (cc + c, pp if pp is not None else p)
-                break
-
-    # 3) 孤儿处理：改锚（正文词条）或章末归位
-    seg_override = {}
-    md_fail, num_fail = [], []
-
-    def _block_text(bi):
-        return seg_override.get(bi, blocks[bi]['seg'])
-
-    # 编号注列表内交叉引用：同一连续列表内 {编号 → 临时 uid}
-    run_map = {}
-    runs, cur_run = [], []
-    for u in units:
-        if u['kind'] == 'num' and 'group' not in u:
-            cur_run.append(u)
-        else:
-            if len(cur_run) > 1:
-                runs.append(cur_run)
-            cur_run = []
-    if len(cur_run) > 1:
-        runs.append(cur_run)
-    for run in runs:
-        m = {}
-        for u in run:
-            m[str(int(u['id']))] = ('n{0}'.format(u['block'])
-                                    if u['kind'] == 'num' else u['id'])
-        run_map[id(run)] = m
-    uid_run = {}
-    for run in runs:
-        for u in run:
-            uid_run[u['block']] = run_map[id(run)]
-
-    def _rewrite_cross(content, block):
-        m = uid_run.get(block)
-        if not m:
-            return content
-        return re.sub(r'\[(\d+)\](?![\]:])',
-                      lambda mm: '[^' + m.get(mm.group(1), mm.group(1)) + ']'
-                      if mm.group(1) in m else mm.group(0), content)
-
-    for u in cand:
-        if u['kind'] not in ('md', 'num', 'tr') or u['block'] in dropped:
-            continue
-        cnt, _p = ref_info.get(u['block'], (0, None))
-        if u['kind'] == 'tr':
-            cnt = 0
-        if cnt:
-            continue
-        hit = None
-        for term in _note_terms(u['content']):
-            for bi, b in body_spans:
-                seg = kept[b['start']:b['end']]
-                if term in seg:
-                    hit = bi
-                    break
-            if hit is not None:
-                break
-        uid = u['id'] if u['kind'] == 'md' else 'n{0}'.format(u['block'])
-        if hit is not None:
-            cur = _block_text(hit)
-            cur = cur.rstrip('\n')
-            nl = '\n' if blocks[hit]['seg'].endswith('\n') else ''
-            seg_override[hit] = cur + '[^' + uid + ']' + nl
-            if u['kind'] in ('num', 'tr'):
-                seg_override[u['block']] = '[^{0}]: {1}\n'.format(
-                    uid, _rewrite_cross(u['content'], u['block']))
-            changes["orphans_attached"] += 1
-        elif u['kind'] == 'tr':
-            continue
-        else:
-            dropped.add(u['block'])
-            if u['kind'] == 'md':
-                md_fail.append(u['content'])
-                changes["md_relocated"] += 1
-            else:
-                num_fail.append('[{0}] {1}'.format(
-                    u['id'], _rewrite_cross(u['content'], u['block'])))
-                changes["num_relocated"] += 1
-
-    # 3b) 章末注释块条目：尽力改锚（编辑器要求"有注无引"→角标；失败者留在块内）
-    for tu in units:
-        if not (tu['kind'] == 'title' and tu.get('title_end') and 'group' in tu):
-            continue
-        members = [u for u in units
-                   if u.get('group') == tu['group'] and u['kind'] == 'num']
-        attached = 0
-        for u in members:
-            terms = _note_terms(u['content'])
-            extra = []
-            for _run in re.findall(r'[\u4e00-\u9fff]{4,}', u['content']):
-                if _run not in extra:
-                    extra.append(_run)
-                for _i in range(len(_run) - 3):
-                    _w = _run[_i:_i + 4]
-                    if _w not in extra:
-                        extra.append(_w)
-            extra = [r for r in extra if r not in terms]
-            terms = terms + extra
-            terms.sort(key=len, reverse=True)
-            hit = None
-            for term in terms:
-                if len(term) < 4 and term not in _note_terms(u['content']):
-                    continue
-                for bi, b in body_spans:
-                    seg = kept[b['start']:b['end']]
-                    if term in seg:
-                        hit = bi
-                        break
-                if hit is not None:
-                    break
-            if hit is None:
-                continue
-            uid = 'n{0}'.format(u['block'])
-            cur = _block_text(hit).rstrip('\n')
-            nl = '\n' if blocks[hit]['seg'].endswith('\n') else ''
-            seg_override[hit] = cur + '[^' + uid + ']' + nl
-            seg_override[u['block']] = '[^{0}]: {1}\n'.format(uid, u['content'])
-            attached += 1
-            changes["orphans_attached"] += 1
-        if members and attached == len(members):
-            dropped.add(tu['block'])
-
-    # 3c) 空壳注释标题（无任何条目的【注释】块）：删除
-    # 仅限"【注释】"制式（结构化编号注的标准标题）；【译注】等可承载
-    # 纯段落说明文字，标题存在即合理，不做清理.
-    _shell_re = re.compile(r'^\s*\*{0,2}\s*【注释】\s*\*{0,2}\s*$')
-    for u in units:
-        if u['kind'] != 'title' or 'group' in u or u['block'] in dropped:
-            continue
-        if _shell_re.match(blocks[u['block']]['seg'].split('\n', 1)[0]):
-            dropped.add(u['block'])
-            changes["title_shells_dropped"] += 1
-
-    # 4) 章末标题块归位（【章末注释】等；已在章末者不动）
-    end_blocks = []
-    for u in units:
-        if u['kind'] != 'title' or not u.get('title_end') or 'group' not in u:
-            continue
-        if u['block'] in dropped:
-            continue
-        grp = [x for x in units if x.get('group') == u['group']]
-        last = max(x['block'] for x in grp)
-        if not any(x['kind'] == 'body' and x['block'] > last for x in units):
-            continue
-        movers = [x for x in grp
-                  if x['block'] not in dropped and x['block'] not in seg_override]
-        movers.sort(key=lambda x: x['block'])
-        for x in movers:
-            dropped.add(x['block'])
-            end_blocks.append(blocks[x['block']]['seg'].rstrip('\n'))
-        if movers:
-            changes["title_blocks_moved"] += 1
-
-    # 5) 组装
-    out_parts, cur = [], 0
-    for bi, b in enumerate(blocks):
-        out_parts.append(text[cur:b['start']])
-        if bi in dropped:
-            seg = ''
-        elif bi in seg_override:
-            seg = seg_override[bi]
-        else:
-            seg = b['seg']
-        out_parts.append(seg)
-        cur = b['end']
-    out_parts.append(text[cur:])
-    assembled = ''.join(out_parts)
-    tail = []
-    if end_blocks:
-        tail.append('---\n\n' + '\n\n'.join(end_blocks))
-    if num_fail:
-        tail.append('---\n\n**【译注】**\n\n' + '\n\n'.join(num_fail))
-    if md_fail:
-        tail.append('---\n\n' + '\n\n'.join('> **译者注：** ' + c for c in md_fail))
-    if tail:
-        assembled = assembled.rstrip('\n') + '\n\n' + '\n\n'.join(tail) + '\n'
-
-    # 6) 顺序重编号（全书连续；被去重旧 id 的引用先并入幸存者）
-    if remap:
-        assembled = re.sub(
-            r'\[\^([^\]]+)\](?!:)',
-            lambda m: '[^' + remap.get(m.group(1), m.group(1)) + ']', assembled)
-    order = []
-    for m in re.finditer(r'\[\^([^\]]+)\](?!:)', assembled):
-        if m.group(1) not in order:
-            order.append(m.group(1))
-    for m in re.finditer(r'\[\^([^\]]+)\]:', assembled):
-        if m.group(1) not in order:
-            order.append(m.group(1))
-    mapping = {old: str(start_num + i) for i, old in enumerate(order)}
-
-    def _sub_ref(m):
-        return '[^' + mapping.get(m.group(1), m.group(1)) + ']'
-
-    assembled = re.sub(r'\[\^([^\]]+)\](?!:)', _sub_ref, assembled)
-    assembled = re.sub(r'\[\^([^\]]+)\]:',
-                       lambda m: '[^' + mapping.get(m.group(1), m.group(1)) + ']:',
-                       assembled)
-    changes["renumbered"] = len(order)
-
-    # 6.5) 脚注定义章末集中（raw md 可读性；编辑器多次建议"集中至章末"）
-    def_lines = {}
-    kept_lines = []
-    for line in assembled.split('\n'):
-        m = re.match(r'^\[\^(\d+)\]:\s(.*)$', line)
-        if m:
-            def_lines[int(m.group(1))] = line
-        else:
-            kept_lines.append(line)
-    if def_lines:
-        while kept_lines and kept_lines[-1].strip() == '':
-            kept_lines.pop()
-        if kept_lines and kept_lines[-1].strip() == '---':
-            kept_lines.pop()
-        while kept_lines and kept_lines[-1].strip() == '':
-            kept_lines.pop()
-        assembled = ('\n'.join(kept_lines).rstrip('\n') + '\n\n---\n\n'
-                     + '\n'.join(def_lines[k] for k in sorted(def_lines)) + '\n')
-    return assembled, changes, start_num + len(order)
-
-def normalize_notes_document(text: str):
-    """全书：按 H1 切章逐章统一（编号全书连续）。→ (new_text, report)"""
-    parts = re.split(r'(?m)^(# .*)$', text)
-    agg = {"merged_dups": 0, "orphans_attached": 0, "md_relocated": 0,
-           "num_relocated": 0, "title_blocks_moved": 0, "renumbered": 0,
-           "title_shells_dropped": 0,
-           "machine_ids": 0}
-    details = []
-    counter = 1
-    pre_new, ch0, counter = normalize_chapter_notes(parts[0], counter)
-    for key in agg:
-        agg[key] += ch0.get(key, 0)
-    if any(ch0.values()):
-        details.append(('(前置)', ch0))
-    out_txt = [pre_new]
-    for k in range(1, len(parts), 2):
-        head = parts[k]
-        body = parts[k + 1] if k + 1 < len(parts) else ''
-        body_new, ch, counter = normalize_chapter_notes(body, counter)
-        for key in agg:
-            agg[key] += ch.get(key, 0)
-        if any(ch.values()):
-            details.append((head.strip(), ch))
-        out_txt.append(head)
-        out_txt.append(body_new)
-    report = {"stats": agg, "chapters": details, "next_num": counter}
-    return ''.join(out_txt), report
-
-def notes_normalize_outputs(project_root=None, output_dir=None, apply: bool = False) -> dict:
-    """对 translated_full.md 执行章级注释统一；默认 dry-run，写 output/note_policy_diff.md。"""
-    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
-    out_root = Path(output_dir) if output_dir else root / "output"
-    merged = out_root / "translated_full.md"
-    stats = {"files": 0, "changed": 0, "merged_dups": 0, "orphans_attached": 0,
-             "md_relocated": 0, "num_relocated": 0, "title_blocks_moved": 0,
-             "renumbered": 0, "title_shells_dropped": 0, "machine_ids": 0}
-    details = []
-    if merged.exists():
-        stats["files"] = 1
-        text = merged.read_text(encoding="utf-8")
-        new_text, rep = normalize_notes_document(text)
-        if new_text != text:
-            stats["changed"] = 1
-            for key in ("merged_dups", "orphans_attached", "md_relocated",
-                        "num_relocated", "title_blocks_moved", "renumbered",
-                        "title_shells_dropped", "machine_ids"):
-                stats[key] = rep["stats"].get(key, 0)
-            details = rep["chapters"]
-            if apply:
-                merged.write_text(new_text, encoding="utf-8")
-    lines = ["# 章级注释统一报告 (note_policy_diff)", "",
-             "- 模式: {0}".format('APPLY (已写入)' if apply else 'DRY RUN (仅报告)'),
-             "- 处理 file: {0} 个；需要变更: {1} 个".format(stats['files'], stats['changed']),
-             "- 去重合并: {0}；孤儿改锚: {1}；md 转译者注: {2}；编号注转译注块: {3}".format(
-                 stats['merged_dups'], stats['orphans_attached'],
-                 stats['md_relocated'], stats['num_relocated']),
-             "- 标题块搬移: {0}；空壳标题清理: {1}；顺编号: {2}；机器 id 清除: {3}".format(
-                 stats['title_blocks_moved'], stats['title_shells_dropped'],
-                 stats['renumbered'], stats['machine_ids']),
-             ""]
-    if details:
-        lines.append("## 明细")
-        lines.append("")
-        for label, ch in details:
-            lines.append("- `{0}`: {1}".format(
-                label, ", ".join("{0}={1}".format(k, v) for k, v in ch.items() if v)))
-    else:
-        lines.append("（无需变更）")
-    lines += ["", "---", "*由 notes-normalize 子命令自动生成*", ""]
-    out_root.mkdir(parents=True, exist_ok=True)
-    report_path = out_root / "note_policy_diff.md"
-    report_path.write_text("\n".join(lines), encoding="utf-8")
-    return {"stats": stats, "report": str(report_path), "applied": bool(apply)}
-
-def _chapter_note_dupes(text: str) -> list:
-    """章切片的注释重复检测（供 lint；与 normalize 同判据）。"""
-    _blocks, units = _note_candidates(text)
-    _group_title_units(units)
-    cand = [u for u in units if u['kind'] in ('md', 'num', 'tr', 'para')
-            and 'group' not in u]
-    out = []
-    for i in range(len(cand)):
-        for j in range(i + 1, len(cand)):
-            if _note_is_dup(cand[i]['content'], cand[j]['content']):
-                out.append("重复注: {0} ~ {1}".format(
-                    _note_key(cand[i]['content'])[:18],
-                    _note_key(cand[j]['content'])[:18]))
-    return out
-
-_NOTE_TITLE_RE = re.compile(r'^\s*\*{0,2}\s*【([^】]{1,12})】\s*\*{0,2}\s*$')
-
-_NOTE_TITLE_END_RE = re.compile(
-    r'^\s*\*{0,2}\s*【(?:章末注释|本章注释|章末注|尾注|文末注)】\s*\*{0,2}\s*$')
-
-_TR_BLOCK_RE = re.compile(r'^\s*>\s*\*\*译者注[:：]\*\*\s*(.*)$')
-
-_BRACKET_DEF_RE = re.compile(r'^\s*[\[［](\d{1,3})[\]］]\s*(\S.*)$')
-
-_PAREN_DEF_RE = re.compile(r'^\s*[（(](\d{1,3})[）)]\s*(\S.*)$')
-
-_BOLD_LEAD_RE = re.compile(r'^\s*\*\*([^*]{1,40})\*\*\s*[：:]\s*\S')
-
-_SEP_LINE_RE = re.compile(r'^\s*-{3,}\s*$')
-
-_MACHINE_FN_ID_RE = re.compile(r'\[\^[^\]]*_c\d+_[^\]]*\]')
-
-_NOTE_LABEL_RE = re.compile(r'^\s*(?:\*+\s*)?(?:译者注|译注|脚注|注释)\s*[:：]?\s*')
-
-_QUOTED_TERM_RE = re.compile(r'[“「『]([^”」』]{2,36})[”」』]')
-
-_NOTE_DUP_RATIO = 0.28
-
-_NOTE_DUP_RATIO_HARD = 0.75
-
-_NOTE_ANCHOR_STOP = {"carroll", "alice", "english", "victorian", "lewis"}
-
-# ── Round 121 L5 镜像区结束 ──
-
-
-
-# ───── T4: final gate（Round 119）— 镜像 src/pipeline.py:run_final_gate ─────
-# 事实源：src/pipeline.py；逐字镜像（一致性由 tests/test_round119_mirror_parity.py 守护）。
-
-
-def run_final_gate(
-    project_root=None,
-    db_path=None,
-    output_dir=None,
-    qa_report_path=None,
-    conversion_audit_path=None,
-) -> dict:
-    """T4: 交付门禁 — 完成信号不变量化（fail-closed）。
-
-    ① 状态机：全部 chunk COMPLETED 且 DIRTY=0
-    ② 产物：每章 final.json 数 == DB 任务数；无 *_final_backup.json 残留
-    ③ QA_REPORT：无 fallback 章节条目（## 段）
-    ④ T5 lint（finals + merged）全绿
-    ⑤ T1 转换审计报告结论为 "✅ 通过"
-    任一为红 → ok=False（translate_book.sh 以非零退出中止 / ⛔）。
-    """
-    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
-    db_file = Path(db_path) if db_path else root / "db" / "workflow.db"
-    out_root = Path(output_dir) if output_dir else root / "output"
-    qa_file = Path(qa_report_path) if qa_report_path else out_root / "QA_REPORT.md"
-    audit_file = (Path(conversion_audit_path) if conversion_audit_path
-                  else root / "input" / "_conversion_audit.md")
-
-    failures: list = []
-    warnings: list = []
-    stats: dict = {"tasks": 0, "states": {}, "chapters": 0, "qa_fallbacks": 0}
-    by_state: dict = {}
-    expected: dict = {}
-
-    # ① 状态机 + ② 产物
-    rows = []
-    scheduler = None
-    if not db_file.exists():
-        failures.append(f"① workflow.db 不存在: {db_file}")
-    else:
-        scheduler = TaskScheduler(db_path=str(db_file))
-        rows = scheduler.conn.execute(
-            "SELECT chapter_id, chunk_id, state FROM chunk_tasks").fetchall()
-    stats["tasks"] = len(rows)
-    for ch, _cid, st in rows:
-        by_state[st] = by_state.get(st, 0) + 1
-        expected[ch] = expected.get(ch, 0) + 1
-    stats["states"] = by_state
-    stats["chapters"] = len(expected)
-
-    dirty_n = by_state.get(TaskState.DIRTY.value, 0)
-    if dirty_n:
-        failures.append(f"① DIRTY={dirty_n}（存在未整合脏块，先跑 consolidate）")
-    non_completed = [(cid, st) for _ch, cid, st in rows if st != TaskState.COMPLETED.value]
-    if non_completed:
-        sample = ", ".join(f"{cid}:{st}" for cid, st in non_completed[:5])
-        failures.append(f"① 非 COMPLETED 任务 {len(non_completed)} 个（如 {sample}）")
-
-    for ch, exp in sorted(expected.items()):
-        finals = list((out_root / ch).glob("*_final.json"))
-        if len(finals) != exp:
-            failures.append(f"② {ch}: final.json {len(finals)} 个 != DB 任务 {exp} 个")
-    backups = [str(p.relative_to(root)) for p in out_root.glob("ch*/*_final_backup.json")]
-    if backups:
-        failures.append(f"② 残留 final_backup {len(backups)} 个: {backups[:5]}")
-
-    # ③ QA_REPORT
-    if not qa_file.exists():
-        failures.append(f"③ QA_REPORT 不存在: {qa_file}")
-    else:
-        falls = [ln[3:].strip() for ln in qa_file.read_text(encoding="utf-8").split("\n")
-                 if ln.startswith("## ")]
-        stats["qa_fallbacks"] = len(falls)
-        if falls:
-            failures.append(f"③ QA_REPORT 记录 {len(falls)} 个 fallback 章节: {falls[:5]}")
-
-    # ④ T5 lint
-    try:
-        from src.book_lint import lint_book
-        lint_res = lint_book(project_root=str(root))
-        stats["lint_failures"] = len(lint_res.get("failures", []))
-        if not lint_res.get("ok"):
-            failures.append(
-                f"④ lint 未通过（{stats['lint_failures']} 项，详见 output/book_lint.md）")
-    except Exception as exc:
-        stats["lint_failures"] = -1
-        failures.append(f"④ lint 执行异常: {exc}")
-
-    # ⑤ T1 转换审计
-    if not audit_file.exists():
-        failures.append(f"⑤ 转换审计报告不存在: {audit_file}")
-    else:
-        audit_text = audit_file.read_text(encoding="utf-8")
-        cov = re.search(r'全书覆盖率:\s*([\d.]+)%', audit_text)
-        if cov:
-            stats["audit_coverage"] = float(cov.group(1))
-        if "✅ 通过" not in audit_text:
-            failures.append(f"⑤ 转换审计未通过（详见 {audit_file}）")
-
-    # ⑥ L1 韵文对齐（verse_lint；manifest 无韵文块或功能关闭时跳过）
-    try:
-        from src.verse import (load_verse_manifest, load_chunk_tags,
-                               fragments_for_chunk, verse_lint, verse_config)
-        _vcfg = verse_config()
-        _vmani = load_verse_manifest(root / "input")
-        _vtags = load_chunk_tags(root / "db")
-        _vblocks_n = sum(len(v or []) for v in (_vmani.get("chapters") or {}).values())
-        verse_stats = {"verse_blocks": _vblocks_n, "checked": 0, "failed": 0}
-        stats["verse"] = verse_stats
-        if _vcfg.get("enabled", True) and _vblocks_n:
-            _vtext_rows = []
-            if scheduler is not None:
-                _vtext_rows = scheduler.conn.execute(
-                    "SELECT chunk_id, chapter_id, text_content FROM chunk_tasks").fetchall()
-            _vfail = []
-            _vreport = ["# 韵文对齐报告 (verse_lint)", "",
-                        f"- 韵文块总数: {_vblocks_n}", ""]
-            for _vcid, _vch, _vtext in _vtext_rows:
-                _vfinal = out_root / _vch / f"{_vcid}_final.json"
-                if not _vfinal.exists():
-                    continue
-                _vfrags = fragments_for_chunk(_vch, _vcid, _vtext or "", _vtags, _vmani)
-                if not _vfrags:
-                    continue
-                try:
-                    _vdata = json.loads(_vfinal.read_text(encoding="utf-8"))
-                except (json.JSONDecodeError, OSError):
-                    continue
-                _vftext = _vdata.get("text", "") if isinstance(_vdata, dict) else str(_vdata)
-                _vres = verse_lint(_vfrags, _vftext,
-                                   min_line_ratio=float(_vcfg.get("min_line_ratio", 0.6)),
-                                   max_line_chars=int(_vcfg.get("max_line_chars", 56)),
-                                   refrain_ratio=float(_vcfg.get("refrain_ratio", 0.5)))
-                verse_stats["checked"] += 1
-                if _vres["ok"]:
-                    _vreport.append(
-                        f"- ✅ {_vcid}: lines {_vres['found_lines']}/{_vres['expected_lines']}, "
-                        f"refrain {_vres['refrain_target']}/{_vres['refrain_source']}")
-                else:
-                    verse_stats["failed"] += 1
-                    _vreport.append(f"- ❌ {_vcid}: {_vres['reason']}")
-                    _vfail.append(f"{_vcid}({_vres['reason']})")
-            if verse_stats["checked"] == 0 and _vblocks_n:
-                failures.append(
-                    "⑥ 韵文清单非空但未匹配到任何 chunk（manifest/tags 可能陈旧，需重新 split+init）")
-            if _vfail:
-                failures.append(f"⑥ verse_lint 未达标 {len(_vfail)} 个 chunk: {_vfail[:5]}")
-            (out_root / "verse_lint.md").write_text(
-                "\n".join(_vreport) + "\n", encoding="utf-8")
-    except Exception as _v_exc:
-        stats["verse"] = {"error": str(_v_exc)}
-        failures.append(f"⑥ verse_lint 执行异常: {_v_exc}")
-    # ⑦ L2 双关核销（pun_audit；watchlist 为空时跳过）
-    try:
-        from src.style_profiler import load_profile as _load_profile
-        _prof = _load_profile(root / "input" / "book_profile.json")
-        _watch = (_prof or {}).get("pun_watchlist") or []
-        if _watch:
-            _pun_json = out_root / "pun_audit.json"
-            if not _pun_json.exists():
-                failures.append("⑦ pun_audit 未运行（缺 output/pun_audit.json，先跑 scripts/pun_audit.py）")
-            else:
-                _pun_report = json.loads(_pun_json.read_text(encoding="utf-8"))
-                _pun_sum = _pun_report.get("summary") or {}
-                stats["pun"] = _pun_sum
-                _pun_miss = int(_pun_sum.get("uncovered_nonwaived", 0) or 0)
-                if _pun_miss:
-                    failures.append(f"⑦ pun_watchlist 未核销 {_pun_miss} 项（详见 output/pun_audit.md）")
-    except Exception as _p_exc:
-        failures.append(f"⑦ pun 审计执行异常: {_p_exc}")
-
-    if stats["tasks"] == 0 and db_file.exists():
-        failures.append("① workflow.db 无任务行（未 init？）")
-
-    result = {"ok": not failures, "failures": failures, "warnings": warnings, "stats": stats}
-    print("🎯 [Gate] 交付门禁检查：")
-    print(f"  ① 状态机: {stats['tasks']} 个任务, states={by_state}")
-    print(f"  ② 产物: {stats['chapters']} 章, final_backup={len(backups)}")
-    print(f"  ③ QA_REPORT: fallback {stats['qa_fallbacks']} 章")
-    print(f"  ④ lint: failures={stats.get('lint_failures')}")
-    if stats.get("audit_coverage") is not None:
-        print(f"  ⑤ 转换审计: 覆盖率 {stats['audit_coverage']}%")
-    _vs = stats.get("verse") or {}
-    if _vs.get("error"):
-        print(f"  ⑥ 韵文: 异常 {_vs['error']}")
-    elif _vs:
-        print(f"  ⑥ 韵文: blocks={_vs.get('verse_blocks', 0)}, "
-              f"checked={_vs.get('checked', 0)}, failed={_vs.get('failed', 0)}")
-    _ps = stats.get("pun") or {}
-    if _ps:
-        print(f"  ⑦ 双关核销: covered={_ps.get('covered', 0)}/{_ps.get('total', 0)}, "
-              f"waived={_ps.get('waived', 0)}, uncovered={_ps.get('uncovered_nonwaived', 0)}")
-    for f in failures:
-        print(f"  ❌ {f}")
-    if result["ok"]:
-        print("  ✅ gate 全绿（可交付）")
-    return result
-
-
-# ───── 韵文通道（Round 119 L1）— 镜像 src/verse.py ─────
-# 事实源：src/verse.py；本块为逐字镜像（函数级一致性由 tests/test_round119_mirror_parity.py 守护）。
-
-VERSE_MANIFEST_VERSION = 1
-CHUNK_TAGS_VERSION = 1
-
-_DEFAULT_VERSE_CONFIG: Dict[str, Any] = {
-    "enabled": True,
-    "min_line_ratio": 0.6,
-    "max_line_chars": 56,
-    "refrain_ratio": 0.5,
-    "retry_on_fail": True,
-}
-
-
-def verse_config() -> Dict[str, Any]:
-    """读取 config.yaml `verse:` 节（缺失/异常时返回内建默认，向后兼容）。"""
-    cfg = dict(_DEFAULT_VERSE_CONFIG)
-    try:
-        from src.config import config as _config
-        section = _config.get_section("verse") or {}
-        for k, v in section.items():
-            cfg[k] = v
-    except Exception:
-        pass
-    return cfg
-
-
-def normalize_whitespace(text: str) -> str:
-    """归一化空白：全部空白折叠为单个空格并去首尾（用于包含/重复判定）。"""
-    return re.sub(r"\s+", " ", text or "").strip()
-
-
-# ── manifest 读写（input/verse_manifest.json） ─────────────────────────
-
-def load_verse_manifest(input_dir) -> dict:
-    path = Path(input_dir) / "verse_manifest.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
-        return {}
-
-
-def save_verse_manifest(input_dir, manifest: dict) -> None:
-    path = Path(input_dir) / "verse_manifest.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-# ── chunk 标签读写（db/chunk_tags.json） ───────────────────────────────
-
-def load_chunk_tags(db_dir) -> dict:
-    path = Path(db_dir) / "chunk_tags.json"
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
-        return {}
-
-
-def save_chunk_tags(db_dir, tags: dict) -> None:
-    path = Path(db_dir) / "chunk_tags.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(tags, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-# ── chunk ↔ 韵文交集（init 时计算） ────────────────────────────────────
-
-def _normalized_index(text: str) -> Tuple[str, List[int]]:
-    """返回 (归一化文本, 每个归一化字符对应的原文本偏移)。"""
-    norm_chars: List[str] = []
-    orig_idx: List[int] = []
-    last_space = True
-    for i, ch in enumerate(text):
-        if ch.isspace():
-            if not last_space:
-                norm_chars.append(" ")
-                orig_idx.append(i)
-                last_space = True
-        else:
-            norm_chars.append(ch)
-            orig_idx.append(i)
-            last_space = False
-    return "".join(norm_chars), orig_idx
-
-
-def locate_chunk_spans(markdown_text: str, chunks: List[str]) -> List[Optional[Tuple[int, int]]]:
-    """按序定位每个 chunk 在 markdown_text 中的 (start_char, end_char)；失败 None。
-
-    归一化空白后查找，再映射回原文本偏移，容忍段落间空白差异。
-    """
-    norm_text, orig_idx = _normalized_index(markdown_text)
-    spans: List[Optional[Tuple[int, int]]] = []
-    cursor = 0
-    for chunk in chunks:
-        nchunk = normalize_whitespace(chunk)
-        if not nchunk:
-            spans.append(None)
-            continue
-        pos = norm_text.find(nchunk, cursor)
-        if pos < 0:
-            pos = norm_text.find(nchunk)
-        if pos < 0:
-            spans.append(None)
-            continue
-        end_norm = pos + len(nchunk)
-        start_char = orig_idx[pos]
-        end_char = orig_idx[end_norm - 1] + 1
-        spans.append((start_char, end_char))
-        cursor = end_norm
-    return spans
-
-
-def _block_lines_in_range(block: dict, start: int, end: int) -> List[str]:
-    """取韵文块中字符区间 [start, end) 覆盖的非空行。"""
-    text = block.get("text") or ""
-    base = int(block.get("start_char", 0) or 0)
-    lines: List[str] = []
-    pos = base
-    for ln in text.split("\n"):
-        ln_s, ln_e = pos, pos + len(ln)
-        if ln.strip() and ln_s < end and ln_e > start:
-            lines.append(ln)
-        pos = ln_e + 1
-    return lines
-
-
-def blocks_for_span(verse_blocks: List[dict], start: int, end: int) -> List[dict]:
-    """与 chunk 字符区间相交的韵文片段：[{"tag", "lines"}]。"""
-    frags: List[dict] = []
-    for b in verse_blocks or []:
-        bs = int(b.get("start_char", -1) or -1)
-        be = int(b.get("end_char", -1) or -1)
-        if bs < 0 or be <= bs or bs >= end or be <= start:
-            continue
-        lines = _block_lines_in_range(b, max(bs, start), min(be, end))
-        if lines:
-            frags.append({"tag": b.get("tag", "unknown"), "lines": lines})
-    return frags
-
-
-def fragments_from_manifest(chunk_text: str, verse_blocks: List[dict]) -> List[dict]:
-    """运行时兜底：按归一化「文本包含」匹配（整块连通命中 → 全行；否则按块序连续 ≥2 行命中）。
-
-    Round 120 P1: 单行命中会误报（如 Fury 诗 "would be" 混入散文 chunk），
-    故仅接受整块连通命中或连续 ≥2 行的命中段。
-    """
-    norm_chunk = normalize_whitespace(chunk_text)
-    if not norm_chunk:
-        return []
-    frags: List[dict] = []
-    for b in verse_blocks or []:
-        lines = [ln for ln in (b.get("text") or "").split("\n") if ln.strip()]
-        if not lines:
-            continue
-        norm_block = normalize_whitespace(b.get("text") or "")
-        if norm_block and norm_block in norm_chunk:
-            frags.append({"tag": b.get("tag", "unknown"), "lines": lines})
-            continue
-        hit = [i for i, ln in enumerate(lines)
-               if len(ln.strip()) >= 8 and normalize_whitespace(ln) in norm_chunk]
-        if not hit:
-            continue
-        best = cur = [hit[0]]
-        for i in hit[1:]:
-            if i == cur[-1] + 1:
-                cur.append(i)
-            else:
-                if len(cur) > len(best):
-                    best = cur
-                cur = [i]
-        if len(cur) > len(best):
-            best = cur
-        if len(best) >= 2:
-            frags.append({"tag": b.get("tag", "unknown"),
-                          "lines": [lines[i] for i in best]})
-    return frags
-
-
-def fragments_for_chunk(chapter_id: str, chunk_id: str, chunk_text: str,
-                        tags: dict, manifest: dict) -> List[dict]:
-    """chunk 的韵文片段：tags 优先（精确交集），miss 时 manifest 包含兜底。"""
-    entry = ((tags.get("chapters") or {}).get(chapter_id) or {}).get(chunk_id)
-    if isinstance(entry, dict) and entry.get("blocks"):
-        return entry["blocks"]
-    blocks = ((manifest.get("chapters") or {}).get(chapter_id)) or []
-    if not blocks:
-        return []
-    return fragments_from_manifest(chunk_text, blocks)
-
-
-def build_chapter_tags(chapter_id: str, markdown_text: str, chunks: List[str],
-                       verse_blocks: List[dict]) -> Dict[str, dict]:
-    """计算本章 verse chunk 标签：{chunk_id: {"verse": true, "blocks": [{"tag","lines"}]}}。"""
-    result: Dict[str, dict] = {}
-    if not verse_blocks or not chunks:
-        return result
-    spans = locate_chunk_spans(markdown_text, chunks)
-    for idx, text in enumerate(chunks):
-        frags: List[dict] = []
-        span = spans[idx] if idx < len(spans) else None
-        if span is not None:
-            frags = blocks_for_span(verse_blocks, span[0], span[1])
-        if not frags:
-            frags = fragments_from_manifest(text, verse_blocks)
-        if frags:
-            result[f"{chapter_id}_chunk{idx:03d}"] = {"verse": True, "blocks": frags}
-    return result
-
-
-# ── 提示词注入 ────────────────────────────────────────────────────────
-
-def _max_line_repeat(lines: List[str], min_len: int = 4) -> int:
-    """归一化后行重复的最大次数（复沓/refrain 探测）。"""
-    counts: Dict[str, int] = {}
-    for ln in lines:
-        key = normalize_whitespace(ln).strip("“”\"'‘’「」")
-        if len(key) < min_len:
-            continue
-        counts[key] = counts.get(key, 0) + 1
-    return max(counts.values()) if counts else 0
-
-
-def build_verse_note(fragments: List[dict]) -> str:
-    """生成注入 literal/rewrite/judge prompt 的韵文处理协议块；无韵文返回 ""。"""
-    lines: List[str] = []
-    for f in fragments or []:
-        lines.extend(f.get("lines") or [])
-    lines = [ln.strip() for ln in lines if ln and ln.strip()]
-    if not lines:
-        return ""
-    n = len(lines)
-    target = max(2, int(round(n * 0.8)))
-    refrain = _max_line_repeat(lines)
-    parts = [
-        f"【韵文/歌词处理协议（本片段含韵文，源共 {n} 行）】",
-        f"1. 逐行对应：每个源行对应一个译行，行与行之间保留换行；译文行数尽量贴近源文"
-        f"（源 {n} 行 → 目标 ≥ {target} 行）；严禁把韵文合并进散文段落。",
-    ]
-    if refrain >= 2:
-        parts.append(
-            f"2. 复沓（refrain）保留：原文有重复出现的歌词句（最多重复 {refrain} 次），"
-            f"译文应按相同的重复节奏重现。")
-    parts.append(
-        "3. 节奏与尾韵：优先保留童谣/歌谣的节奏感；尾韵尽力而为，不得为押韵牺牲语义。")
-    parts.append(
-        "4. 韵文正文内不得插入注释或译者注；注释集中放在章末或脚注中。")
-    parts.append(
-        "5. 本片段为韵文体裁，分行结构是硬性结构要求（不是排版建议），"
-        "不得因顺句而合并诗行。")
-    return "\n".join(parts) + "\n\n"
-
-
-# ── verse_lint ────────────────────────────────────────────────────────
-
-def _longest_short_line_run(lines: List[str], max_chars: int) -> int:
-    """最长「连续短行」段落长度（空行透明，长行重置；容忍诗节空行）。"""
-    best = 0
-    cur = 0
-    for ln in lines:
-        if not ln:
-            continue
-        if len(ln) <= max_chars:
-            cur += 1
-            best = max(best, cur)
-        else:
-            cur = 0
-    return best
-
-
-def verse_lint(fragments: List[dict], translated_text,
-               min_line_ratio: float = 0.6,
-               max_line_chars: int = 56,
-               refrain_ratio: float = 0.5) -> dict:
-    """源行数 vs 译行数偏差 + 复沓存留检查。
-
-    返回 {"ok", "expected_lines", "found_lines", "refrain_source",
-          "refrain_target", "failures", "reason"}。
-    """
-    src_lines: List[str] = []
-    for f in fragments or []:
-        src_lines.extend(ln.strip() for ln in (f.get("lines") or []) if ln and ln.strip())
-    expected = len(src_lines)
-    res: Dict[str, Any] = {
-        "ok": True, "expected_lines": expected, "found_lines": 0,
-        "refrain_source": 0, "refrain_target": 0, "failures": [], "reason": "",
-    }
-    if expected == 0:
-        return res
-    text = translated_text
-    if isinstance(text, dict):
-        text = text.get("text", "")
-    tlines = [ln.strip() for ln in str(text or "").split("\n")]
-    found = _longest_short_line_run(tlines, max_line_chars)
-    res["found_lines"] = found
-    if expected <= 2:
-        need = expected
-    else:
-        need = max(2, int(round(expected * min_line_ratio)))
-    if found < need:
-        res["failures"].append(f"verse_lines:{found}/{expected}(need>={need})")
-    r_src = _max_line_repeat(src_lines)
-    res["refrain_source"] = r_src
-    if r_src >= 3:
-        r_tgt = _max_line_repeat([ln for ln in tlines if ln])
-        res["refrain_target"] = r_tgt
-        need_r = max(2, int(round(r_src * refrain_ratio)))
-        if r_tgt < need_r:
-            res["failures"].append(f"refrain:{r_tgt}/{r_src}(need>={need_r})")
-    res["ok"] = not res["failures"]
-    res["reason"] = "；".join(res["failures"])
-    return res
-
-
 # Section 10 — 统一入口
 # ────────────────────────────────────────────────────────────────────
 
@@ -10487,8 +9376,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="SagaTrans — AI 文学语义编译系统")
     parser.add_argument("command", nargs="?", default="pipeline",
-                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "notes-normalize", "gate", "style-profile", "drift-audit"],
-                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, drift-audit")
+                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "drift-audit", "notes-normalize"],
+                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, drift-audit, notes-normalize")
     parser.add_argument("--chapter", default="ch01", help="章节 ID (默认: ch01)")
     parser.add_argument("--chapters", default=None,
                         help="style-profile 命令：抽样章节，逗号分隔（默认均匀抽 5 章）")
@@ -10503,7 +9392,7 @@ def main():
     parser.add_argument("--min-chapter-size", type=int, default=1000,
                         help="split 命令：短于此字数的章节会被合并到下一章（默认 1000）")
     parser.add_argument("--apply", action="store_true",
-                        help="consistency 命令：执行自动修正（默认仅生成差异报告）")
+                        help="consistency / notes-normalize 命令：执行自动修正（notes-normalize 默认仅生成差异报告）")
     parser.add_argument("--window", type=int, default=None,
                         help="drift-audit 命令：滑动窗口大小（默认 config.pipeline.drift_audit.window=5）")
     parser.add_argument("--jev", action="store_true",
@@ -10522,6 +9411,12 @@ def main():
     if args.chapter and not re.fullmatch(r'[a-zA-Z0-9_-]{1,32}', args.chapter):
         print(f"❌ 非法 chapter_id: '{args.chapter}' (仅允许字母/数字/下划线/连字符，1-32 字符)", file=sys.stderr)
         sys.exit(1)
+
+    # Round 130: 单实例守卫（审计①）——写共享状态的命令必须独占锁；
+    # 只读命令（gate/lint/drift-audit 等）不拦截，便于运行中诊断。
+    if args.command in _MUTATING_COMMANDS or (args.command == "consistency" and args.apply):
+        if not acquire_instance_lock():
+            sys.exit(1)
 
     # P4-9: 顶层异常包装（除已规范的 consistency/golden-gate 外，统一捕获并退出）
     try:
@@ -10589,20 +9484,27 @@ def main():
             n_issues = run_consistency_check(dry_run=not args.apply)
             sys.exit(0 if n_issues == 0 else 2)
         elif args.command == "consolidate":
+            from src.pipeline import consolidate_dirty_chapters
             _cons_res = consolidate_dirty_chapters(max_rounds=args.max_rounds)
             sys.exit(0 if _cons_res.get("converged") else 1)
         elif args.command == "gate":
+            from src.pipeline import run_final_gate
             _gate_res = run_final_gate()
             sys.exit(0 if _gate_res.get("ok") else 1)
         elif args.command == "finalize":
+            from src.book_lint import finalize_outputs
             finalize_outputs(apply=args.apply)
             sys.exit(0)
-        elif args.command == "lint":
-            _lint_res = lint_book()
-            sys.exit(0 if _lint_res.get("ok") else 1)
         elif args.command == "notes-normalize":
-            notes_normalize_outputs(apply=args.apply)
+            from src.book_lint import notes_normalize_outputs
+            _nn_res = notes_normalize_outputs(apply=args.apply)
+            _nn_stats = _nn_res.get("stats") or {}
+            print(f"notes-normalize: files={_nn_stats.get('files', 0)} "
+                  f"changed={_nn_stats.get('changed', 0)} → {_nn_res.get('report', '')}")
             sys.exit(0)
+        elif args.command == "lint":
+            from src.book_lint import lint_book
+            sys.exit(0 if lint_book().get("ok") else 1)
         elif args.command == "split":
             if not args.input:
                 # P0-3: split 提示命令按 __package__ 自适应
@@ -10661,8 +9563,6 @@ _GUTENBERG_TOC_TITLE_PATTERN = re.compile(
     r'^\s*(contents|table of contents|目录)\s*$', re.IGNORECASE | re.MULTILINE)
 
 
-# 编号目录项：罗马数字（I./II.）、阿拉伯数字（1.）或 Chapter 序号
-# （Chapter 1 / CHAPTER X.）开头的行
 _GUTENBERG_TOC_ITEM_PATTERN = re.compile(
     r'^\s*(?:[IVXLC]+\.?|\d+\.?|chapter\s+[IVXLC\d]+\.?)(?:\s|$)',
     re.IGNORECASE | re.MULTILINE)
@@ -10721,169 +9621,9 @@ def _normalize_scores(scores: Optional[dict]) -> dict:
     return normalized
 
 
-# T1：块级提取口径。主路径 = p/标题/pre；blockquote/li/dl(dd/dt)/table(tr)
-# 仅在「无主路径后代」时兜底提取（此前这些容器内容被静默丢弃）。
-_PRIMARY_BLOCK_TAGS = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre']
-_FALLBACK_BLOCK_TAGS = ['blockquote', 'li', 'dd', 'dt', 'tr', 'table']
-
-
-# T-L1（Round 119）：韵文元素识别。三类来源：
-#   1. class 命中 poem/stanza/verse/song/lyric/epigraph（显式标注）；
-#   2. <pre>（天然保行，如老鼠长尾诗 / 地址条）；
-#   3. 短行启发式：元素含 ≥2 个 <br/> 且多数行较短（未标注的韵文）。
-# 命中元素在 br→'\n' 替换前打上 data 属性；提取时保留行结构并记录
-# （供 input/verse_manifest.json 与 verse_lint 使用）。
-_VERSE_TAG_ATTR = 'data-sagatrans-verse'
-_VERSE_CLASS_RE = re.compile(r'poem|stanza|verse|song|lyric|epigraph', re.IGNORECASE)
-_VERSE_HEURISTIC_MIN_BR = 2
-_VERSE_HEURISTIC_MAX_LINE = 40
-_VERSE_HEURISTIC_SHORT_RATIO = 0.6
-
-
-def _mark_verse_elements(soup) -> None:
-    """T-L1：在 br→'\\n' 替换前标记韵文元素（class 命中或短行 br 启发式）。"""
-    for el in soup.find_all(['p', 'pre', 'blockquote', 'div', 'section', 'dd']):
-        cls = ' '.join(el.get('class') or [])
-        if cls and _VERSE_CLASS_RE.search(cls):
-            el[_VERSE_TAG_ATTR] = 'class'
-            continue
-        if el.name == 'pre':
-            continue  # pre 天然保行；tag 在提取时按行数判定
-        br_count = len(el.find_all('br'))
-        if br_count < _VERSE_HEURISTIC_MIN_BR:
-            continue
-        lines = [ln.strip() for ln in el.get_text('\n').split('\n') if ln.strip()]
-        if len(lines) < 3:
-            continue
-        short = sum(1 for ln in lines if len(ln) <= _VERSE_HEURISTIC_MAX_LINE)
-        if short / len(lines) >= _VERSE_HEURISTIC_SHORT_RATIO:
-            el[_VERSE_TAG_ATTR] = 'heuristic'
-
-
-def _el_verse_tag(el) -> Optional[str]:
-    """元素的韵文来源标签：class/启发式 标记 或 pre（多行时）。"""
-    tag = el.get(_VERSE_TAG_ATTR)
-    if tag:
-        return str(tag)
-    if el.name == 'pre':
-        return 'pre'
-    return None
-
-def _block_element_text(el) -> str:
-    """提取单个块级元素文本（pre/韵文保留行结构，其余以空格连接片段）。"""
-    if el.name == 'pre' or el.get(_VERSE_TAG_ATTR):
-        # 韵文/地址条：逐行 strip 保留行结构；内联标签（<i> 等）不切断行，
-        # 故不带分隔符取文本（片段自带空格）。连续空行压成一个（保留诗节）。
-        lines: list = []
-        for raw in el.get_text('').split('\n'):
-            ln = raw.strip()
-            if not ln:
-                if lines and lines[-1] != '':
-                    lines.append('')
-                continue
-            lines.append(ln)
-        while lines and lines[-1] == '':
-            lines.pop()
-        return '\n'.join(lines)
-    return el.get_text(' ', strip=True)
-
-
-def _extract_block_text(root, verse_out: Optional[list] = None) -> str:
-    """按块级元素提取纯文本，以 '\\n\\n' 拼接还原段落边界。
-
-    不含 div（div 常为容器，其 get_text 会把整章压成一段，反而丢失段落
-    结构）。无任何主路径块级标签时退化为整体文本（历史行为）。
-    T-L1：verse_out 非 None 时收集多行韵文块（{"tag", "text"}）。
-    """
-    primary = root.find_all(_PRIMARY_BLOCK_TAGS)
-    if not primary:
-        return root.get_text('\n')
-    parts = []
-    for el in root.find_all(_PRIMARY_BLOCK_TAGS + _FALLBACK_BLOCK_TAGS):
-        if el.name in _FALLBACK_BLOCK_TAGS:
-            # 兜底仅取「主路径不可见」的元素：含主块级后代（已被主路径提取）
-            # 或含更内层兜底元素（避免重复提取）时跳过
-            if el.find(_PRIMARY_BLOCK_TAGS) or el.find(_FALLBACK_BLOCK_TAGS):
-                continue
-        t = _block_element_text(el)
-        if t:
-            parts.append(t)
-            if verse_out is not None and '\n' in t:
-                tag = _el_verse_tag(el)
-                if tag:
-                    verse_out.append({'tag': tag, 'text': t})
-    return '\n\n'.join(parts)
-
-
-def _epub_clean_html_text_ex(html_content: str, verse_out: Optional[list] = None) -> str:
-    """清洗 HTML，提取纯文本（保留段落结构）。
-
-    P 方案修复：原先对每个块级标签 insert_after('\\n') 再用
-    get_text(separator='\\n')，因源 XML 段内自带换行，最终整章塌成 1 段。
-    改为逐个提取块级元素文本、以 '\\n\\n' 拼接，确定性还原段落边界，
-    且对段内换行免疫。
-    T1：块级口径扩展为 p/标题/pre（保留韵文行结构）+ 容器类兜底提取。
-    T-L1：先标记韵文元素；verse_out 非 None 时收集多行韵文块。
-    """
-    soup = BeautifulSoup(html_content, 'html.parser')
-
-    for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside']):
-        tag.decompose()
-
-    _mark_verse_elements(soup)
-
-    for br in soup.find_all('br'):
-        br.replace_with('\n')
-
-    text = _extract_block_text(soup, verse_out)
-
-    text = re.sub(r'[ \t]+', ' ', text)
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    # 注意：不能用 \s（含 \n）配合 MULTILINE 去修整行首尾，否则会把段落间的
-    # \n\n 也吃掉、重新塌成 1 段。仅修剪行首尾的空格/制表符。
-    text = re.sub(r'(?m)^[ \t]+|[ \t]+$', '', text)
-    return text.strip()
-
 def _epub_clean_html_text(html_content: str) -> str:
     """_epub_clean_html_text_ex 的纯文本包装（不收集韵文块，兼容旧调用）。"""
     return _epub_clean_html_text_ex(html_content)
-
-def _build_verse_manifest(chapters: list, chapter_verse: dict) -> dict:
-    """T-L1：由各章韵文块记录构建 input/verse_manifest.json 结构。
-
-    逐块在章节 md 中按序定位（字符偏移 → 行号）；定位失败的块跳过并告警。
-    """
-    chapters_out: dict = {}
-    for ch_id, md in chapters:
-        blocks = chapter_verse.get(ch_id) or []
-        entries: list = []
-        cursor = 0
-        for b in blocks:
-            t = re.sub(r'[ \t]+', ' ', b.get('text') or '')
-            if not t.strip():
-                continue
-            pos = md.find(t, cursor)
-            if pos < 0:
-                pos = md.find(t)
-            if pos < 0:
-                _splitter_log_warn(
-                    f"{ch_id} 韵文块未在 md 中定位（跳过）: {t[:30]!r}")
-                continue
-            cursor = pos + len(t)
-            start_line = md.count('\n', 0, pos) + 1
-            end_line = md.count('\n', 0, pos + len(t)) + 1
-            line_count = sum(1 for ln in t.split('\n') if ln.strip())
-            entries.append({
-                'tag': b.get('tag', 'unknown'),
-                'start_line': start_line,
-                'end_line': end_line,
-                'start_char': pos,
-                'end_char': pos + len(t),
-                'line_count': line_count,
-                'text': t,
-            })
-        chapters_out[ch_id] = entries
-    return {'version': 1, 'chapters': chapters_out}
 
 
 def _strip_epub_front_matter(text: str) -> str:
@@ -10932,264 +9672,10 @@ def _strip_epub_front_matter(text: str) -> str:
     return '\n\n'.join(blocks).strip()
 
 
-def _epub_extract_title(soup, fallback_title: str) -> str:
-    """提取章节标题：优先正文标题标签（h1-h3），退回 <title> 或兜底名。
-
-    T1：<br/> 分隔的标题先在标签内替换为空格；get_text 用空格连接片段，
-    避免「CHAPTER I.<br/>Down…」粘连成 "I.Down" 或「…eBook of
-    <span>Alice's…」粘连成 "ofAlice's"。
-    """
-    title_tag = soup.find(['h1', 'h2', 'h3']) or soup.find('title')
-    if not title_tag:
-        return fallback_title
-    for br in title_tag.find_all('br'):
-        br.replace_with(' ')
-    return title_tag.get_text(' ', strip=True)
-
-
-def _check_title_present(ch_id: str, title: str, text: str) -> None:
-    """T1：H1 与正文标题一致性（信息性告警）。
-
-    标题未在正文开头复现时记录 INFO（通常意味着标题来自页眉/元数据，
-    属「页眉残留」类问题线索），不阻断切分。
-    """
-    normalized = _normalize_chapter_title(title)
-    if normalized and normalized[:60] not in text[:400]:
-        _splitter_log_info(
-            f"{ch_id} 标题未在正文再现（可能来自页眉/元数据）: {normalized}")
-
-
-# ────────────────────────────────────────────────────────────────────
-# T1：转换完整性审计（独立 oracle，token 覆盖率）
-#
-# 设计：oracle 只做最小清洗（去掉脚本/导航/页眉等非正文容器）后原样取
-# 文本，不经过 _extract_block_text 的块选择逻辑，避免「同源盲区」（旧的
-# 字符数基线用同一套清洗器做对照，静默丢失无法被发现）。
-# 豁免（whitelist）：古腾堡许可证特征串、前部「Contents + ≥2 目录项」
-# 区域 —— 这些是 Q2 有意裁剪的 front matter，不算丢失。
-# ────────────────────────────────────────────────────────────────────
-
-_AUDIT_TOKEN_RE = re.compile(r'[A-Za-z0-9]+|[\u4e00-\u9fff]')
-_AUDIT_COVERAGE_THRESHOLD = 0.995
-_AUDIT_CHAPTER_FLOOR = 0.90    # 单章最低覆盖率（防整体达标掩盖单章崩坏）
-_AUDIT_MAX_MISSING_SPANS = 20
-_AUDIT_TOC_SCAN_LINES = 120    # 目录区域仅在前部扫描（防误豁免正文）
-
-
-def _epub_oracle_text(html_content: str) -> str:
-    """独立 oracle 文本：仅去除非正文容器/元数据，其余原样取文本。"""
-    soup = BeautifulSoup(html_content, 'html.parser')
-    for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'title']):
-        tag.decompose()
-    return soup.get_text('\n')
-
-
-def _audit_whitelist_spans(text: str) -> list:
-    """返回 oracle 文本中「策略豁免」的字符区间（许可证串 + 目录区域）。"""
-    spans = []
-    for pat in _GUTENBERG_HEADER_PATTERNS:
-        for m in pat.finditer(text):
-            spans.append((m.start(), m.end()))
-
-    lines = text.split('\n')
-    starts = []
-    pos = 0
-    for ln in lines:
-        starts.append(pos)
-        pos += len(ln) + 1
-
-    for i in range(min(len(lines), _AUDIT_TOC_SCAN_LINES)):
-        if not _GUTENBERG_TOC_TITLE_PATTERN.search(lines[i]):
-            continue
-        j = i + 1
-        items = 0
-        end = j
-        while j < len(lines):
-            ln = lines[j]
-            if ln.strip() == '':
-                # 空行透明：其后仍紧跟目录项行才继续
-                k = j + 1
-                while k < len(lines) and lines[k].strip() == '':
-                    k += 1
-                if k < len(lines) and len(lines[k]) < 120 \
-                        and _GUTENBERG_TOC_ITEM_PATTERN.search(lines[k]):
-                    j = k
-                    continue
-                break
-            if len(ln) >= 120:
-                break
-            if _GUTENBERG_TOC_ITEM_PATTERN.search(ln):
-                items += 1
-                j += 1
-                end = j
-                continue
-            # 续行（如表格 <td> 分列后的标题行）：其后仍紧跟目录项行才纳入
-            k = j + 1
-            while k < len(lines) and lines[k].strip() == '':
-                k += 1
-            if k < len(lines) and len(lines[k]) < 120 \
-                    and _GUTENBERG_TOC_ITEM_PATTERN.search(lines[k]):
-                j = k
-                end = j
-                continue
-            break
-        if items >= 2:
-            # 末尾续行（表格末行标题后无下一项行）：前一行是目录项则一并纳入
-            if end < len(lines):
-                tail = lines[end]
-                if tail.strip() and len(tail) < 120 \
-                        and not _GUTENBERG_TOC_ITEM_PATTERN.search(tail) \
-                        and end - 1 >= i and _GUTENBERG_TOC_ITEM_PATTERN.search(lines[end - 1]):
-                    end += 1
-            spans.append((starts[i], starts[end - 1] + len(lines[end - 1])))
-            break
-    return spans
-
-
-def _audit_tokens_with_pos(text: str) -> list:
-    return [(m.group(0), m.start()) for m in _AUDIT_TOKEN_RE.finditer(text)]
-
-
-def run_conversion_audit(
-    chapter_sources: dict,
-    chapters: list,
-    skipped_docs: list,
-    output_path,
-    threshold: float = _AUDIT_COVERAGE_THRESHOLD,
-) -> dict:
-    """转换完整性审计：oracle token 多重集 vs md 产出 token 多重集。
-
-    返回 {"ok", "overall", "chapter_results", "missing_spans", "report_path"}。
-    低于阈值（或单章低于下限）→ ok=False；报告文件始终写出（可审计）。
-    """
-    from collections import Counter
-    from datetime import datetime
-
-    chapter_results: dict = {}
-    missing_spans: list = []
-    total_oracle = 0
-    total_missing = 0
-    total_whitelisted = 0
-
-    for ch_id, md in chapters:
-        srcs = chapter_sources.get(ch_id, [])
-        oracle_counter: Counter = Counter()
-        token_stream: list = []
-        whitelisted = 0
-        for html in srcs:
-            otext = _epub_oracle_text(html)
-            wl_spans = _audit_whitelist_spans(otext)
-            for tok, pos in _audit_tokens_with_pos(otext):
-                if any(s <= pos < e for s, e in wl_spans):
-                    whitelisted += 1
-                    continue
-                oracle_counter[tok] += 1
-                token_stream.append((tok, pos, otext))
-
-        md_counter = Counter(_AUDIT_TOKEN_RE.findall(md))
-        missing_counter = oracle_counter - md_counter
-        missing_n = sum(missing_counter.values())
-        total_n = sum(oracle_counter.values())
-        coverage = (1.0 - missing_n / total_n) if total_n else 1.0
-
-        # 缺失 span：按 oracle 顺序定位未覆盖 token，合并邻近出现（≤40 字符间隔）
-        if missing_n:
-            remain = missing_counter.copy()
-            runs = []
-            cur = None
-            prev_text = None
-            prev_end = None
-            for tok, pos, otext in token_stream:
-                if remain.get(tok, 0) <= 0:
-                    continue
-                remain[tok] -= 1
-                end = pos + len(tok)
-                if cur is not None and otext is prev_text and pos - prev_end <= 40:
-                    cur['end'] = end
-                else:
-                    if cur is not None:
-                        runs.append(cur)
-                    cur = {'text': otext, 'start': pos, 'end': end}
-                prev_text = otext
-                prev_end = end
-            if cur is not None:
-                runs.append(cur)
-            for r in runs:
-                s = max(0, r['start'] - 40)
-                e = min(len(r['text']), r['end'] + 40)
-                excerpt = re.sub(r'\s+', ' ', r['text'][s:e]).strip()
-                missing_spans.append({'chapter': ch_id, 'excerpt': excerpt})
-
-        chapter_results[ch_id] = {
-            'sources': len(srcs),
-            'oracle_tokens': total_n,
-            'missing': missing_n,
-            'coverage': coverage,
-        }
-        total_oracle += total_n
-        total_missing += missing_n
-        total_whitelisted += whitelisted
-
-    overall = (1.0 - total_missing / total_oracle) if total_oracle else 1.0
-    min_cov = min((r['coverage'] for r in chapter_results.values()), default=1.0)
-    ok = overall >= threshold and min_cov >= _AUDIT_CHAPTER_FLOOR
-
-    report = [
-        '# 转换完整性审计报告 (T1)',
-        '',
-        f'- 生成时间: {datetime.now().isoformat(timespec="seconds")}',
-        f'- 阈值: 全书覆盖率 ≥ {threshold * 100:.1f}%；单章下限 {_AUDIT_CHAPTER_FLOOR * 100:.0f}%',
-        f'- 全书覆盖率: {overall * 100:.3f}%',
-        f'- 策略豁免 token 数（许可证/目录区域）: {total_whitelisted}',
-        f'- 结论: {"✅ 通过" if ok else "❌ 未通过"}',
-        '',
-        '## 逐章覆盖率',
-        '',
-        '| 章 | 源文档数 | oracle tokens | 缺失 | 覆盖率 |',
-        '| --- | ---: | ---: | ---: | ---: |',
-    ]
-    for ch_id, r in chapter_results.items():
-        report.append(
-            f"| {ch_id} | {r['sources']} | {r['oracle_tokens']} | "
-            f"{r['missing']} | {r['coverage'] * 100:.3f}% |")
-
-    report.append('')
-    report.append(f'## 未覆盖片段 Top-{_AUDIT_MAX_MISSING_SPANS}')
-    report.append('')
-    if missing_spans:
-        for s in missing_spans[:_AUDIT_MAX_MISSING_SPANS]:
-            report.append(f"- [{s['chapter']}] …{s['excerpt']}…")
-    else:
-        report.append('- （无）')
-
-    report.append('')
-    report.append('## 策略豁免说明')
-    report.append('')
-    report.append('- 古腾堡许可证特征串区域（Project Gutenberg / www.gutenberg.org 等）')
-    report.append('- 前部「Contents + ≥2 个编号目录项」区域（Q2 有意裁剪的目录）')
-    if skipped_docs:
-        report.append('')
-        report.append('## 按策略跳过的短文档（<50 字符，不计入审计）')
-        report.append('')
-        for d in skipped_docs:
-            report.append(f"- {d.get('id', '?')} ({d.get('chars', 0)} chars)")
-
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text('\n'.join(report) + '\n', encoding='utf-8')
-
-    return {
-        'ok': ok,
-        'overall': overall,
-        'chapter_results': chapter_results,
-        'missing_spans': missing_spans[:_AUDIT_MAX_MISSING_SPANS],
-        'report_path': str(output_path),
-    }
-
-
 def _epub_split_large_doc_by_toc(html_content: str, toc_entries: list, chapter_idx_start: int,
                                  sources_out: Optional[dict] = None,
-                                 verse_out: Optional[dict] = None) -> list:
+                                 verse_out: Optional[dict] = None,
+                                 lead_out: Optional[list] = None) -> list:
     """
     将单个超大 HTML 文档按 TOC 锚点切分。
     返回 [(chapter_id, markdown), ...]
@@ -11216,6 +9702,28 @@ def _epub_split_large_doc_by_toc(html_content: str, toc_entries: list, chapter_i
                     anchor_lines[anchor_id] = (i, title)
 
     sorted_anchors = sorted(anchor_lines.items(), key=lambda x: x[1][0])
+
+    # 接缝回填（Kindle split 格式）：文档开头到第一个锚点之间的正文是物理
+    # 切分的上一章续文（如 ~200KB 分片的 index_split_NNN.html），不处理会被
+    # 整段丢弃。把这段交给调用方回填到上一章末尾（实测《Why Nations Fail》
+    # 此类分片共丢 ~17 万字符）。lead_out 非 None 时收集。
+    if lead_out is not None and sorted_anchors:
+        lead_html = '\n'.join(lines[:sorted_anchors[0][1][0]])
+        if '<head' in lead_html and '</head>' in lead_html:
+            lead_html = lead_html.split('</head>', 1)[1]
+        lead_soup = BeautifulSoup(lead_html, 'html.parser')
+        _mark_verse_elements(lead_soup)
+        for br in lead_soup.find_all('br'):
+            br.replace_with('\n')
+        lead_blocks: list = []
+        lead_text = _extract_block_text(lead_soup, lead_blocks)
+        lead_text = re.sub(r'[ \t]+', ' ', lead_text)
+        lead_text = re.sub(r'\n{3,}', '\n\n', lead_text)
+        lead_text = re.sub(r'(?m)^[ \t]+|[ \t]+$', '', lead_text)
+        lead_text = _strip_epub_front_matter(lead_text.strip())
+        if lead_text:
+            lead_out.append({'text': lead_text, 'html': lead_html, 'verse': lead_blocks})
+
     chapters = []
     for i, (anchor_id, (line_no, toc_title)) in enumerate(sorted_anchors):
         start_line = line_no
@@ -11309,10 +9817,23 @@ def _epub_extract_chapters(book, sources_out: Optional[dict] = None,
             chapters.append((ch_id, f"# {_normalize_chapter_title(title)}\n\n{text}"))
             continue
 
+        lead_box: list = []
         sub_chapters = _epub_split_large_doc_by_toc(html_content, toc_entries, chapter_idx,
                                                     sources_out=sources_out,
-                                                    verse_out=verse_out)
+                                                    verse_out=verse_out,
+                                                    lead_out=lead_box)
         if sub_chapters:
+            if lead_box and chapters:
+                lead = lead_box[0]
+                if len(lead.get('text') or '') >= 40:
+                    prev_id, prev_md = chapters[-1]
+                    chapters[-1] = (prev_id, prev_md.rstrip() + '\n\n' + lead['text'])
+                    if sources_out is not None:
+                        sources_out.setdefault(prev_id, []).append(lead['html'])
+                    if verse_out is not None and lead.get('verse'):
+                        verse_out.setdefault(prev_id, []).extend(lead['verse'])
+                    _splitter_log_info(
+                        f"接缝回填：{len(lead['text'])} 字符续文 → {prev_id}")
             chapters.extend(sub_chapters)
             chapter_idx += len(sub_chapters)
         else:
@@ -11364,6 +9885,7 @@ class EpubSplitter:
         self._chapter_verse: dict = {}
         self.verse_manifest: dict = {}
         self.audit_result: dict = {}
+        self._excluded_ids: set = set()
 
     def load(self):
         if not self.epub_path.exists():
@@ -11386,17 +9908,54 @@ class EpubSplitter:
         self.chapters = _epub_extract_chapters(
             self.book, sources_out=self._chapter_sources, skipped_out=self._skipped_docs,
             verse_out=self._chapter_verse)
+        self._apply_input_prep()
         if not self.chapters:
             _splitter_log_warn("未提取到任何章节内容")
         else:
             _splitter_log_ok(f"共提取 {len(self.chapters)} 章")
             self._validate_split()
-            self.verse_manifest = _build_verse_manifest(self.chapters, self._chapter_verse)
+            _kept = [(cid, md) for cid, md in self.chapters
+                     if cid not in self._excluded_ids]
+            self.verse_manifest = _build_verse_manifest(_kept, self._chapter_verse)
             n_verse = sum(len(v or []) for v in (self.verse_manifest.get('chapters') or {}).values())
             if n_verse:
                 _splitter_log_info(
                     f"韵文通道：检测到 {n_verse} 个韵文块（verse_manifest 随 write_files 落盘）")
         return self.chapters
+
+    def _apply_input_prep(self):
+        """input_prep：文本伪影修复 + 非正文标记（写盘时入 skip_dir，不参与翻译）。
+
+        被排除章节仍保留在 self.chapters（完整性审计口径不变）。
+        """
+        cfg = _input_prep_cfg()
+        if not cfg or cfg.get("enabled", True) is False:
+            return
+        repairs = cfg.get("repairs") or []
+        if repairs:
+            total = 0
+            fixed = []
+            for ch_id, md in self.chapters:
+                md, n = _apply_input_repairs(md, repairs)
+                total += n
+                fixed.append((ch_id, md))
+            self.chapters = fixed
+            if total:
+                _splitter_log_info(f"input_prep：文本伪影修复 {total} 处")
+        skip_titles = {_prep_key(t) for t in (cfg.get("skip_titles") or []) if t}
+        self._excluded_ids = set()
+        if not skip_titles:
+            return
+        labels = []
+        for ch_id, md in self.chapters:
+            title = _chapter_h1(md)
+            if title and _prep_key(title) in skip_titles:
+                self._excluded_ids.add(ch_id)
+                labels.append(f"{ch_id}（{title}）")
+        if self._excluded_ids:
+            _splitter_log_info(
+                f"input_prep：排除 {len(self._excluded_ids)} 个非正文文档"
+                f"（写 {cfg.get('skip_dir') or '_skip'}/，不翻译）: " + "、".join(labels))
 
     def _validate_split(self):
         """P4：切分完整性 + 段落结构回归校验。
@@ -11444,23 +10003,58 @@ class EpubSplitter:
             _splitter_log_warn(f"校验跳过（非致命）：{e}")
 
     def write_files(self) -> list:
-        """将切分结果写入 output_dir/chXX.md，返回生成的文件路径列表"""
+        """将切分结果写入 output_dir/chXX.md，返回「参与翻译」的文件路径列表
+
+        input_prep 标出的非正文文档改写到 output_dir/<skip_dir>/（不计入返回列表，
+        CLI/mapfile 与翻译流程天然跳过）；同时清理上次切分遗留的陈旧 chXX.md。
+        """
         if not self.chapters:
             self.split()
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        _cfg = _input_prep_cfg()
+        _skip_dir_name = str((_cfg or {}).get("skip_dir") or "_skip")
 
         generated = []
+        pairs = []  # [(ch_id, path)] 参与翻译的章节（供 summary 使用）
         for ch_id, markdown in self.chapters:
+            if ch_id in self._excluded_ids:
+                skip_dir = self.output_dir / _skip_dir_name
+                skip_dir.mkdir(parents=True, exist_ok=True)
+                (skip_dir / f"{ch_id}.md").write_text(markdown, encoding='utf-8')
+                _splitter_log_info(
+                    f"非正文排除: {_skip_dir_name}/{ch_id}.md（{len(markdown)} chars，不参与翻译）")
+                continue
             out_file = self.output_dir / f"{ch_id}.md"
             out_file.write_text(markdown, encoding='utf-8')
             generated.append(str(out_file))
+            pairs.append((ch_id, str(out_file)))
             _splitter_log_ok(f"{ch_id}.md ({len(markdown)} chars)")
+
+        # 清理陈旧章节文件（同目录重切时的残留，如曾被排除但仍在根目录的 chXX）
+        if _cfg and _cfg.get("enabled", True) is not False:
+            root_kept = {ch_id for ch_id, _ in pairs}
+            for stale in self.output_dir.glob("ch*.md"):
+                if re.fullmatch(r'ch\d+', stale.stem) and stale.stem not in root_kept:
+                    try:
+                        stale.unlink()
+                        _splitter_log_info(f"清理陈旧章节: {stale.name}")
+                    except OSError:
+                        pass
+            skip_dir = self.output_dir / _skip_dir_name
+            if skip_dir.is_dir():
+                for stale in skip_dir.glob("ch*.md"):
+                    if re.fullmatch(r'ch\d+', stale.stem) and stale.stem not in self._excluded_ids:
+                        try:
+                            stale.unlink()
+                            _splitter_log_info(f"清理陈旧章节: {_skip_dir_name}/{stale.name}")
+                        except OSError:
+                            pass
 
         summary = self.output_dir / "_chapters_summary.txt"
         summary.write_text(
             "\n".join(
                 f"{ch_id}\t{Path(f).stat().st_size} bytes"
-                for ch_id, f in zip([c[0] for c in self.chapters], generated)
+                for ch_id, f in pairs
             ),
             encoding='utf-8'
         )
@@ -11807,10 +10401,6 @@ def _find_slash_aliases(canonical: str) -> list:
     return parts if len(parts) > 1 else []
 
 
-# Round 119 (T6): 尾注区标记（段落首行上标 ¹²³… 或 "注：" 前缀），整段注释豁免
-_NOTE_MARKER_RE = re.compile(r"^\s*(?:[¹²³⁴⁵⁶⁷⁸⁹]+|注\s*[:：])")
-
-
 def _in_quote_or_note(text: str, pos: int) -> bool:
     """判断 pos 是否位于引号内或译注/脚注区块内（英文残留误报豁免）。"""
     q = 0
@@ -11848,29 +10438,6 @@ def _in_quote_or_note(text: str, pos: int) -> bool:
         if lp < pos < rp and text[lp + 1:rp].lstrip().startswith("原文"):
             return True
     return False
-
-
-def _is_common_word_variant(variant: str, canonical: str = None) -> bool:
-    """Round 105: 判定 variant 是否为普通词/假异体（不应作为人名异体替换）。
-
-    复用 src.utils.entity_stopwords 黑名单 + 一字之差高频差异字护栏。
-    导入失败（单文件部署）时退化为仅拦截已知 ch32 污染项，保证安全。
-
-    ch06 倒查：variant_names 被「一字之差」误发现污染（法国→外国/美国/帝国/法庭，
-    绅士乔→绅士一/绅士可，楼梯→楼上/楼下/楼去）。这些假异体的共同特征是
-    变体侧差异字为高频字（一/外/去/上/下…），而真名异体的差异字偏冷僻。
-    故在黑名单之外，追加「一字之差 + 变体侧差异字 ∈ 高频字集」护栏。
-    """
-    try:
-        from src.utils.entity_stopwords import is_likely_common_word
-        return is_likely_common_word(variant)
-    except Exception:
-        _FALLBACK = {
-            "东西", "卡特", "警察", "警督", "警已", "警方", "警惕", "警司", "警官",
-            "材敦", "普敦", "伦次",
-            "伦敦金", "伦敦来", "伦敦最", "伦敦高", "伦敦时", "伦敦警", "伦敦可",
-        }
-        return variant in _FALLBACK
 
 
 def _detect_issues(finals: list, entities: dict, decisions: dict) -> list:
@@ -11939,8 +10506,10 @@ def _detect_issues(finals: list, entities: dict, decisions: dict) -> list:
                         })
 
         # 3c. 中文异体漂移检测（数据源：entity_registry.variant_names）
-        # Round 105: 普通词护栏（与 src/consistency.py 同步）。命中普通词黑名单的
-        # variant 一律跳过，避免把 某样东西→某样黛西 / 卡特姆勋爵→卡洛姆勋爵。
+        # Round 105: 普通词护栏。variant_names 历史上被「一字之差」误发现污染
+        # （东西/卡特/警察/伦敦金 等普通词被登记为人名异体）。盲目替换会改坏正文
+        # （某样东西→某样黛西 / 卡特姆勋爵→卡洛姆勋爵）。命中普通词黑名单的
+        # variant 一律跳过（不报告、不替换）。
         for canonical, info in entities.items():
             variants = info.get("variant_names", [])
             if not variants:
@@ -12174,6 +10743,2852 @@ def run_consistency_check_for_chapter(
 
 
 
+# Section 13 — 镜像补全区（book_lint / verse / 拆分器与判据辅助）
+# ────────────────────────────────────────────────────────────────────
+
+_INLINE_THINK_RE = re.compile(r'<think(.*?)</think>', re.DOTALL)
+
+
+_QUOTA_HINT_RE = re.compile(r"quota|insufficient|欠费|额度|余额", re.IGNORECASE)
+
+
+def build_effort_params(api_base: str, model_name: str, effort: Optional[str]) -> Dict[str, Any]:
+    if not effort:
+        return {}
+    eff = str(effort).strip().lower()
+    payload: Dict[str, Any] = {"reasoning_effort": eff}
+    target = f"{api_base or ''} {model_name or ''}".lower()
+    if "minimax" in target:
+        payload["thinking"] = {"type": "adaptive"}
+    return payload
+
+
+def entity_source_name_in_text(source_name: Optional[str], source_text: Optional[str]) -> bool:
+    """Round 114: source_name 是否以"词/短语边界"形式出现在原文中（而非裸子串）。
+
+    ch30 chunk000 根因: 实体 "伯特"←"Bert" 因原文 "Bertillon measurements" 含子串
+    "Bert" 被误判"实体在场" → 实体核查要求译文出现「伯特」→ 不可满足 → 实体硬失败
+    → rewriter 停滞 → PERMANENTLY_FAILED。同类: "Europe"⊂"European"、
+    "Herzoslovakia"⊂"Herzoslovakian"、"drawing-room"⊂"drawing-rooms"。
+
+    用 Unicode 字母 lookaround（而非 \\b）：兼容以标点结尾的短语（"Mr."/"H. I."）；
+    所有格/连字符形式（"Bert's"/"Bert—"）仍视为在场。大小写敏感（英文原文与登记表
+    形式一致）。
+    """
+    if not source_name or not source_text:
+        return False
+    return re.search(_entity_boundary_pattern(source_name), source_text) is not None
+
+
+def entity_source_name_spans(
+    source_name: Optional[str], source_text: Optional[str],
+) -> List[Tuple[int, int]]:
+    """Round 133b: entity_source_name_in_text 的 span 版本 — 返回全部命中 [start, end) 区间。
+
+    供"更长别名吞并抑制"使用（chunk071 根因："Mother"(杰西卡夫人 的别名) 在原文中
+    唯一出现于 "Reverend Mother"(盖乌斯·海伦·莫希阿姆 的别名) 内部 → 词边界防护
+    放行 → 判杰西卡夫人在场 → 译文被判 missing → rewriter 收到不可执行指令 → 死循环）。
+    语义与 entity_source_name_in_text 完全一致（大小写敏感、Unicode 字母边界）。
+    """
+    if not source_name or not source_text:
+        return []
+    return [
+        (m.start(), m.end())
+        for m in re.finditer(_entity_boundary_pattern(source_name), source_text)
+    ]
+
+
+def _entity_boundary_pattern(source_name: str) -> str:
+    """Round 133b: entity source_name 的"词/短语边界"正则（与 Round 114 语义一致）。"""
+    return r"(?<![^\W\d_])" + re.escape(source_name) + r"(?![^\W\d_])"
+
+
+def _source_term_pattern(source_text: str):
+    """构造「词边界」精筛正则（回溯触发精度）。
+
+    - 仅字母参与边界（(?<![A-Za-z])/(?![A-Za-z])），避免 "well" 命中
+      "dwelling"/"farewell" 之类子串；数字/CJK 不设边界（保护 "1984"、
+      中文短语）。
+    - 连字符与空白视作可互换分隔（变形容差：tea-party ≈ tea party）。
+    - 大小写不敏感（源文大小写与决策条目常不一致）。
+    - 大小写敏感：决策条目按原文摘录，大小写即语义（"Time" 不应命中
+      任意小写 time；小写子串型伪匹配已由字母边界拦截）。唯一放宽：
+      小写首字母词容忍句首大写（"please your Majesty" ≈ "Please ..."），
+      仅放宽首字符、词内其余字符仍严格。
+    返回 None 表示归一后为空。
+    """
+    norm = re.sub(r'\s+', ' ', (source_text or '').strip())
+    raw_parts = [p for p in re.split(r'[\s\-]+', norm) if p]
+    if not raw_parts:
+        return None
+    parts = [re.escape(p) for p in raw_parts]
+    head = raw_parts[0][:1]
+    if head.isalpha() and head.islower():
+        parts[0] = (f'[{re.escape(head)}{re.escape(head.upper())}]'
+                    f'{re.escape(raw_parts[0][1:])}')
+    body = r'[\s\-]+'.join(parts)
+    return re.compile(rf'(?<![A-Za-z]){body}(?![A-Za-z])')
+
+
+SEED_ENTITY_VARIANTS: Dict[str, List[str]] = {}
+
+
+_CONF_ORDER = {"high": 0, "medium": 1, "low": 2}
+
+
+def load_entity_variant_seeds() -> Dict[str, List[str]]:
+    """P1-4 读取器：config 段优先，为空回退 per-work 资源文件（缺失 = 无种子）。"""
+    try:
+        from src.config import get_config as _get_cfg
+        cfg_variants = getattr(_get_cfg(), "entity_variants", None)
+        if isinstance(cfg_variants, dict) and cfg_variants:
+            return cfg_variants
+    except Exception:
+        pass
+    try:
+        from pathlib import Path
+        import yaml as _yaml
+        seed_path = Path("input/entity_variants.yaml")
+        if seed_path.exists():
+            data = _yaml.safe_load(seed_path.read_text(encoding="utf-8")) or {}
+            if isinstance(data, dict):
+                return {str(k): list(v or []) for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
+    """Round 105 P2-2: 归一 entity_registry 中「同人多规范名」冲突。
+
+    背景（ch32 倒查根因）：同一人物被登记到多个 canonical（George Lomax →
+    乔治·洛马克斯阁下 / 洛马克斯先生 / 乔治·洛马克斯先生），运行时 missing 核查
+    只认 pending_review=0 的那一个，rewriter 用其它形式即被判 missing → 硬失败死循环。
+
+    策略：
+      1. 按共享 source_name 聚类（共享 ≥1 个 source_name 视为同一人）。
+      2. 每个 ≥2 成员的簇选一个 winner：
+         优先级 confidence(high>medium>low) → 更早 created_at → 更长规范名 → 字典序。
+      3. 其余成员降级 pending_review=1（退出运行时核查，仍保留供 sibling 查找）。
+
+    Args:
+        conn: sqlite 连接（entity_registry 表）
+        dry_run: True 仅返回计划不写库；False 实际 UPDATE。
+
+    Returns:
+        {cluster_repr: {"winner": canonical, "demoted": [canonical, ...]}}
+        仅包含被处理的（≥2 成员）簇。
+    """
+    import json as _json
+
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, canonical_name, source_names, confidence, created_at, pending_review "
+        "FROM entity_registry"
+    )
+    rows = cursor.fetchall()
+
+    # 聚类：canonical -> set(专名 source_names)
+    # Round 105: 只用「含大写字母」的 source_name 聚类（专名/人名），排除
+    # "a gentleman"/"the young man"/"the other"/"town" 等通用短语——否则并查集
+    # 会经通用指称把不同人物传递性合并（ch32 实测 绅士乔 经 安东尼·凯德 误并入
+    # 男爵洛洛普雷特济尔 簇）。
+    canon_srcs: Dict[str, set] = {}
+    meta: Dict[str, dict] = {}
+    for rid, canon, srcs_json, conf, created, pending in rows:
+        try:
+            srcs = _json.loads(srcs_json) if srcs_json else []
+        except (ValueError, TypeError):
+            srcs = []
+        specific = {
+            s for s in srcs
+            if isinstance(s, str) and s and any(ch.isupper() for ch in s)
+        }
+        canon_srcs.setdefault(canon, set()).update(specific)
+        meta[canon] = {
+            "id": rid, "confidence": conf or "low",
+            "created": created or "", "pending": pending or 0,
+        }
+
+    # 并查集聚类（共享 source_name 连通）
+    parent = {c: c for c in canon_srcs}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    canons = list(canon_srcs)
+    for i in range(len(canons)):
+        for j in range(i + 1, len(canons)):
+            if canon_srcs[canons[i]] & canon_srcs[canons[j]]:
+                union(canons[i], canons[j])
+
+    clusters: Dict[str, list] = {}
+    for c in canons:
+        clusters.setdefault(find(c), []).append(c)
+
+    plan: Dict[str, Dict] = {}
+    for root, members in clusters.items():
+        if len(members) < 2:
+            continue
+        # 选 winner：confidence → 去括注 base 长度（更长=更具体）→ 更早 created_at → 字典序
+        import re as _re_u
+        def _base_len(c):
+            return len(_re_u.sub(r"（[^）]*）|\([^)]*\)", "", c).strip())
+        def _key(c):
+            m = meta[c]
+            return (
+                _CONF_ORDER.get(m["confidence"], 3),
+                -_base_len(c),
+                m["created"],
+                c,
+            )
+        members_sorted = sorted(members, key=_key)
+        winner = members_sorted[0]
+        demoted = [c for c in members_sorted[1:] if meta[c]["pending"] == 0]
+        if not demoted:
+            continue
+        plan[" / ".join(sorted(members))] = {"winner": winner, "demoted": demoted}
+        if not dry_run:
+            for c in demoted:
+                cursor.execute(
+                    "UPDATE entity_registry SET pending_review = 1, "
+                    "review_reason = 'Round105 unify: 同人多规范名降级 (winner=' || ? || ')' "
+                    "WHERE id = ? AND pending_review = 0",
+                    (winner, meta[c]["id"]),
+                )
+    if not dry_run:
+        conn.commit()
+    return plan
+
+
+def _classify_backend_error(exc: Exception) -> Dict[str, Any]:
+    """A6: 把异常分类为可读的诊断 dict（写入 critic_report._backend_diagnostics）
+
+    分类目标：让用户在 critic_report 中看到 Jev 失败的根因（auth/network/schema/...），
+    而不是只能看到一个通用回退路径。
+    """
+    if _TYPESAFE_EXC_AVAILABLE:
+        if isinstance(exc, TypeSafeAuthenticationError):
+            return {"category": "auth", "msg": str(exc), "action": "check TYPESAFE_API_KEY"}
+        if isinstance(exc, TypeSafeRateLimitError):
+            return {"category": "rate_limit", "msg": str(exc), "action": "wait or upgrade quota"}
+        if isinstance(exc, TypeSafeAPITimeoutError):
+            return {"category": "timeout", "msg": str(exc), "action": "increase timeout or retry"}
+        if isinstance(exc, TypeSafeAPIConnectionError):
+            return {"category": "network", "msg": str(exc), "action": "check DNS/firewall/cert"}
+        if isinstance(exc, TypeSafeBadRequestError):
+            return {"category": "bad_request", "msg": str(exc), "action": "check question schema"}
+        if isinstance(exc, TypeSafeAPIResponseValidationError):
+            return {"category": "schema_mismatch", "msg": str(exc), "action": "update verdict parser"}
+        if isinstance(exc, TypeSafeAPIError):
+            return {"category": "api_error", "msg": str(exc), "action": "check typesafe status page"}
+    # 兜底 1（Round 126）: 非 SDK 异常 / SDK 缺失时按错误消息字符串分类。
+    # 与原单体嵌套版（string-matching）逻辑对齐，保留 retryable 语义——
+    # Raw HTTP 错误（requests/httpx 抛出的 429/401/超时等）借此仍能正确归类。
+    # 只用消息文本匹配（不含 repr/类名）：类名如 TypeSafeAuthenticationError
+    # 会让 "authentication" 关键字在 SDK 不可用的退化路径上误命中（Round 53 测试锁定）。
+    combined = str(exc).lower()
+    if any(k in combined for k in ("429", "rate limit", "rate_limit", "quota", "too many requests")):
+        return {"category": "rate_limit", "retryable": True, "msg": str(exc)[:200], "action": "wait or upgrade quota"}
+    if any(k in combined for k in ("timeout", "timed out", "connection reset", "connection aborted")):
+        return {"category": "timeout", "retryable": True, "msg": str(exc)[:200], "action": "increase timeout or retry"}
+    if any(k in combined for k in ("json", "decode", "parse", "invalid response", "malformed")):
+        return {"category": "parse", "retryable": False, "msg": str(exc)[:200], "action": "check response format"}
+    # auth：短语直配；裸 401/403 仅在与 HTTP/认证上下文共现时才算（真实 httpx/requests
+    # 报文必带 URL / "Unauthorized" 字样）。避免退化路径上只含裸状态码的 SDK 异常文本
+    # （如 "401 won't match in degraded mode"）误命中 auth（Round 53 测试锁定）。
+    _auth_phrase = any(k in combined for k in (
+        "unauthorized", "forbidden", "api key", "invalid api",
+        "authentication", "authenticate", "authorization",
+    ))
+    _auth_code_ctx = bool(re.search(r"\b(401|403)\b", combined)) and any(
+        k in combined for k in ("client error", "url:", "url ", "http", "status")
+    )
+    if _auth_phrase or _auth_code_ctx:
+        return {"category": "auth", "retryable": False, "msg": str(exc)[:200], "action": "check TYPESAFE_API_KEY"}
+    if any(k in combined for k in ("500", "502", "503", "504", "internal server", "bad gateway", "service unavailable")):
+        return {"category": "server", "retryable": True, "msg": str(exc)[:200], "action": "check typesafe status page"}
+    if any(k in combined for k in ("connection", "dns", "network", "unreachable", "ssl", "certificate")):
+        return {"category": "network", "retryable": True, "msg": str(exc)[:200], "action": "check DNS/firewall/cert"}
+    # 兜底 2：未分类异常
+    return {"category": "unknown", "retryable": True, "msg": f"{type(exc).__name__}: {exc}", "action": "inspect stack trace"}
+
+
+def apply_entity_presence_override(
+    answers: Dict[str, Any],
+    entity_registry_full: Optional[Dict[str, Dict[str, Any]]],
+    lit_text: str,
+) -> List[Dict[str, Any]]:
+    """把"规范名确已出现"的 per-entity 违规判定覆盖为合规（noul=1.0）。
+
+    Round 110 背景（ch08 chunk001 根因）: Jev 超时回落 openai_compat 后，把
+    "The manager/the manager" 判成违规（noul=0.00），而润色稿含规范名「经理」
+    （确定性 entity audit 也确认 present）→ entity_consistency 被 max 聚合打到 0
+    → judge REJECT → rewriter 收到"统一为规范主名"的不可执行指令 → 输出字节停滞
+    → REWRITER_STAGNATED → PERMANENTLY_FAILED。
+
+    per-entity 问题的 criteria 本身是确定性的（"润色稿包含规范主名或其变体"），
+    因此可用子串比对直接复核：命中 → 强制 noul=1.0，否决 LLM 判定；未命中 →
+    保留原判定（真违规不受影响，避免掩盖真实缺失）。
+
+    聚合语义（max(1-noul)）在 synthesize_verdict 内执行，本函数需在其之前调用。
+
+    Args:
+        answers: backend 返回的 {question_id: Answer}（原地修改）
+        entity_registry_full: {source_name: {"canonical": str, "variants": List[str]}}
+        lit_text: 润色稿
+
+    Returns:
+        被覆盖的实体列表 [{qid, source_name, canonical, old_noul, matched}, ...]
+    """
+    if not answers or not entity_registry_full or not lit_text:
+        return []
+    overrides: List[Dict[str, Any]] = []
+    # key 回放必须与 build_per_entity_questions 完全同序（同样的 skip 条件 +
+    # _sanitize_key 调用顺序），否则多实体 key 冲突（_2/_3 后缀）会错位。
+    used_keys: set = set()
+    for source_name, info in entity_registry_full.items():
+        if not source_name:
+            continue
+        if isinstance(info, dict):
+            canonical = info.get("canonical", "") or ""
+            variants = info.get("variants", []) or []
+        else:
+            canonical = str(info or "")
+            variants = []
+        if not canonical:
+            continue
+        qid = _sanitize_key(source_name, used_keys)
+        ans = answers.get(qid)
+        if ans is None or not hasattr(ans, "noul"):
+            continue
+        old_noul = float(ans.noul)
+        if old_noul >= 1.0:
+            continue
+        matched = entity_present_in_text(canonical, variants, lit_text)
+        if not matched:
+            continue
+        ans.noul = 1.0
+        ans.confidence = 1.0
+        overrides.append({
+            "qid": qid,
+            "source_name": source_name,
+            "canonical": canonical,
+            "old_noul": old_noul,
+            "matched": matched,
+        })
+    return overrides
+
+
+def entity_present_in_text(
+    canonical: str,
+    variants: Optional[List[str]],
+    lit_text: str,
+) -> Optional[str]:
+    """确定性判定规范名（或已登记变体）是否出现在润色稿中，命中返回匹配形式。
+
+    与 pipeline / translator_agent 的 _canonical_present_in_text（Round 105）同语义，
+    消除两类系统性假阳性：
+      1. 规范名带括注（镇（town）/科德斯（Codders））— 译文永远不会含括注；
+      2. 前缀/后缀写法（译文用 乔治·洛马克斯，规范名 乔治·洛马克斯先生）。
+
+    判定顺序：
+      - 完整规范名 / 任一已登记变体直接命中；
+      - 去括注后的 base 命中；
+      - base 长度≥4 时，显著前缀/后缀（长度 ≥ max(3, 2/3·len)）命中。
+
+    Args:
+        canonical: 中文规范主名
+        variants: 已登记的中文变体列表（可为 None/空）
+        lit_text: 待核验的润色稿
+
+    Returns:
+        命中的形式（子串），全不命中返回 None
+    """
+    if not lit_text:
+        return None
+    cands: List[str] = []
+    if canonical:
+        cands.append(str(canonical))
+    cands.extend(str(v) for v in (variants or []) if v)
+    # 1) 完整规范名 / 变体直接命中
+    for form in cands:
+        if form in lit_text:
+            return form
+    # 1.5) Round 115: 斜杠备选 canonical（如 "国民党/民族主义者"）— 译文通常只用其中
+    # 一个备选（ch06 chunk012 用「民族主义者」），整串/前后缀容差都会差在斜杠上 →
+    # 误判 missing → 实体硬失败死循环。任一备选字面命中即算在场。
+    for form in cands:
+        base = re.sub(r"（[^）]*）|\([^)]*\)", "", form).strip()
+        if "/" in base or "／" in base:
+            for alt in re.split(r"[/／]", base):
+                alt = alt.strip()
+                if len(alt) >= 2 and alt in lit_text:
+                    return alt
+    # 2) 去括注 base 命中
+    bases: List[str] = []
+    for form in cands:
+        base = re.sub(r"（[^）]*）|\([^)]*\)", "", form).strip()
+        if base:
+            bases.append(base)
+        if base and base != form and base in lit_text:
+            return base
+    # 3) 长名前/后缀容差（与 Round 105 _canonical_present_in_text 同语义）
+    for base in bases:
+        if len(base) < 4:
+            continue
+        threshold = max(3, (len(base) * 2) // 3)
+        if threshold >= len(base):
+            continue
+        if base[:threshold] in lit_text:
+            return base[:threshold]
+        if base[-threshold:] in lit_text:
+            return base[-threshold:]
+    return None
+
+
+DEFAULT_SOURCE_PROFILES: Dict[str, Dict[str, Any]] = {
+    # Jev：校准概率，阈值按配置原样（margin=0 保证不弱化）
+    "jev": {"calibrated": True, "reject_margin": 0.0, "confidence_margin": 0.0},
+    # LLM-as-judge：自报 confidence + 伪概率分布，reject 需要更强证据
+    "openai_compat": {
+        "calibrated": False, "reject_margin": 0.15, "confidence_margin": 0.15,
+        "widen_noul_uncertain_zone": True,
+    },
+    # Mock：确定性启发式（字符匹配/长度比），精度最低 → 最收紧
+    "mock_heuristic": {
+        "calibrated": False, "reject_margin": 0.25, "confidence_margin": 0.20,
+        "widen_noul_uncertain_zone": True,
+    },
+    # 未知 backend 一律按未校准处理
+    "_uncalibrated": {
+        "calibrated": False, "reject_margin": 0.20, "confidence_margin": 0.15,
+        "widen_noul_uncertain_zone": True,
+    },
+}
+
+
+_MAX_WIDENED_ZONE_HIGH = 0.98
+
+
+_SOURCE_MARGIN_CONFIDENCE_KEYS = (
+    "style_compliance_min_confidence",
+    "low_confidence_threshold",
+    "cjk_low_confidence_threshold",
+)
+
+
+_SOURCE_MARGIN_THRESHOLD_KEYS = (
+    "voice_drift_severe_prob",
+    "register_mismatch_prob",
+    "entity_consistency_noul",
+    "literal_residue_noul",
+    "semantic_loss_noul",
+)
+
+
+def _apply_source_profile(thr: Dict[str, Any], confidence_source: str) -> tuple:
+    """按 confidence_source 生成有效阈值副本，返回 (thr, calibrated)。
+
+    Jev 路径：原阈值原样返回（不弱化）。
+    未校准来源：上调 reject 门槛 / 置信门槛，并拓宽 Noul 不确定区间上界，
+    让边界噪声走保守跳过而不是 hard REJECT。
+    """
+    profiles: Dict[str, Dict[str, Any]] = {
+        k: dict(v) for k, v in DEFAULT_SOURCE_PROFILES.items()
+    }
+    user_profiles = thr.get("confidence_source_profiles")
+    if isinstance(user_profiles, dict):
+        for key, override in user_profiles.items():
+            if isinstance(override, dict):
+                profiles.setdefault(str(key), {}).update(override)
+    source_key = normalize_confidence_source(confidence_source)
+    profile = profiles.get(source_key) or profiles["_uncalibrated"]
+    calibrated = bool(profile.get("calibrated", source_key == "jev"))
+    reject_margin = float(profile.get("reject_margin", 0.0) or 0.0)
+    confidence_margin = float(profile.get("confidence_margin", 0.0) or 0.0)
+    if reject_margin > 0.0:
+        for key in _SOURCE_MARGIN_THRESHOLD_KEYS:
+            base = float(thr.get(key, DEFAULT_THRESHOLDS.get(key, 0.0)) or 0.0)
+            thr[key] = round(min(0.95, base + reject_margin), 4)
+    if confidence_margin > 0.0:
+        for key in _SOURCE_MARGIN_CONFIDENCE_KEYS:
+            raw = thr.get(key, DEFAULT_THRESHOLDS.get(key))
+            if raw is None:
+                continue
+            thr[key] = round(min(0.95, float(raw) + confidence_margin), 4)
+    if reject_margin > 0.0 and profile.get("widen_noul_uncertain_zone", False):
+        zones = thr.get("noul_uncertain_zones")
+        if isinstance(zones, dict) and zones:
+            widened: Dict[str, Any] = {}
+            for dim, zone in zones.items():
+                if isinstance(zone, (list, tuple)) and len(zone) == 2:
+                    widened[dim] = [
+                        zone[0],
+                        round(min(_MAX_WIDENED_ZONE_HIGH, float(zone[1]) + reject_margin), 4),
+                    ]
+                else:
+                    widened[dim] = zone
+            thr["noul_uncertain_zones"] = widened
+        high = float(thr.get(
+            "noul_uncertain_high", DEFAULT_THRESHOLDS.get("noul_uncertain_high", 0.7)
+        ) or 0.0)
+        thr["noul_uncertain_high"] = round(
+            min(_MAX_WIDENED_ZONE_HIGH, high + reject_margin), 4
+        )
+    return thr, calibrated
+
+
+def normalize_confidence_source(source: Optional[str]) -> str:
+    """把 backend 标识归一化到 profile key。
+
+    "jev"/"JevBackend"/"typesafe"/"system_one" → "jev"
+    "openai_compat"/"OpenAICompatBackend"/"llm_self_report" → "openai_compat"
+    "mock_heuristic"/"mock"/"MockBackend" → "mock_heuristic"
+    其余 → "_uncalibrated"
+    """
+    s = str(source or "").strip().lower()
+    if s in ("jev", "jevbackend", "typesafe", "system_one", "calibrated"):
+        return "jev"
+    if s in ("openai_compat", "openaicompatbackend", "llm_self_report", "llm"):
+        return "openai_compat"
+    if s in ("mock_heuristic", "mockbackend", "mock"):
+        return "mock_heuristic"
+    return "_uncalibrated"
+
+
+_NOTE_MARKER_RE = re.compile(r"^\s*(?:[¹²³⁴⁵⁶⁷⁸⁹]+|注\s*[:：])")
+
+
+def _is_common_word_variant(variant: str, canonical: str = None) -> bool:
+    """Round 105: 判定 variant 是否为普通词/假异体（不应作为人名异体替换）。
+
+    复用 src.utils.entity_stopwords 黑名单 + 一字之差高频差异字护栏。
+    导入失败（单文件部署）时退化为仅拦截已知 ch32 污染项，保证安全。
+
+    ch06 倒查：variant_names 被「一字之差」误发现污染（法国→外国/美国/帝国/法庭，
+    绅士乔→绅士一/绅士可，楼梯→楼上/楼下/楼去）。这些假异体的共同特征是
+    变体侧差异字为高频字（一/外/去/上/下…），而真名异体的差异字偏冷僻。
+    故在黑名单之外，追加「一字之差 + 变体侧差异字 ∈ 高频字集」护栏。
+    """
+    try:
+        from src.utils.entity_stopwords import is_likely_common_word
+        return is_likely_common_word(variant)
+    except Exception:
+        # 兜底黑名单（与 entity_stopwords.COMMON_WORDS 的 ch32 污染项一致）
+        _FALLBACK = {
+            "东西", "卡特", "警察", "警督", "警已", "警方", "警惕", "警司", "警官",
+            "材敦", "普敦", "伦次",
+            "伦敦金", "伦敦来", "伦敦最", "伦敦高", "伦敦时", "伦敦警", "伦敦可",
+        }
+        return variant in _FALLBACK
+
+
+def consolidate_dirty_chapters(
+    project_root=None,
+    max_rounds: int = 3,
+    pipeline_factory=None,
+    db_path=None,
+    output_dir=None,
+) -> dict:
+    """T2: 全书决策收敛闭环 — 重跑所有含 DIRTY chunk 的章节直到收敛。
+
+    D2/D3 根因: 章节串行执行时，已结束章节上的回溯标记（DIRTY）没有
+    消费点，全书跑完后 merge 会把"回溯前"陈旧 final 收录进成书。
+    本函数在全书写完之后统一收口: 扫描 workflow.db 的 DIRTY chunk →
+    按章序重跑该章管线（DIRTY 阶段在阶段表首位）→ 重扫；循环到
+    DIRTY=0 或 max_rounds。每个重跑 chunk 的旧/新 final 文本差异写入
+    output/consolidation_diff.md（旧稿在重跑前采样，不依赖 backup 存活）。
+
+    Returns:
+        {
+          "converged": bool,     # 最终 DIRTY=0
+          "rounds": int,         # 实际执行轮数（无 DIRTY 时为 0）
+          "rerun": [...],        # 重跑过的 chunk（按发生顺序）
+          "remaining": {...},    # 未收敛残留 {chapter: [chunk_id]}
+          "diff_path": str|None,
+        }
+    """
+    import difflib
+    from datetime import datetime
+
+    rounds_cap = max(1, int(max_rounds))
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    db_file = Path(db_path) if db_path else root / "db" / "workflow.db"
+    out_root = Path(output_dir) if output_dir else root / "output"
+
+    result = {"converged": True, "rounds": 0, "rerun": [], "remaining": {}, "diff_path": None}
+    if not db_file.exists():
+        print(f"⚠️ [Consolidate] workflow.db 不存在（{db_file}），跳过收敛检查")
+        return result
+
+    if pipeline_factory is None:
+        pipeline_factory = lambda ch: TranslationPipeline(chapter_id=ch)
+
+    scheduler = TaskScheduler(db_path=str(db_file))
+
+    def _dirty_rows():
+        cursor = scheduler.conn.execute(
+            "SELECT chapter_id, chunk_id FROM chunk_tasks WHERE state = ? "
+            "ORDER BY chapter_id ASC, chunk_id ASC",
+            (TaskState.DIRTY.value,),
+        )
+        return [tuple(row) for row in cursor.fetchall()]
+
+    def _read_final_text(chapter_id, chunk_id):
+        path = out_root / chapter_id / f"{chunk_id}_final.json"
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        return data.get("text", "") if isinstance(data, dict) else str(data)
+
+    diff_records = []
+    while result["rounds"] < rounds_cap:
+        rows = _dirty_rows()
+        if not rows:
+            break
+        result["rounds"] += 1
+        round_no = result["rounds"]
+        by_chapter = {}
+        for chapter_id, chunk_id in rows:
+            by_chapter.setdefault(chapter_id, []).append(chunk_id)
+        print(f"🔁 [Consolidate] 第 {round_no}/{rounds_cap} 轮: "
+              f"{len(rows)} 个 DIRTY chunk, {len(by_chapter)} 章待收敛")
+        for chapter_id in sorted(by_chapter):
+            chunk_ids = by_chapter[chapter_id]
+            pre_texts = {cid: _read_final_text(chapter_id, cid) for cid in chunk_ids}
+            try:
+                ok = bool(pipeline_factory(chapter_id).run())
+            except Exception as exc:
+                ok = False
+                print(f"  ⚠️ [Consolidate] 章节 {chapter_id} 重跑异常: {exc}")
+            if not ok:
+                print(f"  ⚠️ [Consolidate] 章节 {chapter_id} 重跑未完全通过（fallback 已兜底的可能）")
+            for cid in chunk_ids:
+                diff_records.append({
+                    "round": round_no,
+                    "chapter": chapter_id,
+                    "chunk": cid,
+                    "old": pre_texts.get(cid),
+                    "new": _read_final_text(chapter_id, cid),
+                })
+                result["rerun"].append(cid)
+
+    remaining_rows = _dirty_rows()
+    result["converged"] = len(remaining_rows) == 0
+    for chapter_id, chunk_id in remaining_rows:
+        result["remaining"].setdefault(chapter_id, []).append(chunk_id)
+
+    lines = [
+        "# 全书决策收敛报告 (consolidation_diff)",
+        "",
+        f"- 生成时间: {datetime.now().isoformat(timespec='seconds')}",
+        f"- 轮次: {result['rounds']} / max_rounds={rounds_cap}",
+        f"- 重跑 chunk: {len(result['rerun'])} 个",
+        f"- 最终状态: {'✅ 收敛 (DIRTY=0)' if result['converged'] else '❌ 未收敛'}",
+        "",
+    ]
+    if result["remaining"]:
+        lines.append("## 未收敛残留")
+        lines.append("")
+        for chapter_id in sorted(result["remaining"]):
+            lines.append(f"- {chapter_id}: {', '.join(result['remaining'][chapter_id])}")
+        lines.append("")
+    if not diff_records:
+        lines.append("（本次扫描 DIRTY=0，无重跑）")
+        lines.append("")
+    else:
+        lines.append("## 重跑明细")
+        lines.append("")
+        for rec in diff_records:
+            lines.append(f"### [{rec['chapter']}/{rec['chunk']}] (轮 {rec['round']})")
+            old_text, new_text = rec["old"], rec["new"]
+            if old_text is None and new_text is None:
+                lines.append("- 旧/新 final 均缺失（重跑失败且无 backup 可恢复）")
+            elif old_text is None:
+                lines.append(f"- 无旧稿对照；新稿 {len(new_text)} 字")
+            elif new_text is None:
+                lines.append(f"- 重跑无新稿（已回滚旧稿）；旧稿 {len(old_text)} 字")
+            elif old_text == new_text:
+                lines.append(f"- 文本无变化（仅决策核销）；{len(new_text)} 字")
+            else:
+                lines.append(f"- 文本变化: {len(old_text)} 字 → {len(new_text)} 字 "
+                             f"(Δ{len(new_text) - len(old_text):+d})")
+                old_lines = old_text.splitlines()
+                new_lines = new_text.splitlines()
+                preview = []
+                for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old_lines, new_lines).get_opcodes():
+                    if tag == "equal":
+                        continue
+                    for ln in old_lines[i1:i2][:3]:
+                        preview.append("- " + ln[:80])
+                    for ln in new_lines[j1:j2][:3]:
+                        preview.append("+ " + ln[:80])
+                    if len(preview) >= 8:
+                        break
+                lines.append("- 差异预览:")
+                lines.append("")
+                lines.append("```diff")
+                lines.extend(preview[:8])
+                lines.append("```")
+            lines.append("")
+    lines.append("---")
+    lines.append("*由 consolidate 子命令自动生成*")
+    lines.append("")
+
+    diff_path = out_root / "consolidation_diff.md"
+    try:
+        out_root.mkdir(parents=True, exist_ok=True)
+        diff_path.write_text("\n".join(lines), encoding="utf-8")
+        result["diff_path"] = str(diff_path)
+    except OSError as exc:
+        print(f"⚠️ [Consolidate] 报告写入失败: {exc}")
+
+    if result["converged"]:
+        print(f"✅ [Consolidate] 收敛完成: DIRTY=0 "
+              f"(重跑 {len(result['rerun'])} chunk, {result['rounds']} 轮)")
+    else:
+        total_left = sum(len(v) for v in result["remaining"].values())
+        print(f"❌ [Consolidate] 未收敛: 仍余 {total_left} 个 DIRTY chunk"
+              f"（max_rounds={rounds_cap} 已用尽）")
+        for chapter_id in sorted(result["remaining"]):
+            print(f"   {chapter_id}: {', '.join(result['remaining'][chapter_id])}")
+    return result
+
+
+def run_final_gate(
+    project_root=None,
+    db_path=None,
+    output_dir=None,
+    qa_report_path=None,
+    conversion_audit_path=None,
+) -> dict:
+    """T4: 交付门禁 — 完成信号不变量化（fail-closed）。
+
+    ① 状态机：全部 chunk COMPLETED 且 DIRTY=0
+    ② 产物：每章 final.json 数 == DB 任务数；无 *_final_backup.json 残留
+    ③ QA_REPORT：无 fallback 章节条目（## 段）
+    ④ T5 lint（finals + merged）全绿
+    ⑤ T1 转换审计报告结论为 "✅ 通过"
+    ⑥ L1 韵文对齐（verse_lint，门禁内联自动运行）
+    ⑦ L2 双关核销（pun_audit，门禁内联自动运行；Round 130 起无需手动补跑）
+    任一为红 → ok=False（translate_book.sh 以非零退出中止 / ⛔）。
+    """
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    db_file = Path(db_path) if db_path else root / "db" / "workflow.db"
+    out_root = Path(output_dir) if output_dir else root / "output"
+    qa_file = Path(qa_report_path) if qa_report_path else out_root / "QA_REPORT.md"
+    audit_file = (Path(conversion_audit_path) if conversion_audit_path
+                  else root / "input" / "_conversion_audit.md")
+
+    failures: list = []
+    warnings: list = []
+    stats: dict = {"tasks": 0, "states": {}, "chapters": 0, "qa_fallbacks": 0}
+    by_state: dict = {}
+    expected: dict = {}
+
+    # ① 状态机 + ② 产物
+    rows = []
+    scheduler = None
+    if not db_file.exists():
+        failures.append(f"① workflow.db 不存在: {db_file}")
+    else:
+        scheduler = TaskScheduler(db_path=str(db_file))
+        rows = scheduler.conn.execute(
+            "SELECT chapter_id, chunk_id, state FROM chunk_tasks").fetchall()
+    stats["tasks"] = len(rows)
+    for ch, _cid, st in rows:
+        by_state[st] = by_state.get(st, 0) + 1
+        expected[ch] = expected.get(ch, 0) + 1
+    stats["states"] = by_state
+    stats["chapters"] = len(expected)
+
+    dirty_n = by_state.get(TaskState.DIRTY.value, 0)
+    if dirty_n:
+        failures.append(f"① DIRTY={dirty_n}（存在未整合脏块，先跑 consolidate）")
+    non_completed = [(cid, st) for _ch, cid, st in rows if st != TaskState.COMPLETED.value]
+    if non_completed:
+        sample = ", ".join(f"{cid}:{st}" for cid, st in non_completed[:5])
+        failures.append(f"① 非 COMPLETED 任务 {len(non_completed)} 个（如 {sample}）")
+
+    for ch, exp in sorted(expected.items()):
+        finals = list((out_root / ch).glob("*_final.json"))
+        if len(finals) != exp:
+            failures.append(f"② {ch}: final.json {len(finals)} 个 != DB 任务 {exp} 个")
+    backups = [str(p.relative_to(root)) for p in out_root.glob("ch*/*_final_backup.json")]
+    if backups:
+        failures.append(f"② 残留 final_backup {len(backups)} 个: {backups[:5]}")
+
+    # ③ QA_REPORT
+    if not qa_file.exists():
+        failures.append(f"③ QA_REPORT 不存在: {qa_file}")
+    else:
+        falls = [ln[3:].strip() for ln in qa_file.read_text(encoding="utf-8").split("\n")
+                 if ln.startswith("## ")]
+        stats["qa_fallbacks"] = len(falls)
+        if falls:
+            failures.append(f"③ QA_REPORT 记录 {len(falls)} 个 fallback 章节: {falls[:5]}")
+
+    # ④ T5 lint
+    try:
+        from src.book_lint import lint_book
+        lint_res = lint_book(project_root=str(root))
+        stats["lint_failures"] = len(lint_res.get("failures", []))
+        if not lint_res.get("ok"):
+            failures.append(
+                f"④ lint 未通过（{stats['lint_failures']} 项，详见 output/book_lint.md）")
+    except Exception as exc:
+        stats["lint_failures"] = -1
+        failures.append(f"④ lint 执行异常: {exc}")
+
+    # ⑤ T1 转换审计
+    if not audit_file.exists():
+        failures.append(f"⑤ 转换审计报告不存在: {audit_file}")
+    else:
+        audit_text = audit_file.read_text(encoding="utf-8")
+        cov = re.search(r'全书覆盖率:\s*([\d.]+)%', audit_text)
+        if cov:
+            stats["audit_coverage"] = float(cov.group(1))
+        if "✅ 通过" not in audit_text:
+            failures.append(f"⑤ 转换审计未通过（详见 {audit_file}）")
+
+    # ⑥ L1 韵文对齐（verse_lint；manifest 无韵文块或功能关闭时跳过）
+    try:
+        from src.verse import (load_verse_manifest, load_chunk_tags,
+                               fragments_for_chunk, verse_lint, verse_config)
+        _vcfg = verse_config()
+        _vmani = load_verse_manifest(root / "input")
+        _vtags = load_chunk_tags(root / "db")
+        _vblocks_n = sum(len(v or []) for v in (_vmani.get("chapters") or {}).values())
+        verse_stats = {"verse_blocks": _vblocks_n, "checked": 0, "failed": 0}
+        stats["verse"] = verse_stats
+        if _vcfg.get("enabled", True) and _vblocks_n:
+            _vtext_rows = []
+            if scheduler is not None:
+                _vtext_rows = scheduler.conn.execute(
+                    "SELECT chunk_id, chapter_id, text_content FROM chunk_tasks").fetchall()
+            _vfail = []
+            _vreport = ["# 韵文对齐报告 (verse_lint)", "",
+                        f"- 韵文块总数: {_vblocks_n}", ""]
+            for _vcid, _vch, _vtext in _vtext_rows:
+                _vfinal = out_root / _vch / f"{_vcid}_final.json"
+                if not _vfinal.exists():
+                    continue
+                _vfrags = fragments_for_chunk(_vch, _vcid, _vtext or "", _vtags, _vmani)
+                if not _vfrags:
+                    continue
+                try:
+                    _vdata = json.loads(_vfinal.read_text(encoding="utf-8"))
+                except (json.JSONDecodeError, OSError):
+                    continue
+                _vftext = _vdata.get("text", "") if isinstance(_vdata, dict) else str(_vdata)
+                _vres = verse_lint(_vfrags, _vftext,
+                                   min_line_ratio=float(_vcfg.get("min_line_ratio", 0.6)),
+                                   max_line_chars=int(_vcfg.get("max_line_chars", 56)),
+                                   refrain_ratio=float(_vcfg.get("refrain_ratio", 0.5)))
+                verse_stats["checked"] += 1
+                if _vres["ok"]:
+                    _vreport.append(
+                        f"- ✅ {_vcid}: lines {_vres['found_lines']}/{_vres['expected_lines']}, "
+                        f"refrain {_vres['refrain_target']}/{_vres['refrain_source']}")
+                else:
+                    verse_stats["failed"] += 1
+                    _vreport.append(f"- ❌ {_vcid}: {_vres['reason']}")
+                    _vfail.append(f"{_vcid}({_vres['reason']})")
+            if verse_stats["checked"] == 0 and _vblocks_n:
+                failures.append(
+                    "⑥ 韵文清单非空但未匹配到任何 chunk（manifest/tags 可能陈旧，需重新 split+init）")
+            if _vfail:
+                failures.append(f"⑥ verse_lint 未达标 {len(_vfail)} 个 chunk: {_vfail[:5]}")
+            (out_root / "verse_lint.md").write_text(
+                "\n".join(_vreport) + "\n", encoding="utf-8")
+    except Exception as _v_exc:
+        stats["verse"] = {"error": str(_v_exc)}
+        failures.append(f"⑥ verse_lint 执行异常: {_v_exc}")
+    # ⑦ L2 双关核销（pun_audit；watchlist 为空时跳过）
+    try:
+        from src.style_profiler import load_profile as _load_profile
+        _prof = _load_profile(root / "input" / "book_profile.json")
+        _watch = (_prof or {}).get("pun_watchlist") or []
+        if _watch:
+            _pun_json = out_root / "pun_audit.json"
+            # Round 130（外部审计②）: 门禁内联自动运行 pun_audit（纯静态、无 LLM 调用），
+            # 消除"必须手动先跑 scripts/pun_audit.py，否则 gate ⑦ 必红"的顺序耦合。
+            _pun_script = root / "scripts" / "pun_audit.py"
+            if _pun_script.exists():
+                import subprocess as _subprocess
+                try:
+                    _pun_proc = _subprocess.run(
+                        [sys.executable, str(_pun_script),
+                         "--project-root", str(root), "--no-fail"],
+                        cwd=str(root), capture_output=True, text=True, timeout=120)
+                    if _pun_proc.returncode != 0:
+                        warnings.append(
+                            f"⑦ pun_audit 自动执行异常(rc={_pun_proc.returncode}): "
+                            f"{(_pun_proc.stderr or _pun_proc.stdout or '').strip()[:200]}")
+                except Exception as _pun_run_exc:
+                    failures.append(
+                        f"⑦ pun_audit 自动执行失败: {type(_pun_run_exc).__name__}: {_pun_run_exc}")
+            if not _pun_json.exists():
+                failures.append("⑦ pun_audit 未运行（缺 output/pun_audit.json；自动补跑不可用，请手动跑 scripts/pun_audit.py）")
+            else:
+                _pun_report = json.loads(_pun_json.read_text(encoding="utf-8"))
+                _pun_sum = _pun_report.get("summary") or {}
+                stats["pun"] = _pun_sum
+                _pun_miss = int(_pun_sum.get("uncovered_nonwaived", 0) or 0)
+                if _pun_miss:
+                    failures.append(f"⑦ pun_watchlist 未核销 {_pun_miss} 项（详见 output/pun_audit.md）")
+    except Exception as _p_exc:
+        failures.append(f"⑦ pun 审计执行异常: {_p_exc}")
+
+    if stats["tasks"] == 0 and db_file.exists():
+        failures.append("① workflow.db 无任务行（未 init？）")
+
+    result = {"ok": not failures, "failures": failures, "warnings": warnings, "stats": stats}
+    print("🎯 [Gate] 交付门禁检查：")
+    print(f"  ① 状态机: {stats['tasks']} 个任务, states={by_state}")
+    print(f"  ② 产物: {stats['chapters']} 章, final_backup={len(backups)}")
+    print(f"  ③ QA_REPORT: fallback {stats['qa_fallbacks']} 章")
+    print(f"  ④ lint: failures={stats.get('lint_failures')}")
+    if stats.get("audit_coverage") is not None:
+        print(f"  ⑤ 转换审计: 覆盖率 {stats['audit_coverage']}%")
+    _vs = stats.get("verse") or {}
+    if _vs.get("error"):
+        print(f"  ⑥ 韵文: 异常 {_vs['error']}")
+    elif _vs:
+        print(f"  ⑥ 韵文: blocks={_vs.get('verse_blocks', 0)}, "
+              f"checked={_vs.get('checked', 0)}, failed={_vs.get('failed', 0)}")
+    _ps = stats.get("pun") or {}
+    if _ps:
+        print(f"  ⑦ 双关核销: covered={_ps.get('covered', 0)}/{_ps.get('total', 0)}, "
+              f"waived={_ps.get('waived', 0)}, uncovered={_ps.get('uncovered_nonwaived', 0)}")
+    for f in failures:
+        print(f"  ❌ {f}")
+    if result["ok"]:
+        print("  ✅ gate 全绿（可交付）")
+    return result
+
+
+_INSTANCE_LOCK_FD: Optional[int] = None
+
+
+_MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile",
+                      "consolidate", "finalize", "notes-normalize"}
+
+
+def acquire_instance_lock(lock_path: Optional[Path] = None) -> bool:
+    """非阻塞获取单实例锁。
+
+    Returns:
+        True  — 已持有（或由祖先进程持有 / 放行开关生效），可继续执行；
+        False — 已有另一实例在运行，调用方应中止。
+    """
+    global _INSTANCE_LOCK_FD
+    if os.environ.get("SAGATRANS_LOCK_HELD") == "1":
+        return True
+    import fcntl
+    import time as _time
+    path = Path(lock_path) if lock_path else Path.cwd() / "db" / ".sagatrans.lock"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:
+        print(f"⚠️ [Lock] 无法创建锁文件 {path}: {e}（继续执行）", file=sys.stderr)
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            holder = path.read_text(encoding="utf-8").strip().replace("\n", " ") or "(无持有者信息)"
+        except OSError:
+            holder = "(无持有者信息)"
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        if os.environ.get("SAGATRANS_ALLOW_CONCURRENT") == "1":
+            print(f"⚠️ [Lock] 已有 SagaTrans 实例在运行（{holder}）——"
+                  f"SAGATRANS_ALLOW_CONCURRENT=1 放行", file=sys.stderr)
+            return True
+        print(f"⛔ [Lock] 已有 SagaTrans 实例在运行：{holder}", file=sys.stderr)
+        print(f"   锁文件: {path}；确认无残留进程后可设 SAGATRANS_ALLOW_CONCURRENT=1 强制放行（风险自担）",
+              file=sys.stderr)
+        return False
+    try:
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, (f"pid={os.getpid()} started={_time.strftime('%F %T')} "
+                      f"cmd={' '.join(sys.argv[1:]) or 'pipeline'}\n").encode("utf-8"))
+    except OSError:
+        pass
+    _INSTANCE_LOCK_FD = fd  # 进程存活期间保持打开；fd 随进程退出关闭 → 自动释放锁
+    return True
+
+
+_AUDIT_CHAPTER_FLOOR = 0.90
+
+
+_AUDIT_COVERAGE_THRESHOLD = 0.995
+
+
+_AUDIT_MAX_MISSING_SPANS = 20
+
+
+_AUDIT_TOC_SCAN_LINES = 120
+
+
+_AUDIT_TOKEN_RE = re.compile(r'[A-Za-z0-9]+|[\u4e00-\u9fff]')
+
+
+_FALLBACK_BLOCK_TAGS = ['blockquote', 'li', 'dd', 'dt', 'tr', 'table']
+
+
+_PRIMARY_BLOCK_TAGS = ['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'pre']
+
+
+_VERSE_CLASS_RE = re.compile(r'poem|stanza|verse|song|lyric|epigraph', re.IGNORECASE)
+
+
+_CHAPTER_TITLE_PATTERNS = [
+    re.compile(r'^\s*(?:Chapter|CHAPTER|第[一二三四五六七八九十百千零\d]+章|序章|楔子|引子|前言|后记|尾声)\s*[\s\d.、:：\-—]*[^\n]*$', re.IGNORECASE),
+    re.compile(r'^\s*\[(?:CHAPTER|Chapter|第[一二三四五六七八九十百千零\d]+章)[^\]]*\]\s*$', re.IGNORECASE),
+    re.compile(r'^\s*#{1,2}\s*[^\n]+$'),  # Markdown H1/H2
+]
+
+
+def _apply_input_repairs(text: str, repairs) -> tuple:
+    """按 input_prep.repairs 表顺序替换文本伪影，返回 (新文本, 替换次数)。"""
+    n = 0
+    for item in repairs or []:
+        try:
+            old, new = str(item[0]), str(item[1])
+        except (TypeError, IndexError, KeyError):
+            continue
+        if old and old in text:
+            n += text.count(old)
+            text = text.replace(old, new)
+    return text, n
+
+
+def _chapter_h1(md: str) -> str:
+    """取章节 Markdown 的 H1 标题（前几行内首个 '# ' 行）。"""
+    for line in (md or "").splitlines()[:5]:
+        if line.startswith("# "):
+            return line[2:].strip()
+    return ""
+
+
+def _input_prep_cfg() -> dict:
+    """读取 config.yaml 的 input_prep 配置（不可用时返回 {} = 功能关闭）。"""
+    try:
+        from src.config import get_config as _gc
+        return dict(_gc().input_prep or {})
+    except Exception:
+        return {}
+
+
+def _prep_key(s: str) -> str:
+    """标题归一（忽略大小写/多余空白）供 skip_titles 匹配。"""
+    return " ".join((s or "").strip().casefold().split())
+
+
+_VERSE_HEURISTIC_MAX_LINE = 40
+
+
+_VERSE_HEURISTIC_MIN_BR = 2
+
+
+_VERSE_HEURISTIC_SHORT_RATIO = 0.6
+
+
+_VERSE_TAG_ATTR = 'data-sagatrans-verse'
+
+
+def _audit_tokens_with_pos(text: str) -> list:
+    return [(m.group(0), m.start()) for m in _AUDIT_TOKEN_RE.finditer(text)]
+
+
+def _audit_whitelist_spans(text: str) -> list:
+    """返回 oracle 文本中「策略豁免」的字符区间（许可证串 + 目录区域）。"""
+    spans = []
+    for pat in _GUTENBERG_HEADER_PATTERNS:
+        for m in pat.finditer(text):
+            spans.append((m.start(), m.end()))
+
+    lines = text.split('\n')
+    starts = []
+    pos = 0
+    for ln in lines:
+        starts.append(pos)
+        pos += len(ln) + 1
+
+    for i in range(min(len(lines), _AUDIT_TOC_SCAN_LINES)):
+        if not _GUTENBERG_TOC_TITLE_PATTERN.search(lines[i]):
+            continue
+        j = i + 1
+        items = 0
+        end = j
+        while j < len(lines):
+            ln = lines[j]
+            if ln.strip() == '':
+                # 空行透明：其后仍紧跟目录项行才继续
+                k = j + 1
+                while k < len(lines) and lines[k].strip() == '':
+                    k += 1
+                if k < len(lines) and len(lines[k]) < 120 \
+                        and _GUTENBERG_TOC_ITEM_PATTERN.search(lines[k]):
+                    j = k
+                    continue
+                break
+            if len(ln) >= 120:
+                break
+            if _GUTENBERG_TOC_ITEM_PATTERN.search(ln):
+                items += 1
+                j += 1
+                end = j
+                continue
+            # 续行（如表格 <td> 分列后的标题行）：其后仍紧跟目录项行才纳入
+            k = j + 1
+            while k < len(lines) and lines[k].strip() == '':
+                k += 1
+            if k < len(lines) and len(lines[k]) < 120 \
+                    and _GUTENBERG_TOC_ITEM_PATTERN.search(lines[k]):
+                j = k
+                end = j
+                continue
+            break
+        if items >= 2:
+            # 末尾续行（表格末行标题后无下一项行）：前一行是目录项则一并纳入
+            if end < len(lines):
+                tail = lines[end]
+                if tail.strip() and len(tail) < 120 \
+                        and not _GUTENBERG_TOC_ITEM_PATTERN.search(tail) \
+                        and end - 1 >= i and _GUTENBERG_TOC_ITEM_PATTERN.search(lines[end - 1]):
+                    end += 1
+            spans.append((starts[i], starts[end - 1] + len(lines[end - 1])))
+            break
+    return spans
+
+
+def _block_element_text(el) -> str:
+    """提取单个块级元素文本（pre/韵文保留行结构，其余以空格连接片段）。"""
+    if el.name == 'pre' or el.get(_VERSE_TAG_ATTR):
+        # 韵文/地址条：逐行 strip 保留行结构；内联标签（<i> 等）不切断行，
+        # 故不带分隔符取文本（片段自带空格）。连续空行压成一个（保留诗节）。
+        lines: list = []
+        for raw in el.get_text('').split('\n'):
+            ln = raw.strip()
+            if not ln:
+                if lines and lines[-1] != '':
+                    lines.append('')
+                continue
+            lines.append(ln)
+        while lines and lines[-1] == '':
+            lines.pop()
+        return '\n'.join(lines)
+    return el.get_text(' ', strip=True)
+
+
+def _build_verse_manifest(chapters: list, chapter_verse: dict) -> dict:
+    """T-L1：由各章韵文块记录构建 input/verse_manifest.json 结构。
+
+    逐块在章节 md 中按序定位（字符偏移 → 行号）；定位失败的块跳过并告警。
+    """
+    chapters_out: dict = {}
+    for ch_id, md in chapters:
+        blocks = chapter_verse.get(ch_id) or []
+        entries: list = []
+        cursor = 0
+        for b in blocks:
+            t = re.sub(r'[ \t]+', ' ', b.get('text') or '')
+            if not t.strip():
+                continue
+            pos = md.find(t, cursor)
+            if pos < 0:
+                pos = md.find(t)
+            if pos < 0:
+                _splitter_log_warn(
+                    f"{ch_id} 韵文块未在 md 中定位（跳过）: {t[:30]!r}")
+                continue
+            cursor = pos + len(t)
+            start_line = md.count('\n', 0, pos) + 1
+            end_line = md.count('\n', 0, pos + len(t)) + 1
+            line_count = sum(1 for ln in t.split('\n') if ln.strip())
+            entries.append({
+                'tag': b.get('tag', 'unknown'),
+                'start_line': start_line,
+                'end_line': end_line,
+                'start_char': pos,
+                'end_char': pos + len(t),
+                'line_count': line_count,
+                'text': t,
+            })
+        chapters_out[ch_id] = entries
+    return {'version': 1, 'chapters': chapters_out}
+
+
+def _check_title_present(ch_id: str, title: str, text: str) -> None:
+    """T1：H1 与正文标题一致性（信息性告警）。
+
+    标题未在正文开头复现时记录 INFO（通常意味着标题来自页眉/元数据，
+    属「页眉残留」类问题线索），不阻断切分。
+    """
+    normalized = _normalize_chapter_title(title)
+    if normalized and normalized[:60] not in text[:400]:
+        _splitter_log_info(
+            f"{ch_id} 标题未在正文再现（可能来自页眉/元数据）: {normalized}")
+
+
+def _el_verse_tag(el) -> Optional[str]:
+    """元素的韵文来源标签：class/启发式 标记 或 pre（多行时）。"""
+    tag = el.get(_VERSE_TAG_ATTR)
+    if tag:
+        return str(tag)
+    if el.name == 'pre':
+        return 'pre'
+    return None
+
+
+def _epub_clean_html_text_ex(html_content: str, verse_out: Optional[list] = None) -> str:
+    """清洗 HTML，提取纯文本（保留段落结构）。
+
+    P 方案修复：原先对每个块级标签 insert_after('\\n') 再用
+    get_text(separator='\\n')，因源 XML 段内自带换行，最终整章塌成 1 段。
+    改为逐个提取块级元素文本、以 '\\n\\n' 拼接，确定性还原段落边界，
+    且对段内换行免疫。
+    T1：块级口径扩展为 p/标题/pre（保留韵文行结构）+ 容器类兜底提取。
+    T-L1：先标记韵文元素；verse_out 非 None 时收集多行韵文块。
+    """
+    soup = BeautifulSoup(html_content, 'html.parser')
+
+    for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside']):
+        tag.decompose()
+
+    _mark_verse_elements(soup)
+
+    for br in soup.find_all('br'):
+        br.replace_with('\n')
+
+    text = _extract_block_text(soup, verse_out)
+
+    text = re.sub(r'[ \t]+', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    # 注意：不能用 \s（含 \n）配合 MULTILINE 去修整行首尾，否则会把段落间的
+    # \n\n 也吃掉、重新塌成 1 段。仅修剪行首尾的空格/制表符。
+    text = re.sub(r'(?m)^[ \t]+|[ \t]+$', '', text)
+    return text.strip()
+
+
+def _epub_extract_title(soup, fallback_title: str) -> str:
+    """提取章节标题：优先正文标题标签（h1-h3），退回 <title> 或兜底名。
+
+    T1：<br/> 分隔的标题先在标签内替换为空格；get_text 用空格连接片段，
+    避免「CHAPTER I.<br/>Down…」粘连成 "I.Down" 或「…eBook of
+    <span>Alice's…」粘连成 "ofAlice's"。
+    """
+    title_tag = soup.find(['h1', 'h2', 'h3']) or soup.find('title')
+    if not title_tag:
+        return fallback_title
+    for br in title_tag.find_all('br'):
+        br.replace_with(' ')
+    return title_tag.get_text(' ', strip=True)
+
+
+def _epub_oracle_text(html_content: str) -> str:
+    """独立 oracle 文本：仅去除非正文容器/元数据，其余原样取文本。"""
+    soup = BeautifulSoup(html_content, 'html.parser')
+    for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'title']):
+        tag.decompose()
+    return soup.get_text('\n')
+
+
+def _extract_block_text(root, verse_out: Optional[list] = None) -> str:
+    """按块级元素提取纯文本，以 '\\n\\n' 拼接还原段落边界。
+
+    不含 div（div 常为容器，其 get_text 会把整章压成一段，反而丢失段落
+    结构）。无任何主路径块级标签时退化为整体文本（历史行为）。
+    T-L1：verse_out 非 None 时收集多行韵文块（{"tag", "text"}）。
+    """
+    primary = root.find_all(_PRIMARY_BLOCK_TAGS)
+    if not primary:
+        return root.get_text('\n')
+    parts = []
+    for el in root.find_all(_PRIMARY_BLOCK_TAGS + _FALLBACK_BLOCK_TAGS):
+        if el.name in _FALLBACK_BLOCK_TAGS:
+            # 兜底仅取「主路径不可见」的元素：含主块级后代（已被主路径提取）
+            # 或含更内层兜底元素（避免重复提取）时跳过
+            if el.find(_PRIMARY_BLOCK_TAGS) or el.find(_FALLBACK_BLOCK_TAGS):
+                continue
+        t = _block_element_text(el)
+        if t:
+            parts.append(t)
+            if verse_out is not None and '\n' in t:
+                tag = _el_verse_tag(el)
+                if tag:
+                    verse_out.append({'tag': tag, 'text': t})
+    return '\n\n'.join(parts)
+
+
+def _mark_verse_elements(soup) -> None:
+    """T-L1：在 br→'\\n' 替换前标记韵文元素（class 命中或短行 br 启发式）。"""
+    for el in soup.find_all(['p', 'pre', 'blockquote', 'div', 'section', 'dd']):
+        cls = ' '.join(el.get('class') or [])
+        if cls and _VERSE_CLASS_RE.search(cls):
+            el[_VERSE_TAG_ATTR] = 'class'
+            continue
+        if el.name == 'pre':
+            continue  # pre 天然保行；tag 在提取时按行数判定
+        br_count = len(el.find_all('br'))
+        if br_count < _VERSE_HEURISTIC_MIN_BR:
+            continue
+        lines = [ln.strip() for ln in el.get_text('\n').split('\n') if ln.strip()]
+        if len(lines) < 3:
+            continue
+        short = sum(1 for ln in lines if len(ln) <= _VERSE_HEURISTIC_MAX_LINE)
+        if short / len(lines) >= _VERSE_HEURISTIC_SHORT_RATIO:
+            el[_VERSE_TAG_ATTR] = 'heuristic'
+
+
+def run_conversion_audit(
+    chapter_sources: dict,
+    chapters: list,
+    skipped_docs: list,
+    output_path,
+    threshold: float = _AUDIT_COVERAGE_THRESHOLD,
+) -> dict:
+    """转换完整性审计：oracle token 多重集 vs md 产出 token 多重集。
+
+    返回 {"ok", "overall", "chapter_results", "missing_spans", "report_path"}。
+    低于阈值（或单章低于下限）→ ok=False；报告文件始终写出（可审计）。
+    """
+    from collections import Counter
+    from datetime import datetime
+
+    chapter_results: dict = {}
+    missing_spans: list = []
+    total_oracle = 0
+    total_missing = 0
+    total_whitelisted = 0
+
+    for ch_id, md in chapters:
+        srcs = chapter_sources.get(ch_id, [])
+        oracle_counter: Counter = Counter()
+        token_stream: list = []
+        whitelisted = 0
+        for html in srcs:
+            otext = _epub_oracle_text(html)
+            wl_spans = _audit_whitelist_spans(otext)
+            for tok, pos in _audit_tokens_with_pos(otext):
+                if any(s <= pos < e for s, e in wl_spans):
+                    whitelisted += 1
+                    continue
+                oracle_counter[tok] += 1
+                token_stream.append((tok, pos, otext))
+
+        md_counter = Counter(_AUDIT_TOKEN_RE.findall(md))
+        missing_counter = oracle_counter - md_counter
+        missing_n = sum(missing_counter.values())
+        total_n = sum(oracle_counter.values())
+        coverage = (1.0 - missing_n / total_n) if total_n else 1.0
+
+        # 缺失 span：按 oracle 顺序定位未覆盖 token，合并邻近出现（≤40 字符间隔）
+        if missing_n:
+            remain = missing_counter.copy()
+            runs = []
+            cur = None
+            prev_text = None
+            prev_end = None
+            for tok, pos, otext in token_stream:
+                if remain.get(tok, 0) <= 0:
+                    continue
+                remain[tok] -= 1
+                end = pos + len(tok)
+                if cur is not None and otext is prev_text and pos - prev_end <= 40:
+                    cur['end'] = end
+                else:
+                    if cur is not None:
+                        runs.append(cur)
+                    cur = {'text': otext, 'start': pos, 'end': end}
+                prev_text = otext
+                prev_end = end
+            if cur is not None:
+                runs.append(cur)
+            for r in runs:
+                s = max(0, r['start'] - 40)
+                e = min(len(r['text']), r['end'] + 40)
+                excerpt = re.sub(r'\s+', ' ', r['text'][s:e]).strip()
+                missing_spans.append({'chapter': ch_id, 'excerpt': excerpt})
+
+        chapter_results[ch_id] = {
+            'sources': len(srcs),
+            'oracle_tokens': total_n,
+            'missing': missing_n,
+            'coverage': coverage,
+        }
+        total_oracle += total_n
+        total_missing += missing_n
+        total_whitelisted += whitelisted
+
+    overall = (1.0 - total_missing / total_oracle) if total_oracle else 1.0
+    min_cov = min((r['coverage'] for r in chapter_results.values()), default=1.0)
+    ok = overall >= threshold and min_cov >= _AUDIT_CHAPTER_FLOOR
+
+    report = [
+        '# 转换完整性审计报告 (T1)',
+        '',
+        f'- 生成时间: {datetime.now().isoformat(timespec="seconds")}',
+        f'- 阈值: 全书覆盖率 ≥ {threshold * 100:.1f}%；单章下限 {_AUDIT_CHAPTER_FLOOR * 100:.0f}%',
+        f'- 全书覆盖率: {overall * 100:.3f}%',
+        f'- 策略豁免 token 数（许可证/目录区域）: {total_whitelisted}',
+        f'- 结论: {"✅ 通过" if ok else "❌ 未通过"}',
+        '',
+        '## 逐章覆盖率',
+        '',
+        '| 章 | 源文档数 | oracle tokens | 缺失 | 覆盖率 |',
+        '| --- | ---: | ---: | ---: | ---: |',
+    ]
+    for ch_id, r in chapter_results.items():
+        report.append(
+            f"| {ch_id} | {r['sources']} | {r['oracle_tokens']} | "
+            f"{r['missing']} | {r['coverage'] * 100:.3f}% |")
+
+    report.append('')
+    report.append(f'## 未覆盖片段 Top-{_AUDIT_MAX_MISSING_SPANS}')
+    report.append('')
+    if missing_spans:
+        for s in missing_spans[:_AUDIT_MAX_MISSING_SPANS]:
+            report.append(f"- [{s['chapter']}] …{s['excerpt']}…")
+    else:
+        report.append('- （无）')
+
+    report.append('')
+    report.append('## 策略豁免说明')
+    report.append('')
+    report.append('- 古腾堡许可证特征串区域（Project Gutenberg / www.gutenberg.org 等）')
+    report.append('- 前部「Contents + ≥2 个编号目录项」区域（Q2 有意裁剪的目录）')
+    if skipped_docs:
+        report.append('')
+        report.append('## 按策略跳过的短文档（<50 字符，不计入审计）')
+        report.append('')
+        for d in skipped_docs:
+            report.append(f"- {d.get('id', '?')} ({d.get('chars', 0)} chars)")
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text('\n'.join(report) + '\n', encoding='utf-8')
+
+    return {
+        'ok': ok,
+        'overall': overall,
+        'chapter_results': chapter_results,
+        'missing_spans': missing_spans[:_AUDIT_MAX_MISSING_SPANS],
+        'report_path': str(output_path),
+    }
+
+
+CHUNK_TAGS_VERSION = 1
+
+
+VERSE_MANIFEST_VERSION = 1
+
+
+_DEFAULT_VERSE_CONFIG: Dict[str, Any] = {
+    "enabled": True,
+    "min_line_ratio": 0.6,
+    "max_line_chars": 56,
+    "refrain_ratio": 0.5,
+    "retry_on_fail": True,
+}
+
+
+def _block_lines_in_range(block: dict, start: int, end: int) -> List[str]:
+    """取韵文块中字符区间 [start, end) 覆盖的非空行。"""
+    text = block.get("text") or ""
+    base = int(block.get("start_char", 0) or 0)
+    lines: List[str] = []
+    pos = base
+    for ln in text.split("\n"):
+        ln_s, ln_e = pos, pos + len(ln)
+        if ln.strip() and ln_s < end and ln_e > start:
+            lines.append(ln)
+        pos = ln_e + 1
+    return lines
+
+
+def _longest_short_line_run(lines: List[str], max_chars: int) -> int:
+    """最长「连续短行」段落长度（空行透明，长行重置；容忍诗节空行）。"""
+    best = 0
+    cur = 0
+    for ln in lines:
+        if not ln:
+            continue
+        if len(ln) <= max_chars:
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 0
+    return best
+
+
+def _max_line_repeat(lines: List[str], min_len: int = 4) -> int:
+    """归一化后行重复的最大次数（复沓/refrain 探测）。"""
+    counts: Dict[str, int] = {}
+    for ln in lines:
+        key = normalize_whitespace(ln).strip("“”\"'‘’「」")
+        if len(key) < min_len:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+    return max(counts.values()) if counts else 0
+
+
+def _normalized_index(text: str) -> Tuple[str, List[int]]:
+    """返回 (归一化文本, 每个归一化字符对应的原文本偏移)。"""
+    norm_chars: List[str] = []
+    orig_idx: List[int] = []
+    last_space = True
+    for i, ch in enumerate(text):
+        if ch.isspace():
+            if not last_space:
+                norm_chars.append(" ")
+                orig_idx.append(i)
+                last_space = True
+        else:
+            norm_chars.append(ch)
+            orig_idx.append(i)
+            last_space = False
+    return "".join(norm_chars), orig_idx
+
+
+def blocks_for_span(verse_blocks: List[dict], start: int, end: int) -> List[dict]:
+    """与 chunk 字符区间相交的韵文片段：[{"tag", "lines"}]。"""
+    frags: List[dict] = []
+    for b in verse_blocks or []:
+        bs = int(b.get("start_char", -1) or -1)
+        be = int(b.get("end_char", -1) or -1)
+        if bs < 0 or be <= bs or bs >= end or be <= start:
+            continue
+        lines = _block_lines_in_range(b, max(bs, start), min(be, end))
+        if lines:
+            frags.append({"tag": b.get("tag", "unknown"), "lines": lines})
+    return frags
+
+
+def build_chapter_tags(chapter_id: str, markdown_text: str, chunks: List[str],
+                       verse_blocks: List[dict]) -> Dict[str, dict]:
+    """计算本章 verse chunk 标签：{chunk_id: {"verse": true, "blocks": [{"tag","lines"}]}}。"""
+    result: Dict[str, dict] = {}
+    if not verse_blocks or not chunks:
+        return result
+    spans = locate_chunk_spans(markdown_text, chunks)
+    for idx, text in enumerate(chunks):
+        frags: List[dict] = []
+        span = spans[idx] if idx < len(spans) else None
+        if span is not None:
+            frags = blocks_for_span(verse_blocks, span[0], span[1])
+        if not frags:
+            frags = fragments_from_manifest(text, verse_blocks)
+        if frags:
+            result[f"{chapter_id}_chunk{idx:03d}"] = {"verse": True, "blocks": frags}
+    return result
+
+
+def build_verse_note(fragments: List[dict]) -> str:
+    """生成注入 literal/rewrite/judge prompt 的韵文处理协议块；无韵文返回 ""。"""
+    lines: List[str] = []
+    for f in fragments or []:
+        lines.extend(f.get("lines") or [])
+    lines = [ln.strip() for ln in lines if ln and ln.strip()]
+    if not lines:
+        return ""
+    n = len(lines)
+    target = max(2, int(round(n * 0.8)))
+    refrain = _max_line_repeat(lines)
+    parts = [
+        f"【韵文/歌词处理协议（本片段含韵文，源共 {n} 行）】",
+        f"1. 逐行对应：每个源行对应一个译行，行与行之间保留换行；译文行数尽量贴近源文"
+        f"（源 {n} 行 → 目标 ≥ {target} 行）；严禁把韵文合并进散文段落。",
+    ]
+    if refrain >= 2:
+        parts.append(
+            f"2. 复沓（refrain）保留：原文有重复出现的歌词句（最多重复 {refrain} 次），"
+            f"译文应按相同的重复节奏重现。")
+    parts.append(
+        "3. 节奏与尾韵：优先保留童谣/歌谣的节奏感；尾韵尽力而为，不得为押韵牺牲语义。")
+    parts.append(
+        "4. 韵文正文内不得插入注释或译者注；注释集中放在章末或脚注中。")
+    parts.append(
+        "5. 本片段为韵文体裁，分行结构是硬性结构要求（不是排版建议），"
+        "不得因顺句而合并诗行。")
+    return "\n".join(parts) + "\n\n"
+
+
+def fragments_for_chunk(chapter_id: str, chunk_id: str, chunk_text: str,
+                        tags: dict, manifest: dict) -> List[dict]:
+    """chunk 的韵文片段：tags 优先（精确交集），miss 时 manifest 包含兜底。"""
+    entry = ((tags.get("chapters") or {}).get(chapter_id) or {}).get(chunk_id)
+    if isinstance(entry, dict) and entry.get("blocks"):
+        return entry["blocks"]
+    blocks = ((manifest.get("chapters") or {}).get(chapter_id)) or []
+    if not blocks:
+        return []
+    return fragments_from_manifest(chunk_text, blocks)
+
+
+def fragments_from_manifest(chunk_text: str, verse_blocks: List[dict]) -> List[dict]:
+    """运行时兜底：按归一化「文本包含」匹配（整块连通命中 → 全行；否则按块序连续 ≥2 行命中）。
+
+    Round 120 P1: 单行命中会误报（如 Fury 诗 "would be" 混入散文 chunk），
+    故仅接受整块连通命中或连续 ≥2 行的命中段。
+    """
+    norm_chunk = normalize_whitespace(chunk_text)
+    if not norm_chunk:
+        return []
+    frags: List[dict] = []
+    for b in verse_blocks or []:
+        lines = [ln for ln in (b.get("text") or "").split("\n") if ln.strip()]
+        if not lines:
+            continue
+        norm_block = normalize_whitespace(b.get("text") or "")
+        if norm_block and norm_block in norm_chunk:
+            frags.append({"tag": b.get("tag", "unknown"), "lines": lines})
+            continue
+        hit = [i for i, ln in enumerate(lines)
+               if len(ln.strip()) >= 8 and normalize_whitespace(ln) in norm_chunk]
+        if not hit:
+            continue
+        best = cur = [hit[0]]
+        for i in hit[1:]:
+            if i == cur[-1] + 1:
+                cur.append(i)
+            else:
+                if len(cur) > len(best):
+                    best = cur
+                cur = [i]
+        if len(cur) > len(best):
+            best = cur
+        if len(best) >= 2:
+            frags.append({"tag": b.get("tag", "unknown"),
+                          "lines": [lines[i] for i in best]})
+    return frags
+
+
+def load_chunk_tags(db_dir) -> dict:
+    path = Path(db_dir) / "chunk_tags.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+        return {}
+
+
+def load_verse_manifest(input_dir) -> dict:
+    path = Path(input_dir) / "verse_manifest.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError):
+        return {}
+
+
+def locate_chunk_spans(markdown_text: str, chunks: List[str]) -> List[Optional[Tuple[int, int]]]:
+    """按序定位每个 chunk 在 markdown_text 中的 (start_char, end_char)；失败 None。
+
+    归一化空白后查找，再映射回原文本偏移，容忍段落间空白差异。
+    """
+    norm_text, orig_idx = _normalized_index(markdown_text)
+    spans: List[Optional[Tuple[int, int]]] = []
+    cursor = 0
+    for chunk in chunks:
+        nchunk = normalize_whitespace(chunk)
+        if not nchunk:
+            spans.append(None)
+            continue
+        pos = norm_text.find(nchunk, cursor)
+        if pos < 0:
+            pos = norm_text.find(nchunk)
+        if pos < 0:
+            spans.append(None)
+            continue
+        end_norm = pos + len(nchunk)
+        start_char = orig_idx[pos]
+        end_char = orig_idx[end_norm - 1] + 1
+        spans.append((start_char, end_char))
+        cursor = end_norm
+    return spans
+
+
+def normalize_whitespace(text: str) -> str:
+    """归一化空白：全部空白折叠为单个空格并去首尾（用于包含/重复判定）。"""
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def save_chunk_tags(db_dir, tags: dict) -> None:
+    path = Path(db_dir) / "chunk_tags.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(tags, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_verse_manifest(input_dir, manifest: dict) -> None:
+    path = Path(input_dir) / "verse_manifest.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def verse_config() -> Dict[str, Any]:
+    """读取 config.yaml `verse:` 节（缺失/异常时返回内建默认，向后兼容）。"""
+    cfg = dict(_DEFAULT_VERSE_CONFIG)
+    try:
+        from src.config import config as _config
+        section = _config.get_section("verse") or {}
+        for k, v in section.items():
+            cfg[k] = v
+    except Exception:
+        pass
+    return cfg
+
+
+def verse_lint(fragments: List[dict], translated_text,
+               min_line_ratio: float = 0.6,
+               max_line_chars: int = 56,
+               refrain_ratio: float = 0.5) -> dict:
+    """源行数 vs 译行数偏差 + 复沓存留检查。
+
+    返回 {"ok", "expected_lines", "found_lines", "refrain_source",
+          "refrain_target", "failures", "reason"}。
+    """
+    src_lines: List[str] = []
+    for f in fragments or []:
+        src_lines.extend(ln.strip() for ln in (f.get("lines") or []) if ln and ln.strip())
+    expected = len(src_lines)
+    res: Dict[str, Any] = {
+        "ok": True, "expected_lines": expected, "found_lines": 0,
+        "refrain_source": 0, "refrain_target": 0, "failures": [], "reason": "",
+    }
+    if expected == 0:
+        return res
+    text = translated_text
+    if isinstance(text, dict):
+        text = text.get("text", "")
+    tlines = [ln.strip() for ln in str(text or "").split("\n")]
+    found = _longest_short_line_run(tlines, max_line_chars)
+    res["found_lines"] = found
+    if expected <= 2:
+        need = expected
+    else:
+        need = max(2, int(round(expected * min_line_ratio)))
+    if found < need:
+        res["failures"].append(f"verse_lines:{found}/{expected}(need>={need})")
+    r_src = _max_line_repeat(src_lines)
+    res["refrain_source"] = r_src
+    if r_src >= 3:
+        r_tgt = _max_line_repeat([ln for ln in tlines if ln])
+        res["refrain_target"] = r_tgt
+        need_r = max(2, int(round(r_src * refrain_ratio)))
+        if r_tgt < need_r:
+            res["failures"].append(f"refrain:{r_tgt}/{r_src}(need>={need_r})")
+    res["ok"] = not res["failures"]
+    res["reason"] = "；".join(res["failures"])
+    return res
+
+
+_BOLD_LEAD_RE = re.compile(r'^\s*\*\*([^*]{1,40})\*\*\s*[：:]\s*\S')
+
+
+_BRACKET_DEF_RE = re.compile(r'^\s*[\[［](\d{1,3})[\]］]\s*(\S.*)$')
+
+
+_CHAPTER_HEAD_RE = re.compile(r'^\s*#?\s*第[一二三四五六七八九十百千零〇\d]+\s*[章.。．]')
+
+
+_DANGLING_RE = re.compile(r'[：:]\s*——\s*$')
+
+
+_FOOTNOTE_HEADER_RE = re.compile(
+    r'^\s*\*{0,2}\s*【?脚注】?\s*\*{0,2}'
+    r'(?:\s*[（(][^）)\n]{0,48}[）)])?'
+    r'\s*\*{0,2}\s*[：:]?\s*\*{0,2}\s*$'
+)
+
+
+_FRONTMATTER_LINE_RE = re.compile(
+    r'^\s*#?\s*(?:The Project Gutenberg eBook\b.*|THE MILLENNIUM FULCRUM EDITION\b.*'
+    r'|古腾堡计划.*|千[禧年]*年支点版.*|目录|Contents)\s*$')
+
+
+_FRONTMATTER_RESIDUE_RES = [
+    ("Gutenberg 英文残留", re.compile(r'The Project Gutenberg eBook')),
+    ("Gutenberg 中文残留", re.compile(r'古腾堡')),
+    ("版本行残留", re.compile(r'MILLENNIUM FULCRUM|千[禧年]*年支点版')),
+    ("标题粘连残留", re.compile(r'ofAlice')),
+    ("章节标题缺空格", re.compile(r'CHAPTER\s+[IVXLCDM]+\.(?=[A-Z])')),
+]
+
+
+_MACHINE_FN_ID_RE = re.compile(r'\[\^[^\]]*_c\d+_[^\]]*\]')
+
+
+_MD_DEF_RE = re.compile(r'^\s*\[\^([^\]]+)\]:\s?(.*)$')
+
+
+_MD_REF_RE = re.compile(r'\[\^([^\]]+)\](?!:)')
+
+
+_META_TOKENS = ["保留与加注策略", "保留并加注", "策略池", "RETAIN_AND_ANNOTATE",
+                "加注策略", "保留音译", "按约束", "直译自"]
+
+
+_NOTE_DUP_RATIO = 0.28
+
+
+_NOTE_DUP_RATIO_HARD = 0.75
+
+
+_NOTE_LABEL_RE = re.compile(r'^\s*(?:\*+\s*)?(?:译者注|译注|脚注|注释)\s*[:：]?\s*')
+
+
+_NOTE_TITLE_END_RE = re.compile(
+    r'^\s*\*{0,2}\s*【(?:章末注释|本章注释|章末注|尾注|文末注)】\s*\*{0,2}\s*$')
+
+
+_NOTE_TITLE_RE = re.compile(r'^\s*\*{0,2}\s*【([^】]{1,12})】\s*\*{0,2}\s*$')
+
+
+_NUM_DEF_RE = re.compile(r'^\s*(\d+)\.\s+(\S.*)$')
+
+
+_NUM_DEF_START_RE = re.compile(r'^[“”‘’「『（【*\u4e00-\u9fffA-Za-z]')
+
+
+_PAREN_DEF_RE = re.compile(r'^\s*[（(](\d{1,3})[）)]\s*(\S.*)$')
+
+
+_QUOTED_TERM_RE = re.compile(r'[“「『]([^”」』]{2,36})[”」』]')
+
+
+_SEP_LINE_RE = re.compile(r'^\s*-{3,}\s*$')
+
+
+_SUPER = "¹²³⁴⁵⁶⁷⁸⁹"
+
+
+_SUP_DEF_RE = re.compile(r'^\s*([¹²³⁴⁵⁶⁷⁸⁹]+)\s+(\S.*)$')
+
+
+_SUP_REF_RE = re.compile(r'[¹²³⁴⁵⁶⁷⁸⁹]+')
+
+
+_TR_BLOCK_RE = re.compile(r'^\s*>\s*\*\*译者注[:：]\*\*\s*(.*)$')
+
+
+def _audit_text(text: str) -> dict:
+    """单文本 lint 审计（返回 problems 与统计）。"""
+    problems = []
+    straight = text.count('"')
+    if straight:
+        problems.append(f"直引号 {straight} 处")
+    cjk_q = sum(text.count(c) for c in '「」『』')
+    if cjk_q:
+        problems.append(f"「」/『』引号 {cjk_q} 处")
+    items, defs, refs = _scan_lines(text)
+    sup_defs = [d for d in defs if d['style'] == 'sup']
+    if sup_defs:
+        problems.append(f"上标脚注定义 {len(sup_defs)} 行（未转 [^n]）")
+    def_ids = {d['id'] for d in defs}
+    orphans = [d for d in defs if d['id'] not in refs]
+    if orphans:
+        problems.append(f"悬空脚注定义 {len(orphans)} 条: {[d['id'] for d in orphans]}")
+    dangling_refs = sorted(refs - def_ids)
+    meta = sum(text.count(t) for t in _META_TOKENS)
+    if meta:
+        problems.append(f"策略元语 {meta} 处")
+    keys = {}
+    dups = []
+    for d in defs:
+        k = _def_key(d['content'])
+        if k in keys and keys[k] != d['content']:
+            dups.append(k)
+        keys[k] = d['content']
+    if dups:
+        problems.append(f"同键重复注释: {dups}")
+    return {"problems": problems, "defs": defs, "orphan_count": len(orphans),
+            "dangling_refs": dangling_refs, "meta_count": meta}
+
+
+def _book_style_config() -> dict:
+    try:
+        from src.config import config as _cfg
+        data = _cfg.get("book", {}) if hasattr(_cfg, "get") else {}
+        if data:
+            return data
+    except Exception:
+        pass
+    try:
+        from src.config import get_config as _get_config
+        return _get_config().get("book", {}) or {}
+    except Exception:
+        return {}
+
+
+def _chapter_dup_notes(entries) -> list:
+    """entries: [(label, text)]（同章）。返回重复注 failures/warnings。"""
+    failures, warnings = [], []
+    seen = {}
+    for label, text in entries:
+        _items, defs, _refs = _scan_lines(text)
+        for d in defs:
+            k = _def_key(d['content'])
+            if not k:
+                continue
+            if k in seen:
+                prev_label, prev_content = seen[k]
+                if prev_content == d['content']:
+                    failures.append(f"重复注（同键同文）: {k} @ {prev_label} / {label}")
+                else:
+                    import difflib as _dl
+                    r = _dl.SequenceMatcher(None, prev_content, d['content']).ratio()
+                    if r >= 0.8:
+                        failures.append(f"重复注（同键近似 r={r:.2f}）: {k} @ {prev_label} / {label}")
+                    else:
+                        warnings.append(f"同键不同注: {k} @ {prev_label} / {label}")
+            else:
+                seen[k] = (label, d['content'])
+    return failures, warnings
+
+
+def _chapter_note_dupes(text: str) -> list:
+    """章切片的注释重复检测（供 lint；与 normalize 同判据）。"""
+    _blocks, units = _note_candidates(text)
+    _group_title_units(units)
+    cand = [u for u in units if u['kind'] in ('md', 'num', 'tr', 'para')
+            and 'group' not in u]
+    out = []
+    _stop = _note_anchor_stop([c['content'] for c in cand])
+    for i in range(len(cand)):
+        for j in range(i + 1, len(cand)):
+            if _note_is_dup(cand[i]['content'], cand[j]['content'], stop=_stop):
+                out.append("重复注: {0} ~ {1}".format(
+                    _note_key(cand[i]['content'])[:18],
+                    _note_key(cand[j]['content'])[:18]))
+    return out
+
+
+def _def_key(content: str) -> str:
+    m = re.match(r'^\s*\*\*(.+?)\*\*', content)
+    if m:
+        return m.group(1).strip()
+    m = re.match(r'^\s*[“「](.+?)[”」]', content)
+    if m:
+        return m.group(1).strip()
+    return content.strip()[:12]
+
+
+def _find_finals(out_root: Path):
+    return sorted(out_root.glob("ch*/*_final.json"))
+
+
+def _group_title_units(units) -> None:
+    """标题块打组：title 及紧随其后的连续 num 单元。"""
+    i, n = 0, len(units)
+    while i < n:
+        if units[i]['kind'] == 'title':
+            j = i + 1
+            while j < n and units[j]['kind'] == 'num':
+                j += 1
+            if j - i > 1:
+                for k in range(i, j):
+                    units[k]['group'] = i
+            i = j
+        else:
+            i += 1
+
+
+def _note_anchor_stop(contents) -> set:
+    """章内频率派生的停用锚点（纯统计，零作品先验，Round 130 审计④）。
+
+    在 ≥60%（且 ≥2 条）注释中都出现的拉丁词（≥4 字母）不构成"两注同源"
+    的证据——某词若高频遍布全章注释（典型：作者名/书名/时代词），它对区分
+    不同注释没有信息量。初始样本中 Carroll 类词即由此机制自然覆盖，不再
+    硬编码任何作品专属停用表。
+    """
+    import math
+    from collections import Counter
+    texts = [str(c) for c in contents if c]
+    n = len(texts)
+    if n < 2:
+        return set()
+    cnt: Counter = Counter()
+    for c in texts:
+        cnt.update({w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", c)})
+    threshold = max(2, math.ceil(n * 0.6))
+    return {w for w, k in cnt.items() if k >= threshold}
+
+
+def _note_candidates(text: str):
+    """注释单元扫描。→ (blocks, units)；blocks 含字符偏移，units 含 kind/id/content。"""
+    raw_blocks = [{'start': m.start(), 'end': m.end(), 'seg': m.group(0)}
+                  for m in re.finditer(r'(?m)(?:^[ \t]*\S.*(?:\n|$))+', text)]
+    blocks = []
+    for _b in raw_blocks:
+        _ls = _b['seg'].split('\n')
+        _body_ls = [l for l in _ls if l.strip()]
+        if (len(_body_ls) > 1
+                and all(_TR_BLOCK_RE.match(l) for l in _body_ls)):
+            _pos = _b['start']
+            for _l in _ls:
+                if _l.strip():
+                    blocks.append({'start': _pos, 'end': _pos + len(_l), 'seg': _l})
+                _pos += len(_l) + 1
+        else:
+            blocks.append(_b)
+    units = []
+    prev = None
+    for bi, b in enumerate(blocks):
+        seg = b['seg']
+        first = seg.split('\n', 1)[0]
+        m_md = _MD_DEF_RE.match(first)
+        m_tr = _TR_BLOCK_RE.match(first)
+        m_title = _NOTE_TITLE_RE.match(first)
+        m_br = _BRACKET_DEF_RE.match(first)
+        m_pa = _PAREN_DEF_RE.match(first)
+        if m_md:
+            u = {'kind': 'md', 'id': m_md.group(1), 'content': m_md.group(2), 'block': bi}
+        elif m_tr:
+            rest = [re.sub(r'^\s*>\s?', '', l) for l in seg.split('\n')[1:]]
+            u = {'kind': 'tr', 'id': None,
+                 'content': ' '.join([m_tr.group(1)] + rest).strip(), 'block': bi}
+        elif m_title and len(seg.rstrip('\n').split('\n')) == 1:
+            u = {'kind': 'title', 'id': None, 'content': m_title.group(1), 'block': bi,
+                 'title_end': bool(_NOTE_TITLE_END_RE.match(first))}
+        elif (m_br or m_pa) and prev in ('sep', 'num', 'title'):
+            g = m_br or m_pa
+            u = {'kind': 'num', 'id': g.group(1), 'content': g.group(2), 'block': bi}
+        elif _SEP_LINE_RE.match(first):
+            u = {'kind': 'sep', 'id': None, 'content': '', 'block': bi}
+        elif (_BOLD_LEAD_RE.match(first) and len(seg.strip()) <= 800):
+            u = {'kind': 'para', 'id': None, 'content': seg.strip(), 'block': bi}
+        else:
+            u = {'kind': 'body', 'id': None, 'content': seg, 'block': bi}
+        units.append(u)
+        prev = u['kind']
+    return blocks, units
+
+
+def _note_is_dup(a: str, b: str, stop=frozenset()) -> bool:
+    """内容级重复判定（保守，校准值见上方注释）。
+
+    stop: 章内频率派生的停用锚点（_note_anchor_stop()）；生产调用方须显式传入，
+    缺省空集 = 不做停用（仅供单测/直调）。
+    """
+    import difflib
+    na, nb = _note_norm(a), _note_norm(b)
+    if not na or not nb or min(len(na), len(nb)) < 30:
+        return False
+    r = difflib.SequenceMatcher(None, na, nb).ratio()
+    if r >= _NOTE_DUP_RATIO_HARD:
+        return True
+    if r < _NOTE_DUP_RATIO:
+        return False
+    la = {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", a)} - stop
+    lb = {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", b)} - stop
+    if la & lb:
+        return True
+    ca, cb = set(), set()
+    for run in re.findall(r'[\u4e00-\u9fff]{3,}', na):
+        ca.update(run[i:i + 4] for i in range(len(run) - 3))
+    for run in re.findall(r'[\u4e00-\u9fff]{3,}', nb):
+        cb.update(run[i:i + 4] for i in range(len(run) - 3))
+    return len(ca & cb) >= 4
+
+
+def _note_key(content: str) -> str:
+    """注释主键：粗体词条 / 引号词条 / 归一化前 12 字。"""
+    m = re.match(r'^\s*\*\*(.+?)\*\*', content)
+    if m:
+        return m.group(1).strip()
+    m = re.match(r'^\s*[“「『](.+?)[”」』]', content)
+    if m:
+        return m.group(1).strip()
+    return _note_norm(content)[:12]
+
+
+def _note_norm(content: str) -> str:
+    """注释内容归一化（去重比较用）：剥 markdown/标签/空白。"""
+    t = re.sub(r'[*`>]', '', content)
+    t = re.sub(r'^\s*\[\^[^\]]+\]:\s*', '', t)
+    t = _NOTE_LABEL_RE.sub('', t)
+    return re.sub(r'\s+', '', t)
+
+
+def _note_terms(content: str) -> list:
+    """孤儿注改锚候选词（长词优先，只从词条头部提取）。"""
+    cands = []
+    m = re.match(r'^\s*\*\*([^*]{1,40})\*\*', content)
+    if m:
+        cands.append(m.group(1))
+    for m in _QUOTED_TERM_RE.finditer(content):
+        cands.append(m.group(1))
+    m = re.match(r'^\s*([^：:]{2,24})[：:]', content)
+    if m:
+        cands.append(m.group(1))
+    seen, out = set(), []
+    for t in cands:
+        t = re.sub(r'^\s*\[[^\]]*\]\s*', '', t).strip(' *“”"「」『』\u3000')
+        pieces = [t, t.split('（')[0], t.split('(')[0]]
+        pieces += re.findall(r'[\u4e00-\u9fff]{2,}', t)
+        pieces += re.findall(r"[A-Za-z][A-Za-z'-]{3,}", t)
+        for p in pieces:
+            p = p.strip(' *“”"「」『』：「:」（()）')
+            if len(p) >= 2 and p not in seen:
+                seen.add(p)
+                out.append(p)
+    out.sort(key=len, reverse=True)
+    return out
+
+
+def _scan_lines(text: str):
+    """一次扫描：行分类 + 注释定义 + 引用集合。
+
+    Returns:
+        (items, defs, refs)
+        items: [('header', None) | ('def', def_dict) | ('body', line)]
+        defs:  [{'style': 'sup'|'md'|'num', 'id': str, 'content': str}]
+        refs:  set[str]（正文中的 [^id] 与上标引用，统一为字符串 id）
+    """
+    items = []
+    defs = []
+    header_seen = False
+    for line in text.split('\n'):
+        if _FOOTNOTE_HEADER_RE.match(line):
+            header_seen = True
+            items.append(('header', None))
+            continue
+        m = _SUP_DEF_RE.match(line)
+        if m:
+            d = {'style': 'sup', 'id': str(sup_run_to_int(m.group(1))), 'content': m.group(2)}
+            defs.append(d)
+            items.append(('def', d))
+            continue
+        m = _MD_DEF_RE.match(line)
+        if m:
+            d = {'style': 'md', 'id': m.group(1), 'content': m.group(2)}
+            defs.append(d)
+            items.append(('def', d))
+            continue
+        if header_seen:
+            m = _NUM_DEF_RE.match(line)
+            if m and _NUM_DEF_START_RE.match(m.group(2)):
+                d = {'style': 'num', 'id': m.group(1), 'content': m.group(2)}
+                defs.append(d)
+                items.append(('def', d))
+                continue
+        items.append(('body', line))
+    body_text = '\n'.join(p for k, p in items if k == 'body')
+    refs = set()
+    for mm in _SUP_REF_RE.finditer(body_text):
+        refs.add(str(sup_run_to_int(mm.group(0))))
+    for mm in _MD_REF_RE.finditer(body_text):
+        refs.add(mm.group(1))
+    return items, defs, refs
+
+
+def _split_h1_sections(text: str):
+    """按 H1 切章 → [(章标题, 正文)]（前置段标题为 '(前置)'）。"""
+    parts = re.split(r'(?m)^(# .*)$', text)
+    out = [('(前置)', parts[0])]
+    for k in range(1, len(parts), 2):
+        out.append((parts[k].strip(), parts[k + 1] if k + 1 < len(parts) else ''))
+    return out
+
+
+def chapter_heading(project_root, chapter_id: str, style: str = None) -> str:
+    """merge 层章节标题。默认 config.book.chapter_titles（bilingual）。
+
+    bilingual: "第一章 掉进兔子洞（Down the Rabbit-Hole）"
+    zh:        "第一章 掉进兔子洞"
+    keep:      input/<ch>.md 原始 H1（清理 Gutenberg 前缀）
+    """
+    root = Path(project_root)
+    if style is None:
+        style = str(_book_style_config().get("chapter_titles", "bilingual"))
+    orig = ""
+    md = root / "input" / f"{chapter_id}.md"
+    if md.exists():
+        for line in md.read_text(encoding="utf-8").split('\n')[:10]:
+            s = line.strip()
+            if s.startswith('# '):
+                orig = s[2:].strip()
+                break
+    orig_clean = re.sub(r'^The Project Gutenberg eBook of\s*', '', orig)
+    zh = ""
+    out_dir = root / "output" / chapter_id
+    firsts = sorted(out_dir.glob("*_final.json"))
+    if firsts:
+        try:
+            data = json.loads(firsts[0].read_text(encoding="utf-8"))
+            text = data.get("text", "") if isinstance(data, dict) else str(data)
+        except Exception:
+            text = ""
+        for line in text.split('\n')[:20]:
+            m = re.match(r'^#?\s*(第[一二三四五六七八九十百千零〇\d]+\s*[章.。．]\s*\S.*)$', line.strip())
+            if m and len(m.group(1)) <= 60:
+                zh = m.group(1).strip().rstrip('。．.')
+                zh = re.sub(r'\[\^[^\]]+\]', '', zh)
+                break
+    if style == "keep":
+        return orig_clean or chapter_id
+    if style == "zh":
+        return zh or orig_clean or chapter_id
+    orig_short = re.sub(r'^CHAPTER\s+[IVXLCDM]+\.\s*', '', orig_clean)
+    if zh and orig_short and orig_short not in zh:
+        return f"{zh}（{orig_short}）"
+    return zh or orig_short or chapter_id
+
+
+def finalize_outputs(project_root=None, output_dir=None, apply: bool = False) -> dict:
+    """对全部 final.json 执行 normalize（默认 dry-run），写 output/finalize_diff.md。"""
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    out_root = Path(output_dir) if output_dir else root / "output"
+    finals = _find_finals(out_root)
+    stats = {"files": len(finals), "changed": 0, "headers_removed": 0,
+             "sup_defs_converted": 0, "md_defs_kept": 0, "orphans_relocated": 0,
+             "cjk_quotes": 0, "straight_quotes": 0}
+    details = []
+    for fp in finals:
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+        except Exception:
+            print(f"  ⚠️ [Finalize] 跳过损坏 JSON: {fp}")
+            continue
+        text = data.get("text", "") if isinstance(data, dict) else str(data)
+        new_text, ch = normalize_final_style(text)
+        if new_text == text:
+            continue
+        stats["changed"] += 1
+        for k in ("headers_removed", "sup_defs_converted", "md_defs_kept",
+                  "orphans_relocated", "cjk_quotes", "straight_quotes"):
+            stats[k] += ch[k]
+        details.append((str(fp.relative_to(root)), ch))
+        if apply and isinstance(data, dict):
+            data["text"] = new_text
+            meta = data.get("metadata", {})
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["style_normalized"] = True
+            data["metadata"] = meta
+            fp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    lines = ["# 成书样式规范化报告 (finalize_diff)", ""]
+    lines.append(f"- 模式: {'APPLY (已写入)' if apply else 'DRY RUN (仅报告)'}")
+    lines.append(f"- 扫描 final.json: {stats['files']} 个；需要变更: {stats['changed']} 个")
+    lines.append(f"- 注释标题行清除: {stats['headers_removed']}；上标定义转 [^n]: {stats['sup_defs_converted']}")
+    lines.append(f"- 悬空定义转译者注: {stats['orphans_relocated']}；「」引号: {stats['cjk_quotes']}；直引号: {stats['straight_quotes']}")
+    lines.append("")
+    if details:
+        lines.append("## 明细")
+        lines.append("")
+        for path, ch in details:
+            lines.append(f"- `{path}`: " + ", ".join(f"{k}={v}" for k, v in ch.items() if v))
+    else:
+        lines.append("（无需变更，样式已统一）")
+    lines.append("")
+    lines.append("---")
+    lines.append("*由 finalize 子命令自动生成*")
+    lines.append("")
+    out_root.mkdir(parents=True, exist_ok=True)
+    report_path = out_root / "finalize_diff.md"
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    return {"stats": stats, "report": str(report_path), "applied": bool(apply)}
+
+
+def lint_book(project_root=None, output_dir=None, merged_path=None) -> dict:
+    """成书级 lint：finals（逐 chunk）+ merged（整书）双跑；写 output/book_lint.md。"""
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    out_root = Path(output_dir) if output_dir else root / "output"
+    merged = Path(merged_path) if merged_path else out_root / "translated_full.md"
+    failures, warnings = [], []
+    stats = {"finals": 0}
+
+    by_chapter = {}
+    for fp in _find_finals(out_root):
+        try:
+            data = json.loads(fp.read_text(encoding="utf-8"))
+        except Exception:
+            failures.append(f"{fp.name}: JSON 解析失败")
+            continue
+        text = data.get("text", "") if isinstance(data, dict) else str(data)
+        label = f"{fp.parent.name}/{fp.name}"
+        stats["finals"] += 1
+        by_chapter.setdefault(fp.parent.name, []).append((label, text))
+        a = _audit_text(text)
+        for p in a["problems"]:
+            failures.append(f"{label}: {p}")
+        if a["dangling_refs"]:
+            warnings.append(f"{label}: 无定义引用 {a['dangling_refs']}")
+    for ch, entries in sorted(by_chapter.items()):
+        df, dw = _chapter_dup_notes(entries)
+        failures.extend(f"{ch}: {x}" for x in df)
+        warnings.extend(f"{ch}: {x}" for x in dw)
+
+    if merged.exists():
+        mtext = merged.read_text(encoding="utf-8")
+        for name, pat in _FRONTMATTER_RESIDUE_RES:
+            n = len(pat.findall(mtext))
+            if n:
+                failures.append(f"merged: {name} {n} 处")
+        style = str(_book_style_config().get("chapter_titles", "bilingual"))
+        headings = [ln.strip() for ln in mtext.split('\n') if ln.startswith('# ')]
+        stats["headings"] = len(headings)
+        if style in ("bilingual", "zh"):
+            for h in headings[1:]:
+                if not re.match(r'^#\s*第[一二三四五六七八九十百千零〇\d]+\s*章', h):
+                    failures.append(f"merged: 章节标题不符合制式({style}): {h[:40]}")
+        for h in headings:
+            for name, pat in _FRONTMATTER_RESIDUE_RES:
+                if pat.search(h):
+                    failures.append(f"merged: 标题含残留（{name}）: {h[:40]}")
+        dangling = [ln.strip()[:60] for ln in mtext.split('\n') if _DANGLING_RE.search(ln)]
+        for d in dangling:
+            warnings.append(f"merged: 疑似悬空承诺: {d}")
+        a = _audit_text(mtext)
+        for p in a["problems"]:
+            failures.append(f"merged: {p}")
+        machine_ids = _MACHINE_FN_ID_RE.findall(mtext)
+        if machine_ids:
+            failures.append(
+                f"merged: 机器脚注 id 残留 {len(machine_ids)} 处（应先跑 notes-normalize）")
+        for label, body in _split_h1_sections(mtext):
+            dups = _chapter_note_dupes(body)
+            for d in dups[:5]:
+                failures.append(f"merged/{label}: {d}")
+            if len(dups) > 5:
+                failures.append(f"merged/{label}: 另有 {len(dups) - 5} 组重复注未列出")
+    else:
+        warnings.append("merged 未生成（translated_full.md 缺失），跳过整书级检查")
+
+    result = {"ok": not failures, "failures": failures, "warnings": warnings, "stats": stats}
+    lines = ["# 成书 lint 报告 (book_lint)", ""]
+    lines.append(f"- 结论: {'✅ 全绿' if result['ok'] else '❌ 未通过'}")
+    lines.append(f"- 扫描 final.json: {stats['finals']} 个")
+    lines.append("")
+    if failures:
+        lines.append(f"## 失败项 ({len(failures)})")
+        lines.append("")
+        for f in failures:
+            lines.append(f"- {f}")
+        lines.append("")
+    if warnings:
+        lines.append(f"## 警告项 ({len(warnings)})")
+        lines.append("")
+        for w in warnings:
+            lines.append(f"- {w}")
+        lines.append("")
+    lines.append("---")
+    lines.append("*由 lint 子命令自动生成*")
+    lines.append("")
+    out_root.mkdir(parents=True, exist_ok=True)
+    (out_root / "book_lint.md").write_text("\n".join(lines), encoding="utf-8")
+    return result
+
+
+def lint_texts(items) -> dict:
+    """items: [(label, text), ...] → {'ok': bool, 'failures': [...], 'warnings': [...]}"""
+    failures = []
+    warnings = []
+    for label, text in items:
+        a = _audit_text(text)
+        for p in a["problems"]:
+            failures.append(f"{label}: {p}")
+        if a["dangling_refs"]:
+            warnings.append(f"{label}: 无定义引用 {a['dangling_refs']}")
+    return {"ok": not failures, "failures": failures, "warnings": warnings}
+
+
+def normalize_chapter_notes(text: str, start_num: int = 1):
+    """章级注释统一：去重 → 孤儿改锚/章末归位 → 顺序重编号（幂等）。
+
+    Returns: (new_text, changes: dict, next_num: int)
+    """
+    blocks, units = _note_candidates(text)
+    _group_title_units(units)
+    changes = {"merged_dups": 0, "orphans_attached": 0, "md_relocated": 0,
+               "num_relocated": 0, "title_blocks_moved": 0, "renumbered": 0,
+               "title_shells_dropped": 0,
+               "machine_ids": len(_MACHINE_FN_ID_RE.findall(text))}
+
+    # 1) 去重（标题块/分隔行/正文豁免）
+    cand = [u for u in units if u['kind'] in ('md', 'num', 'tr', 'para')
+            and 'group' not in u]
+    parent = list(range(len(cand)))
+
+    def _root(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    _stop = _note_anchor_stop([c['content'] for c in cand])
+    for i in range(len(cand)):
+        for j in range(i + 1, len(cand)):
+            if _note_is_dup(cand[i]['content'], cand[j]['content'], stop=_stop):
+                ri, rj = _root(i), _root(j)
+                if ri != rj:
+                    parent[rj] = ri
+    clusters = {}
+    for i in range(len(cand)):
+        clusters.setdefault(_root(i), []).append(i)
+    dropped = set()
+    remap = {}
+
+    def _rank(u):
+        score = 2 if u['kind'] == 'md' else (1 if u['kind'] == 'num' else 0)
+        return (score, len(_note_norm(u['content'])))
+
+    for members in clusters.values():
+        if len(members) < 2:
+            continue
+        members = sorted(members, key=lambda i: _rank(cand[i]), reverse=True)
+        surv = cand[members[0]]
+        for mi in members[1:]:
+            u = cand[mi]
+            dropped.add(u['block'])
+            changes["merged_dups"] += 1
+            if (u['kind'] == 'md' and surv['kind'] == 'md'
+                    and u['id'] != surv['id']):
+                remap[u['id']] = surv['id']
+
+    # 2) 保留区（去重删除块置空以稳定偏移）内统计引用
+    kept = text
+    for bi in dropped:
+        b = blocks[bi]
+        kept = kept[:b['start']] + (' ' * (b['end'] - b['start'])) + kept[b['end']:]
+    body_spans = [(u['block'], blocks[u['block']]) for u in units
+                  if u['kind'] == 'body' and u['block'] not in dropped]
+
+    def _count_refs(uid, md=True):
+        pat = (re.compile(r'\[\^' + re.escape(uid) + r'\](?!:)') if md
+               else re.compile(r'[\[［]' + re.escape(uid) + r'[\]］](?!\s*[:：])'))
+        cnt, pos = 0, None
+        for bi, b in body_spans:
+            seg = kept[b['start']:b['end']]
+            for m in pat.finditer(seg):
+                cnt += 1
+                if pos is None:
+                    pos = b['start'] + m.start()
+        return cnt, pos
+
+    ref_info = {}
+    for u in cand:
+        if u['kind'] in ('md', 'num') and u['block'] not in dropped:
+            ref_info[u['block']] = _count_refs(u['id'], md=(u['kind'] == 'md'))
+    for old, new in remap.items():
+        for u in cand:
+            if u['kind'] == 'md' and u['id'] == new and u['block'] in ref_info:
+                c, p = _count_refs(old, md=True)
+                cc, pp = ref_info[u['block']]
+                ref_info[u['block']] = (cc + c, pp if pp is not None else p)
+                break
+
+    # 3) 孤儿处理：改锚（正文词条）或章末归位
+    seg_override = {}
+    md_fail, num_fail = [], []
+
+    def _block_text(bi):
+        return seg_override.get(bi, blocks[bi]['seg'])
+
+    # 编号注列表内交叉引用：同一连续列表内 {编号 → 临时 uid}
+    run_map = {}
+    runs, cur_run = [], []
+    for u in units:
+        if u['kind'] == 'num' and 'group' not in u:
+            cur_run.append(u)
+        else:
+            if len(cur_run) > 1:
+                runs.append(cur_run)
+            cur_run = []
+    if len(cur_run) > 1:
+        runs.append(cur_run)
+    for run in runs:
+        m = {}
+        for u in run:
+            m[str(int(u['id']))] = ('n{0}'.format(u['block'])
+                                    if u['kind'] == 'num' else u['id'])
+        run_map[id(run)] = m
+    uid_run = {}
+    for run in runs:
+        for u in run:
+            uid_run[u['block']] = run_map[id(run)]
+
+    def _rewrite_cross(content, block):
+        m = uid_run.get(block)
+        if not m:
+            return content
+        return re.sub(r'\[(\d+)\](?![\]:])',
+                      lambda mm: '[^' + m.get(mm.group(1), mm.group(1)) + ']'
+                      if mm.group(1) in m else mm.group(0), content)
+
+    for u in cand:
+        if u['kind'] not in ('md', 'num', 'tr') or u['block'] in dropped:
+            continue
+        cnt, _p = ref_info.get(u['block'], (0, None))
+        if u['kind'] == 'tr':
+            cnt = 0
+        if cnt:
+            continue
+        hit = None
+        for term in _note_terms(u['content']):
+            for bi, b in body_spans:
+                seg = kept[b['start']:b['end']]
+                if term in seg:
+                    hit = bi
+                    break
+            if hit is not None:
+                break
+        uid = u['id'] if u['kind'] == 'md' else 'n{0}'.format(u['block'])
+        if hit is not None:
+            cur = _block_text(hit)
+            cur = cur.rstrip('\n')
+            nl = '\n' if blocks[hit]['seg'].endswith('\n') else ''
+            seg_override[hit] = cur + '[^' + uid + ']' + nl
+            if u['kind'] in ('num', 'tr'):
+                seg_override[u['block']] = '[^{0}]: {1}\n'.format(
+                    uid, _rewrite_cross(u['content'], u['block']))
+            changes["orphans_attached"] += 1
+        elif u['kind'] == 'tr':
+            continue
+        else:
+            dropped.add(u['block'])
+            if u['kind'] == 'md':
+                md_fail.append(u['content'])
+                changes["md_relocated"] += 1
+            else:
+                num_fail.append('[{0}] {1}'.format(
+                    u['id'], _rewrite_cross(u['content'], u['block'])))
+                changes["num_relocated"] += 1
+
+    # 3b) 章末注释块条目：尽力改锚（编辑器要求"有注无引"→角标；失败者留在块内）
+    for tu in units:
+        if not (tu['kind'] == 'title' and tu.get('title_end') and 'group' in tu):
+            continue
+        members = [u for u in units
+                   if u.get('group') == tu['group'] and u['kind'] == 'num']
+        attached = 0
+        for u in members:
+            terms = _note_terms(u['content'])
+            extra = []
+            for _run in re.findall(r'[\u4e00-\u9fff]{4,}', u['content']):
+                if _run not in extra:
+                    extra.append(_run)
+                for _i in range(len(_run) - 3):
+                    _w = _run[_i:_i + 4]
+                    if _w not in extra:
+                        extra.append(_w)
+            extra = [r for r in extra if r not in terms]
+            terms = terms + extra
+            terms.sort(key=len, reverse=True)
+            hit = None
+            for term in terms:
+                if len(term) < 4 and term not in _note_terms(u['content']):
+                    continue
+                for bi, b in body_spans:
+                    seg = kept[b['start']:b['end']]
+                    if term in seg:
+                        hit = bi
+                        break
+                if hit is not None:
+                    break
+            if hit is None:
+                continue
+            uid = 'n{0}'.format(u['block'])
+            cur = _block_text(hit).rstrip('\n')
+            nl = '\n' if blocks[hit]['seg'].endswith('\n') else ''
+            seg_override[hit] = cur + '[^' + uid + ']' + nl
+            seg_override[u['block']] = '[^{0}]: {1}\n'.format(uid, u['content'])
+            attached += 1
+            changes["orphans_attached"] += 1
+        if members and attached == len(members):
+            dropped.add(tu['block'])
+
+    # 3c) 空壳注释标题（无任何条目的【注释】块）：删除
+    # 仅限"【注释】"制式（结构化编号注的标准标题）；【译注】等可承载
+    # 纯段落说明文字，标题存在即合理，不做清理.
+    _shell_re = re.compile(r'^\s*\*{0,2}\s*【注释】\s*\*{0,2}\s*$')
+    for u in units:
+        if u['kind'] != 'title' or 'group' in u or u['block'] in dropped:
+            continue
+        if _shell_re.match(blocks[u['block']]['seg'].split('\n', 1)[0]):
+            dropped.add(u['block'])
+            changes["title_shells_dropped"] += 1
+
+    # 4) 章末标题块归位（【章末注释】等；已在章末者不动）
+    end_blocks = []
+    for u in units:
+        if u['kind'] != 'title' or not u.get('title_end') or 'group' not in u:
+            continue
+        if u['block'] in dropped:
+            continue
+        grp = [x for x in units if x.get('group') == u['group']]
+        last = max(x['block'] for x in grp)
+        if not any(x['kind'] == 'body' and x['block'] > last for x in units):
+            continue
+        movers = [x for x in grp
+                  if x['block'] not in dropped and x['block'] not in seg_override]
+        movers.sort(key=lambda x: x['block'])
+        for x in movers:
+            dropped.add(x['block'])
+            end_blocks.append(blocks[x['block']]['seg'].rstrip('\n'))
+        if movers:
+            changes["title_blocks_moved"] += 1
+
+    # 5) 组装
+    out_parts, cur = [], 0
+    for bi, b in enumerate(blocks):
+        out_parts.append(text[cur:b['start']])
+        if bi in dropped:
+            seg = ''
+        elif bi in seg_override:
+            seg = seg_override[bi]
+        else:
+            seg = b['seg']
+        out_parts.append(seg)
+        cur = b['end']
+    out_parts.append(text[cur:])
+    assembled = ''.join(out_parts)
+    tail = []
+    if end_blocks:
+        tail.append('---\n\n' + '\n\n'.join(end_blocks))
+    if num_fail:
+        tail.append('---\n\n**【译注】**\n\n' + '\n\n'.join(num_fail))
+    if md_fail:
+        tail.append('---\n\n' + '\n\n'.join('> **译者注：** ' + c for c in md_fail))
+    if tail:
+        assembled = assembled.rstrip('\n') + '\n\n' + '\n\n'.join(tail) + '\n'
+
+    # 6) 顺序重编号（全书连续；被去重旧 id 的引用先并入幸存者）
+    if remap:
+        assembled = re.sub(
+            r'\[\^([^\]]+)\](?!:)',
+            lambda m: '[^' + remap.get(m.group(1), m.group(1)) + ']', assembled)
+    order = []
+    for m in re.finditer(r'\[\^([^\]]+)\](?!:)', assembled):
+        if m.group(1) not in order:
+            order.append(m.group(1))
+    for m in re.finditer(r'\[\^([^\]]+)\]:', assembled):
+        if m.group(1) not in order:
+            order.append(m.group(1))
+    mapping = {old: str(start_num + i) for i, old in enumerate(order)}
+
+    def _sub_ref(m):
+        return '[^' + mapping.get(m.group(1), m.group(1)) + ']'
+
+    assembled = re.sub(r'\[\^([^\]]+)\](?!:)', _sub_ref, assembled)
+    assembled = re.sub(r'\[\^([^\]]+)\]:',
+                       lambda m: '[^' + mapping.get(m.group(1), m.group(1)) + ']:',
+                       assembled)
+    changes["renumbered"] = len(order)
+
+    # 6.5) 脚注定义章末集中（raw md 可读性；编辑器多次建议"集中至章末"）
+    def_lines = {}
+    kept_lines = []
+    for line in assembled.split('\n'):
+        m = re.match(r'^\[\^(\d+)\]:\s(.*)$', line)
+        if m:
+            def_lines[int(m.group(1))] = line
+        else:
+            kept_lines.append(line)
+    if def_lines:
+        while kept_lines and kept_lines[-1].strip() == '':
+            kept_lines.pop()
+        if kept_lines and kept_lines[-1].strip() == '---':
+            kept_lines.pop()
+        while kept_lines and kept_lines[-1].strip() == '':
+            kept_lines.pop()
+        assembled = ('\n'.join(kept_lines).rstrip('\n') + '\n\n---\n\n'
+                     + '\n'.join(def_lines[k] for k in sorted(def_lines)) + '\n')
+    return assembled, changes, start_num + len(order)
+
+
+def normalize_final_style(text: str):
+    """T5 规范化 pass（幂等）。Returns: (new_text, changes dict)。"""
+    changes = {"headers_removed": 0, "sup_defs_converted": 0, "md_defs_kept": 0,
+               "orphans_relocated": 0, "cjk_quotes": 0, "straight_quotes": 0}
+    items, defs, refs = _scan_lines(text)
+    out = []
+    relocated = []
+    for kind, payload in items:
+        if kind == 'header':
+            changes["headers_removed"] += 1
+            continue
+        if kind == 'def':
+            d = payload
+            if d['style'] == 'num':
+                relocated.append(d['content'])
+                continue
+            if d['id'] in refs:
+                out.append("[^" + str(d['id']) + "]: " + d['content'])
+                if d['style'] == 'sup':
+                    changes["sup_defs_converted"] += 1
+                else:
+                    changes["md_defs_kept"] += 1
+            else:
+                relocated.append(d['content'])
+            continue
+        line = payload
+        line = _SUP_REF_RE.sub(lambda m: "[^" + str(sup_run_to_int(m.group(0))) + "]", line)
+        out.append(line)
+    if relocated:
+        changes["orphans_relocated"] = len(relocated)
+        while out and out[-1].strip() == '':
+            out.pop()
+        if out and out[-1].strip() == '---':
+            out.pop()
+        out.append('')
+        for content in relocated:
+            out.append('> **译者注：** ' + content)
+    t = '\n'.join(out)
+    if '「' in t or '」' in t:
+        changes["cjk_quotes"] += t.count('「') + t.count('」')
+        t = t.replace('「', '“').replace('」', '”')
+    if '『' in t or '』' in t:
+        changes["cjk_quotes"] += t.count('『') + t.count('』')
+        t = t.replace('『', '‘').replace('』', '’')
+    if '"' in t:
+        changes["straight_quotes"] = t.count('"')
+        parts = t.split('"')
+        rebuilt = parts[0]
+        for k, p in enumerate(parts[1:]):
+            rebuilt += ('“' if k % 2 == 0 else '”') + p
+        t = rebuilt
+    return t, changes
+
+
+def normalize_notes_document(text: str):
+    """全书：按 H1 切章逐章统一（编号全书连续）。→ (new_text, report)"""
+    parts = re.split(r'(?m)^(# .*)$', text)
+    agg = {"merged_dups": 0, "orphans_attached": 0, "md_relocated": 0,
+           "num_relocated": 0, "title_blocks_moved": 0, "renumbered": 0,
+           "title_shells_dropped": 0,
+           "machine_ids": 0}
+    details = []
+    counter = 1
+    pre_new, ch0, counter = normalize_chapter_notes(parts[0], counter)
+    for key in agg:
+        agg[key] += ch0.get(key, 0)
+    if any(ch0.values()):
+        details.append(('(前置)', ch0))
+    out_txt = [pre_new]
+    for k in range(1, len(parts), 2):
+        head = parts[k]
+        body = parts[k + 1] if k + 1 < len(parts) else ''
+        body_new, ch, counter = normalize_chapter_notes(body, counter)
+        for key in agg:
+            agg[key] += ch.get(key, 0)
+        if any(ch.values()):
+            details.append((head.strip(), ch))
+        out_txt.append(head)
+        out_txt.append(body_new)
+    report = {"stats": agg, "chapters": details, "next_num": counter}
+    return ''.join(out_txt), report
+
+
+def notes_normalize_outputs(project_root=None, output_dir=None, apply: bool = False) -> dict:
+    """对 translated_full.md 执行章级注释统一；默认 dry-run，写 output/note_policy_diff.md。"""
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    out_root = Path(output_dir) if output_dir else root / "output"
+    merged = out_root / "translated_full.md"
+    stats = {"files": 0, "changed": 0, "merged_dups": 0, "orphans_attached": 0,
+             "md_relocated": 0, "num_relocated": 0, "title_blocks_moved": 0,
+             "renumbered": 0, "title_shells_dropped": 0, "machine_ids": 0}
+    details = []
+    if merged.exists():
+        stats["files"] = 1
+        text = merged.read_text(encoding="utf-8")
+        new_text, rep = normalize_notes_document(text)
+        if new_text != text:
+            stats["changed"] = 1
+            for key in ("merged_dups", "orphans_attached", "md_relocated",
+                        "num_relocated", "title_blocks_moved", "renumbered",
+                        "title_shells_dropped", "machine_ids"):
+                stats[key] = rep["stats"].get(key, 0)
+            details = rep["chapters"]
+            if apply:
+                merged.write_text(new_text, encoding="utf-8")
+    lines = ["# 章级注释统一报告 (note_policy_diff)", "",
+             "- 模式: {0}".format('APPLY (已写入)' if apply else 'DRY RUN (仅报告)'),
+             "- 处理 file: {0} 个；需要变更: {1} 个".format(stats['files'], stats['changed']),
+             "- 去重合并: {0}；孤儿改锚: {1}；md 转译者注: {2}；编号注转译注块: {3}".format(
+                 stats['merged_dups'], stats['orphans_attached'],
+                 stats['md_relocated'], stats['num_relocated']),
+             "- 标题块搬移: {0}；空壳标题清理: {1}；顺编号: {2}；机器 id 清除: {3}".format(
+                 stats['title_blocks_moved'], stats['title_shells_dropped'],
+                 stats['renumbered'], stats['machine_ids']),
+             ""]
+    if details:
+        lines.append("## 明细")
+        lines.append("")
+        for label, ch in details:
+            lines.append("- `{0}`: {1}".format(
+                label, ", ".join("{0}={1}".format(k, v) for k, v in ch.items() if v)))
+    else:
+        lines.append("（无需变更）")
+    lines += ["", "---", "*由 notes-normalize 子命令自动生成*", ""]
+    out_root.mkdir(parents=True, exist_ok=True)
+    report_path = out_root / "note_policy_diff.md"
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    return {"stats": stats, "report": str(report_path), "applied": bool(apply)}
+
+
+def postprocess_chunk_text(text: str, chapter_id: str, chunk_idx: int) -> str:
+    """merge 前处理：剥离页眉/版本行残留 + chunk 内嵌章节标题行。"""
+    out = []
+    for line in text.split('\n'):
+        s = line.strip()
+        if _FRONTMATTER_LINE_RE.match(s):
+            continue
+        if _CHAPTER_HEAD_RE.match(s):
+            continue
+        out.append(line)
+    return '\n'.join(out)
+
+
+def sup_run_to_int(run: str) -> int:
+    """上标数字串 → 整数（"¹²" → 12）。"""
+    return int(''.join(str(_SUPER.index(c) + 1) for c in run))
+
+
+
+try:
+    from typesafe_sdk import (
+        TypeSafeError,
+        TypeSafeAPIConnectionError,
+        TypeSafeAPITimeoutError,
+        TypeSafeAuthenticationError,
+        TypeSafeRateLimitError,
+        TypeSafeBadRequestError,
+        TypeSafeAPIResponseValidationError,  # 注：实际 SDK 类名带 "API" 前缀
+        TypeSafeAPIError,
+    )
+    _TYPESAFE_EXC_AVAILABLE = True
+except ImportError:
+    _TYPESAFE_EXC_AVAILABLE = False
+    TypeSafeError = TypeSafeAPIConnectionError = TypeSafeAPITimeoutError = Exception  # type: ignore
+    TypeSafeAuthenticationError = TypeSafeRateLimitError = TypeSafeBadRequestError = Exception  # type: ignore
+    TypeSafeAPIResponseValidationError = TypeSafeAPIError = Exception
+
+
+
+
+
+
 # Section 11.6 — typesafe-ai judges（多原子原语 + verdict 合成）
 # ────────────────────────────────────────────────────────────────────
 
@@ -12261,6 +13676,13 @@ class CompositeVerdict:
         下游 consumer 可以据此区分"明确 PASS"（assert 0 violation）与
         "不确定跳过"（Jev 给出边界值，未达到 reject 门槛）。
       - skipped_reasons: 跳过原因明细（dict：dimension → reason 字符串）
+
+    Round 118 P1-1 新增字段：
+      - confidence_source: 概率来源（"jev"=System One 校准概率 /
+        "openai_compat"=LLM 自报伪概率 / "mock_heuristic"=确定性启发式 /
+        "_uncalibrated"=未知来源按未校准处理）。
+      - confidence_calibrated: False 表示阈值已按未校准来源收紧，
+        PASS 未经 Jev 认证（降级模式审计标记）。
     """
     decision: str  # "PASS" | "REJECT"
     confidence: float  # 综合置信度 0..1
@@ -12268,7 +13690,6 @@ class CompositeVerdict:
     primitive_summary: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     skipped_dimensions: List[str] = field(default_factory=list)
     skipped_reasons: Dict[str, str] = field(default_factory=dict)
-    # Round 118 P1-1: 概率来源与校准标记（镜像 src/judges/typesafe_spec.py）
     confidence_source: str = "jev"
     confidence_calibrated: bool = True
 
@@ -12895,6 +14316,8 @@ class FallbackBackend(SystemOneBackend):
         self._mock = MockBackend() if allow_mock else None
         # Round 118 P1-1: 记录本次实际命中的后端（供 verdict confidence_source 分档）
         self.last_backend: str = "unknown"
+        # Round 121: 401 鉴权失败缓存 —— key 修复须重启进程，本轮内不再反复试探 Jev
+        self._jev_auth_dead = False
 
     def evaluate(self, state, questions, *, model=None, timeout=None):
         # 有效 timeout：调用方传入优先，否则用 self.timeout（来自 config.yaml typesafe.timeout）
@@ -12907,14 +14330,20 @@ class FallbackBackend(SystemOneBackend):
                 return self._mock.evaluate(state, questions, model=model, timeout=eff_timeout)
             raise RuntimeError("typesafe 已禁用 (enabled=false)，且 Mock 未启用")
 
-        # 1. 尝试 Jev（typesafe.ai 原生）
-        if self.primary.api_key:
+        # 1. 尝试 Jev（typesafe.ai 原生）；401 后本轮不再试探（见下方 except）
+        if self.primary.api_key and not self._jev_auth_dead:
             try:
                 answers = self.primary.evaluate(state, questions, model=model, timeout=eff_timeout)
                 self.last_backend = "jev"
                 return answers
             except Exception as e:
-                logger.info(f"Jev 不可用: {type(e).__name__}: {e}")
+                if type(e).__name__ == "TypeSafeAuthenticationError":
+                    # 401 鉴权失败：key 修复须重启进程；本进程内不再试探 Jev（避免每 chunk 白跑+刷屏）
+                    if not self._jev_auth_dead:
+                        logger.warning(f"Jev 鉴权失败（{e}）；本进程内不再尝试 Jev，改走降级链")
+                    self._jev_auth_dead = True
+                else:
+                    logger.info(f"Jev 不可用: {type(e).__name__}: {e}")
                 if not self.allow_openai_fallback:
                     # 默认跳过 OpenAICompat（设计原则：Jev → Mock，不模拟 Jev）
                     # 详见 audit A3；OpenAICompat 不返回校准概率，与 Jev 语义不等价。
@@ -13056,113 +14485,6 @@ DEFAULT_THRESHOLDS = {
     # 调用方在 thresholds dict 中覆盖; 未配置走全局 fallback.
     "noul_uncertain_zones": {},  # 例: {"literal_residue": [0.3, 0.8], "semantic_loss": [0.3, 0.75]}
 }
-
-
-# ────────────────────────────────────────────────────────────────────────
-# Round 118 P1-1: confidence_source 分档（镜像 src/judges/verdict.py）
-# ────────────────────────────────────────────────────────────────────────
-# Jev 校准概率按配置阈值原样裁决，绝不削弱；未校准来源（LLM 自报伪概率 /
-# mock 启发式）上调 reject 门槛与不确定区间上界，只有更强信号才允许 REJECT。
-
-DEFAULT_SOURCE_PROFILES: Dict[str, Dict[str, Any]] = {
-    "jev": {"calibrated": True, "reject_margin": 0.0, "confidence_margin": 0.0},
-    "openai_compat": {
-        "calibrated": False, "reject_margin": 0.15, "confidence_margin": 0.15,
-        "widen_noul_uncertain_zone": True,
-    },
-    "mock_heuristic": {
-        "calibrated": False, "reject_margin": 0.25, "confidence_margin": 0.20,
-        "widen_noul_uncertain_zone": True,
-    },
-    "_uncalibrated": {
-        "calibrated": False, "reject_margin": 0.20, "confidence_margin": 0.15,
-        "widen_noul_uncertain_zone": True,
-    },
-}
-
-_SOURCE_MARGIN_THRESHOLD_KEYS = (
-    "voice_drift_severe_prob",
-    "register_mismatch_prob",
-    "entity_consistency_noul",
-    "literal_residue_noul",
-    "semantic_loss_noul",
-)
-_SOURCE_MARGIN_CONFIDENCE_KEYS = (
-    "style_compliance_min_confidence",
-    "low_confidence_threshold",
-    "cjk_low_confidence_threshold",
-)
-_MAX_WIDENED_ZONE_HIGH = 0.98
-
-
-def normalize_confidence_source(source: Optional[str]) -> str:
-    """把 backend 标识归一化到 profile key。
-
-    "jev"/"JevBackend"/"typesafe"/"system_one" → "jev"
-    "openai_compat"/"OpenAICompatBackend"/"llm_self_report" → "openai_compat"
-    "mock_heuristic"/"mock"/"MockBackend" → "mock_heuristic"
-    其余 → "_uncalibrated"
-    """
-    s = str(source or "").strip().lower()
-    if s in ("jev", "jevbackend", "typesafe", "system_one", "calibrated"):
-        return "jev"
-    if s in ("openai_compat", "openaicompatbackend", "llm_self_report", "llm"):
-        return "openai_compat"
-    if s in ("mock_heuristic", "mockbackend", "mock"):
-        return "mock_heuristic"
-    return "_uncalibrated"
-
-
-def _apply_source_profile(thr: Dict[str, Any], confidence_source: str) -> tuple:
-    """按 confidence_source 生成有效阈值副本，返回 (thr, calibrated)。
-
-    Jev 路径：原阈值原样返回（不弱化）。
-    未校准来源：上调 reject 门槛 / 置信门槛，并拓宽 Noul 不确定区间上界，
-    让边界噪声走保守跳过而不是 hard REJECT。
-    """
-    profiles: Dict[str, Dict[str, Any]] = {
-        k: dict(v) for k, v in DEFAULT_SOURCE_PROFILES.items()
-    }
-    user_profiles = thr.get("confidence_source_profiles")
-    if isinstance(user_profiles, dict):
-        for key, override in user_profiles.items():
-            if isinstance(override, dict):
-                profiles.setdefault(str(key), {}).update(override)
-    source_key = normalize_confidence_source(confidence_source)
-    profile = profiles.get(source_key) or profiles["_uncalibrated"]
-    calibrated = bool(profile.get("calibrated", source_key == "jev"))
-    reject_margin = float(profile.get("reject_margin", 0.0) or 0.0)
-    confidence_margin = float(profile.get("confidence_margin", 0.0) or 0.0)
-    if reject_margin > 0.0:
-        for key in _SOURCE_MARGIN_THRESHOLD_KEYS:
-            base = float(thr.get(key, DEFAULT_THRESHOLDS.get(key, 0.0)) or 0.0)
-            thr[key] = round(min(0.95, base + reject_margin), 4)
-    if confidence_margin > 0.0:
-        for key in _SOURCE_MARGIN_CONFIDENCE_KEYS:
-            raw = thr.get(key, DEFAULT_THRESHOLDS.get(key))
-            if raw is None:
-                continue
-            thr[key] = round(min(0.95, float(raw) + confidence_margin), 4)
-    if reject_margin > 0.0 and profile.get("widen_noul_uncertain_zone", False):
-        zones = thr.get("noul_uncertain_zones")
-        if isinstance(zones, dict) and zones:
-            widened: Dict[str, Any] = {}
-            for dim, zone in zones.items():
-                if isinstance(zone, (list, tuple)) and len(zone) == 2:
-                    widened[dim] = [
-                        zone[0],
-                        round(min(_MAX_WIDENED_ZONE_HIGH, float(zone[1]) + reject_margin), 4),
-                    ]
-                else:
-                    widened[dim] = zone
-            thr["noul_uncertain_zones"] = widened
-        high = float(thr.get(
-            "noul_uncertain_high", DEFAULT_THRESHOLDS.get("noul_uncertain_high", 0.7)
-        ) or 0.0)
-        thr["noul_uncertain_high"] = round(
-            min(_MAX_WIDENED_ZONE_HIGH, high + reject_margin), 4
-        )
-    return thr, calibrated
 
 
 def synthesize_verdict(
@@ -13554,7 +14876,8 @@ def evaluate_chunk(
     questions = build_question_set()
 
     # Round 61: 构造 per-entity atomic Nouls 并合并（一次 system_one 调用全部完成）
-    # Round 105 P2-3: entity_registry_full 始终构造，供 synthesize_verdict 映射违规实体
+    # Round 105 P2-3: entity_registry_full 始终构造（即使无 variants），供
+    # synthesize_verdict 把违规实体映射到规范主名（可执行拒因）。
     entity_registry_full: Dict[str, Dict[str, Any]] = {}
     for source_name, canonical in (entity_registry or {}).items():
         variants = (entity_variants or {}).get(source_name, []) or []
@@ -13575,10 +14898,7 @@ def evaluate_chunk(
 
     # 调 backend（Jev → OpenAICompat fallback）— 一次调用评估所有 questions
     answers = backend.evaluate(state, questions)
-    # Round 118 P1-1: 记录实际命中的 backend（供 verdict confidence_source 分档）
-    confidence_source = getattr(backend, "last_backend", None) or getattr(
-        backend, "backend_kind", type(backend).__name__
-    )
+    confidence_source = backend_confidence_source(backend)
 
     # Round 110: per-entity 确定性护栏 — 规范名/变体确已出现时覆盖 LLM 假阳性
     # （ch08 chunk001: Jev 超时回落 openai_compat 后把 "The manager" 判为违规
@@ -13587,6 +14907,7 @@ def evaluate_chunk(
     apply_entity_presence_override(answers, entity_registry_full, literary_translation)
 
     # code 端合成 verdict（自动处理 per-entity 聚合）
+    # Round 96 P3: 传 lit_text 让 synthesize_verdict 派生 cjk_compliance 硬闸门
     # Round 105 P2-3: 传 entity_registry_full 让违规实体拒因含规范主名
     return synthesize_verdict(
         answers, thresholds=thresholds or {}, lit_text=literary_translation,
@@ -13810,144 +15131,6 @@ def aggregate_per_entity_nouls(
     if not nouls:
         return None
     return max(1.0 - n for n in nouls)
-
-
-# ────────────────────────────────────────────────────────────────────────
-# Round 110: per-entity 确定性护栏（抵消 LLM/Jev 对 CJK 的假阳性）
-# 镜像 src/judges/primitives.py（事实源）— 修改时两处需同步。
-# ────────────────────────────────────────────────────────────────────────
-
-def entity_present_in_text(
-    canonical: str,
-    variants: Optional[List[str]],
-    lit_text: str,
-) -> Optional[str]:
-    """确定性判定规范名（或已登记变体）是否出现在润色稿中，命中返回匹配形式。
-
-    与 pipeline / translator_agent 的 _canonical_present_in_text（Round 105）同语义，
-    消除两类系统性假阳性：
-      1. 规范名带括注（镇（town）/科德斯（Codders））— 译文永远不会含括注；
-      2. 前缀/后缀写法（译文用 乔治·洛马克斯，规范名 乔治·洛马克斯先生）。
-
-    判定顺序：
-      - 完整规范名 / 任一已登记变体直接命中；
-      - 去括注后的 base 命中；
-      - base 长度≥4 时，显著前缀/后缀（长度 ≥ max(3, 2/3·len)）命中。
-
-    Args:
-        canonical: 中文规范主名
-        variants: 已登记的中文变体列表（可为 None/空）
-        lit_text: 待核验的润色稿
-
-    Returns:
-        命中的形式（子串），全不命中返回 None
-    """
-    if not lit_text:
-        return None
-    cands: List[str] = []
-    if canonical:
-        cands.append(str(canonical))
-    cands.extend(str(v) for v in (variants or []) if v)
-    # 1) 完整规范名 / 变体直接命中
-    for form in cands:
-        if form in lit_text:
-            return form
-    # 1.5) Round 115: 斜杠备选 canonical（如 "国民党/民族主义者"）— 译文通常只用其中
-    # 一个备选（ch06 chunk012 用「民族主义者」），整串/前后缀容差都会差在斜杠上 →
-    # 误判 missing → 实体硬失败死循环。任一备选字面命中即算在场。
-    for form in cands:
-        base = re.sub(r"（[^）]*）|\([^)]*\)", "", form).strip()
-        if "/" in base or "／" in base:
-            for alt in re.split(r"[/／]", base):
-                alt = alt.strip()
-                if len(alt) >= 2 and alt in lit_text:
-                    return alt
-    # 2) 去括注 base 命中
-    bases: List[str] = []
-    for form in cands:
-        base = re.sub(r"（[^）]*）|\([^)]*\)", "", form).strip()
-        if base:
-            bases.append(base)
-        if base and base != form and base in lit_text:
-            return base
-    # 3) 长名前/后缀容差（与 Round 105 _canonical_present_in_text 同语义）
-    for base in bases:
-        if len(base) < 4:
-            continue
-        threshold = max(3, (len(base) * 2) // 3)
-        if threshold >= len(base):
-            continue
-        if base[:threshold] in lit_text:
-            return base[:threshold]
-        if base[-threshold:] in lit_text:
-            return base[-threshold:]
-    return None
-
-
-def apply_entity_presence_override(
-    answers: Dict[str, Any],
-    entity_registry_full: Optional[Dict[str, Dict[str, Any]]],
-    lit_text: str,
-) -> List[Dict[str, Any]]:
-    """把"规范名确已出现"的 per-entity 违规判定覆盖为合规（noul=1.0）。
-
-    Round 110 背景（ch08 chunk001 根因）: Jev 超时回落 openai_compat 后，把
-    "The manager/the manager" 判成违规（noul=0.00），而润色稿含规范名「经理」
-    （确定性 entity audit 也确认 present）→ entity_consistency 被 max 聚合打到 0
-    → judge REJECT → rewriter 收到"统一为规范主名"的不可执行指令 → 输出字节停滞
-    → REWRITER_STAGNATED → PERMANENTLY_FAILED。
-
-    per-entity 问题的 criteria 本身是确定性的（"润色稿包含规范主名或其变体"），
-    因此可用子串比对直接复核：命中 → 强制 noul=1.0，否决 LLM 判定；未命中 →
-    保留原判定（真违规不受影响，避免掩盖真实缺失）。
-
-    聚合语义（max(1-noul)）在 synthesize_verdict 内执行，本函数需在其之前调用。
-
-    Args:
-        answers: backend 返回的 {question_id: Answer}（原地修改）
-        entity_registry_full: {source_name: {"canonical": str, "variants": List[str]}}
-        lit_text: 润色稿
-
-    Returns:
-        被覆盖的实体列表 [{qid, source_name, canonical, old_noul, matched}, ...]
-    """
-    if not answers or not entity_registry_full or not lit_text:
-        return []
-    overrides: List[Dict[str, Any]] = []
-    # key 回放必须与 build_per_entity_questions 完全同序（同样的 skip 条件 +
-    # _sanitize_key 调用顺序），否则多实体 key 冲突（_2/_3 后缀）会错位。
-    used_keys: set = set()
-    for source_name, info in entity_registry_full.items():
-        if not source_name:
-            continue
-        if isinstance(info, dict):
-            canonical = info.get("canonical", "") or ""
-            variants = info.get("variants", []) or []
-        else:
-            canonical = str(info or "")
-            variants = []
-        if not canonical:
-            continue
-        qid = _sanitize_key(source_name, used_keys)
-        ans = answers.get(qid)
-        if ans is None or not hasattr(ans, "noul"):
-            continue
-        old_noul = float(ans.noul)
-        if old_noul >= 1.0:
-            continue
-        matched = entity_present_in_text(canonical, variants, lit_text)
-        if not matched:
-            continue
-        ans.noul = 1.0
-        ans.confidence = 1.0
-        overrides.append({
-            "qid": qid,
-            "source_name": source_name,
-            "canonical": canonical,
-            "old_noul": old_noul,
-            "matched": matched,
-        })
-    return overrides
 
 
 
@@ -14209,8 +15392,7 @@ for _mod_name, _attrs in {
 # 这样 `from src.utils.llm_adapter import ...` 等也能工作
 _SRC_SUBMODULES = {
     "src.utils.llm_adapter": [
-        "LLMAdapter", "MockLLMAdapter", "OpenAICompatibleAdapter", "MLXNativeAdapter",
-        "get_llm_client", "get_llm_client_for_task", "get_role_model_name", "get_role_extra_body",
+        "get_llm_client", "get_llm_client_for_task", "get_role_model_name", "get_task_extra_body",
         "robust_json_loads", "_build_role_client", "_client_instances",
     ],
     # Round 96: 加 text_match shim 让 CJK 比例原语可在整合模式下访问
@@ -14222,6 +15404,8 @@ _SRC_SUBMODULES = {
         "reset_cjk_ratio_cache",
         # Round 114: 词边界实体在场判定（ch30 chunk000 "Bert"⊂"Bertillon" 根因）
         "entity_source_name_in_text",
+        # Round 133b: span 版原语 + 共享边界正则（别名吞并抑制）
+        "entity_source_name_spans", "_entity_boundary_pattern",
     ],
 
     "src.utils.chunker": ["SmartChunker"],
@@ -14254,7 +15438,7 @@ _SRC_SUBMODULES = {
                       # Round 121: 注释统一新面（editor_review / 测试复用）
                       "_split_h1_sections", "normalize_chapter_notes",
                       "normalize_notes_document", "notes_normalize_outputs",
-                      "_chapter_note_dupes", "_note_is_dup"],
+                      "_chapter_note_dupes", "_note_is_dup", "_note_anchor_stop"],
     "src.consistency": ["run_consistency_check", "_load_glossary", "_load_decisions",
                         "_scan_finals", "_find_slash_aliases", "_in_quote_or_note",
                         "_NOTE_MARKER_RE",
@@ -14275,7 +15459,11 @@ _SRC_SUBMODULES = {
                       "_mark_verse_elements", "_el_verse_tag",
                       "_epub_clean_html_text_ex", "_build_verse_manifest",
                       # R104 P4: split 入口 (translator_agent.py:7064/9469) 依赖此常量
-                      "_EPUB_DEPS_OK"],
+                      "_EPUB_DEPS_OK",
+                      # Round 130 修复: input_prep 助手（_apply_input_prep 依赖）
+                      "_input_prep_cfg", "_prep_key", "_chapter_h1", "_apply_input_repairs",
+                      # TextSplitter 标题正则（_text_detect_chapter_title 依赖）
+                      "_CHAPTER_TITLE_PATTERNS"],
     # Round 119 L1: 韵文通道单源（散装 src/verse.py）
     "src.verse": [
         "verse_config", "normalize_whitespace",
@@ -14325,7 +15513,6 @@ from src.judges.verdict import (synthesize_verdict, DEFAULT_THRESHOLDS)
 from src.judges.judge import (build_state, evaluate_chunk, to_legacy_scores)
 
 # Round 96: compute_cjk_ratio 在文件顶部 inline 定义, 镜像 src/utils/text_match.py, 避免 shim 后的虚拟 src.utils.text_match 包缺失该符号
-
 
 
 # Section 12 — 统一入口点 (split_input_to_chapters)
@@ -14466,6 +15653,7 @@ try:
         _CJK_RATIO_CACHE_MAX = _real_text_match._CJK_RATIO_CACHE_MAX
 except (ImportError, AttributeError):
     pass
+
 
 
 if __name__ == "__main__":

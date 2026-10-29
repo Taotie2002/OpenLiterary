@@ -61,7 +61,7 @@ HEADER = '''#!/usr/bin/env python3
 
 目录：
   Section 1 — 枚举与类型定义        (TaskState, DecisionLevel)
-  Section 2 — LLM 适配层            (LLMAdapter, MockLLMAdapter, OpenAICompatibleAdapter, MLXNativeAdapter, get_llm_client)
+  Section 2 — LLM 适配层            (LLMAdapter, MockLLMAdapter, OpenAICompatibleAdapter, get_llm_client)
   Section 3 — Scheduler 任务调度器   (TaskScheduler)
   Section 4 — Decision Engine 决策引擎 (DecisionEngine)
   Section 5 — SmartChunker 文本切分器 (SmartChunker)
@@ -134,15 +134,6 @@ except ImportError:
     _epub_lib = None
     BeautifulSoup = None
 
-# MLX (可选，仅 macOS ARM64 需要)
-try:
-    from mlx_lm import load as _mlx_load
-    from mlx_lm import generate as _mlx_generate
-    from mlx_lm.sample_utils import make_sampler as _make_sampler
-    import mlx.core as mx
-except ImportError:
-    _mlx_load = _mlx_generate = _make_sampler = mx = None
-
 def print_banner():
     """横幅输出到 stderr，避免污染 stdout（stdout 留给机器可解析的输出，如章节路径）"""
     print(r"""
@@ -200,20 +191,18 @@ if _config is None:
             "critic_scoring": {"model": "primary", "params_override": {"temperature": 0.1}},
             "judge_decision": {"model": "primary", "params_override": {}},
         }
-        mlx_models = {
-            "literal_translator": {"model_id": "google/gemma-2-9b-it-mlx-4bit", "default_params": {}},
-            "primary": {"model_id": "qwen/Qwen2.5-7B-Instruct-MLX-4bit", "default_params": {}},
+        # Round 126: 模型定义集中于此（唯一事实源）；本地 mlx 支持已移除。
+        models = {
+            "literal_translator": {"model_name": "deepseek-v4-flash", "thinking": False},
+            "primary": {"model_name": "MiniMax-M3.1-Flash", "thinking": True},
+            "secondary": {"model_name": "Qwen3.8-Flash-Next-SS", "thinking": False},
         }
-        openai_models = {
-            "literal_translator": {"model_name": "gpt-4o-mini", "default_params": {}},
-            "primary": {"model_name": "gpt-4o-mini", "default_params": {}},
-        }
-        mlx_memory = {"warning_threshold": 0.8, "auto_unload_on_pressure": True}
         openai_api = {"api_base": "http://127.0.0.1:1234/v1", "api_key": "lm-studio",
                       "max_retries": 3, "retry_delay": 2.0, "request_timeout": 300,
                       "max_concurrent_requests": 4}
         pipeline = {"batch_size": 50, "max_retries": 3, "max_quality_retries": 6, "judge_safety_net_avg_min": 5.5,
                     "poll_interval": 0.5, "entity_hard_fail": True,
+                    "version_merit": {"enabled": True, "tolerance": 0.0},
                     "early_stop": {"enabled": True, "max_low_dims": 3, "low_score_threshold": 3.0, "apply_only_first_round": True}}
         chunker = {"soft_limit": 1000, "hard_limit": 2500}
         decision_engine = {"terminology_triggers_backtrack": True,
@@ -221,6 +210,9 @@ if _config is None:
                            "style_triggers_backtrack": False,
                            "max_affected_chunks_per_decision": 50,
                            "backtrack_scope": "book",
+                           "backtrack_mode": "deferred",
+                           "max_backtrack_sweeps_per_chapter": 1,
+                           "max_backtrack_rounds_per_chunk": 2,
                            "context_max_terminology": 40,
                            "context_max_reference": 20,
                            "context_max_style": 10,
@@ -229,6 +221,25 @@ if _config is None:
                             "voice_consistency": 7.0, "semantic_preservation": 7.0,
                             "literal_residue": 7.0,
                             "average_score_min": 7.0}
+
+        def critic_thresholds_for_book(self, project_root=None):
+            """通用默认 + book_profile 可选覆盖（与 src/config.py::Config 方法同语义；
+            单文件部署兜底不读缓存，直接合并）。"""
+            merged = dict(self.critic_thresholds or {})
+            try:
+                root = Path(project_root) if project_root else Path.cwd()
+                pp = root / "input" / "book_profile.json"
+                if pp.exists():
+                    data = json.loads(pp.read_text(encoding="utf-8"))
+                    blk = data.get("critic_thresholds") if isinstance(data, dict) else None
+                    if isinstance(blk, dict):
+                        for k, v in blk.items():
+                            if (isinstance(v, (int, float)) and not isinstance(v, bool)
+                                    and 0.0 <= float(v) <= 10.0):
+                                merged[str(k)] = float(v)
+            except Exception:
+                pass
+            return merged
         style_guide = {"avg_sentence_length": "适中、口语化",
                        "lexicon_preference": "平实、克制、英式幽默",
                        "author_priority_ratio": 0.7,
@@ -236,46 +247,71 @@ if _config is None:
                        "work_type": "长篇童话"}
 
         def resolve_task_model(self, task_name):
-            routing = self.task_routing.get(task_name, {})
-            model_key = routing.get("model", "primary")
-            return model_key, routing.get("params_override", {})
-
-        def _get_model_config(self, model_key):
-            if self.llm_backend == "mlx":
-                return self.mlx_models.get(model_key, {})
-            if self.llm_backend == "openai_api":
-                nested = self.openai_api.get("models", {})
-                if nested and model_key in nested:
-                    return nested[model_key]
-            return self.openai_models.get(model_key, {})
+            EFFORT_LEVELS_BY_PROVIDER = {
+                "minimax": ("low", "medium", "high", "xhigh", "max"),
+                "deepseek": ("none", "low", "high", "xhigh", "max"),
+                "qwen": ("none", "low", "medium", "xhigh"),
+            }
+            model_key = self.get_task_role(task_name)
+            role_cfg = self.models.get(model_key, {}) or {}
+            params = dict(role_cfg.get("default_params", {}) or {})
+            if "thinking" in role_cfg or "thinking" in params:
+                raise ValueError(f"{task_name}: `thinking` 已废弃（Round 128）——改用任务级 effort")
+            routing = dict(self.task_routing.get(task_name, {}) or {})
+            override = dict(routing.get("params_override", {}) or {})
+            if "thinking" in override:
+                raise ValueError(f"{task_name}: `thinking` 已废弃（Round 128）——改用任务级 effort")
+            nested_effort = override.pop("effort", None)
+            merged = {**params, **override}
+            merged.pop("effort", None)
+            effort = routing.get("effort")
+            if effort is None:
+                effort = nested_effort
+            if effort is not None:
+                if isinstance(effort, bool):  # YAML 1.1: 裸 off/on/no/yes 会被解析为布尔
+                    if effort is True:
+                        raise ValueError(
+                            f"{task_name}: effort 为布尔 true（应出自裸 on/yes）——"
+                            f"需要思考请写具体档位；关闭思考写 none"
+                        )
+                    effort = "none"
+                effort = str(effort).strip().lower()
+                target = f"{role_cfg.get('model_name', '')} {role_cfg.get('api_base', '')}".lower()
+                for provider, levels in EFFORT_LEVELS_BY_PROVIDER.items():
+                    if provider in target:
+                        if effort not in levels:
+                            raise ValueError(
+                                f"{task_name}: effort '{effort}' 对 {provider} 非法；"
+                                f"合法档位: {'/'.join(levels)}"
+                            )
+                        break
+                merged["effort"] = effort
+            nested_extra = merged.pop("extra_body", None)
+            task_extra = routing.get("extra_body")
+            if task_extra is None:
+                task_extra = nested_extra
+            merged["extra_body"] = dict(task_extra) if isinstance(task_extra, dict) else {}
+            return model_key, merged
 
         def get_task_role(self, task_name):
             return self.task_routing.get(task_name, {}).get("model", "primary")
 
         def has_role_models(self):
-            return False
+            return bool(self.models)
 
         def role_models(self):
-            return {}
+            return self.models
 
         def get_role_config(self, role):
-            legacy = self._get_model_config(role)
             if self.llm_backend == "mock":
                 return {"backend": "mock", "default_params": {}}
-            if self.llm_backend == "mlx":
-                return {
-                    "backend": "mlx",
-                    "model_id": legacy.get("model_id", "qwen/Qwen2.5-7B-Instruct-MLX-4bit"),
-                    "default_params": legacy.get("default_params", {}),
-                }
+            cfg = dict(self.models.get(role, {}) or {})
             section = self.openai_api
-            return {
-                "backend": "openai_api",
-                "api_base": section.get("api_base", "http://127.0.0.1:1234/v1"),
-                "api_key": section.get("api_key", "lm-studio"),
-                "model_name": legacy.get("model_name", "deepseek-v4-flash"),
-                "default_params": legacy.get("default_params", {}),
-            }
+            cfg.setdefault("backend", "openai_api")
+            cfg.setdefault("api_base", section.get("api_base", "http://127.0.0.1:1234/v1"))
+            cfg.setdefault("api_key", section.get("api_key", "lm-studio"))
+            cfg.setdefault("model_name", "deepseek-v4-flash")
+            return cfg
 
     _config = _BuiltinConfig()
     if os.environ.get("SAGATRANS__STRICT") == "1":
@@ -450,9 +486,16 @@ def build_section_2() -> str:
     robust = extract_function(src, "robust_json_loads")
     # 全局客户端缓存（被 get_llm_client 引用）
     cache = extract_constant(src, "_client_instances")
-    # 然后是 4 个 class 和 helper 函数
-    classes = [extract_class(src, c) for c in ["LLMAdapter", "MockLLMAdapter", "OpenAICompatibleAdapter", "MLXNativeAdapter"]]
-    helpers = [extract_function(src, f) for f in ["_build_role_client", "get_llm_client", "get_llm_client_for_task", "get_role_model_name", "get_role_extra_body"]]
+    # 然后是 class 和 helper 函数（Round 129: 增加配额降级包装器与拆分后的构建函数）
+    classes = [extract_class(src, c) for c in [
+        "QuotaExhaustedError", "LLMAdapter", "MockLLMAdapter",
+        "OpenAICompatibleAdapter", "FallbackRoleAdapter",
+    ]]
+    helpers = [extract_function(src, f) for f in [
+        "_map_effort_for_fallback", "_fallback_levels_for",
+        "_build_single_client", "_build_role_client",
+        "get_llm_client", "get_llm_client_for_task", "get_role_model_name", "get_task_extra_body",
+    ]]
     
     body = robust + "\n\n\n" + cache + "\n\n\n" + "\n\n\n".join(classes) + "\n\n\n" + "\n\n\n".join(helpers)
     return section_comment("2", "LLM 适配层") + body
@@ -742,108 +785,659 @@ def build_section_11_6() -> str:
 
     # 6) src.judges.* 兼容 shim（让整合脚本内部 `from src.judges.X import Y` 也能用）
     # 真实 src.judges 模块并不存在（散装时被拍扁），故用 sys.modules 注入虚拟模块
-    out += """
+    out += '''
 # ───── src.judges.* 兼容 shim（单文件部署模式） ─────
+
+# Round 102 P1: compute_cjk_ratio 按 id(text) 缓存. 与散装 src/utils/text_match.py 同步.
+# 简化版: cache 直接持有 str 强引用 (key=id(text)). 见散装版注释了解 id 复用 trade-off.
+_cjk_ratio_cache: "dict[int, float]" = {}
+_CJK_RATIO_CACHE_MAX = 512
+
+
+def _cjk_ratio_cache_get(text):
+    return _cjk_ratio_cache.get(id(text))
+
+
+def _cjk_ratio_cache_put(text, ratio):
+    if len(_cjk_ratio_cache) >= _CJK_RATIO_CACHE_MAX:
+        try:
+            oldest_key = next(iter(_cjk_ratio_cache))
+            _cjk_ratio_cache.pop(oldest_key, None)
+        except StopIteration:
+            pass
+    _cjk_ratio_cache[id(text)] = ratio
+
+
+def reset_cjk_ratio_cache() -> None:
+    """Chapter 切换时清空 cjk_ratio 缓存 (整合模式 shim 入口)."""
+    _cjk_ratio_cache.clear()
+
+
+def compute_cjk_ratio(text: str) -> float:
+    """计算 CJK 字符占非空白字符的比例.
+
+    Round 96: 复制到 translator_agent.py 内联 (避免虚拟 src.utils.text_match 包找不到).
+    Round 102 P1: 加 id(text) 缓存. 散装 src.utils.text_match.compute_cjk_ratio 仍是事实源.
+    """
+    if not text:
+        return 0.0
+    cached = _cjk_ratio_cache_get(text)
+    if cached is not None:
+        return cached
+    import re as _re
+    stripped = _re.sub(r"\s+", "", text)
+    if not stripped:
+        _cjk_ratio_cache_put(text, 0.0)
+        return 0.0
+    cjk_count = 0
+    for ch in stripped:
+        cp = ord(ch)
+        if (0x4E00 <= cp <= 0x9FFF) or (0x3400 <= cp <= 0x4DBF):
+            cjk_count += 1
+    ratio = cjk_count / len(stripped)
+    _cjk_ratio_cache_put(text, ratio)
+    return ratio
+
+
+# ───── Round 105: 实体变体普通词护栏 (镜像 src/utils/entity_stopwords.py) ─────
+# 单文件部署时虚拟 src.utils.entity_stopwords 包找不到, 这里内联定义供 shim 填入.
+# 散装 src/utils/entity_stopwords.py 仍是事实源; 修改时两处需同步.
+_ENTITY_COMMON_CHARS: frozenset = frozenset(
+    "的一是了我不人在他有这个上们来到时大地为子中你说生国年着就那和要她出也得里后自以会家可下而过天去能对小多然于心学么之都好看起发当没成只如事把还用第样道想作种开美总从无情己面最女但现前些所同日手又行意动方期它头经长儿回位分爱老因很给名法间斯知世什两次使身者被高已亲其进此话常与活正感"
+    "尔意条状点再做外孩声西果将头把分还认问由什每没口体全机重明力理信马步听真话别打走叫见远近深浅宽窄厚薄粗细长短高低大小多少新旧好坏美丑真假对错是非黑白红黄蓝绿金银铜铁石木水火土风雨雪云雷电光明暗冷热温凉干湿软硬轻重快慢早晚今明昨昼夜晨昏朝夕春夏秋冬东南西北中央"
+    "警察官方司督已去过来回到达至向往朝向对面前后左右上下里外内中间旁边侧邻远近深浅"
+    "东西南北上下左右前后里外中间旁边侧近远深浅宽窄厚薄粗细长短高低大小多少新旧好坏美丑真假对错是非"
+    "谁啥哪咋吗呢吧啊呀嘛啦哇哟呐哦噢嗯嘿喂哎唉喔"
+    "金来最时可可高可时警金来最时"
+)
+_ENTITY_COMMON_WORDS: frozenset = frozenset({
+    "东西", "卡特", "警察", "警督", "警已", "警方", "警惕", "警司", "警官",
+    "材敦", "普敦", "伦次",
+    "伦敦金", "伦敦来", "伦敦最", "伦敦高", "伦敦时", "伦敦警", "伦敦可",
+    "我们", "你们", "他们", "她们", "它们", "自己", "什么", "怎么", "这样",
+    "那样", "这个", "那个", "这些", "那些", "没有", "不是", "可以", "已经",
+    "因为", "所以", "但是", "如果", "虽然", "然而", "于是", "然后", "接着",
+    "突然", "忽然", "渐渐", "慢慢", "轻轻", "重重", "深深", "浅浅",
+    "时候", "时间", "地方", "事情", "问题", "办法", "意思", "感觉",
+    "声音", "光线", "空气", "天气", "日子", "年月", "世界", "国家", "人民",
+    "生活", "工作", "学习", "学校", "家庭", "朋友", "老师", "学生", "孩子",
+    "大人", "老人", "青年", "少年", "男人", "女人", "丈夫", "妻子", "父亲",
+    "母亲", "哥哥", "姐姐", "弟弟", "妹妹", "叔叔", "阿姨", "舅舅", "姨妈",
+    "警卫", "警局", "警长", "警方", "警官", "警司", "警督", "警惕",
+})
+# 与散装 src/utils/entity_stopwords.py 的公开名对齐 (shim 按此名暴露)
+COMMON_CHARS = _ENTITY_COMMON_CHARS
+COMMON_WORDS = _ENTITY_COMMON_WORDS
+
+
+def is_likely_common_word(word: str) -> bool:
+    """Round 105: 判定中文词是否为已确认普通词 (仅依赖黑名单, 不用高频字占比)."""
+    if not word:
+        return True
+    return word in _ENTITY_COMMON_WORDS
+
+
+def differing_char(canonical: str, candidate: str):
+    """Round 105: 返回 canonical 与 candidate 唯一不同字符; 非一字之差返回 None."""
+    if not canonical or not candidate or len(canonical) != len(candidate):
+        return None
+    diff_pos = -1
+    diff_count = 0
+    for i, (a, b) in enumerate(zip(canonical, candidate)):
+        if a != b:
+            diff_count += 1
+            diff_pos = i
+    if diff_count != 1:
+        return None
+    return candidate[diff_pos]
+
+
+def is_plausible_name_variant(canonical: str, candidate: str):
+    """Round 105: 判定 candidate 是否可能是 canonical 的人名/地名异体 (一字之差).
+
+    返回 (是否可信, 原因). 可信: 恰好一字之差 + 不在普通词黑名单 + 差异字非高频字.
+    """
+    if not canonical or not candidate:
+        return False, "empty"
+    if candidate == canonical:
+        return False, "same_as_canonical"
+    dchar = differing_char(canonical, candidate)
+    if dchar is None:
+        return False, "not_one_char_diff"
+    if is_likely_common_word(candidate):
+        return False, f"candidate_is_common_word({candidate})"
+    if dchar in _ENTITY_COMMON_CHARS:
+        return False, f"differing_char_is_common({dchar})"
+    return True, "ok"
+
+
+def flagged_entity_labels(answers, noul_threshold, entity_registry_full=None):
+    """Round 105 P2-3: 列出 per-entity 违规实体标签（镜像 src/judges/verdict.py）。
+
+    供 synthesize_verdict 把违规实体映射到规范主名，生成可执行拒因。
+    """
+    from src.judges.primitives import PER_ENTITY_KEY_PREFIX as _PEP
+    labels = []
+    bar = max(float(noul_threshold), 0.5)
+    key_to_src = {}
+    if entity_registry_full:
+        from src.judges.primitives import _sanitize_key, PER_ENTITY_KEY_PREFIX as _PEP
+        used = set()
+        for sn in entity_registry_full:
+            if sn:
+                # Round 108: _sanitize_key 返回带 entity_per_ 前缀的 key，而查表侧用
+                # 去前缀的 base_key — 修前多词 source_name 的规范名映射永远失效
+                # （ch07 chunk016 根因：拒因只剩不可执行的 sanitized key）。
+                key_to_src[_sanitize_key(sn, used)[len(_PEP):]] = sn
+    for qid, ans in answers.items():
+        if not qid.startswith(_PEP):
+            continue
+        if not hasattr(ans, "noul"):
+            continue
+        noul = float(ans.noul)
+        if (1.0 - noul) < bar:
+            continue
+        sanitized = qid[len(_PEP):]
+        base_key = sanitized.rsplit("_", 1)[0] if sanitized.rsplit("_", 1)[-1].isdigit() else sanitized
+        src_name = key_to_src.get(base_key, sanitized)
+        if entity_registry_full and src_name in entity_registry_full:
+            info = entity_registry_full[src_name]
+            canonical = info.get("canonical", "") if isinstance(info, dict) else str(info)
+            if canonical:
+                labels.append(f"{src_name}→{canonical}(noul={noul:.2f})")
+                continue
+        labels.append(f"{src_name}(noul={noul:.2f})")
+    labels.sort(key=lambda s: float(s.rsplit("noul=", 1)[-1].rstrip(")")))
+    return labels[:8]
+
+
+# R104 P6: shim 创建假模块时从 globals() 取属性, 之前这两个 const 未在 monolith
+# 内联定义, 导致 fake.src.main 没有 _INPUT_FORMAT_TABLE, fake.src.splitters 没有
+# _EPUB_DEPS_OK, CLI split 报 "无法识别输入格式 / 缺少依赖". 这里显式定义,
+# 与 src/main.py 和 src/splitters.py 同步, 让 shim block 填入.
+_INPUT_FORMAT_TABLE = {'.epub': 'epub', '.txt': 'txt', '.md': 'md', '.markdown': 'md'}
+_EPUB_DEPS_OK = True
+_EPUB_DEPS_ERROR = ''
+
 import sys as _sys_j
 import types as _types_j
 # 先注册父包「src」为 package（需要 __path__ 才能 import 子模块）
+# Round 103 P4: 只在 sys.modules 完全缺失时创建假 ModuleType. 若已有
+# 真实 package 加载（__path__ 含子目录）, 不要再覆盖 — 否则后续
+# `from src.core.decision_engine import X` 会返回 __file__=None 的
+# 空模块 (Round 71 fixture cleanup 后导致 test_round70→test_round71 连锁失败).
+# 单文件部署场景 (standalone 运行本文件, sys.modules 完全干净) 走
+# "if not in sys.modules" 分支创建假包, 与旧行为一致.
 if "src" not in _sys_j.modules:
     _src_pkg = _types_j.ModuleType("src")
     _src_pkg.__path__ = []
     _sys_j.modules["src"] = _src_pkg
-if "src.judges" not in _sys_j.modules:
-    _j_pkg = _types_j.ModuleType("src.judges")
-    _j_pkg.__path__ = []
-    _sys_j.modules["src.judges"] = _j_pkg
+# Round 117 P1: 优先加载真实包/模块，仅在磁盘上确实不存在时才创建假模块。
+# 旧行为：只要目标尚未 import，就先塞一个 __path__=[] 的假包进 sys.modules；
+# 此后 `from src.judges.pairwise import X`（任何新增子模块）都会报
+# "No module named 'src.judges.pairwise'; 'src.judges' is not a package"（新模块地雷）。
+# 单文件部署（磁盘无 src 包）时 import 失败 → 仍走假模块兜底，行为不变。
+def _ensure_real_or_fake(_name: str) -> None:
+    if _name in _sys_j.modules:
+        return
+    try:
+        import importlib as _il_j
+        _il_j.import_module(_name)
+        return
+    except Exception:
+        pass
+    _fake = _types_j.ModuleType(_name)
+    _fake.__path__ = []
+    _sys_j.modules[_name] = _fake
+
+_ensure_real_or_fake("src.judges")
 # 其他 src.* 子包（如 critic 内部 from src.utils.llm_adapter import）
 for _sub in ("src.utils", "src.config", "src.agents", "src.core", "src.consistency", "src.splitters", "src.pipeline", "src.main"):
-    if _sub not in _sys_j.modules:
-        _m = _types_j.ModuleType(_sub)
-        _m.__path__ = []
-        _sys_j.modules[_sub] = _m
+    _ensure_real_or_fake(_sub)
+# Round 103 P2: src.judges.* shim 不覆盖真实模块, 仅补 attr.
+# R104 P1 修复: 旧条件 `_existing.__path__` 仅对父 package 有效, 子模块
+# (typesafe_spec / primitives / typesafe_backend / verdict / judge) 没有
+# __path__, 旧逻辑把它们误判为"未加载", 走 else 创建无 __file__ 的假 ModuleType
+# 覆盖 sys.modules, 导致下游 `from src.judges.typesafe_spec import X` 拿到
+# 假模块对象 (与真实模块 identity 不一致, isinstance 检查挂掉). 改用 __file__
+# 真值 (与 R103 P5 第二个块一致), 真实子模块已加载时只补 attr, 不替换.
+#   (a) 真实模块已加载: 只补充暴露整合脚本中的符号到现有模块.
+#   (b) 未加载或占位符: 创建假 ModuleType 兜底 (单文件部署).
 for _mod_name, _attrs in {
     "src.judges.typesafe_spec": ["NoulAnswer", "ChoiceAnswer", "ScoreAnswer", "CompositeVerdict", "Answer"],
     # Round 87 修复: 旧 shim 漏掉了 primitives.py 的 PER_ENTITY_KEY_PREFIX 常量 /
     # build_per_entity_questions / _sanitize_key 函数, 整合脚本中 MockBackend 等位置
     # 的 `from src.judges.primitives import PER_ENTITY_KEY_PREFIX` 触发 ImportError.
-    "src.judges.primitives": ["VOICE_DRIFT", "REGISTER_MATCH", "ENTITY_CONSISTENCY", "LITERAL_RESIDUE", "SEMANTIC_LOSS", "STYLE_COMPLIANCE_SCORE", "ALL_PRIMITIVES", "build_question_set", "PER_ENTITY_KEY_PREFIX", "build_per_entity_questions", "_sanitize_key", "aggregate_per_entity_nouls"],
+    "src.judges.primitives": ["VOICE_DRIFT", "REGISTER_MATCH", "ENTITY_CONSISTENCY", "LITERAL_RESIDUE", "SEMANTIC_LOSS", "STYLE_COMPLIANCE_SCORE", "ALL_PRIMITIVES", "build_question_set", "PER_ENTITY_KEY_PREFIX", "build_per_entity_questions", "_sanitize_key", "aggregate_per_entity_nouls", "entity_present_in_text", "apply_entity_presence_override"],
     "src.judges.typesafe_backend": ["SystemOneBackend", "JevBackend", "OpenAICompatBackend", "MockBackend", "FallbackBackend", "get_backend", "_DEFAULT_BACKEND"],
-    "src.judges.verdict": ["synthesize_verdict", "DEFAULT_THRESHOLDS"],
+    "src.judges.verdict": ["synthesize_verdict", "DEFAULT_THRESHOLDS",
+                           "flagged_entity_labels"],
     "src.judges.judge": ["build_state", "evaluate_chunk", "to_legacy_scores"],
     "src.judges": ["NoulAnswer", "ChoiceAnswer", "ScoreAnswer", "CompositeVerdict", "Answer",
                    "VOICE_DRIFT", "REGISTER_MATCH", "ENTITY_CONSISTENCY", "LITERAL_RESIDUE", "SEMANTIC_LOSS", "STYLE_COMPLIANCE_SCORE", "ALL_PRIMITIVES", "build_question_set",
                    "PER_ENTITY_KEY_PREFIX", "build_per_entity_questions", "_sanitize_key", "aggregate_per_entity_nouls",
+                   "entity_present_in_text", "apply_entity_presence_override",
                    "SystemOneBackend", "JevBackend", "OpenAICompatBackend", "MockBackend", "FallbackBackend", "get_backend",
                    "synthesize_verdict", "DEFAULT_THRESHOLDS",
                    "build_state", "evaluate_chunk", "to_legacy_scores"],
 }.items():
-    _m = _types_j.ModuleType(_mod_name)
-    for _a in _attrs:
-        if _a in globals() and not _a.startswith("_sys_") and not _a.startswith("_types_"):
-            setattr(_m, _a, globals()[_a])
-    _sys_j.modules[_mod_name] = _m
+    _existing = _sys_j.modules.get(_mod_name)
+    # R104 P1: 用 __file__ 真值判断 (与 R103 P5 第二块对齐).
+    # __path__ 仅对父 package 有效, 子模块 (typesafe_spec 等) 无 __path__ 会误判.
+    if _existing is not None and hasattr(_existing, '__file__') and _existing.__file__:
+        # (a) 真实模块已加载 — 不覆盖, 只补充暴露整合脚本中的符号到现有模块.
+        # 这些符号 (如 NoulAnswer) 在真实 src/judges/typesafe_spec.py 里也存在,
+        # 不会与真实模块冲突 (函数签名相同).
+        for _a in _attrs:
+            if _a in globals() and not _a.startswith("_sys_") and not _a.startswith("_types_"):
+                if not hasattr(_existing, _a):
+                    setattr(_existing, _a, globals()[_a])
+    else:
+        # (b) 未加载或占位符 — 创建假 ModuleType 兜底 (单文件部署).
+        _m = _types_j.ModuleType(_mod_name)
+        for _a in _attrs:
+            if _a in globals() and not _a.startswith("_sys_") and not _a.startswith("_types_"):
+                setattr(_m, _a, globals()[_a])
+        _sys_j.modules[_mod_name] = _m
 
 # ───── 把散装模块的内容塞进对应的 src.* 虚拟子包 ─────
 # 这样 `from src.utils.llm_adapter import ...` 等也能工作
 _SRC_SUBMODULES = {
     "src.utils.llm_adapter": [
-        "LLMAdapter", "MockLLMAdapter", "OpenAICompatibleAdapter", "MLXNativeAdapter",
-        "get_llm_client", "get_llm_client_for_task", "get_role_model_name", "get_role_extra_body",
+        "get_llm_client", "get_llm_client_for_task", "get_role_model_name", "get_task_extra_body",
         "robust_json_loads", "_build_role_client", "_client_instances",
     ],
+    # Round 96: 加 text_match shim 让 CJK 比例原语可在整合模式下访问
+    # Round 102 P1: 增加 cjk_ratio 缓存相关符号, 让整合模式下也可访问.
+    "src.utils.text_match": [
+        "compute_cjk_ratio", "extract_reject_categories",
+        "_normalize_category", "_CATEGORY_SYNONYMS", "case_insensitive_find",
+        "_cjk_ratio_cache", "_CJK_RATIO_CACHE_MAX",
+        "reset_cjk_ratio_cache",
+        # Round 114: 词边界实体在场判定（ch30 chunk000 "Bert"⊂"Bertillon" 根因）
+        "entity_source_name_in_text",
+        # Round 133b: span 版原语 + 共享边界正则（别名吞并抑制）
+        "entity_source_name_spans", "_entity_boundary_pattern",
+    ],
+
     "src.utils.chunker": ["SmartChunker"],
+    # Round 105: 实体变体普通词护栏 shim (镜像 src/utils/entity_stopwords.py)
+    "src.utils.entity_stopwords": [
+        "COMMON_CHARS", "COMMON_WORDS", "is_likely_common_word",
+        "differing_char", "is_plausible_name_variant",
+        "_ENTITY_COMMON_CHARS", "_ENTITY_COMMON_WORDS",
+    ],
     "src.config": ["Config", "get_config", "config"],
     "src.core.scheduler": ["TaskState", "TaskScheduler", "VALID_TRANSITIONS"],
     "src.core.decision_engine": [
         "DecisionLevel", "DecisionEngine", "query_high_confidence_entities",
         "query_reviewable_entities", "get_sibling_canonicals_by_source",
         "detect_cross_person_conflicts", "seed_entity_variants", "SEED_ENTITY_VARIANTS",
+        # Round 105 P2-2: 同人多规范名归一
+        "unify_entity_registry", "_CONF_ORDER",
     ],
     "src.agents.reference_agent": ["ReferenceAgent"],
     "src.agents.rewriter_agent": ["LiteraryRewriterAgent"],
     "src.agents.critic_agent": ["CriticAgent"],
     "src.agents.judge_agent": ["JudgeAgent"],
-    "src.pipeline": ["TranslationPipeline"],
+    "src.pipeline": ["TranslationPipeline", "consolidate_dirty_chapters", "run_final_gate"],
+    # Round 119 (T5): 成书样式/lint 单源（散装 src/book_lint.py）
+    "src.book_lint": ["normalize_final_style", "finalize_outputs", "lint_texts",
+                      "lint_book", "postprocess_chunk_text", "chapter_heading",
+                      "sup_run_to_int",
+                      # L2/L6: pun_audit / literary_metrics 复用的私有 helper
+                      "_scan_lines", "_def_key",
+                      # Round 121: 注释统一新面（editor_review / 测试复用）
+                      "_split_h1_sections", "normalize_chapter_notes",
+                      "normalize_notes_document", "notes_normalize_outputs",
+                      "_chapter_note_dupes", "_note_is_dup", "_note_anchor_stop"],
     "src.consistency": ["run_consistency_check", "_load_glossary", "_load_decisions",
                         "_scan_finals", "_find_slash_aliases", "_in_quote_or_note",
+                        "_NOTE_MARKER_RE",
                         "_detect_issues", "_generate_report", "_apply_issues",
-                        "run_consistency_check_for_chapter"],
+                        "run_consistency_check_for_chapter",
+                        # Round 105: 普通词护栏 helper
+                        "_is_common_word_variant"],
     "src.splitters": ["EpubSplitter", "TextSplitter", "MdSplitter",
                       "_splitter_log_info", "_splitter_log_ok", "_splitter_log_warn", "_splitter_log_err",
                       "_normalize_chapter_title", "_normalize_scores",
                       "_epub_clean_html_text", "_strip_epub_front_matter",
                       "_epub_split_large_doc_by_toc", "_epub_extract_chapters",
-                      "_text_detect_chapter_title"],
+                      "_text_detect_chapter_title",
+                      # Round 119 T1: 转换完整性审计与标题提取
+                      "_epub_extract_title", "_check_title_present",
+                      "run_conversion_audit",
+                      # Round 119 L1: 韵文元素标记 / 清洗扩展 / 清单构建
+                      "_mark_verse_elements", "_el_verse_tag",
+                      "_epub_clean_html_text_ex", "_build_verse_manifest",
+                      # R104 P4: split 入口 (translator_agent.py:7064/9469) 依赖此常量
+                      "_EPUB_DEPS_OK",
+                      # Round 130 修复: input_prep 助手（_apply_input_prep 依赖）
+                      "_input_prep_cfg", "_prep_key", "_chapter_h1", "_apply_input_repairs",
+                      # TextSplitter 标题正则（_text_detect_chapter_title 依赖）
+                      "_CHAPTER_TITLE_PATTERNS"],
+    # Round 119 L1: 韵文通道单源（散装 src/verse.py）
+    "src.verse": [
+        "verse_config", "normalize_whitespace",
+        "load_verse_manifest", "save_verse_manifest",
+        "load_chunk_tags", "save_chunk_tags",
+        "locate_chunk_spans", "blocks_for_span",
+        "fragments_from_manifest", "fragments_for_chunk",
+        "build_chapter_tags", "build_verse_note", "verse_lint",
+        "VERSE_MANIFEST_VERSION", "CHUNK_TAGS_VERSION", "_DEFAULT_VERSE_CONFIG",
+        "_normalized_index", "_block_lines_in_range",
+        "_max_line_repeat", "_longest_short_line_run",
+    ],
     "src.main": ["init_project", "debug_db", "print_banner", "main",
-                 "detect_input_format", "split_input_to_chapters"],
+                 "detect_input_format", "split_input_to_chapters",
+                 # R104 P4: detect_input_format (translator_agent.py:9433) 依赖此 table
+                 "_INPUT_FORMAT_TABLE"],
     "src.test_golden_set": ["GoldenSetEvaluator", "_levenshtein_distance", "run_golden_test",
                             "GOLDEN_AB_MATRIX", "_extract_confidence_source",
                             "summarize_golden_results", "recommend_golden_combo", "run_golden_ab",
                             "run_golden_gate"],
     "src.test_memory_pressure": ["get_system_memory", "get_process_memory", "simulate_memory_load", "test_memory_pressure"],
 }
+# Round 103 P5: 第二个 shim 块 (源散装模块) 也需要保护真实包.
+# 旧代码无条件 `_sys_j.modules[_mod] = _m` 覆盖, 当散装模块已加载时
+# (例如先 `import src.core.decision_engine` 后再 `import src.translator_agent`),
+# 会丢失原模块的 __file__/__loader__ 等属性, 触发 ImportError.
+# 规则与上面 src.judges.* 块一致: 真实包已加载时只补 attr, 不覆盖.
 for _mod, _attrs in _SRC_SUBMODULES.items():
-    _m = _types_j.ModuleType(_mod)
-    for _a in _attrs:
-        if _a in globals():
-            setattr(_m, _a, globals()[_a])
-    _sys_j.modules[_mod] = _m
+    _existing = _sys_j.modules.get(_mod)
+    if _existing is not None and hasattr(_existing, '__file__') and _existing.__file__:
+        # (a) 真实模块已加载 — 不覆盖, 只补充暴露整合脚本中的符号.
+        for _a in _attrs:
+            if _a in globals() and not hasattr(_existing, _a):
+                setattr(_existing, _a, globals()[_a])
+    else:
+        # (b) 未加载或被占位符 — 创建假 ModuleType 兜底 (单文件部署).
+        _m = _types_j.ModuleType(_mod)
+        for _a in _attrs:
+            if _a in globals():
+                setattr(_m, _a, globals()[_a])
+        _sys_j.modules[_mod] = _m
 # 重新绑定到顶层 import 路径，便于直接 from src.judges.X import Y
 from src.judges.typesafe_spec import (NoulAnswer, ChoiceAnswer, ScoreAnswer, CompositeVerdict, Answer)
 from src.judges.primitives import (VOICE_DRIFT, REGISTER_MATCH, ENTITY_CONSISTENCY, LITERAL_RESIDUE, SEMANTIC_LOSS, STYLE_COMPLIANCE_SCORE, ALL_PRIMITIVES, build_question_set)
 from src.judges.typesafe_backend import (SystemOneBackend, JevBackend, OpenAICompatBackend, MockBackend, FallbackBackend, get_backend)
 from src.judges.verdict import (synthesize_verdict, DEFAULT_THRESHOLDS)
 from src.judges.judge import (build_state, evaluate_chunk, to_legacy_scores)
-"""
+
+# Round 96: compute_cjk_ratio 在文件顶部 inline 定义, 镜像 src/utils/text_match.py, 避免 shim 后的虚拟 src.utils.text_match 包缺失该符号
+'''
 
     return out
 
 
+
+def extract_symbol_any(src: str, name: str) -> str:
+    """提取顶层常量/函数/类（供 Section 13 镜像区使用）。"""
+    seg = extract_constant(src, name)
+    if seg:
+        return seg
+    seg = extract_function(src, name)
+    if seg:
+        return seg
+    return extract_class(src, name)
+
+
+def build_section_13() -> str:
+    """镜像补全区：单体运行需要、但不属于主 Section 提取范围的散装符号（逐字镜像）。
+
+    Round 126: 这些符号此前靠手工镜像进单体（book_lint 另有 sync_book_lint_mirror.py），
+    导致 `build_integrated.py --check` 长期失真。现纳入生成器，重建即为完整单体；
+    book_lint 的 sync 脚本仍可作校验（--check 幂等）。
+    """
+    spec = [
+        ("utils/llm_adapter.py", [
+            "_INLINE_THINK_RE", "_QUOTA_HINT_RE", "build_effort_params",
+        ]),
+        ("utils/text_match.py", [
+            "entity_source_name_in_text",
+            "entity_source_name_spans", "_entity_boundary_pattern",
+        ]),
+        ("core/scheduler.py", [
+            "_source_term_pattern",
+        ]),
+        ("core/decision_engine.py", [
+            "SEED_ENTITY_VARIANTS", "_CONF_ORDER", "load_entity_variant_seeds", "unify_entity_registry",
+        ]),
+        ("agents/critic_agent.py", [
+            "_classify_backend_error",
+        ]),
+        ("judges/primitives.py", [
+            "apply_entity_presence_override", "entity_present_in_text",
+        ]),
+        ("judges/verdict.py", [
+            "DEFAULT_SOURCE_PROFILES", "_MAX_WIDENED_ZONE_HIGH", "_SOURCE_MARGIN_CONFIDENCE_KEYS", "_SOURCE_MARGIN_THRESHOLD_KEYS",
+            "_apply_source_profile", "normalize_confidence_source",
+        ]),
+        ("consistency.py", [
+            "_NOTE_MARKER_RE", "_is_common_word_variant",
+        ]),
+        ("pipeline.py", [
+            "consolidate_dirty_chapters", "run_final_gate",
+        ]),
+        # Round 130: 单实例守卫（main() 引用，须随 Section 10 一并进入单体）
+        ("main.py", [
+            "_INSTANCE_LOCK_FD", "_MUTATING_COMMANDS", "acquire_instance_lock",
+        ]),
+        ("splitters.py", [
+            "_AUDIT_CHAPTER_FLOOR", "_AUDIT_COVERAGE_THRESHOLD", "_AUDIT_MAX_MISSING_SPANS", "_AUDIT_TOC_SCAN_LINES",
+            "_AUDIT_TOKEN_RE", "_FALLBACK_BLOCK_TAGS", "_PRIMARY_BLOCK_TAGS", "_VERSE_CLASS_RE",
+            "_CHAPTER_TITLE_PATTERNS", "_apply_input_repairs", "_chapter_h1", "_input_prep_cfg", "_prep_key",
+            "_VERSE_HEURISTIC_MAX_LINE", "_VERSE_HEURISTIC_MIN_BR", "_VERSE_HEURISTIC_SHORT_RATIO", "_VERSE_TAG_ATTR",
+            "_audit_tokens_with_pos", "_audit_whitelist_spans", "_block_element_text", "_build_verse_manifest",
+            "_check_title_present", "_el_verse_tag", "_epub_clean_html_text_ex", "_epub_extract_title",
+            "_epub_oracle_text", "_extract_block_text", "_mark_verse_elements", "run_conversion_audit",
+        ]),
+        ("verse.py", [
+            "CHUNK_TAGS_VERSION", "VERSE_MANIFEST_VERSION", "_DEFAULT_VERSE_CONFIG", "_block_lines_in_range",
+            "_longest_short_line_run", "_max_line_repeat", "_normalized_index", "blocks_for_span",
+            "build_chapter_tags", "build_verse_note", "fragments_for_chunk", "fragments_from_manifest",
+            "load_chunk_tags", "load_verse_manifest", "locate_chunk_spans", "normalize_whitespace",
+            "save_chunk_tags", "save_verse_manifest", "verse_config", "verse_lint",
+        ]),
+        ("book_lint.py", [
+            "_BOLD_LEAD_RE", "_BRACKET_DEF_RE", "_CHAPTER_HEAD_RE", "_DANGLING_RE",
+            "_FOOTNOTE_HEADER_RE", "_FRONTMATTER_LINE_RE", "_FRONTMATTER_RESIDUE_RES", "_MACHINE_FN_ID_RE",
+            "_MD_DEF_RE", "_MD_REF_RE", "_META_TOKENS",
+            "_NOTE_DUP_RATIO", "_NOTE_DUP_RATIO_HARD", "_NOTE_LABEL_RE", "_NOTE_TITLE_END_RE",
+            "_NOTE_TITLE_RE", "_NUM_DEF_RE", "_NUM_DEF_START_RE", "_PAREN_DEF_RE",
+            "_QUOTED_TERM_RE", "_SEP_LINE_RE", "_SUPER", "_SUP_DEF_RE",
+            "_SUP_REF_RE", "_TR_BLOCK_RE", "_audit_text", "_book_style_config",
+            "_chapter_dup_notes", "_chapter_note_dupes", "_def_key", "_find_finals",
+            "_group_title_units", "_note_anchor_stop", "_note_candidates", "_note_is_dup", "_note_key",
+            "_note_norm", "_note_terms", "_scan_lines", "_split_h1_sections",
+            "chapter_heading", "finalize_outputs", "lint_book", "lint_texts",
+            "normalize_chapter_notes", "normalize_final_style", "normalize_notes_document", "notes_normalize_outputs",
+            "postprocess_chunk_text", "sup_run_to_int",
+        ]),
+    ]
+    out = section_comment("13", "镜像补全区（book_lint / verse / 拆分器与判据辅助）")
+    missing = []
+    for rel, names in spec:
+        src = load_module(rel)
+        for name in names:
+            seg = extract_symbol_any(src, name)
+            if not seg:
+                missing.append(f"{rel}:{name}")
+                continue
+            out += seg.rstrip("\n") + "\n\n\n"
+    if missing:
+        raise SystemExit(f"❌ Section 13 镜像缺源: {missing}")
+    # typesafe 异常分类用导入块（src/agents/critic_agent.py 逐字镜像；
+    # 单文件部署无 src 包时走 except 分支，靠异常名字字符串兜底分类）
+    out += r'''
+try:
+    from typesafe_sdk import (
+        TypeSafeError,
+        TypeSafeAPIConnectionError,
+        TypeSafeAPITimeoutError,
+        TypeSafeAuthenticationError,
+        TypeSafeRateLimitError,
+        TypeSafeBadRequestError,
+        TypeSafeAPIResponseValidationError,  # 注：实际 SDK 类名带 "API" 前缀
+        TypeSafeAPIError,
+    )
+    _TYPESAFE_EXC_AVAILABLE = True
+except ImportError:
+    _TYPESAFE_EXC_AVAILABLE = False
+    TypeSafeError = TypeSafeAPIConnectionError = TypeSafeAPITimeoutError = Exception  # type: ignore
+    TypeSafeAuthenticationError = TypeSafeRateLimitError = TypeSafeBadRequestError = Exception  # type: ignore
+    TypeSafeAPIResponseValidationError = TypeSafeAPIError = Exception
+''' + "\n\n\n"
+    return out
+
+
 def build_section_12() -> str:
-    """detect_input_format, split_input_to_chapters（main.py 中）"""
-    src = load_module("main.py")
-    body = extract_function(src, "detect_input_format") + "\n\n\n" + extract_function(src, "split_input_to_chapters")
-    return section_comment("12", "统一入口点 (split_input_to_chapters)") + body
+    """统一入口点（detect_input_format / split_input_to_chapters）+ 真实模块同步块。
+
+    Round 126: 与单体逐字一致（含 R104 P5 的 shim namespace 适配与 R103 P7 的
+    TaskState/TaskScheduler/_cjk_ratio_cache 真实实现同步块 —— 后者必须在 shim 之后执行，
+    否则 repo 模式下 monolith.TaskScheduler 身份与 src.core.scheduler 不一致）。
+    """
+    return r'''
+# Section 12 — 统一入口点 (split_input_to_chapters)
+# ────────────────────────────────────────────────────────────────────
+
+def detect_input_format(file_path: str) -> str:
+    """根据文件扩展名自动检测输入格式"""
+    suffix = Path(file_path).suffix.lower()
+    # R104 P5: 走 src.main namespace 取 shim 注入的 table, 而不是裸名
+    # (monolith 内联不再维护 _INPUT_FORMAT_TABLE, 避免与散装组件相撞).
+    _fmt_table = getattr(sys.modules.get("src.main"), "_INPUT_FORMAT_TABLE", None) or {}
+    fmt = _fmt_table.get(suffix)
+    if fmt is None:
+        raise ValueError(
+            f"无法识别输入格式: {file_path}\n"
+            f"支持的扩展名: {list(_fmt_table.keys())}"
+        )
+    return fmt
+
+
+def split_input_to_chapters(
+    input_path: str,
+    output_dir: str,
+    input_format: str = 'auto',
+    target_chars: int = 5000,
+    min_chars: int = 1000,
+) -> list:
+    """
+    统一入口：根据输入格式自动选择 Splitter 并切分章节。
+
+    参数:
+      input_path: 输入文件路径（EPUB / TXT / MD）
+      output_dir: 输出目录（将生成 chXX.md）
+      input_format: 'auto' | 'epub' | 'txt' | 'md'
+      target_chars: TXT/MD 均分模式下的目标章节字数
+      min_chars: 短于此字数的章节会被合并
+
+    返回:
+      生成的章节文件路径列表（仅 stdout，方便 mapfile 捕获）
+
+    仅输出文件路径到 stdout，日志走 stderr。
+    """
+    if input_format == 'auto':
+        input_format = detect_input_format(input_path)
+
+    # P4-10: 依赖预检 — EPUB 格式在构造 splitter 前检查依赖，避免 RuntimeError 滞后
+    # R104 P5: 走 src.splitters namespace 取 shim 注入的常量, 避免裸名 NameError
+    if input_format == 'epub':
+        _epub_deps_ok = getattr(sys.modules.get("src.splitters"), "_EPUB_DEPS_OK", True)
+        if not _epub_deps_ok:
+            raise RuntimeError(
+                f"❌ 缺少 EPUB 解析依赖: {_EPUB_DEPS_ERROR}\n"
+                "   请先安装: pip install ebooklib beautifulsoup4 lxml"
+            )
+        splitter = EpubSplitter(input_path, output_dir)
+    elif input_format == 'txt':
+        splitter = TextSplitter(input_path, output_dir, target_chars, min_chars)
+    elif input_format == 'md':
+        splitter = MdSplitter(input_path, output_dir, target_chars, min_chars)
+    else:
+        raise ValueError(f"不支持的格式: {input_format}")
+
+    splitter.chapters = splitter.split()
+    _audit = getattr(splitter, "audit_result", None) or {}
+    if _audit and _audit.get("ok") is False:
+        _splitter_log_err(
+            f"转换完整性审计未通过（覆盖率 {_audit.get('overall', 0.0) * 100:.3f}%），"
+            f"已中止；报告: {_audit.get('report_path')}")
+        sys.exit(1)
+    generated = splitter.write_files()
+
+    # 汇总信息（stderr）
+    _splitter_log_ok(f"完成！共生成 {len(generated)} 个章节文件")
+    _splitter_log_info("下一步：")
+    for f in generated[:5]:
+        ch_id = Path(f).stem
+        # P0-3: 根据 __package__ 自适应提示命令（单文件部署 vs python -m）
+        if __package__:
+            _cmd_prefix = f"python -m {__package__}"
+        else:
+            _cmd_prefix = "python translator_agent.py"
+        _splitter_log_info(f"     {_cmd_prefix} init --chapter {ch_id} --force")
+        _splitter_log_info(f"     {_cmd_prefix} pipeline --chapter {ch_id}")
+    if len(generated) > 5:
+        _splitter_log_info(f"     ... (共 {len(generated)} 章)")
+
+    # 章节路径输出到 stdout（供 mapfile / shell 脚本捕获）
+    for f in generated:
+        print(f)
+    return generated
+
+
+# Round 103 P7: 同步 src.core.scheduler 的 TaskState/TaskScheduler/VALID_TRANSITIONS
+# 到本模块 globals. 解决 test_round96_p2_raw_cjk_gate 等测试期望 enum 身份相等.
+# `from src.translator_agent import TranslationPipeline` 后调用 pipeline._process_*
+# 使用的 TaskState 与 `from src.core.scheduler import TaskState` 是同一 enum 实例.
+# 单文件部署模式 (src.* 不在 path) 走 except 分支, 保留内联定义.
+# R104 P2 修复: shim 先于本块执行, 已把 src.core.scheduler 写进 sys.modules (假模块,
+# __file__=None). 此处先 pop 假模块再 import, 才能拿到真实的 src.core.scheduler,
+# 否则 sync 命中不了 (fake.__file__ is None), 保留 monolith 内联定义, 身份与真实 enum 不一致.
+try:
+    # R104 P3 修复: 父包 src.core 是 shim 占位 (__path__=[]), 必须先清掉 src.core 才能
+    # import src.core.scheduler 找到真实文件. R104 P7 修正: 之前版本用宽口径
+    # `for _k in list(sys.modules): if src.* and __file__ is None: pop`, 把 shim
+    # 同批次创建的 src.main / src.splitters / src.utils 等假父包也清掉, 导致
+    # `python -m src.translator_agent split` 报 "无法识别输入格式" (src.main
+    # 没了, shim 没补回去). 改为只 pop 自己依赖的父包.
+    if "src.core" in sys.modules and getattr(sys.modules.get("src.core"), "__file__", None) is None:
+        sys.modules.pop("src.core", None)
+    if "src.core.scheduler" in sys.modules and getattr(sys.modules.get("src.core.scheduler"), "__file__", None) is None:
+        sys.modules.pop("src.core.scheduler", None)
+    import src.core.scheduler as _real_sched
+    if getattr(_real_sched, "__file__", None):
+        TaskState = _real_sched.TaskState
+        TaskScheduler = _real_sched.TaskScheduler
+        VALID_TRANSITIONS = _real_sched.VALID_TRANSITIONS
+except (ImportError, AttributeError):
+    pass
+
+# Round 103 P7: 同步 _cjk_ratio_cache, 让 monolith reset_cjk_ratio_cache()
+# 清的是散装 src.utils.text_match._cjk_ratio_cache 同一个 dict. 否则
+# test_round102_compute_cjk_ratio_cache::test_pipeline_reset_clears_module_cache
+# 等测试 import _cjk_ratio_cache (来自 src.utils.text_match) 后断言清空,
+# 但 monolith 清的是自己 globals 里的副本, 真实 dict 不变.
+# R104 P2 修复: shim 先于本块执行, 已把 src.utils.text_match 写进 sys.modules (假模块,
+# __file__=None). 此处先 pop 假模块再 import, 才能拿到真实的 src.utils.text_match,
+# 让 monolith._cjk_ratio_cache 与真实 _cjk_ratio_cache 是同一 dict (is 关系).
+try:
+    # R104 P3 + R104 P7: 只 pop 自己依赖的父包 src.utils (而非所有 src.*),
+    # 避免误删 shim 同批次创建的 src.main / src.splitters 等假父包.
+    if "src.utils" in sys.modules and getattr(sys.modules.get("src.utils"), "__file__", None) is None:
+        sys.modules.pop("src.utils", None)
+    if "src.utils.text_match" in sys.modules and getattr(sys.modules.get("src.utils.text_match"), "__file__", None) is None:
+        sys.modules.pop("src.utils.text_match", None)
+    import src.utils.text_match as _real_text_match
+    if getattr(_real_text_match, "__file__", None):
+        _cjk_ratio_cache = _real_text_match._cjk_ratio_cache
+        _CJK_RATIO_CACHE_MAX = _real_text_match._CJK_RATIO_CACHE_MAX
+except (ImportError, AttributeError):
+    pass
+'''
 
 
 # ========================================
@@ -864,6 +1458,7 @@ def build() -> str:
     parts.append(build_section_10())
     parts.append(build_section_11())
     parts.append(build_section_11_5())
+    parts.append(build_section_13())
     parts.append(build_section_11_6())
     parts.append(build_section_12())
     parts.append('\n')

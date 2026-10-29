@@ -26,8 +26,11 @@ env/
 db/*.db
 db/*.sqlite
 db/*.sqlite-journal
+db/*.sqlite-wal
+db/*.sqlite-shm
 db/*.db-wal
 db/*.db-shm
+db/.sagatrans.lock
 src/db/*.db
 src/db/*.sqlite
 

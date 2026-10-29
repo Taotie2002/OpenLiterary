@@ -16,7 +16,6 @@ from src.config import config as _config
 from src.utils.llm_adapter import (
     get_llm_client_for_task,
     get_role_model_name,
-    get_role_extra_body,
     robust_json_loads,
 )
 from src.judges import evaluate_chunk as ts_evaluate_chunk
@@ -64,8 +63,36 @@ def _classify_backend_error(exc: Exception) -> Dict[str, Any]:
             return {"category": "schema_mismatch", "msg": str(exc), "action": "update verdict parser"}
         if isinstance(exc, TypeSafeAPIError):
             return {"category": "api_error", "msg": str(exc), "action": "check typesafe status page"}
-    # 兜底：未分类异常
-    return {"category": "unknown", "msg": f"{type(exc).__name__}: {exc}", "action": "inspect stack trace"}
+    # 兜底 1（Round 126）: 非 SDK 异常 / SDK 缺失时按错误消息字符串分类。
+    # 与原单体嵌套版（string-matching）逻辑对齐，保留 retryable 语义——
+    # Raw HTTP 错误（requests/httpx 抛出的 429/401/超时等）借此仍能正确归类。
+    # 只用消息文本匹配（不含 repr/类名）：类名如 TypeSafeAuthenticationError
+    # 会让 "authentication" 关键字在 SDK 不可用的退化路径上误命中（Round 53 测试锁定）。
+    combined = str(exc).lower()
+    if any(k in combined for k in ("429", "rate limit", "rate_limit", "quota", "too many requests")):
+        return {"category": "rate_limit", "retryable": True, "msg": str(exc)[:200], "action": "wait or upgrade quota"}
+    if any(k in combined for k in ("timeout", "timed out", "connection reset", "connection aborted")):
+        return {"category": "timeout", "retryable": True, "msg": str(exc)[:200], "action": "increase timeout or retry"}
+    if any(k in combined for k in ("json", "decode", "parse", "invalid response", "malformed")):
+        return {"category": "parse", "retryable": False, "msg": str(exc)[:200], "action": "check response format"}
+    # auth：短语直配；裸 401/403 仅在与 HTTP/认证上下文共现时才算（真实 httpx/requests
+    # 报文必带 URL / "Unauthorized" 字样）。避免退化路径上只含裸状态码的 SDK 异常文本
+    # （如 "401 won't match in degraded mode"）误命中 auth（Round 53 测试锁定）。
+    _auth_phrase = any(k in combined for k in (
+        "unauthorized", "forbidden", "api key", "invalid api",
+        "authentication", "authenticate", "authorization",
+    ))
+    _auth_code_ctx = bool(re.search(r"\b(401|403)\b", combined)) and any(
+        k in combined for k in ("client error", "url:", "url ", "http", "status")
+    )
+    if _auth_phrase or _auth_code_ctx:
+        return {"category": "auth", "retryable": False, "msg": str(exc)[:200], "action": "check TYPESAFE_API_KEY"}
+    if any(k in combined for k in ("500", "502", "503", "504", "internal server", "bad gateway", "service unavailable")):
+        return {"category": "server", "retryable": True, "msg": str(exc)[:200], "action": "check typesafe status page"}
+    if any(k in combined for k in ("connection", "dns", "network", "unreachable", "ssl", "certificate")):
+        return {"category": "network", "retryable": True, "msg": str(exc)[:200], "action": "check DNS/firewall/cert"}
+    # 兜底 2：未分类异常
+    return {"category": "unknown", "retryable": True, "msg": f"{type(exc).__name__}: {exc}", "action": "inspect stack trace"}
 
 
 class CriticAgent:
@@ -205,12 +232,14 @@ Schema 要求：
             try:
                 if isinstance(backend, FallbackBackend):
                     # 探测：哪个 backend 能用（A6 修复：异常不再静默吞，分类记录）
-                    if backend.primary.api_key:
+                    if backend.primary.api_key and not getattr(backend, "_jev_auth_dead", False):
                         try:
                             answers = backend.primary.evaluate(state, questions, timeout=backend.timeout)
                             backend_path = "jev"
                         except Exception as e_jev:
                             backend_diagnostics["jev"] = _classify_backend_error(e_jev)
+                            if type(e_jev).__name__ == "TypeSafeAuthenticationError":
+                                backend._jev_auth_dead = True
                     if not answers and backend.allow_openai_fallback:
                         try:
                             answers = backend.fallback.evaluate(state, questions, timeout=backend.timeout)
@@ -296,7 +325,9 @@ Schema 要求：
         except Exception as e:
             # A6: 把异常分类后写入 stderr + 不再静默吞
             diag = _classify_backend_error(e)
-            print(f"⚠️ [Jev] typesafe 路径失败 [{diag["category"]}]: {diag["msg"]} → {diag["action"]}", file=sys.stderr)
+            # Round 130: 内层引号用单引号——f-string 内嵌套同类引号需 PEP 701（3.12+），
+            # README 声明支持 >=3.10，此处曾致 3.10 生产解释器全库 SyntaxError。
+            print(f"⚠️ [Jev] typesafe 路径失败 [{diag['category']}]: {diag['msg']} → {diag['action']}", file=sys.stderr)
 
         # ───── 旧 LLM 路径（fallback） ─────
         print(f"🧐 [Critic Agent] 正在对 {chunk_id} 进行多维度文学审计...")
@@ -304,13 +335,11 @@ Schema 要求：
 
         model_key, params = _config.resolve_task_model("critic_scoring")
         model_name = get_role_model_name(self.role) or model_key
-        extra_body = get_role_extra_body(self.role)
 
         raw_output = self.llm.generate(
             prompt=prompt,
             model_name=model_name,
             **params,
-            extra_body=extra_body,
         )
 
         result = robust_json_loads(raw_output)

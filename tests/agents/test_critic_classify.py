@@ -12,6 +12,9 @@ import pytest
 from unittest.mock import patch
 
 from src.agents.critic_agent import _classify_backend_error, _TYPESAFE_EXC_AVAILABLE
+# Round 130: typesafe_sdk 是可选依赖（缺失时生产自动降级）；本文件测其异常分类，
+# 无依赖环境应跳过而非收集失败。
+pytest.importorskip("typesafe_sdk", reason="可选依赖 typesafe_sdk 未安装（Jev 后端）")
 from typesafe_sdk import (
     TypeSafeAuthenticationError, TypeSafeRateLimitError,
     TypeSafeAPITimeoutError, TypeSafeAPIConnectionError,

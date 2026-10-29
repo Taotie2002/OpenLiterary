@@ -174,14 +174,77 @@ def print_banner():
   共 {_module_count} 个模块 | 散装 = 事实源，整合脚本定期同步
 """, file=sys.stderr)
 
+# ────────────────────────────────────────────────────────────────────
+# Round 130: 单实例守卫（外部审计①）——文档承诺落地为代码约束。
+# 与 scripts/translate_book.sh 共用同一把 flock（默认 db/.sagatrans.lock，
+# flock(1) 与 fcntl.flock 底层同源，可互相阻塞）：
+#   - 脚本持锁后 export SAGATRANS_LOCK_HELD=1，其子进程（本 CLI）跳过重复加锁；
+#   - 应急绕过：SAGATRANS_ALLOW_CONCURRENT=1（会在 stderr 打警告，风险自担）。
+# 历史事故：双进程让 MiniMax 配额瞬间打爆、chunk 状态互相覆盖、整章重译两遍。
+# ────────────────────────────────────────────────────────────────────
+_INSTANCE_LOCK_FD: Optional[int] = None
+
+_MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile",
+                      "consolidate", "finalize", "notes-normalize"}
+
+
+def acquire_instance_lock(lock_path: Optional[Path] = None) -> bool:
+    """非阻塞获取单实例锁。
+
+    Returns:
+        True  — 已持有（或由祖先进程持有 / 放行开关生效），可继续执行；
+        False — 已有另一实例在运行，调用方应中止。
+    """
+    global _INSTANCE_LOCK_FD
+    if os.environ.get("SAGATRANS_LOCK_HELD") == "1":
+        return True
+    import fcntl
+    import time as _time
+    path = Path(lock_path) if lock_path else Path.cwd() / "db" / ".sagatrans.lock"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:
+        print(f"⚠️ [Lock] 无法创建锁文件 {path}: {e}（继续执行）", file=sys.stderr)
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            holder = path.read_text(encoding="utf-8").strip().replace("\n", " ") or "(无持有者信息)"
+        except OSError:
+            holder = "(无持有者信息)"
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        if os.environ.get("SAGATRANS_ALLOW_CONCURRENT") == "1":
+            print(f"⚠️ [Lock] 已有 SagaTrans 实例在运行（{holder}）——"
+                  f"SAGATRANS_ALLOW_CONCURRENT=1 放行", file=sys.stderr)
+            return True
+        print(f"⛔ [Lock] 已有 SagaTrans 实例在运行：{holder}", file=sys.stderr)
+        print(f"   锁文件: {path}；确认无残留进程后可设 SAGATRANS_ALLOW_CONCURRENT=1 强制放行（风险自担）",
+              file=sys.stderr)
+        return False
+    try:
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, (f"pid={os.getpid()} started={_time.strftime('%F %T')} "
+                      f"cmd={' '.join(sys.argv[1:]) or 'pipeline'}\n").encode("utf-8"))
+    except OSError:
+        pass
+    _INSTANCE_LOCK_FD = fd  # 进程存活期间保持打开；fd 随进程退出关闭 → 自动释放锁
+    return True
+
+
 def main():
     print_banner()
 
     import argparse
     parser = argparse.ArgumentParser(description="SagaTrans — AI 文学语义编译系统")
     parser.add_argument("command", nargs="?", default="pipeline",
-                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "drift-audit"],
-                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, drift-audit")
+                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "drift-audit", "notes-normalize"],
+                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, drift-audit, notes-normalize")
     parser.add_argument("--chapter", default="ch01", help="章节 ID (默认: ch01)")
     parser.add_argument("--chapters", default=None,
                         help="style-profile 命令：抽样章节，逗号分隔（默认均匀抽 5 章）")
@@ -196,7 +259,7 @@ def main():
     parser.add_argument("--min-chapter-size", type=int, default=1000,
                         help="split 命令：短于此字数的章节会被合并到下一章（默认 1000）")
     parser.add_argument("--apply", action="store_true",
-                        help="consistency 命令：执行自动修正（默认仅生成差异报告）")
+                        help="consistency / notes-normalize 命令：执行自动修正（notes-normalize 默认仅生成差异报告）")
     parser.add_argument("--window", type=int, default=None,
                         help="drift-audit 命令：滑动窗口大小（默认 config.pipeline.drift_audit.window=5）")
     parser.add_argument("--jev", action="store_true",
@@ -215,6 +278,12 @@ def main():
     if args.chapter and not re.fullmatch(r'[a-zA-Z0-9_-]{1,32}', args.chapter):
         print(f"❌ 非法 chapter_id: '{args.chapter}' (仅允许字母/数字/下划线/连字符，1-32 字符)", file=sys.stderr)
         sys.exit(1)
+
+    # Round 130: 单实例守卫（审计①）——写共享状态的命令必须独占锁；
+    # 只读命令（gate/lint/drift-audit 等）不拦截，便于运行中诊断。
+    if args.command in _MUTATING_COMMANDS or (args.command == "consistency" and args.apply):
+        if not acquire_instance_lock():
+            sys.exit(1)
 
     # P4-9: 顶层异常包装（除已规范的 consistency/golden-gate 外，统一捕获并退出）
     try:
@@ -292,6 +361,13 @@ def main():
         elif args.command == "finalize":
             from src.book_lint import finalize_outputs
             finalize_outputs(apply=args.apply)
+            sys.exit(0)
+        elif args.command == "notes-normalize":
+            from src.book_lint import notes_normalize_outputs
+            _nn_res = notes_normalize_outputs(apply=args.apply)
+            _nn_stats = _nn_res.get("stats") or {}
+            print(f"notes-normalize: files={_nn_stats.get('files', 0)} "
+                  f"changed={_nn_stats.get('changed', 0)} → {_nn_res.get('report', '')}")
             sys.exit(0)
         elif args.command == "lint":
             from src.book_lint import lint_book

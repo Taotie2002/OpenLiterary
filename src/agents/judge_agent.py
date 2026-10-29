@@ -17,7 +17,6 @@ from src.config import config as _config
 from src.utils.llm_adapter import (
     get_llm_client_for_task,
     get_role_model_name,
-    get_role_extra_body,
     robust_json_loads,
 )
 from src.core.decision_engine import DecisionEngine
@@ -98,12 +97,11 @@ class JudgeAgent:
 3. 最多 {max_edits} 条；不要输出 JSON 以外的任何文字。"""
         model_key, params = _config.resolve_task_model("judge_decision")
         model_name = get_role_model_name(self.role) or model_key
-        extra_body = get_role_extra_body(self.role)
         params = dict(params)
         params["temperature"] = float(cfg.get("temperature", 0.2))
         try:
             raw = self.llm.generate(
-                prompt=prompt, model_name=model_name, **params, extra_body=extra_body,
+                prompt=prompt, model_name=model_name, **params,
             )
             data = robust_json_loads(raw)
             if not isinstance(data, dict):
@@ -141,7 +139,7 @@ class JudgeAgent:
 
     def _build_prompt(self, source_text: str, lit_trans: str, critic_report: dict, rewriter_self_review: Optional[list] = None, verse_note: Optional[str] = None) -> str:
         # P0: 将 critic_thresholds 注入为参考阈值（非硬性否决条件）
-        thresholds = _config.critic_thresholds
+        thresholds = _config.critic_thresholds_for_book()
         thresholds_lines = "\n".join(
             f"  - {dim}: 参考阈值 {v}"
             for dim, v in thresholds.items() if dim != "average_score_min"
@@ -308,13 +306,11 @@ reject_reason 中说明具体位置与改法。
 
         model_key, params = _config.resolve_task_model("judge_decision")
         model_name = get_role_model_name(self.role) or model_key
-        extra_body = get_role_extra_body(self.role)
 
         raw_output = self.llm.generate(
             prompt=prompt,
             model_name=model_name,
             **params,
-            extra_body=extra_body,
         )
 
         result = robust_json_loads(raw_output)

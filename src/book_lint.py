@@ -479,12 +479,14 @@ _SEP_LINE_RE = re.compile(r'^\s*-{3,}\s*$')
 _MACHINE_FN_ID_RE = re.compile(r'\[\^[^\]]*_c\d+_[^\]]*\]')
 _NOTE_LABEL_RE = re.compile(r'^\s*(?:\*+\s*)?(?:译者注|译注|脚注|注释)\s*[:：]?\s*')
 _QUOTED_TERM_RE = re.compile(r'[“「『]([^”」』]{2,36})[”」』]')
-# 去重阈值校准自 Phase 1 真实样本：重复组 r=0.31~0.39（共享 whiting/白垩粉锚点），
-# 对照组（帽匠/三月兔/黑豹各注互异）r≤0.21；硬阈值兜底近同文本。
-# 拉丁锚点须排除高频"作者/书目"词（Carroll 几乎每注都有，曾致三月兔×睡鼠误合并）。
+# 去重比率：通用统计兜底，校准自一本真实书的注释样本
+# （重复组 r≈0.31~0.39、对照组 r≤0.21）；换书若观察到误合并/漏合并，
+# 用新样本重校准这两个比率即可——非任何作品专属规则。
+# 拉丁锚点停用改为章内频率动态派生（Round 130 审计④：不再硬编码任何作品
+# 专属词——历史初始样本中每注都含作者/书名词，曾致高频词误合并；
+# 现由 _note_anchor_stop() 按章自动识别）。
 _NOTE_DUP_RATIO = 0.28
 _NOTE_DUP_RATIO_HARD = 0.75
-_NOTE_ANCHOR_STOP = {"carroll", "alice", "english", "victorian", "lewis"}
 
 
 def _note_norm(content: str) -> str:
@@ -506,8 +508,33 @@ def _note_key(content: str) -> str:
     return _note_norm(content)[:12]
 
 
-def _note_is_dup(a: str, b: str) -> bool:
-    """内容级重复判定（保守，校准值见上方注释）。"""
+def _note_anchor_stop(contents) -> set:
+    """章内频率派生的停用锚点（纯统计，零作品先验，Round 130 审计④）。
+
+    在 ≥60%（且 ≥2 条）注释中都出现的拉丁词（≥4 字母）不构成"两注同源"
+    的证据——某词若高频遍布全章注释（典型：作者名/书名/时代词），它对区分
+    不同注释没有信息量。初始样本中 Carroll 类词即由此机制自然覆盖，不再
+    硬编码任何作品专属停用表。
+    """
+    import math
+    from collections import Counter
+    texts = [str(c) for c in contents if c]
+    n = len(texts)
+    if n < 2:
+        return set()
+    cnt: Counter = Counter()
+    for c in texts:
+        cnt.update({w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", c)})
+    threshold = max(2, math.ceil(n * 0.6))
+    return {w for w, k in cnt.items() if k >= threshold}
+
+
+def _note_is_dup(a: str, b: str, stop=frozenset()) -> bool:
+    """内容级重复判定（保守，校准值见上方注释）。
+
+    stop: 章内频率派生的停用锚点（_note_anchor_stop()）；生产调用方须显式传入，
+    缺省空集 = 不做停用（仅供单测/直调）。
+    """
     import difflib
     na, nb = _note_norm(a), _note_norm(b)
     if not na or not nb or min(len(na), len(nb)) < 30:
@@ -517,8 +544,8 @@ def _note_is_dup(a: str, b: str) -> bool:
         return True
     if r < _NOTE_DUP_RATIO:
         return False
-    la = {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", a)} - _NOTE_ANCHOR_STOP
-    lb = {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", b)} - _NOTE_ANCHOR_STOP
+    la = {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", a)} - stop
+    lb = {w.lower() for w in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", b)} - stop
     if la & lb:
         return True
     ca, cb = set(), set()
@@ -653,9 +680,10 @@ def normalize_chapter_notes(text: str, start_num: int = 1):
             x = parent[x]
         return x
 
+    _stop = _note_anchor_stop([c['content'] for c in cand])
     for i in range(len(cand)):
         for j in range(i + 1, len(cand)):
-            if _note_is_dup(cand[i]['content'], cand[j]['content']):
+            if _note_is_dup(cand[i]['content'], cand[j]['content'], stop=_stop):
                 ri, rj = _root(i), _root(j)
                 if ri != rj:
                     parent[rj] = ri
@@ -1016,9 +1044,10 @@ def _chapter_note_dupes(text: str) -> list:
     cand = [u for u in units if u['kind'] in ('md', 'num', 'tr', 'para')
             and 'group' not in u]
     out = []
+    _stop = _note_anchor_stop([c['content'] for c in cand])
     for i in range(len(cand)):
         for j in range(i + 1, len(cand)):
-            if _note_is_dup(cand[i]['content'], cand[j]['content']):
+            if _note_is_dup(cand[i]['content'], cand[j]['content'], stop=_stop):
                 out.append("重复注: {0} ~ {1}".format(
                     _note_key(cand[i]['content'])[:18],
                     _note_key(cand[j]['content'])[:18]))

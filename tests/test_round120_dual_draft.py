@@ -23,7 +23,8 @@ def dual_cfg():
     import src.config
     old = src.config.config.pipeline.get("dual_draft")
     src.config.config.pipeline["dual_draft"] = {
-        "enabled": True, "alternate_role": "primary", "max_chunks": 25,
+        "enabled": True, "alternate_role": "primary",
+        "alternate_effort": "max", "max_chunks": 25,
     }
     yield
     if old is not None:
@@ -122,6 +123,7 @@ class TestRoutingAndSelection:
         assert meta["roles"]["a"] == _c.config.get_task_role("literary_rewrite")
         kwargs = p.rewriter_agent.process_chunk.call_args.kwargs
         assert kwargs["model_role"] == "primary" and kwargs["retry_count"] == 0
+        assert kwargs["model_effort"] == "max", "Round 129: 第二稿（MiniMax）加档 max"
 
     def test_verse_takes_priority_over_pun(self, tmp_path, dual_cfg):
         p, store = _make_pipeline(

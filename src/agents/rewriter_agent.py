@@ -22,7 +22,6 @@ from src.utils.llm_adapter import (
     get_llm_client_for_task,
     get_llm_client,
     get_role_model_name,
-    get_role_extra_body,
     robust_json_loads,
 )
 from src.core.decision_engine import DecisionEngine
@@ -705,6 +704,7 @@ class LiteraryRewriterAgent:
         skipped_dimensions: Optional[List[str]] = None,
         verse_note: Optional[str] = None,  # Round 119 L1 韵文协议
         model_role: Optional[str] = None,  # Round 116: 停滞换模型覆盖角色
+        model_effort: Optional[str] = None,  # Round 129: 换模型时覆盖 effort（如 primary→max）
     ):
         print(f"✍️ [Rewriter Agent] 正在进行文学润色: {chunk_id} (retry={retry_count})...")
 
@@ -713,7 +713,8 @@ class LiteraryRewriterAgent:
         # N 方案：章节级 register 目标，作为 retry 的方向锚点
         register_target = self._infer_register_target(source_text) if source_text else ""
 
-        # Round 116: 停滞换模型 — 本次调用可覆盖角色（客户端/模型名/extra_body 随之切换）
+        # Round 116: 停滞换模型 — 本次调用可覆盖角色（客户端/模型名随之切换；
+        # Round 127: extra_body 为任务级配置，不随角色变化）
         llm = self.llm
         role = self.role
         if model_role and model_role != role:
@@ -722,6 +723,9 @@ class LiteraryRewriterAgent:
 
         # 使用配置路由：literary_rewrite（先于 temperature 计算，确保 base 从 config 读取）
         model_key, params = _config.resolve_task_model("literary_rewrite")
+        # Round 129: 停滞换模型/双稿第二稿切到更强模型时，按调用方要求加档
+        if model_effort:
+            params["effort"] = str(model_effort).strip().lower()
         model_name = get_role_model_name(role) or model_key
         base_temp = params.get("temperature", 0.3)
 
@@ -757,13 +761,11 @@ class LiteraryRewriterAgent:
 
         # 覆盖 temperature（用计算后的值替换 params 中的配置值）
         params = {**params, "temperature": temperature}
-        extra_body = get_role_extra_body(role)
 
         final_markdown = llm.generate(
             prompt=prompt,
             model_name=model_name,
             **params,
-            extra_body=extra_body,
         )
 
         # 解析自评 JSON（仅 retry 轮）
@@ -808,4 +810,4 @@ class LiteraryRewriterAgent:
 
 # ----- 6.3 CriticAgent -----
 
-# 注意：阈值配置从 _config.critic_thresholds 读取，而非此处常量
+# 注意：阈值配置从 _config.critic_thresholds_for_book() 读取（config 通用默认 ⊕ book_profile 覆盖），而非此处常量

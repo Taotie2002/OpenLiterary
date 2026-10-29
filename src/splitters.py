@@ -599,7 +599,8 @@ def run_conversion_audit(
 
 def _epub_split_large_doc_by_toc(html_content: str, toc_entries: list, chapter_idx_start: int,
                                  sources_out: Optional[dict] = None,
-                                 verse_out: Optional[dict] = None) -> list:
+                                 verse_out: Optional[dict] = None,
+                                 lead_out: Optional[list] = None) -> list:
     """
     将单个超大 HTML 文档按 TOC 锚点切分。
     返回 [(chapter_id, markdown), ...]
@@ -626,6 +627,28 @@ def _epub_split_large_doc_by_toc(html_content: str, toc_entries: list, chapter_i
                     anchor_lines[anchor_id] = (i, title)
 
     sorted_anchors = sorted(anchor_lines.items(), key=lambda x: x[1][0])
+
+    # 接缝回填（Kindle split 格式）：文档开头到第一个锚点之间的正文是物理
+    # 切分的上一章续文（如 ~200KB 分片的 index_split_NNN.html），不处理会被
+    # 整段丢弃。把这段交给调用方回填到上一章末尾（实测《Why Nations Fail》
+    # 此类分片共丢 ~17 万字符）。lead_out 非 None 时收集。
+    if lead_out is not None and sorted_anchors:
+        lead_html = '\n'.join(lines[:sorted_anchors[0][1][0]])
+        if '<head' in lead_html and '</head>' in lead_html:
+            lead_html = lead_html.split('</head>', 1)[1]
+        lead_soup = BeautifulSoup(lead_html, 'html.parser')
+        _mark_verse_elements(lead_soup)
+        for br in lead_soup.find_all('br'):
+            br.replace_with('\n')
+        lead_blocks: list = []
+        lead_text = _extract_block_text(lead_soup, lead_blocks)
+        lead_text = re.sub(r'[ \t]+', ' ', lead_text)
+        lead_text = re.sub(r'\n{3,}', '\n\n', lead_text)
+        lead_text = re.sub(r'(?m)^[ \t]+|[ \t]+$', '', lead_text)
+        lead_text = _strip_epub_front_matter(lead_text.strip())
+        if lead_text:
+            lead_out.append({'text': lead_text, 'html': lead_html, 'verse': lead_blocks})
+
     chapters = []
     for i, (anchor_id, (line_no, toc_title)) in enumerate(sorted_anchors):
         start_line = line_no
@@ -660,6 +683,44 @@ def _epub_split_large_doc_by_toc(html_content: str, toc_entries: list, chapter_i
         chapters.append((ch_id, f"# {_normalize_chapter_title(title)}\n\n{text}"))
 
     return chapters
+
+
+# ── input_prep：切分后自动排除非正文 + 文本伪影修复（config.yaml input_prep 段） ──
+
+def _input_prep_cfg() -> dict:
+    """读取 config.yaml 的 input_prep 配置（不可用时返回 {} = 功能关闭）。"""
+    try:
+        from src.config import get_config as _gc
+        return dict(_gc().input_prep or {})
+    except Exception:
+        return {}
+
+
+def _prep_key(s: str) -> str:
+    """标题归一（忽略大小写/多余空白）供 skip_titles 匹配。"""
+    return " ".join((s or "").strip().casefold().split())
+
+
+def _chapter_h1(md: str) -> str:
+    """取章节 Markdown 的 H1 标题（前几行内首个 '# ' 行）。"""
+    for line in (md or "").splitlines()[:5]:
+        if line.startswith("# "):
+            return line[2:].strip()
+    return ""
+
+
+def _apply_input_repairs(text: str, repairs) -> tuple:
+    """按 input_prep.repairs 表顺序替换文本伪影，返回 (新文本, 替换次数)。"""
+    n = 0
+    for item in repairs or []:
+        try:
+            old, new = str(item[0]), str(item[1])
+        except (TypeError, IndexError, KeyError):
+            continue
+        if old and old in text:
+            n += text.count(old)
+            text = text.replace(old, new)
+    return text, n
 
 
 def _epub_extract_chapters(book, sources_out: Optional[dict] = None,
@@ -719,10 +780,23 @@ def _epub_extract_chapters(book, sources_out: Optional[dict] = None,
             chapters.append((ch_id, f"# {_normalize_chapter_title(title)}\n\n{text}"))
             continue
 
+        lead_box: list = []
         sub_chapters = _epub_split_large_doc_by_toc(html_content, toc_entries, chapter_idx,
                                                     sources_out=sources_out,
-                                                    verse_out=verse_out)
+                                                    verse_out=verse_out,
+                                                    lead_out=lead_box)
         if sub_chapters:
+            if lead_box and chapters:
+                lead = lead_box[0]
+                if len(lead.get('text') or '') >= 40:
+                    prev_id, prev_md = chapters[-1]
+                    chapters[-1] = (prev_id, prev_md.rstrip() + '\n\n' + lead['text'])
+                    if sources_out is not None:
+                        sources_out.setdefault(prev_id, []).append(lead['html'])
+                    if verse_out is not None and lead.get('verse'):
+                        verse_out.setdefault(prev_id, []).extend(lead['verse'])
+                    _splitter_log_info(
+                        f"接缝回填：{len(lead['text'])} 字符续文 → {prev_id}")
             chapters.extend(sub_chapters)
             chapter_idx += len(sub_chapters)
         else:
@@ -764,6 +838,7 @@ class EpubSplitter:
         self._chapter_verse: dict = {}
         self.verse_manifest: dict = {}
         self.audit_result: dict = {}
+        self._excluded_ids: set = set()
 
     def load(self):
         if not self.epub_path.exists():
@@ -786,17 +861,54 @@ class EpubSplitter:
         self.chapters = _epub_extract_chapters(
             self.book, sources_out=self._chapter_sources, skipped_out=self._skipped_docs,
             verse_out=self._chapter_verse)
+        self._apply_input_prep()
         if not self.chapters:
             _splitter_log_warn("未提取到任何章节内容")
         else:
             _splitter_log_ok(f"共提取 {len(self.chapters)} 章")
             self._validate_split()
-            self.verse_manifest = _build_verse_manifest(self.chapters, self._chapter_verse)
+            _kept = [(cid, md) for cid, md in self.chapters
+                     if cid not in self._excluded_ids]
+            self.verse_manifest = _build_verse_manifest(_kept, self._chapter_verse)
             n_verse = sum(len(v or []) for v in (self.verse_manifest.get('chapters') or {}).values())
             if n_verse:
                 _splitter_log_info(
                     f"韵文通道：检测到 {n_verse} 个韵文块（verse_manifest 随 write_files 落盘）")
         return self.chapters
+
+    def _apply_input_prep(self):
+        """input_prep：文本伪影修复 + 非正文标记（写盘时入 skip_dir，不参与翻译）。
+
+        被排除章节仍保留在 self.chapters（完整性审计口径不变）。
+        """
+        cfg = _input_prep_cfg()
+        if not cfg or cfg.get("enabled", True) is False:
+            return
+        repairs = cfg.get("repairs") or []
+        if repairs:
+            total = 0
+            fixed = []
+            for ch_id, md in self.chapters:
+                md, n = _apply_input_repairs(md, repairs)
+                total += n
+                fixed.append((ch_id, md))
+            self.chapters = fixed
+            if total:
+                _splitter_log_info(f"input_prep：文本伪影修复 {total} 处")
+        skip_titles = {_prep_key(t) for t in (cfg.get("skip_titles") or []) if t}
+        self._excluded_ids = set()
+        if not skip_titles:
+            return
+        labels = []
+        for ch_id, md in self.chapters:
+            title = _chapter_h1(md)
+            if title and _prep_key(title) in skip_titles:
+                self._excluded_ids.add(ch_id)
+                labels.append(f"{ch_id}（{title}）")
+        if self._excluded_ids:
+            _splitter_log_info(
+                f"input_prep：排除 {len(self._excluded_ids)} 个非正文文档"
+                f"（写 {cfg.get('skip_dir') or '_skip'}/，不翻译）: " + "、".join(labels))
 
     def _validate_split(self):
         """P4：切分完整性 + 段落结构回归校验。
@@ -844,23 +956,58 @@ class EpubSplitter:
             _splitter_log_warn(f"校验跳过（非致命）：{e}")
 
     def write_files(self) -> list:
-        """将切分结果写入 output_dir/chXX.md，返回生成的文件路径列表"""
+        """将切分结果写入 output_dir/chXX.md，返回「参与翻译」的文件路径列表
+
+        input_prep 标出的非正文文档改写到 output_dir/<skip_dir>/（不计入返回列表，
+        CLI/mapfile 与翻译流程天然跳过）；同时清理上次切分遗留的陈旧 chXX.md。
+        """
         if not self.chapters:
             self.split()
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        _cfg = _input_prep_cfg()
+        _skip_dir_name = str((_cfg or {}).get("skip_dir") or "_skip")
 
         generated = []
+        pairs = []  # [(ch_id, path)] 参与翻译的章节（供 summary 使用）
         for ch_id, markdown in self.chapters:
+            if ch_id in self._excluded_ids:
+                skip_dir = self.output_dir / _skip_dir_name
+                skip_dir.mkdir(parents=True, exist_ok=True)
+                (skip_dir / f"{ch_id}.md").write_text(markdown, encoding='utf-8')
+                _splitter_log_info(
+                    f"非正文排除: {_skip_dir_name}/{ch_id}.md（{len(markdown)} chars，不参与翻译）")
+                continue
             out_file = self.output_dir / f"{ch_id}.md"
             out_file.write_text(markdown, encoding='utf-8')
             generated.append(str(out_file))
+            pairs.append((ch_id, str(out_file)))
             _splitter_log_ok(f"{ch_id}.md ({len(markdown)} chars)")
+
+        # 清理陈旧章节文件（同目录重切时的残留，如曾被排除但仍在根目录的 chXX）
+        if _cfg and _cfg.get("enabled", True) is not False:
+            root_kept = {ch_id for ch_id, _ in pairs}
+            for stale in self.output_dir.glob("ch*.md"):
+                if re.fullmatch(r'ch\d+', stale.stem) and stale.stem not in root_kept:
+                    try:
+                        stale.unlink()
+                        _splitter_log_info(f"清理陈旧章节: {stale.name}")
+                    except OSError:
+                        pass
+            skip_dir = self.output_dir / _skip_dir_name
+            if skip_dir.is_dir():
+                for stale in skip_dir.glob("ch*.md"):
+                    if re.fullmatch(r'ch\d+', stale.stem) and stale.stem not in self._excluded_ids:
+                        try:
+                            stale.unlink()
+                            _splitter_log_info(f"清理陈旧章节: {_skip_dir_name}/{stale.name}")
+                        except OSError:
+                            pass
 
         summary = self.output_dir / "_chapters_summary.txt"
         summary.write_text(
             "\n".join(
                 f"{ch_id}\t{Path(f).stat().st_size} bytes"
-                for ch_id, f in zip([c[0] for c in self.chapters], generated)
+                for ch_id, f in pairs
             ),
             encoding='utf-8'
         )

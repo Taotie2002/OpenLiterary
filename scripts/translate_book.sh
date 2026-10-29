@@ -7,9 +7,9 @@
 #
 # 临时切换后端/模型（不修改 config.yaml，通过环境变量）：
 #   export SAGATRANS__LLM_BACKEND=openai_api
-#   export SAGATRANS__MAIN__MODELS__PRIMARY__MODEL_NAME=mistral-large
-#   export SAGATRANS__MAIN__MODELS__PRIMARY__API_BASE=https://api.mistral.ai/v1
-#   export SAGATRANS__MAIN__MODELS__PRIMARY__API_KEY=$MISTRAL_KEY
+#   export SAGATRANS__MODELS__PRIMARY__MODEL_NAME=mistral-large
+#   export SAGATRANS__MODELS__PRIMARY__API_BASE=https://api.mistral.ai/v1
+#   export SAGATRANS__MODELS__PRIMARY__API_KEY=$MISTRAL_KEY
 #   ./scripts/translate_book.sh book.epub
 #
 # 示例:
@@ -84,9 +84,9 @@ usage() {
 
  环境变量 (临时覆盖配置，不修改磁盘 config.yaml；使用 __ 分隔嵌套键):
   SAGATRANS__LLM_BACKEND
-  SAGATRANS__MAIN__MODELS__<ROLE>__MODEL_NAME
-  SAGATRANS__MAIN__MODELS__<ROLE>__API_BASE
-  SAGATRANS__MAIN__MODELS__<ROLE>__API_KEY
+  SAGATRANS__MODELS__<ROLE>__MODEL_NAME
+  SAGATRANS__MODELS__<ROLE>__API_BASE
+  SAGATRANS__MODELS__<ROLE>__API_KEY
   其中 <ROLE> ∈ literal_translator | primary
 
 示例:
@@ -94,9 +94,9 @@ usage() {
   $0 book.epub
 
   # 临时切到云 API 不改 yaml (Mistral 示例)
-  SAGATRANS__MAIN__MODELS__PRIMARY__API_BASE=https://api.mistral.ai/v1 \\
-  SAGATRANS__MAIN__MODELS__PRIMARY__API_KEY=\$MISTRAL_KEY \\
-  SAGATRANS__MAIN__MODELS__PRIMARY__MODEL_NAME=mistral-large \\
+  SAGATRANS__MODELS__PRIMARY__API_BASE=https://api.mistral.ai/v1 \\
+  SAGATRANS__MODELS__PRIMARY__API_KEY=\$MISTRAL_KEY \\
+  SAGATRANS__MODELS__PRIMARY__MODEL_NAME=mistral-large \\
   $0 book.epub
 
   # 仅测试流程 (不消耗 token)
@@ -189,15 +189,6 @@ check_deps() {
         }
     fi
 
-    # MLX 后端检查：仅在环境变量明确指定 mlx 时安装
-    local effective_backend="${SAGATRANS__LLM_BACKEND:-}"
-    if [[ "$effective_backend" == "mlx" && "$DRY_RUN" != "true" ]]; then
-        python3 -c "import mlx_lm, mlx" 2>/dev/null || {
-            log_warn "MLX 未安装，尝试安装..."
-            pip install -q mlx mlx-lm
-        }
-    fi
-
     log_ok "依赖检查通过"
 }
 
@@ -205,9 +196,9 @@ check_deps() {
 # 临时覆盖配置（不修改磁盘 config.yaml）
 # 通过 SAGATRANS_* 环境变量实现：
 #   SAGATRANS__LLM_BACKEND
-#   SAGATRANS__MAIN__MODELS__PRIMARY__MODEL_NAME
-#   SAGATRANS__MAIN__MODELS__PRIMARY__API_BASE
-#   SAGATRANS__MAIN__MODELS__PRIMARY__API_KEY
+#   SAGATRANS__MODELS__PRIMARY__MODEL_NAME
+#   SAGATRANS__MODELS__PRIMARY__API_BASE
+#   SAGATRANS__MODELS__PRIMARY__API_KEY
 # ===========================
 
 # ===========================
@@ -527,7 +518,14 @@ reset_state() {
     
     if [[ -t 0 ]]; then
         log_warn "$confirm_msg"
-        read -r -p "确认清空？[y/N] " reply
+        # 提示直写 /dev/tty（stderr 被管道/过滤器接走时也能立即显示；此前 perl -p
+        # 行缓冲会让无换行的提示等到按键后才出现）；无 /dev/tty 时退回 stderr。
+        if { printf '确认清空？[y/N] ' >/dev/tty; } 2>/dev/null; then
+            read -r reply </dev/tty || reply=""
+        else
+            printf '确认清空？[y/N] ' >&2
+            read -r reply || reply=""
+        fi
         [[ "$reply" != "y" && "$reply" != "Y" ]] && { log_info "已取消"; exit 0; }
     fi
 
@@ -535,6 +533,8 @@ reset_state() {
 
     rm -rf "$PROJECT_ROOT/db/workflow.db" "$PROJECT_ROOT/db/workflow.db-shm" "$PROJECT_ROOT/db/workflow.db-wal"
     rm -rf "$PROJECT_ROOT/db/decision_db.sqlite" "$PROJECT_ROOT/db/decision_db.sqlite-shm" "$PROJECT_ROOT/db/decision_db.sqlite-wal"
+    # verse chunk 标签（db/chunk_tags.json）是作品级状态，旧书残留会污染新书 verse 通道
+    rm -f "$PROJECT_ROOT/db/chunk_tags.json"
     rm -rf "$PROJECT_ROOT/output"
     rm -f "$PROJECT_ROOT/$OUTPUT_DIR/translated_full.md"
     rm -rf "$PROJECT_ROOT/$CHAPTERS_DIR"
@@ -546,8 +546,37 @@ reset_state() {
 # ===========================
 # 主流程
 # ===========================
+
+# ────────────────────────────────────────────────────────────────────
+# Round 130: 单实例守卫（外部审计①）——与 src/main.py::acquire_instance_lock
+# 共用同一把 flock 文件（flock(1) 与 fcntl.flock 底层同源，互相阻塞）。
+# 应急绕过：SAGATRANS_ALLOW_CONCURRENT=1（会打警告，风险自担）。
+# ────────────────────────────────────────────────────────────────────
+acquire_instance_lock() {
+    local lock_file="$PROJECT_ROOT/db/.sagatrans.lock"
+    mkdir -p "$(dirname "$lock_file")"
+    exec 9>>"$lock_file"
+    if ! flock -n 9; then
+        local holder
+        holder=$(head -c 200 "$lock_file" 2>/dev/null | tr '\n' ' ')
+        if [[ "${SAGATRANS_ALLOW_CONCURRENT:-}" == "1" ]]; then
+            log_warn "⚠️ [Lock] 已有 SagaTrans 实例在运行（${holder:-未知}）——SAGATRANS_ALLOW_CONCURRENT=1 放行"
+        else
+            log_err "⛔ [Lock] 已有 SagaTrans 实例在运行：${holder:-未知}"
+            log_err "   锁文件: $lock_file；确认无残留进程后可设 SAGATRANS_ALLOW_CONCURRENT=1 强制放行（风险自担）"
+            exit 1
+        fi
+    else
+        printf 'pid=%s started=%s cmd=translate_book.sh %s\n' "$$" "$(date '+%F %T')" "$*" >"$lock_file"
+        export SAGATRANS_LOCK_HELD=1
+    fi
+}
+
 main() {
     parse_args "$@"
+
+    # Round 130: 单实例守卫（先于任何破坏性操作；审计①）
+    acquire_instance_lock "$@"
 
     # --clean-only 独立模式：清理中间产物后退出
     if [[ "$CLEAN_ONLY" == "true" ]]; then
@@ -599,6 +628,8 @@ main() {
             [[ ${#chapter_files[@]} -eq 0 ]] && { log_err "input/ 下无章节文件"; exit 1; }
         else
             mapfile -t chapter_files < <(convert_epub)
+            # convert_epub 在进程替换子壳中运行，其内部 exit 1 传不回来；此处兜底终止
+            [[ ${#chapter_files[@]} -eq 0 ]] && { log_err "章节切分未产出任何文件，终止。"; exit 1; }
         fi
 
         # 1.5 Round 117 P0: 动态风格剖面（作品隔离）— 缺失时生成一次，全章子进程共享
@@ -745,7 +776,7 @@ except Exception:
     if [[ "$gate_ok" == "true" ]]; then
         log_ok "🎉 翻译全流程完成！"
     else
-        log_err "⛔ 交付门禁未通过（失败项见上方 gate 清单；报告: output/book_lint.md / input/_conversion_audit.md）"
+        log_err "⛔ 交付门禁未通过（失败项见上方 gate 清单；报告: output/book_lint.md / output/pun_audit.md / input/_conversion_audit.md）"
         [[ "$ALLOW_INCOMPLETE" == "true" ]] || exit 1
         log_warn "--allow-incomplete 放行：产出保留，请人工复核失败项"
     fi

@@ -1,11 +1,11 @@
 # SagaTrans - AI 文学语义编译系统
 # 依赖包分层说明：
 #   requirements-core.txt   → 核心管线最小依赖（生产必备）
-#   requirements.txt        → 当前文件，包含 EPUB 工具 + MLX 等可选依赖
+#   requirements.txt        → 当前文件，包含 EPUB 工具等可选依赖
 #
 # 推荐安装顺序：
 #   pip install -r requirements-core.txt           # 生产最小集
-#   pip install -r requirements.txt                # 完整集（含 EPUB 处理、MLX 本地推理）
+#   pip install -r requirements.txt                # 完整集（含 EPUB 处理）
 #   pip install -r requirements.txt -r requirements-dev.txt  # 含测试与质量门禁（未来提供）
 
 # ===========================
@@ -22,13 +22,6 @@ psutil>=5.9.0
 
 # 防御性 JSON 解析（处理 LLM 输出格式违规）
 json-repair>=0.24.0
-
-# ===========================
-# LLM 后端适配器（可选）
-# ===========================
-# MLX (Apple Silicon 原生推理) - 仅 macOS ARM64 需要
-# mlx-lm>=0.18.0
-# mlx>=0.18.0
 
 # ===========================
 # EPUB 预处理工具
@@ -61,7 +54,6 @@ lxml>=4.9.0
 # 备注
 # ===========================
 # 1. 核心管线只需：pyyaml, requests, psutil, json-repair（详见 requirements-core.txt）
-# 2. MLX 后端需在 macOS ARM64 单独安装：pip install mlx-lm
 # 3. EPUB 预处理需：ebooklib, beautifulsoup4, lxml
 # 4. 标注为 # 的依赖均为可选，未启用功能
 # 5. 生产部署建议锁定版本：pip freeze > requirements.lock

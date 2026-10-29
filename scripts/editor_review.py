@@ -39,15 +39,14 @@ def _default_generate(prompt: str) -> str:
     """editor_review 角色（MiniMax-M3, thinking on）单次生成。"""
     from src.config import get_config
     from src.utils.llm_adapter import (
-        get_llm_client_for_task, get_role_model_name, get_role_extra_body,
+        get_llm_client_for_task, get_role_model_name,
     )
     cfg = get_config()
     model_key, params = cfg.resolve_task_model("editor_review")
     role = cfg.get_task_role("editor_review")
     llm = get_llm_client_for_task("editor_review")
     model_name = get_role_model_name(role) or model_key
-    extra_body = get_role_extra_body(role)
-    return llm.generate(prompt, model_name=model_name, extra_body=extra_body, **params)
+    return llm.generate(prompt, model_name=model_name, **params)
 
 
 def _model_label() -> str:

@@ -1,8 +1,8 @@
-"""Round 118 P2-7: 黄金集 A/B — 直译模型×thinking 组合对比与来源分组统计.
+"""Round 118 P2-7 / Round 128: 黄金集 A/B — 直译模型×effort 档位组合对比与来源分组统计.
 
 覆盖:
-  - GOLDEN_AB_MATRIX 四组合结构 (DeepSeek/MiniMax × thinking on/off)
-  - run_golden_test 的 ab_override 覆盖 role + enable_thinking 并落盘新字段
+  - GOLDEN_AB_MATRIX 四组合结构 (literal_translator/primary × effort none/档位)
+  - run_golden_test 的 ab_override 覆盖 role + effort 并落盘新字段
   - summarize_golden_results 按 judge_backend / confidence_source 分组
   - recommend_golden_combo 仅在 Jev 校准占比达标时给推荐 (降级环境拒绝结论)
   - run_golden_ab 聚合与报告落盘
@@ -86,7 +86,10 @@ class _FakeConfig:
         return "literal_translator"
 
     def resolve_task_model(self, task_name):
-        return "literal_translator", {"temperature": 0.1, "enable_thinking": False}
+        return "literal_translator", {
+            "temperature": 0.1,
+            "extra_body": {"vendor": task_name},
+        }
 
 
 def _prepare_golden_env(tmp_path, monkeypatch):
@@ -100,7 +103,6 @@ def _prepare_golden_env(tmp_path, monkeypatch):
     monkeypatch.setattr(g, "GoldenSetEvaluator", _FakeEvaluator)
     monkeypatch.setattr(g, "SmartChunker", _FakeChunker)
     monkeypatch.setattr(g, "get_role_model_name", lambda role: f"model:{role}")
-    monkeypatch.setattr(g, "get_role_extra_body", lambda role: {"vendor": role})
 
 
 def _chunk_result(decision="PASS", backend="jev", conf="jev", score=8.0):
@@ -120,15 +122,15 @@ def _chunk_result(decision="PASS", backend="jev", conf="jev", score=8.0):
 # ---------------------------------------------------------------------------
 
 class TestGoldenAbMatrix:
-    def test_four_combos_two_models_two_thinking_states(self):
+    def test_four_combos_two_models_two_effort_states(self):
         combos = g.GOLDEN_AB_MATRIX
         assert len(combos) == 4
-        axis = {(c["role"], bool(c["enable_thinking"])) for c in combos}
+        axis = {(c["role"], c.get("effort")) for c in combos}
         assert axis == {
-            ("literal_translator", False),
-            ("literal_translator", True),
-            ("primary", False),
-            ("primary", True),
+            ("literal_translator", None),
+            ("literal_translator", "xhigh"),
+            ("primary", None),
+            ("primary", "max"),
         }
         names = [c["name"] for c in combos]
         assert len(set(names)) == 4
@@ -139,22 +141,23 @@ class TestGoldenAbMatrix:
 # ---------------------------------------------------------------------------
 
 class TestGoldenTestAbOverride:
-    def test_override_plumbs_role_and_thinking(self, tmp_path, monkeypatch):
+    def test_override_plumbs_role_and_effort(self, tmp_path, monkeypatch):
         _prepare_golden_env(tmp_path, monkeypatch)
         report = tmp_path / "report.json"
         results = g.run_golden_test(
-            ab_override={"name": "minimax_lit_on", "role": "primary", "enable_thinking": True},
+            ab_override={"name": "primary_effort_max", "role": "primary", "effort": "max"},
             report_path=report,
         )
         assert _FakeEvaluator.last_init["literal_role"] == "primary"
         call = _FakeEvaluator.instance.calls[0]
-        assert call["params"]["enable_thinking"] is True
+        assert call["params"]["effort"] == "max"
         assert call["model_name"] == "model:primary"
-        assert call["extra_body"] == {"vendor": "primary"}
+        # Round 127: extra_body 为任务级配置，A/B 覆盖角色不再改变它
+        assert call["extra_body"] == {"vendor": "literal_translation"}
 
-        assert results[0]["ab"] == "minimax_lit_on"
+        assert results[0]["ab"] == "primary_effort_max"
         assert results[0]["literal_role"] == "primary"
-        assert results[0]["literal_thinking"] is True
+        assert results[0]["literal_effort"] == "max"
         assert results[0]["judge_backend"] == "jev"
         assert results[0]["confidence_source"] == "jev"
 
@@ -162,17 +165,17 @@ class TestGoldenTestAbOverride:
         stats = data["summary"]["ab_stats"]
         assert stats["pass_rate"] == 1.0
         assert stats["calibrated_ratio"] == 1.0
-        assert data["details"][0]["ab"] == "minimax_lit_on"
+        assert data["details"][0]["ab"] == "primary_effort_max"
 
     def test_default_run_keeps_config_literal_settings(self, tmp_path, monkeypatch):
         _prepare_golden_env(tmp_path, monkeypatch)
         results = g.run_golden_test(report_path=tmp_path / "r.json")
         assert _FakeEvaluator.last_init["literal_role"] == "literal_translator"
         call = _FakeEvaluator.instance.calls[0]
-        assert call["params"]["enable_thinking"] is False
+        assert "effort" not in call["params"], "literal_translation 任务默认不下发 effort"
         assert call["model_name"] == "model:literal_translator"
         assert results[0]["ab"] is None
-        assert results[0]["literal_thinking"] is False
+        assert results[0]["literal_effort"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -259,8 +262,8 @@ class TestRunGoldenAb:
 
         monkeypatch.setattr(g, "run_golden_test", fake_run_golden_test)
         matrix = [
-            {"name": "a", "role": "literal_translator", "enable_thinking": False},
-            {"name": "b", "role": "primary", "enable_thinking": True},
+            {"name": "a", "role": "literal_translator", "effort": None},
+            {"name": "b", "role": "primary", "effort": "max"},
         ]
         report = g.run_golden_ab(matrix=matrix, report_path=tmp_path / "ab.json")
         assert calls == ["a", "b"]
@@ -279,7 +282,7 @@ class TestRunGoldenAb:
             return [_chunk_result("PASS", "openai_compat", "openai_compat")]
 
         monkeypatch.setattr(g, "run_golden_test", fake_run_golden_test)
-        matrix = [{"name": "m", "role": "primary", "enable_thinking": True}]
+        matrix = [{"name": "m", "role": "primary", "effort": "max"}]
         report = g.run_golden_ab(matrix=matrix, report_path=tmp_path / "ab.json")
         assert report["recommendation"]["name"] is None
         assert report["recommendation"]["reason"] == "no_calibrated_combo"

@@ -19,7 +19,6 @@ from src.config import config as _config
 from src.utils.llm_adapter import (
     get_llm_client_for_task,
     get_role_model_name,
-    get_role_extra_body,
     robust_json_loads,
 )
 from src.core.decision_engine import DecisionEngine, DecisionLevel
@@ -179,7 +178,6 @@ Schema 如下：
             print(f"⚠️ [Reference Agent] 两阶段确认不可用（保留召回结果）: {e}", file=sys.stderr)
             return None
         model_name = get_role_model_name(role) or model_key
-        extra_body = get_role_extra_body(role)
         max_chars = int(cfg.get("max_recall_chars", 12000))
         recall_json = json.dumps(recall_data, ensure_ascii=False, indent=2)[:max_chars]
         prompt = f"""你是资深文学考据复核员（第二意见）。另一位考据员已对片段做「高召回」初筛，你的任务是复核并定稿。
@@ -205,7 +203,6 @@ Schema 如下：
                 prompt=prompt,
                 model_name=model_name,
                 **params,
-                extra_body=extra_body,
             )
         except Exception as e:
             print(
@@ -238,13 +235,11 @@ Schema 如下：
         prompt = self._build_prompt(text_chunk)
         model_key, params = _config.resolve_task_model("reference_extraction")
         model_name = get_role_model_name(self.role) or model_key
-        extra_body = get_role_extra_body(self.role)
 
         raw_output = self.llm.generate(
             prompt=prompt,
             model_name=model_name,
             **params,
-            extra_body=extra_body,
         )
 
         # 2. 解析 JSON

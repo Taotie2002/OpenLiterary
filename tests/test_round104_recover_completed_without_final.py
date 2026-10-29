@@ -44,13 +44,18 @@ class _StubScheduler:
     def get_all_tasks_by_chapter(self, chapter_id):
         return list(self._tasks.values())
 
-    def update_task_state(self, chunk_id, new_state, error_msg=None, quality_retry=False):
+    def update_task_state(self, chunk_id, new_state, error_msg=None, quality_retry=False,
+                          allow_terminal_restore=False):
+        # Round 130（外部审计③）: 真 scheduler 恒返回 bool（True=已更新/False=被拒绝），
+        # stub 镜像该契约。
         task = self._tasks.get(chunk_id)
         if task is None:
-            return
+            return False
         # 与 VALID_TRANSITIONS 对齐: 仅允许 COMPLETED -> DIRTY
         if task["state"] == "COMPLETED" and new_state.value == "DIRTY":
             task["state"] = "DIRTY"
+            return True
+        return False
 
 
 def _make_pipeline(output_dir, tasks):

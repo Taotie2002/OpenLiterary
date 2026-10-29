@@ -1,7 +1,7 @@
 """Round 34: 共享文本匹配 helpers."""
 from __future__ import annotations
 import re
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 
 # Round 69: 不同代码路径产出的 reject category 名称同义映射
@@ -127,8 +127,30 @@ def entity_source_name_in_text(source_name: Optional[str], source_text: Optional
     """
     if not source_name or not source_text:
         return False
-    pattern = r"(?<![^\W\d_])" + re.escape(source_name) + r"(?![^\W\d_])"
-    return re.search(pattern, source_text) is not None
+    return re.search(_entity_boundary_pattern(source_name), source_text) is not None
+
+
+def _entity_boundary_pattern(source_name: str) -> str:
+    """Round 133b: entity source_name 的"词/短语边界"正则（与 Round 114 语义一致）。"""
+    return r"(?<![^\W\d_])" + re.escape(source_name) + r"(?![^\W\d_])"
+
+
+def entity_source_name_spans(
+    source_name: Optional[str], source_text: Optional[str],
+) -> List[Tuple[int, int]]:
+    """Round 133b: entity_source_name_in_text 的 span 版本 — 返回全部命中 [start, end) 区间。
+
+    供"更长别名吞并抑制"使用（chunk071 根因："Mother"(杰西卡夫人 的别名) 在原文中
+    唯一出现于 "Reverend Mother"(盖乌斯·海伦·莫希阿姆 的别名) 内部 → 词边界防护
+    放行 → 判杰西卡夫人在场 → 译文被判 missing → rewriter 收到不可执行指令 → 死循环）。
+    语义与 entity_source_name_in_text 完全一致（大小写敏感、Unicode 字母边界）。
+    """
+    if not source_name or not source_text:
+        return []
+    return [
+        (m.start(), m.end())
+        for m in re.finditer(_entity_boundary_pattern(source_name), source_text)
+    ]
 
 
 # Round 96: CJK 字符比例计算 — final sanity 闸门的基础原语.

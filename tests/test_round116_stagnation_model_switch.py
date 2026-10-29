@@ -24,7 +24,8 @@ def switch_cfg():
         "enabled": False, "stagnation_detection": {"enabled": False},
     }
     src.config.config.pipeline["stagnation_model_switch"] = {
-        "enabled": True, "alternate_role": "primary", "max_switches": 1,
+        "enabled": True, "alternate_role": "primary",
+        "alternate_effort": "max", "max_switches": 1,
     }
     yield
     if old_osc is not None:
@@ -117,10 +118,14 @@ class TestStagnationModelSwitch:
         sw = sidecar["switches"]
         assert len(sw) == 1 and sw[0]["to"] == "primary"
         p.scheduler.update_task_state.assert_not_called()
+        import src.config as _c
+        base_role = _c.config.get_task_role("literary_rewrite")  # Round 129: secondary(DeepSeek)
         meta = store.get(("ch_test_chunk000", "rewrite_meta_v1"))
-        assert meta["model_role"] == "literal_translator"
+        assert meta["model_role"] == base_role
         assert meta["model_switch_to"] == "primary"
-        assert p.rewriter_agent.process_chunk.call_args.kwargs["model_role"] == "literal_translator"
+        assert p.rewriter_agent.process_chunk.call_args.kwargs["model_role"] == base_role
+        assert p.rewriter_agent.process_chunk.call_args.kwargs.get("model_effort") is None, \
+            "未换模型时不加档（沿用任务默认 effort）"
 
     def test_second_attempt_uses_alternate_then_fails(self, tmp_path, switch_cfg):
         lit = "这是上一版文学润色稿的完整内容。"
@@ -130,6 +135,8 @@ class TestStagnationModelSwitch:
         p._process_rewriting_batch(_tasks())
 
         assert p.rewriter_agent.process_chunk.call_args.kwargs["model_role"] == "primary"
+        assert p.rewriter_agent.process_chunk.call_args.kwargs["model_effort"] == "max", \
+            "Round 129: 换到 MiniMax 救稿时加到最高档"
         from src.core.scheduler import TaskState
         p.scheduler.update_task_state.assert_any_call(
             "ch_test_chunk000", TaskState.PERMANENTLY_FAILED,

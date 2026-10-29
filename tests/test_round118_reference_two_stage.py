@@ -69,7 +69,8 @@ CONFIRMED = {
 
 class TestConfig:
     def test_routes_and_flags_exist(self):
-        assert _config.get_task_role("reference_confirmation") == "primary"
+        # Round 125: 确认阶段由 MiniMax 换为 secondary(Qwen) 分流；仍在强模型上（非直译 flash）
+        assert _config.get_task_role("reference_confirmation") == "secondary"
         assert _config.pipeline["reference_two_stage"]["enabled"] is True
         assert _config.pipeline["reference_two_stage"]["max_recall_chars"] >= 4000
 

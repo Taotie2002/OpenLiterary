@@ -5,6 +5,7 @@ import re
 
 from src.book_lint import (
     _chapter_note_dupes,
+    _note_anchor_stop,
     _note_is_dup,
     lint_book,
     normalize_chapter_notes,
@@ -30,8 +31,14 @@ def _refs(text):
     return re.findall(r'\[\^([^\]]+)\](?!:)', text)
 
 
-def test_stopword_anchor_no_false_merge():
-    assert not _note_is_dup(HARE, DORMOUSE)
+def test_frequency_derived_stopword_no_false_merge():
+    """Round 130 审计④: 停用锚点改为章内频率派生（零作品先验）。
+
+    Carroll 在两注中共现（2/2 ≥ 60%）→ 不构成同源证据 → 不得误合并。
+    """
+    stop = _note_anchor_stop([HARE, DORMOUSE])
+    assert "carroll" in stop
+    assert not _note_is_dup(HARE, DORMOUSE, stop=stop)
 
 
 def test_whiting_cluster_merge_and_remap():

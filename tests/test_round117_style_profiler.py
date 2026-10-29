@@ -164,5 +164,5 @@ def test_config_style_profiling_routing():
     cfg = get_config()
     role, params = cfg.resolve_task_model("style_profiling")
     assert role == "primary"
-    assert params.get("enable_thinking") is True
+    assert params.get("effort") == "max"    # Round 129: 需要文学史判定 → 开到最高
     assert "entity_variants" in dir(cfg) or hasattr(type(cfg), "entity_variants")
