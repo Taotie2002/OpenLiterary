@@ -479,7 +479,8 @@ def synthesize_verdict(
                         entity_registry_full,
                     )
                     if flagged:
-                        reason += " | 违规实体(须统一为规范主名): " + ", ".join(flagged)
+                        reason += (" | 违规实体(须使用规范主名或其已登记异写之一"
+                                   "，语境称谓如公爵/简称属合规): " + ", ".join(flagged))
                     reasons.append(reason)
             elif qid == "literal_residue":
                 if ans.noul >= thr["literal_residue_noul"]:

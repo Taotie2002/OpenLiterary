@@ -95,7 +95,7 @@ class TestEffortNormalization:
         _, params = cfg.resolve_task_model("critic_scoring")
         assert params.get("effort") == "none"
         _, params = cfg.resolve_task_model("literary_rewrite")
-        assert params.get("effort") == "max"
+        assert params.get("effort") == "xhigh"  # Round 138 A/B 降档
 
     def test_legacy_thinking_raises(self, fresh_config):
         cfg = fresh_config

@@ -185,7 +185,7 @@ def print_banner():
 _INSTANCE_LOCK_FD: Optional[int] = None
 
 _MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile",
-                      "consolidate", "finalize", "notes-normalize"}
+                      "consolidate", "finalize", "notes-normalize", "requeue"}
 
 
 def acquire_instance_lock(lock_path: Optional[Path] = None) -> bool:
@@ -243,8 +243,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="SagaTrans — AI 文学语义编译系统")
     parser.add_argument("command", nargs="?", default="pipeline",
-                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "drift-audit", "notes-normalize"],
-                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, drift-audit, notes-normalize")
+                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "drift-audit", "notes-normalize", "requeue"],
+                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, drift-audit, notes-normalize, requeue")
     parser.add_argument("--chapter", default="ch01", help="章节 ID (默认: ch01)")
     parser.add_argument("--chapters", default=None,
                         help="style-profile 命令：抽样章节，逗号分隔（默认均匀抽 5 章）")
@@ -354,6 +354,21 @@ def main():
             from src.pipeline import consolidate_dirty_chapters
             _cons_res = consolidate_dirty_chapters(max_rounds=args.max_rounds)
             sys.exit(0 if _cons_res.get("converged") else 1)
+        elif args.command == "requeue":
+            # Round 135: PF 终态块复活（≥1 次评审通道）——把 PERMANENTLY_FAILED
+            # 恢复为 DIRTY 重跑；--force 绕 pf_requeue_max 预算。复活块走 dirty 通道：
+            # final.json 自动转 backup，重跑失败由 _restore_dirty_backups 恢复旧版。
+            _rq_root = Path(__file__).resolve().parent.parent
+            _rq_sched = TaskScheduler(db_path=str(_rq_root / "db" / "workflow.db"))
+            _rq_res = _rq_sched.requeue_permanently_failed(args.chapter, force=args.force)
+            _rq_n = len(_rq_res["requeued"])
+            print(f"♻️ requeue: {args.chapter} 共 {_rq_n} 个 PF 块恢复 DIRTY")
+            if _rq_res["requeued"]:
+                print(f"    {', '.join(_rq_res['requeued'])}")
+                print(f"    → 运行: python3 -m src.translator_agent pipeline --chapter {args.chapter}")
+            if _rq_res["over_cap"]:
+                print(f"    ⚠️ 复活预算用尽(pf_requeue_max): {', '.join(_rq_res['over_cap'])}（--force 可强制）")
+            sys.exit(0 if _rq_n or not _rq_res["over_cap"] else 1)
         elif args.command == "gate":
             from src.pipeline import run_final_gate
             _gate_res = run_final_gate()

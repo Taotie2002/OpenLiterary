@@ -28,7 +28,7 @@ TASK_EFFORT_EXPECTED = {
     # reference_confirmation→low（max 档实测超 300s 被掐断）。此处与 config.yaml 同步。
     "reference_extraction": "none",
     "reference_confirmation": "low",
-    "literary_rewrite": "max",
+    "literary_rewrite": "xhigh",  # Round 138 A/B：max 无质量增益（0 胜）、失败率 3× → 降档
     "literal_translation": "none",
     "critic_scoring": "none",
     "judge_decision": "max",

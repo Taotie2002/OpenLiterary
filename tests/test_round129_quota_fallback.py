@@ -233,7 +233,7 @@ class TestConfigRound129:
     def test_rewrite_moved_to_secondary_max(self, cfg):
         assert cfg.get_task_role("literary_rewrite") == "secondary"
         _, params = cfg.resolve_task_model("literary_rewrite")
-        assert params.get("effort") == "max", "DS 大任务实测 max 稳定 → 思考开到最高"
+        assert params.get("effort") == "xhigh", "Round 138 A/B：max 无质量增益（0 胜）且失败率 3× → 降档 xhigh"
 
     def test_effort_tables_measured_levels(self, cfg):
         from src.config import EFFORT_LEVELS_BY_PROVIDER

@@ -661,6 +661,9 @@ def build_section_11_5() -> str:
     src = load_module("consistency.py")
     fns = ["_load_glossary", "_load_decisions", "_scan_finals", "_find_slash_aliases",
            "_in_quote_or_note", "_detect_issues", "_generate_report", "_apply_issues",
+           # Round 134: 名称统一 pass（同人归一 + 别名白名单 + 音译漂移全文统一）
+           "_load_name_unification_cfg", "_vet_name_drift_candidates",
+           "_apply_name_unification_pass",
            "run_consistency_check", "run_consistency_check_for_chapter"]
     out = section_comment("11.5", "译后命名一致性校正")
     for fn in fns:
@@ -1075,6 +1078,9 @@ _SRC_SUBMODULES = {
         "detect_cross_person_conflicts", "seed_entity_variants", "SEED_ENTITY_VARIANTS",
         # Round 105 P2-2: 同人多规范名归一
         "unify_entity_registry", "_CONF_ORDER",
+        # Round 134: 名称统一（pair 判定 / 映射生成 / 正文应用）
+        "classify_entity_variant", "build_name_unification_maps",
+        "apply_name_unification", "_r134_registry_rows",
     ],
     "src.agents.reference_agent": ["ReferenceAgent"],
     "src.agents.rewriter_agent": ["LiteraryRewriterAgent"],
@@ -1097,7 +1103,10 @@ _SRC_SUBMODULES = {
                         "_detect_issues", "_generate_report", "_apply_issues",
                         "run_consistency_check_for_chapter",
                         # Round 105: 普通词护栏 helper
-                        "_is_common_word_variant"],
+                        "_is_common_word_variant",
+                        # Round 134: 名称统一 pass（配置 / LLM 候选裁决 / 全文应用）
+                        "_load_name_unification_cfg", "_vet_name_drift_candidates",
+                        "_apply_name_unification_pass"],
     "src.splitters": ["EpubSplitter", "TextSplitter", "MdSplitter",
                       "_splitter_log_info", "_splitter_log_ok", "_splitter_log_warn", "_splitter_log_err",
                       "_normalize_chapter_title", "_normalize_scores",
@@ -1202,6 +1211,21 @@ def build_section_13() -> str:
         ]),
         ("core/decision_engine.py", [
             "SEED_ENTITY_VARIANTS", "_CONF_ORDER", "load_entity_variant_seeds", "unify_entity_registry",
+            # Round 134: 同人归一 / 音译漂移全链路（通用机制，无作品专名）
+            "_EN_ROLE_WORDS", "_EN_RELATION_WORDS", "_EN_GENERIC_MODIFIERS", "_EN_DETERMINERS",
+            "_ZH_ROLE_WORDS", "_ZH_GENERIC_MODIFIERS", "_NAME_SEP_CHARS", "_NAME_SEP_RE",
+            # Round 136: 分量级一致性护栏（语境指称保护）
+            "_ZH_REFERENCE_WORDS", "_is_context_reference_word",
+            # Round 137: 长公共段漂移扫描（非人名一致性扩展）
+            "_ZH_SCAN_EDGE_STOP", "_ZH_ANCHOR_STOP", "_is_cjk_char", "_name_scan_view",
+            "_r134_strip_parens", "_en_tokens", "_en_normalize_token",
+            "_r134_registry_rows",
+            "source_name_is_relational", "source_name_proper_tokens", "source_name_normalized",
+            "source_name_generic_keys", "generic_key_is_plain",
+            "canonical_is_title_only", "canonical_tokens", "canonical_tokens_with_spans",
+            "_lcs_len", "name_char_similarity", "_align_variant_tokens",
+            "_longest_common_run", "_split_by_common_run",
+            "classify_entity_variant", "build_name_unification_maps", "apply_name_unification",
         ]),
         ("agents/critic_agent.py", [
             "_classify_backend_error",

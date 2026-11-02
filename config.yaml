@@ -112,9 +112,15 @@ task_routing:
       temperature: 0.1
       max_tokens: 20000
       # 困难片段由难度路由切到 primary/MiniMax 并按段加档（见 pipeline.difficulty_routing）
+  name_vetting:                # 漂移候选 LLM 裁决（Round 134，轻量二分类任务）
+    model: literal_translator
+    effort: "none"             # 纯分类判定，不需要思考
+    params_override:
+      temperature: 0.0
+      max_tokens: 4000
   literary_rewrite:            # 文学润色
     model: secondary
-    effort: max                # DeepSeek 档位：大任务实测 max 稳定出正文（推理约 4k 字符，20.8s）
+    effort: xhigh              # Round 138 A/B（12 困难块）：max 0 胜 / 失败 3× / 延迟 +50% → 降档；xhigh 偶发 no_content 仍由 Round 133 降档链兜底
     params_override:
       temperature: 0.6
       max_tokens: 20000
@@ -177,7 +183,7 @@ pipeline:
     enabled: true
     hard_threshold: 2.0
     hard_role: primary
-    hard_effort: max             # MiniMax 档位（low/medium/high/xhigh/max）
+    hard_effort: xhigh           # Round 138 降档（润色 A/B 证据 + R132 MiniMax max 高难推理失控 ~10%）；失控仍由 Round 133 降档链兜底
   # Round 133: 重试适配 — 「仅推理无正文」(no_content) 签名驱动自动降档/换角色救稿。
   # 背景：ch01 通宵跑实测 7 块 PERMANENTLY_FAILED 全部是 effort=max 思考链（5-7 万字符）
   # 吃光 max_tokens、正文为空；同参数重试必然复现（复现率约 100%）。命中签名后：
@@ -320,6 +326,17 @@ pipeline:
   post_consistency:
     enabled: true             # 章节完成后是否自动跑 consistency apply
     chapter_scoped: true      # true=仅修当前章节；false=修全部 output/（生产环境慎用）
+  # Round 134: 名称统一（同人归一 + 音译漂移全文统一）
+  # 与 consistency 共用同一 pass（章节完成后自动跑）：
+  #   - allow 类别名（公爵 / 雷托公爵 / 杰西卡）：只登记白名单，正文保持多样性不替换；
+  #   - replace 类（菲德-劳萨 / 保罗·厄崔迪 / 彼得·德弗里斯）：音译漂移 → 全文统一；
+  #   - 扫描发现的一字漂移（费德→菲德 / 皮特→彼得）需 LLM 一次性裁决通过才应用，
+  #     LLM 不可用 → 保守不改（宁缺勿滥，防 Round 105「改坏正文」事故重演）。
+  name_unification:
+    enabled: true
+    llm_vetting: true        # 漂移候选 LLM 裁决（对齐所得直接信任，不经 LLM）
+    preferred_forms: {}      # 外挂首选形 {旧形: 首选形}（通用机制，无作品默认值）
+
   # Round 9: 实体完整性审计（纯诊断，不改译文）
   # 章节 run() 完成后扫描所有 final.json，对比 source_text 中的 source_names 与 final_text 是否含 canonical/variant
   # 输出 output/chXX/entity_audit.md：哪些已登记实体被 Rewriter 漏译
@@ -404,6 +421,10 @@ decision_engine:
   backtrack_mode: deferred
   max_backtrack_sweeps_per_chapter: 1    # deferred: 每章每次运行最多合并回溯 N 轮；0=不合并（登记保留到下次运行）
   max_backtrack_rounds_per_chunk: 2      # 治理计数: 单块累计被回溯重跑上限（跨 episode，两种模式通用）；0=不限制
+  # Round 135: PF 终态块复活预算（PERMANENTLY_FAILED → DIRTY，独立于回溯轮数上限）：
+  # 回溯登记触达终态块时给 N 次重跑机会（Round 134 白名单/软通过可治愈实体族死循环）；
+  # 0=关闭自动复活（仍可用 `requeue --force` 手动强制）。重跑失败由 backup 恢复旧版。
+  pf_requeue_max: 1
   context_max_terminology: 40            # 注入 prompt 的术语上限
   context_max_reference: 20
   context_max_style: 10

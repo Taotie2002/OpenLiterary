@@ -270,35 +270,10 @@ def _detect_issues(finals: list, entities: dict, decisions: dict) -> list:
                             "issue_type": "english_residue",
                         })
 
-        # 3c. 中文异体漂移检测（数据源：entity_registry.variant_names）
-        # Round 105: 普通词护栏。variant_names 历史上被「一字之差」误发现污染
-        # （东西/卡特/警察/伦敦金 等普通词被登记为人名异体）。盲目替换会改坏正文
-        # （某样东西→某样黛西 / 卡特姆勋爵→卡洛姆勋爵）。命中普通词黑名单的
-        # variant 一律跳过（不报告、不替换）。
-        for canonical, info in entities.items():
-            variants = info.get("variant_names", [])
-            if not variants:
-                continue
-            for v in variants:
-                if v not in text:
-                    continue
-                if _is_common_word_variant(v):
-                    continue
-                for m in re.finditer(re.escape(v), text):
-                    if _in_quote_or_note(text, m.start()):
-                        continue
-                    ctx = text[max(0, m.start() - 20): m.end() + 20].replace("\n", " ")
-                    issues.append({
-                        "chapter": fin["chapter"],
-                        "file": fin["file"],
-                        "path": fin["path"],
-                        "position": m.start(),
-                        "variant": v,
-                        "canonical": canonical,
-                        "context": ctx,
-                        "issue_type": "cjk_variant",
-                    })
-
+        # 3c. 中文异体漂移检测 —— Round 134 起从本函数移除：
+        #     variant_names 现在表达「同人白名单」（含语境称谓 公爵/雷托公爵），
+        #     一律替换会破坏文学多样性；改由 _apply_name_unification_pass 按
+        #     allow/replace 分类处理（音译漂移统一 + 分隔符复原，含 LLM 裁决）。
     return issues
 
 
@@ -388,6 +363,307 @@ def _apply_issues(finals: list, issues: list) -> int:
     return patched_files
 
 
+# ════════════════════════════════════════════════════════════════════
+# Round 134: 译后「名称统一」pass（同人归一 → 别名白名单 → 音译漂移全文统一）
+#
+# 与旧 3c（variant_names 盲替换）的区别：
+#   - 旧 3c 把所有 variant_names 一律替换为 canonical —— 会把「公爵/雷托公爵」
+#     这类语境称谓也替换掉，破坏文学多样性，且 variant_names 曾被普通词污染。
+#   - 新 pass 先做同人归一（unify_entity_registry），再用 classify_entity_variant
+#     分成两类：allow（称谓类，仅登记、正文不动）与 replace（音译漂移，全文统一）。
+#   - 扫描发现的一字漂移（费德→菲德 / 皮特→彼得）必须经 LLM 一次性批量裁决才应用；
+#     LLM 不可用/解析失败 → 保守不改（宁缺勿滥）。
+# ════════════════════════════════════════════════════════════════════
+
+def _load_name_unification_cfg() -> dict:
+    try:
+        from src.config import config as _cfg
+        return dict((getattr(_cfg, "pipeline", {}) or {}).get("name_unification", {}) or {})
+    except Exception:
+        return {}
+
+
+def _vet_name_drift_candidates(candidates: dict, cfg: dict, cache_path: Path) -> dict:
+    """Round 134: 对「扫描发现」的漂移候选做 LLM 一次性批量裁决。
+
+    Args:
+        candidates: {cand: {"to", "count", "contexts", "entity", "sources"}}
+        cfg: name_unification 配置段
+        cache_path: 裁决缓存 JSON（按 "cand->to" 键持久化，避免重复调用）
+
+    Returns:
+        {cand: to} —— 仅包含被裁决为「同一专名的不同写法」的候选。
+        任何失败（网络/解析/配额）→ 返回已裁决的部分或 {}（保守：不替换）。
+    """
+    if not candidates:
+        return {}
+    cache: dict = {}
+    try:
+        if cache_path.exists():
+            cache = robust_json_loads(cache_path.read_text(encoding="utf-8"), expected_type=dict) or {}
+    except Exception:
+        cache = {}
+    approved: dict = {}
+    to_ask = []
+    for cand, info in candidates.items():
+        key = f"{cand}->{info.get('to')}"
+        if key in cache:
+            if cache[key]:
+                approved[cand] = info.get("to")
+            continue
+        to_ask.append((cand, info))
+    if not to_ask:
+        return approved
+    if not bool(cfg.get("llm_vetting", True)):
+        return approved
+    # Round 137: 按出现次数降序送审——多出现候选优先，防止高价值目标被截断挤出。
+    to_ask.sort(key=lambda ci: -int((ci[1] or {}).get("count") or 0))
+
+    lines = []
+    for cand, info in to_ask[:80]:
+        ctx = " / ".join(info.get("contexts") or [])[:160]
+        srcs = "、".join(info.get("sources") or [])[:80]
+        lines.append(
+            f'- 候选「{cand}」→ 规范「{info.get("to")}」 | 实体: {info.get("entity", "")} '
+            f'| 英文指称: {srcs} | 正文出现 {info.get("count", 0)} 次 | 上下文: {ctx}'
+        )
+    prompt = (
+        "你在校验小说译文中的「专名书写漂移」（译名不统一的另一种写法）。下列每行给出"
+        "一个候选写法与规范写法、所属实体、英文指称与候选写法在正文中的上下文。\n"
+        "请判断：候选写法是否为**同一个专名的另一种书写/音译/错字形式**——专名包括"
+        "人物、地名、组织、器物、概念术语等（如人物「玛丽安/玛莉安」、地名"
+        "「卡斯提尔/卡斯蒂亚」、组织「银月商会/银月商团」这类整词改写）。\n"
+        "判 false 的情形：① 普通中文词或句子片段（尤其含「的/了/会/是」等功能字、"
+        "或名字后接谓语动词）；② 指称不同对象（组织 vs 其成员/分支、家族 vs 个人、"
+        "器物 vs 使用者）；③ 两个不同的专名。\n"
+        "只输出 JSON（不要解释、不要代码围栏）：\n"
+        '{"results":[{"from":"<候选>","to":"<规范>","is_name_drift":true}]}\n\n'
+        + "\n".join(lines)
+    )
+    try:
+        from src.utils.llm_adapter import (
+            get_llm_client, get_role_model_name, get_task_extra_body,
+        )
+        from src.config import config as _cfg
+        role = _cfg.get_task_role("name_vetting")
+        client = get_llm_client(role)
+        model_name = get_role_model_name(role)
+        extra = get_task_extra_body("name_vetting")
+        raw = client.generate(
+            prompt=prompt, model_name=model_name, max_tokens=4000,
+            temperature=0.0, **extra,
+        )
+    except Exception as e:
+        print(f"  ⚠️ [NameUnify] 漂移候选裁决失败（保守跳过）: {e}", file=sys.stderr)
+        return approved
+
+    try:
+        data = robust_json_loads(raw, expected_type=dict)
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        m = re.search(r"\{.*\}", raw or "", re.DOTALL)
+        data = robust_json_loads(m.group(0), expected_type=dict) if m else None
+    if not isinstance(data, dict):
+        print("  ⚠️ [NameUnify] 裁决结果解析失败（保守跳过）", file=sys.stderr)
+        return approved
+    asked = {c: info.get("to") for c, info in to_ask}
+    for item in (data.get("results") or []):
+        if not isinstance(item, dict):
+            continue
+        c, t = item.get("from"), item.get("to")
+        if c not in asked:
+            continue
+        ok = bool(item.get("is_name_drift"))
+        cache[f"{c}->{asked[c]}"] = ok
+        if ok:
+            approved[c] = asked[c]
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+    return approved
+
+
+def _apply_name_unification_pass(
+    finals: list,
+    db_path: str,
+    report_path: Path,
+    cache_path: Path,
+    scope_label: str = "",
+    dry_run: bool = False,
+) -> dict:
+    """Round 134: 章节/全书级名称统一（登记表归一 + 别名整形 + 漂移 token 统一）。
+
+    Args:
+        finals: 待处理 final.json 列表（[{chapter,file,text,path}]）
+        dry_run: True 时在数据库**临时拷贝**上试算并生成报告，真实 DB 与
+                 final.json 均不写入；LLM 候选裁决跳过（候选写入报告，apply 时裁决）。
+
+    Returns: {"files", "files_pending", "sep_restore", "forms", "tokens",
+              "approved", "rejected", "pending", "clusters", "dry_run"}
+    """
+    cfg = _load_name_unification_cfg()
+    if not bool(cfg.get("enabled", True)):
+        return {"files": 0, "sep_restore": 0, "forms": 0, "tokens": 0,
+                "approved": [], "rejected": [], "pending": [], "clusters": 0,
+                "dry_run": bool(dry_run), "skipped": True}
+    out = {"files": 0, "files_pending": 0, "sep_restore": 0, "forms": 0, "tokens": 0,
+           "approved": [], "rejected": [], "pending": [], "clusters": 0,
+           "dry_run": bool(dry_run)}
+    tmp_path = None
+    conn = None
+    try:
+        if dry_run:
+            # 临时拷贝：归一/映射在“与真库一致的视图”上试算，真库零写入
+            import tempfile
+            _fd, _tmp_name = tempfile.mkstemp(prefix="sagatrans_nu_", suffix=".sqlite")
+            os.close(_fd)
+            tmp_path = Path(_tmp_name)
+            conn = sqlite3.connect(str(tmp_path))
+            try:
+                _src_conn = sqlite3.connect(db_path)
+                _src_conn.backup(conn)
+                _src_conn.close()
+            except Exception as e:
+                print(f"  ⚠️ [NameUnify] dry-run 数据库拷贝失败: {e}", file=sys.stderr)
+        else:
+            conn = sqlite3.connect(db_path)
+    except Exception as e:
+        print(f"  ⚠️ [NameUnify] 数据库打开失败: {e}", file=sys.stderr)
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+        return out
+    try:
+        from src.core.decision_engine import (
+            unify_entity_registry, build_name_unification_maps, apply_name_unification,
+            _NAME_SEP_CHARS,
+        )
+        plan = unify_entity_registry(conn, dry_run=False)
+        out["clusters"] = len(plan)
+        corpus = "\n".join(f.get("text", "") for f in finals)
+        maps = build_name_unification_maps(
+            conn, corpus, preferred_forms=cfg.get("preferred_forms") or {},
+        )
+        cands = maps.get("token_candidates") or {}
+        if cands and dry_run:
+            out["pending"] = sorted(f"{c}→{i.get('to')}" for c, i in cands.items())
+        elif cands:
+            approved = _vet_name_drift_candidates(cands, cfg, cache_path)
+            for c, t in approved.items():
+                # Round 137: 长公共段扫描的候选携带原文形（可能含 ·/空格等分隔符，
+                # 戈姆·贾巴尔）→ 走 forms 通道，apply 的 forms 阶段按分隔符不敏感
+                # 正则替换（兼容同一名字的无分隔写法）；「一字之差」旧候选（纯 CJK
+                # 同长形）不带 form，维持 tokens 字面替换，行为与 Round 136 一致。
+                _info = cands.get(c) or {}
+                if _info.get("form"):
+                    maps.setdefault("forms", []).append(
+                        [_info["form"], t, _info.get("entity") or t])
+                else:
+                    maps["tokens"][c] = t
+            out["approved"] = sorted(f"{c}→{t}" for c, t in approved.items())
+            out["rejected"] = sorted(f"{c}→{i.get('to')}" for c, i in cands.items()
+                                     if c not in approved)
+        for fin in finals:
+            new_text, st = apply_name_unification(fin.get("text", ""), maps)
+            if new_text and new_text != fin.get("text", ""):
+                if dry_run:
+                    out["files_pending"] += 1
+                else:
+                    try:
+                        data = robust_json_loads(
+                            Path(fin["path"]).read_text(encoding="utf-8"), expected_type=dict,
+                        )
+                        if data:
+                            data["text"] = new_text
+                            meta = data.get("metadata")
+                            if not isinstance(meta, dict):
+                                meta = {}
+                            n_patch = st["sep_restore"] + st["forms"] + st["tokens"]
+                            meta["name_unification_patched"] = True
+                            meta["name_unification_patches"] = int(meta.get("name_unification_patches", 0)) + n_patch
+                            meta["name_unification_at"] = datetime.now().isoformat(timespec="seconds")
+                            data["metadata"] = meta
+                            Path(fin["path"]).write_text(
+                                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8",
+                            )
+                            fin["text"] = new_text
+                            out["files"] += 1
+                    except Exception as e:
+                        print(f"  ⚠️ [NameUnify] 写入失败 {fin.get('file')}: {e}", file=sys.stderr)
+            out["sep_restore"] += st["sep_restore"]
+            out["forms"] += st["forms"]
+            out["tokens"] += st["tokens"]
+        # 报告
+        try:
+            lines = [f"# Round 134 名称统一报告 — {scope_label}", ""]
+            mode = ("DRY RUN（仅报告；真实 DB 与 final.json 均未写入）" if dry_run
+                    else "已应用（登记表 + 正文）")
+            lines.append(f"- 模式: **{mode}**")
+            total = out["sep_restore"] + out["forms"] + out["tokens"]
+            lines.append(f"- 同人归一簇数: **{out['clusters']}**（登记表 winner/白名单）")
+            lines.append(f"- 正文替换合计: **{total}** 处 "
+                         f"(分隔符复原 {out['sep_restore']} / 别名整形 {out['forms']} / token 漂移 {out['tokens']})")
+            if dry_run:
+                lines.append(f"- 待写入文件: {out['files_pending']} / {len(finals)}")
+            else:
+                lines.append(f"- 受影响文件: {out['files']} / {len(finals)}")
+            lines.append("")
+            lines.append("## 统一映射（音译漂移 → 规范形）")
+            for v, t, w in maps.get("forms", [])[:40]:
+                lines.append(f"- `{v}` → `{t}`（{w}）")
+            token_map = maps.get("tokens") or {}
+            if token_map:
+                lines.append("")
+                lines.append("## token 级统一（含 LLM 裁决通过的候选）")
+                for a in sorted(token_map, key=lambda x: -len(x))[:60]:
+                    lines.append(f"- `{a}` → `{token_map[a]}`")
+            sem = maps.get("semantic_pending") or []
+            if sem:
+                lines.append("")
+                lines.append(f"## 同源语义别名（{len(sem)}；零字面交集/证据不足，未自动替换）")
+                lines += [f"- `{x}`" for x in sem[:20]]
+            if out["approved"]:
+                lines.append("")
+                lines.append(f"## LLM 裁决通过（{len(out['approved'])}）")
+                lines += [f"- `{x}`" for x in out["approved"][:40]]
+            if out["rejected"]:
+                lines.append("")
+                lines.append(f"## LLM 裁决否决（{len(out['rejected'])}，正文保持不变）")
+                lines += [f"- `{x}`" for x in out["rejected"][:40]]
+            if out["pending"]:
+                lines.append("")
+                lines.append(f"## LLM 裁决候选（{len(out['pending'])}，dry-run 未裁决；apply 时自动裁决）")
+                lines += [f"- `{x}`" for x in out["pending"][:40]]
+            allowed_only = [g for g in maps.get("guards", [])
+                            if g and g not in set(maps.get("authorities", []))]
+            lines.append("")
+            lines.append("## 白名单（允许并存的语境称谓/简称，正文不动）")
+            lines.append(f"- {len(allowed_only)} 项（variant_names policy=allow；详见 entity_registry）")
+            if allowed_only:
+                lines.append(f"- 示例: {'、'.join(sorted(set(allowed_only))[:12])}")
+            lines.append("")
+            report_path.write_text("\n".join(lines), encoding="utf-8")
+        except Exception as e:
+            print(f"  ⚠️ [NameUnify] 报告写入失败: {e}", file=sys.stderr)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+    return out
+
+
 def run_consistency_check(dry_run: bool = True, check_only: bool = False,
                           db_path: str = "", output_dir: str = "") -> int:
     """
@@ -437,6 +713,22 @@ def run_consistency_check(dry_run: bool = True, check_only: bool = False,
         print(f"    修改了 {patched} 个文件")
     elif dry_run and issues:
         print("\n⏸️  DRY RUN 模式：未修改任何文件（--apply 以执行修正）")
+
+    # Round 134: 名称统一 pass（全书 scope；dry_run 仅出报告）
+    try:
+        nu = _apply_name_unification_pass(
+            finals, db_path,
+            report_path=Path(output_dir) / "name_unification_report.md",
+            cache_path=Path(output_dir) / "_name_drift_vetting.json",
+            scope_label="(global)",
+            dry_run=dry_run,
+        )
+        if not nu.get("skipped"):
+            n_repl = nu["sep_restore"] + nu["forms"] + nu["tokens"]
+            print(f"\n🔗 [NameUnify] 同人归一 {nu['clusters']} 簇，正文替换 {n_repl} 处"
+                  f"（文件 {nu['files']}）→ name_unification_report.md")
+    except Exception as e:
+        print(f"⚠️ [NameUnify] 名称统一异常（不影响主流程）: {e}")
 
     print("\n🏁 完成")
     return len(issues)
@@ -501,6 +793,25 @@ def run_consistency_check_for_chapter(
         print(f"    ✏️ 已修正 {patched} 个文件")
     elif dry_run and issues:
         print(f"    ⏸️ DRY RUN：未修改文件")
+
+    # Round 134: 名称统一 pass —— 应用范围为 output/** 全文（音译漂移须跨章统一），
+    # 由 name_unification.enabled 独立门控（不受 legacy consistency_auto_fix 影响，
+    # 因其替换全部经过 winner 白名单 + LLM 裁决护栏）。
+    try:
+        finals_all = _scan_finals(output_root) or finals
+        nu = _apply_name_unification_pass(
+            finals_all, db_path,
+            report_path=Path(output_root) / "name_unification_report.md",
+            cache_path=Path(output_root) / "_name_drift_vetting.json",
+            scope_label=f"{chapter_id} → 全文 output/**",
+            dry_run=False,
+        )
+        if not nu.get("skipped"):
+            n_repl = nu["sep_restore"] + nu["forms"] + nu["tokens"]
+            print(f"    🔗 [NameUnify] 同人归一 {nu['clusters']} 簇，正文替换 {n_repl} 处"
+                  f"（文件 {nu['files']}）→ name_unification_report.md")
+    except Exception as e:
+        print(f"    ⚠️ [NameUnify] 名称统一异常（不影响主流程）: {e}")
 
     return len(issues)
 

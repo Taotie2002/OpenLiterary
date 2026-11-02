@@ -1106,6 +1106,16 @@ class TranslationPipeline:
     @staticmethod
     def _extract_reject_categories(reason_text: str) -> set:
         return extract_reject_categories(reason_text, as_set=True)
+
+    # Round 134: 从拒因文本提取「被点名实体」集合（用于停滞判据）。
+    # 旧判据只比 primitive category 集合 → 实体集合在变（在修）也被判"没修"。
+    @staticmethod
+    def _extract_flagged_entities(reason_text: str) -> set:
+        return {
+            m.group(0).rsplit("(noul=", 1)[0]
+            for m in re.finditer(r"[^\s,，|]+?\(noul=[0-9.]+\)", reason_text or "")
+            if m.group(0)
+        }
     # Round 34: thin shim — delegates to src.utils.text_match.case_insensitive_find
     @staticmethod
     def _case_insensitive_find(name: str, haystack: "str | None") -> "str | None":
@@ -1252,9 +1262,25 @@ class TranslationPipeline:
 
             time.sleep(poll_interval)
 
+        # Round 135: 备份恢复/版本择优必须先于章末归一与各项审计执行 ——
+        # 否则版本择优回滚（final.json ← final_backup.json）会把刚应用到新版
+        # final.json 的归一替换静默抹掉（ch01 run: 5 块择优回滚），且
+        # entity_audit / consistency 会基于回滚前文本判定，口径失真。
+        # Round 107 P7: 恢复回溯重跑失败的 final_backup.json (在验证前)
+        try:
+            self._restore_dirty_backups()
+        except Exception as e:
+            print(f"⚠️ [Pipeline] 恢复 dirty backup 异常（不影响主流程）: {e}")
+
+        # Round 134: 章末再归一一次（收尾注册的别名，保证 consistency 与报告口径一致）
+        try:
+            self._maybe_unify_entity_registry()
+        except Exception:
+            pass
+
         # Round 7: 译后一致性校正（章节级 scope，auto-apply）
-        # 修复 alias_mixed / english_residue / cjk_variant 三类命名漂移
-        # QA_REPORT 显示 162 处不一致散落在历史章节里，启用后可批量修复
+        # 修复 alias_mixed / english_residue 两类命名漂移（Round 134 起 cjk_variant
+        # 由名称统一 pass 处理：allow 类保持多样性，replace 类全文统一）
         post_consistency_cfg = _config.pipeline.get("post_consistency", {}) or {}
         if post_consistency_cfg.get("enabled", True):
             try:
@@ -1272,17 +1298,26 @@ class TranslationPipeline:
                 if conflicts:
                     cross = sum(1 for c in conflicts if c["conflict_type"] == "cross_entity")
                     variant = sum(1 for c in conflicts if c["conflict_type"] == "variant_for_same_person")
+                    resolved = sum(1 for c in conflicts if c["conflict_type"] == "resolved_same_person")
                     lines = []
                     lines.append(f"# entity_registry 冲突检测 - {self.chapter_id}\n\n")
-                    lines.append(f"- 总冲突数: {len(conflicts)} (跨人物: {cross}, 同人变体: {variant})\n\n")
+                    lines.append(f"- 总冲突数: {len(conflicts)} "
+                                 f"(跨人物: {cross}, 同人变体: {variant}, 已自动归一: {resolved})\n\n")
+                    if resolved:
+                        lines.append("## ✅ 已自动归一（Round 134 同人归一生效，无需人工处理）\n\n")
+                        for c in [x for x in conflicts if x["conflict_type"] == "resolved_same_person"]:
+                            lines.append("- **\"" + c["source_name"] + "\"** ← " + str(c["canonicals"])
+                                         + "  →  簇: `" + str(c.get("resolved_by", "")) + "`\n")
+                        lines.append("")
                     lines.append("## 跨人物冲突（明确错误，需人工修复）\n\n")
                     for c in [x for x in conflicts if x["conflict_type"] == "cross_entity"]:
                         lines.append("- **\"" + c["source_name"] + "\"** ← " + str(c["canonicals"]) + "\n")
                     lines.append("\n## 同人变体（可接受但建议整合）\n\n")
                     for c in [x for x in conflicts if x["conflict_type"] == "variant_for_same_person"]:
                         lines.append("- **\"" + c["source_name"] + "\"** ← " + str(c["canonicals"]) + "\n")
-                    lines.append("\n注：本报告为诊断用，**不会自动修改 entity_registry**。\n")
-                    lines.append("修复方式：人工编辑 decision_db.sqlite 的 entity_registry 表 source_names 列。\n")
+                    lines.append("\n注：Round 134 起，同人别名会由 unify_entity_registry 自动归一\n")
+                    lines.append("（winner + 白名单 variant_names 写库），")
+                    lines.append("残留人工项只需处理「跨人物冲突」。\n")
                     conflict_path = self.output_dir / "entity_registry_conflicts.md"
                     conflict_path.write_text("".join(lines), encoding="utf-8")
                     print(f"⚠️ [Entity Registry] 发现 {cross} 个跨人物冲突 + {variant} 个同人变体（详见 entity_registry_conflicts.md）")
@@ -1312,12 +1347,6 @@ class TranslationPipeline:
             self._cleanup_intermediates()
         except Exception as e:
             print(f"⚠️ [Pipeline] 中间文件清理异常（不影响主流程）: {e}")
-
-        # Round 107 P7: 恢复回溯重跑失败的 final_backup.json (在验证前)
-        try:
-            self._restore_dirty_backups()
-        except Exception as e:
-            print(f"⚠️ [Pipeline] 恢复 dirty backup 异常（不影响主流程）: {e}")
 
         # 完成后交叉验证：final.json 落盘数应与任务数一致，否则视为假阳性完成
         return self._verify_final_outputs(len(existing_tasks))
@@ -2147,6 +2176,24 @@ class TranslationPipeline:
                 "conflict_type": conflict_type,
             })
 
+        # Round 134: 已被同人归一（unify_entity_registry）覆盖的冲突 → resolved。
+        # 语义：同一 source_name 落到同一簇的多个 canonical 上 = 已收编为白名单,
+        # 不再是"跨人物错误"（残留的人工编辑提示也不再需要）。
+        try:
+            from src.core.decision_engine import unify_entity_registry
+            plan = unify_entity_registry(self.decision_engine.conn, dry_run=True)
+            cluster_of = {}
+            for key, info in plan.items():
+                for canon in [info["winner"]] + list(info.get("demoted", [])):
+                    cluster_of[canon] = key
+            for c in conflicts:
+                keys = {cluster_of.get(x) for x in c["canonicals"]}
+                if keys and None not in keys and len(keys) == 1:
+                    c["conflict_type"] = "resolved_same_person"
+                    c["resolved_by"] = keys.pop()
+        except Exception:
+            pass
+
         return conflicts
 
     def _post_pipeline_entity_audit(self) -> dict:
@@ -2226,6 +2273,10 @@ class TranslationPipeline:
                 # Round 105: 用 _canonical_present_in_text 容差判定（与一致性检查同语义），
                 # 消除括注名（镇（town）/科德斯（Codders））与前缀写法（乔治·洛马克斯 vs 乔治·洛马克斯先生）的假阳性
                 present_forms = [canonical] + [v for v in variant_names if v]
+                # Round 134: 复合名简称/单段形也算在场（菲德-罗萨 ⊂ 菲德-罗萨·哈克南 族）
+                if not any(f and f in text for f in present_forms) \
+                        and self._canonical_present_in_text(canonical, text):
+                    present_forms.append(self._strip_parenthetical(canonical))
                 found = any(self._canonical_present_in_text(form, text) for form in present_forms)
                 if found:
                     chunk_present.append({
@@ -2577,8 +2628,13 @@ class TranslationPipeline:
         self._backtrack_sweeps_done = sweeps_done + 1
         dirty = stats.get("dirty", []) if isinstance(stats, dict) else []
         over_cap = stats.get("over_cap", []) if isinstance(stats, dict) else []
+        pf_over = stats.get("pf_over_cap", []) if isinstance(stats, dict) else []
         print(f"🧩 [Backtrack] 章末合并回溯：登记 {len(entries)} 个 → 标记 DIRTY {len(dirty)} 个"
               + (f"，治理冻结 {len(over_cap)} 个（超单块预算）" if over_cap else ""))
+        if pf_over:
+            # Round 135: PF 复活预算用尽（终态块不再复活；可用 requeue --force 强制）
+            print(f"🧊 [Backtrack] PF 复活预算用尽 {len(pf_over)} 个："
+                  f"{', '.join(pf_over[:5])}{'…' if len(pf_over) > 5 else ''}（requeue --force 可强制）")
         if over_cap:
             self._write_backtrack_frozen_report(over_cap, entries)
         return bool(dirty)
@@ -2998,6 +3054,7 @@ class TranslationPipeline:
             self.scheduler.batch_update_state(success_ids, TaskState.REWRITING_LITERARY)
 
     def _process_rewriting_batch(self, tasks):
+        self._maybe_unify_entity_registry()  # Round 134
         success_ids = []
         entity_feedback: str = ''
         entity_registry_for_rewriter: Dict[str, str] = {}
@@ -3279,8 +3336,11 @@ class TranslationPipeline:
                         prev_reject_summary = prev_meta_obj.get("reject_reason_summary", "") or ""
                         if match_mode == "category":
                             # Round 16: 比较 primitive category 集合（忽略 noul 浮动）
+                            # Round 134: 纳入「被点名实体」集合 —— 实体在变（在修）不算停滞
                             prev_cats = self._extract_reject_categories(prev_reject_summary)
                             curr_cats = self._extract_reject_categories(current_reject_summary)
+                            prev_cats |= self._extract_flagged_entities(prev_reject_summary)
+                            curr_cats |= self._extract_flagged_entities(current_reject_summary)
                             is_stagnation = bool(prev_cats) and prev_cats == curr_cats
                         elif match_mode == "exact":
                             is_stagnation = (prev_reject_summary == current_reject_summary)
@@ -3363,6 +3423,30 @@ class TranslationPipeline:
                         pass
 
                 if should_force_fallback:
+                    # Round 134: 「仅实体一致性维度」停滞不再判 PERMANENTLY_FAILED。
+                    # ch01 实测：实体拒因族不可执行（要求把 公爵 改为全名等）导致 6 个 chunk
+                    # 连续 retry 后 PF；Round 134 已用白名单 + 音译统一从根上消除该冲突，
+                    # 此处再加一道护栏：实体-only 停滞 → 接受当前稿并标注（COMPLETED），
+                    # 避免整章被 6 次无效重试拖死（用户此前实测 ch09 超 24h 未收敛）。
+                    _cur_cats = self._extract_reject_categories(current_reject_summary)
+                    # Round 116 优先：换模型机会尚在 → 先换模型再试一轮（质量优先）；
+                    # 换模型已用尽/不可用 → 实体-only 停滞才软通过（终止性护栏）。
+                    _switch_available = bool(
+                        sw_enabled and sw_alt_role and sw_state
+                        and sw_state.get("can_switch")
+                    )
+                    if is_stagnation and _cur_cats and _cur_cats <= {"实体一致性违反"} \
+                            and not _switch_available:
+                        self._save_final_with_sanity(chunk_id, lit_text)
+                        self.scheduler.update_task_state(
+                            chunk_id, TaskState.COMPLETED,
+                            error_msg=(
+                                f"[ENTITY_SOFT_PASS] 实体维度停滞（{force_reason}），"
+                                f"白名单/统一 pass 兜底，接受当前稿"
+                            ),
+                        )
+                        print(f"🛡️ [Pipeline] {chunk_id} 实体维度停滞 → 软通过（不再判死）: {force_reason}")
+                        continue
                     print(
                         f"⏹️ [Pipeline] {chunk_id} retry={quality_retries} 强制 fallback：{force_reason}"
                     )
@@ -3436,6 +3520,16 @@ class TranslationPipeline:
             return False
         if canonical in lit_text:
             return True
+        # Round 134: token 级容差 —— 复合名（菲德-罗萨·哈克南 / 彼得·德·弗里斯）在正文
+        # 里常以简称或单段形式出现（菲德-罗萨 / 菲德 / 保罗）。整串匹配误判 missing →
+        # rewriter 死循环。任一分段（≥2 字）在场即视为在场（读者可凭上下文识别）。
+        try:
+            from src.core.decision_engine import canonical_tokens
+            for tok in canonical_tokens(canonical):
+                if len(tok) >= 2 and tok in lit_text:
+                    return True
+        except Exception:
+            pass
         base = self._strip_parenthetical(canonical)
         if not base:
             return False
@@ -3680,6 +3774,61 @@ class TranslationPipeline:
                 start = idx + 1
         return None
 
+    def _maybe_unify_entity_registry(self) -> int:
+        """Round 134: 运行中惰性同人归一（entity_registry max(id) 变化即重跑，幂等）。
+
+        背景：同人别名在流程中途才出现（公爵 ch31 注册、雷托·阿特雷德斯 ch47 注册），
+        若只在章末归一，其间所有 chunk 都拿不到白名单 → 实体核查死循环（ch01 实测）。
+        因此每个批处理阶段入口按「max(id) 变化」触发一次；成本 = 一次全表读 + O(n²)
+        聚类（n≈百级，毫秒级），归一写入后清空三个实体缓存。
+        """
+        if not getattr(self, "decision_engine", None):
+            return 0  # 兼容测试桩（__new__ 构造、未注入 decision_engine）
+        try:
+            row = self.decision_engine.conn.execute(
+                "SELECT COUNT(*), COALESCE(MAX(id), 0) FROM entity_registry"
+            ).fetchone()
+            sig = (int(row[0]), int(row[1]))
+        except Exception:
+            return 0
+        if getattr(self, "_unify_registry_sig", None) == sig:
+            return 0
+        try:
+            from src.core.decision_engine import unify_entity_registry
+            plan = unify_entity_registry(self.decision_engine.conn, dry_run=False)
+        except Exception as e:
+            print(f"  ⚠️ [Entity Registry] Round134 同人归一失败: {e}", file=sys.stderr)
+            self._unify_registry_sig = sig
+            return 0
+        self._unify_registry_sig = sig
+        changed = sum(int(v.get("changed", 0)) for v in plan.values())
+        if changed:
+            if hasattr(self, "_entity_registry_cache"):
+                self._entity_registry_cache.clear()
+            if hasattr(self, "_entity_variants_cache"):
+                self._entity_variants_cache.clear()
+            self._sibling_canonicals_cache = None
+            winners = sorted({v["winner"] for v in plan.values()})
+            print(f"🔗 [Entity Registry] Round134 同人归一: {len(plan)} 簇 / {changed} 行 "
+                  f"(winner: {', '.join(winners[:6])}{'…' if len(winners) > 6 else ''})")
+        return changed
+
+    def _entity_note_satisfied(self, note: dict, lit_text: str) -> bool:
+        """Round 134: 判定一条实体违规是否已被「允许写法/简称」满足（防误判死循环）。
+
+        - missing / variant_instead_of_canonical 且规范名（或其 token）在场 → 满足；
+        - 中文 found 形（已登记别名残留）→ 满足；英文残留（无 CJK）→ 不满足（真问题）。
+        """
+        if not isinstance(note, dict) or not lit_text:
+            return False
+        ent = note.get("entity") or note.get("expected") or ""
+        if ent and self._canonical_present_in_text(ent, lit_text):
+            return True
+        found = note.get("found")
+        if isinstance(found, str) and found and re.search(r"[\u4e00-\u9fff]", found) and found in lit_text:
+            return True
+        return False
+
     def _get_sibling_canonicals(self) -> Dict[str, Set[str]]:
         """Round 71/133b: 全 registry 的 source_name → {canonical} 映射（含 pending 行）。
 
@@ -3808,18 +3957,17 @@ class TranslationPipeline:
             if not appears_in_source:
                 continue
 
-            # Round 21: 收集所有出现在 lit_text 中的 variant（不只第一个）
-            matched_variants = []  # [(variant_found_in_lit, source_name_matched)]
+            # Round 134: 已登记变体 = 允许写法（unify 写入的白名单：公爵 / 雷托公爵 /
+            # 杰西卡 / 菲德-劳萨 …）。旧 Round 21 把 variant 一律判为违规，
+            # 与 per-entity Jev criteria（变体=合规）自相矛盾，且逼 rewriter 把
+            # 语境称谓改写成全名 → 死循环。这里改为：命中即视为「在场」，不报违规。
+            allowed_variant_hit = None
             for vn in variant_names:
                 found_form = self._case_insensitive_find(vn, lit_text)
                 if found_form:
-                    # 反查该 variant 在原文中以哪种 source_name 形式出现
-                    matched_src = None
-                    for sn in source_names:
-                        if self._case_insensitive_find(sn, source_text):
-                            matched_src = sn
-                            break
-                    matched_variants.append((found_form, matched_src))
+                    allowed_variant_hit = found_form
+                    break
+            matched_variants = []  # [(variant_found_in_lit, source_name_matched)]
 
             # Round 21: 收集所有出现在 lit_text 中的 source_name
             matched_source_names = []
@@ -3851,7 +3999,10 @@ class TranslationPipeline:
             else:
                 # Round 108: 一字之差近变体检测（译名漂移，如 伊琳·布伦特夫人 vs 艾琳·布伦特夫人）。
                 # 比 missing 更可执行：给 rewriter 具体的 found→expected 替换清单。
-                near_variant = self._find_near_variant(canonical, lit_text)
+                # Round 134: 已归一实体（variant_names 非空）的音译漂移由译后统一 pass
+                # 全文修正；逐 chunk 报漂移会诱发 retry 死循环（ch01 6 个 PF 根因）。
+                near_variant = None if (variant_names or allowed_variant_hit) else \
+                    self._find_near_variant(canonical, lit_text)
                 if near_variant:
                     matched_source = None
                     for sn in effective_source_names:
@@ -3866,7 +4017,8 @@ class TranslationPipeline:
                         "type": "variant_instead_of_canonical",
                         "chunk_id": chunk_id,
                     })
-            if not all_violations and not near_variant and not self._canonical_present_in_text(canonical, lit_text):
+            if not all_violations and not near_variant and not allowed_variant_hit \
+                    and not self._canonical_present_in_text(canonical, lit_text):
                 # 只有原文中确实出现了该实体时才报 missing
                 # 避免"全书角色本章未出场"的假阳性
                 matched_source = None
@@ -4109,6 +4261,7 @@ class TranslationPipeline:
         )
 
     def _process_auditing_batch(self, tasks):
+        self._maybe_unify_entity_registry()  # Round 134: 归一后再建 sibling 缓存
         success_ids = []
         # Round 71: 每次审计批次开始重置跨人物冲突 sibling 缓存, 避免跨章节脏数据
         self._sibling_canonicals_cache = None
@@ -4210,6 +4363,8 @@ class TranslationPipeline:
                     n for n in (entity_notes or [])
                     if n.get("type") in ("variant_instead_of_canonical", "missing")
                 ]
+                # Round 134: 允许写法/简称确已在场 → 不计严重违规（防"不可执行拒因"死循环）
+                serious = [n for n in serious if not self._entity_note_satisfied(n, lit_text)]
                 # Round 101 P1: audit 高分直通 — 所有维度评分 ≥ high_threshold + 无实体违规 + CJK 高,
                 # 直接 COMPLETED, 跳过 judge LLM 调用. 与 AUDIT_EARLY_STOP (R99 P3) 互补:
                 #   R99 P3: 评分低 → PERMANENTLY_FAILED (跳 judge + rewriter)

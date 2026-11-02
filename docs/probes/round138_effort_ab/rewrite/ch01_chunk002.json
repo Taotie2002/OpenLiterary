@@ -1,0 +1,26 @@
+{
+ "track": "rewrite",
+ "chunk": "ch01_chunk002",
+ "chapter": "ch01",
+ "difficulty": 4.0,
+ "retries": 2,
+ "quality_retries": 0,
+ "model": "Deepseek-V4.1-Flash-1017-SS",
+ "drafts": {
+  "max": {
+   "ok": false,
+   "text": null,
+   "latency": 217.7,
+   "err": "RuntimeError: 模型仅输出推理、无正文（reasoning=51458 chars）——疑似 thinking 耗尽 max_tokens，判定调用失败"
+  },
+  "xhigh": {
+   "ok": false,
+   "text": null,
+   "latency": 195.3,
+   "err": "RuntimeError: 模型仅输出推理、无正文（reasoning=29433 chars）——疑似 thinking 耗尽 max_tokens，判定调用失败"
+  }
+ },
+ "referee": {
+  "kind": "arm_failed"
+ }
+}

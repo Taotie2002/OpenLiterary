@@ -17,7 +17,7 @@
 
 - **文学编译而非翻译**：整本书被解构为编译流水线，每个阶段都有可检查的中间产物（chunk 初译 / 润色稿 / 维度评分 / 裁决记录），任何质量问题都能定位到具体阶段与片段。
 - **决策驱动**：`Decision DB`（SQLite）维护全局翻译决策（术语、典故、风格、注释策略）；决策变更会触发受影响 chunk 的增量回溯重译，保证全书一致。
-- **多模型分工路由**：`literal_translator`(Qwen) 承担直译与考据召回；`secondary`(DeepSeek) 承担文学润色（Round 129 起，实测 max 稳定）、审计评分与考据确认；`primary`(MiniMax-M3.1) 保留最终裁决、风格剖面、成书审读与困难片段直译——三家族分工降低同源盲区。思考档位按任务配置（`task_routing.<task>.effort`，合法档位逐家校验、2026-10 实测；如 judge=max、rewrite=max、critic=none、直译=none；`none`=显式关闭思考），高难度片段经难度路由切至主力模型并加档，停滞救稿/双稿第二稿同样加档。**配额韧性（Round 129）**：MiniMax 配额/限流持续耗尽时 primary 角色自动降级到 secondary，流水线不中断。
+- **多模型分工路由**：`literal_translator`(Qwen) 承担直译与考据召回；`secondary`(DeepSeek) 承担文学润色（Round 138 起 xhigh：max 档 A/B 零胜、失败率 3×，证据见 docs/probes/round138_effort_ab/）、审计评分与考据确认；`primary`(MiniMax-M3.1) 保留最终裁决、风格剖面、成书审读与困难片段直译——三家族分工降低同源盲区。思考档位按任务配置（`task_routing.<task>.effort`，合法档位逐家校验、2026-10 实测；如 judge=max、rewrite=xhigh、critic=none、直译=none；`none`=显式关闭思考），高难度片段经难度路由切至主力模型并加档，停滞救稿/双稿第二稿同样加档。**配额韧性（Round 129）**：MiniMax 配额/限流持续耗尽时 primary 角色自动降级到 secondary，流水线不中断。
 - **动态风格剖面**：风格提示词由 `StyleProfiler` 从原文抽样动态生成（按作品隔离落盘 `input/book_profile.json`），不硬编码任何作品先验。
 - **Jev 仲裁核心**：TypeSafe System One 概率校准裁决；不可用时按 `confidence_source` 分档降级并标记未校准（绝不静默当作 Jev 结论使用）。
 
@@ -30,8 +30,27 @@ split → init → pipeline → style-profile → consolidate → finalize
 
 - **pipeline**：chunk 级「直译 → 文学润色 → 批评评分 → 裁决 → 回溯」闭环，状态机 + SQLite 持久化，可断点续跑。
 - **回溯治理（Round 130）**：决策变更默认**章末合并式回溯**（`decision_engine.backtrack_mode: deferred`）——先登记 `pending_backtrack` 队列，章节队列清空时合并应用一次；单块累计回溯轮数（`max_backtrack_rounds_per_chunk`）与章级合并轮数（`max_backtrack_sweeps_per_chapter`）超预算即冻结（明细见 `output/chXX/backtrack_frozen.md`）；重跑新版 critic 均分低于备份版时自动保留旧版（`pipeline.version_merit`）。设 `backtrack_mode: immediate` 可回退旧行为。
+- **PF 复活（Round 135）**：`PERMANENTLY_FAILED` 终态块被回溯登记触达时自动复活一次重跑（`decision_engine.pf_requeue_max`，默认 1 次/块，独立于回溯轮数上限；重跑失败由备份恢复旧稿，不劣化）；显式通道 `requeue --chapter chXX [--force]`（`--force` 绕预算强制复活）。
 - **consolidate / finalize**：跨 chunk 合并、章内衔接与终稿整合，产出 `output/ch*/ch*_chunk*_final.json` → `output/translated_full.md`。
 - **lint / consistency / gate**：脚注、引号、韵文、双关、术语一致性与交付门禁。
+- **实体名归一 / 音译漂移统一（Round 134）**：同人多译名自动合并（winner + 白名单），
+  语境称谓（公爵/简称）保留多样性；音译漂移（菲德-劳萨↔菲德-罗萨 类）全文统一，
+  扫描候选经 LLM 裁决后应用，LLM 不可用则保守不改。章节完成自动执行，
+  报告见 `output/name_unification_report.md`（`consistency` 子命令默认 dry-run 仅报告，`--apply` 落地）。
+  字面无交集的双译法（皮特/彼得 类）可用 `pipeline.name_unification.preferred_forms` 外挂统一。
+  **分量级一致性（Round 136）**：同一人物的同名分量（first/last name）用字必须一致，
+  但**粒度各自保留**——原文全名→译文全名，原文简称→译文简称（皮特→彼得，简称仍是简称；
+  绝不展开/收缩）。零字面交集分量按长度唯一匹配对齐；语境指称/敬语（孩子/少主/老巫婆/令尊
+  类）与头衔称谓不参与替换。另含「决策桥接」：winner 的英文指称在 decision_db 有译文 t
+  而 t 未登记为任何实体形式、且与 winner 分量对齐时，把正文 t 统一为对齐结果（证据链：
+  专名级来源 + person 实体 + 非关系指称）。
+  **非人名专名一致性（Round 137）**：一致性扩展从人物名推广到**全部实体类型**
+  （地名/组织/器物/概念术语）——①决策桥接放宽到非 person，低相似度证据
+  （Guildsman→公会成员 类）不替换、仅进报告；②新增长公共段漂移扫描（规范名 +
+  上下文窗口，护栏剔除「专名+谓语」句子片段），候选经 LLM 裁决后按分隔符不敏感
+  替换（戈姆·贾巴尔→戈姆刺 类，含无分隔写法兼容）；③同源语义别名
+  （官邸 vs 总督府，零字面交集）**不**强行替换——只在报告「同源语义别名」节列出，
+  交由人工/后续流程判断，保护文学性。
 
 ## 质量体系
 

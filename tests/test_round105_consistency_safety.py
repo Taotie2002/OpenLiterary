@@ -42,17 +42,23 @@ class TestCjkVariantCommonWordFilter:
         cjk = [i for i in issues if i["issue_type"] == "cjk_variant"]
         assert cjk == [], f"普通词不应被报告为 cjk_variant: {cjk}"
 
-    def test_real_variant_still_flagged(self):
-        """真异体（非普通词）仍应被 3c 报告。"""
+    def test_whitelist_variant_not_reported_by_detect(self):
+        """Round 134: variant_names = 同人白名单（允许写法）→ _detect_issues 不再报 cjk_variant。"""
         from src.consistency import _detect_issues
-        # 规范名 黛曦，异体 黛西（非普通词，差异字冷僻）
         text = "黛西站在门口。"
         finals = [_fin(text)]
         entities = _entities({"黛曦": ["黛西"]})
         issues = _detect_issues(finals, entities, {})
         cjk = [i for i in issues if i["issue_type"] == "cjk_variant"]
-        assert any(i["variant"] == "黛西" and i["canonical"] == "黛曦" for i in cjk), \
-            f"真异体应被报告: {cjk}"
+        assert cjk == [], f"白名单写法不应再被 cjk_variant 报告: {cjk}"
+
+    def test_real_drift_replaced_by_unification_pass(self):
+        """真音译漂移（多 token 对齐，如 黛曦·罗德 vs 黛西·罗德）仍会被统一 pass 全文修正。"""
+        from src.core.decision_engine import classify_entity_variant
+        cls = classify_entity_variant("黛曦·罗德", "黛西·罗德")
+        assert cls["policy"] == "replace", cls
+        assert cls["target"] == "黛西·罗德", cls
+        assert ("黛曦", "黛西") in (cls.get("token_map") or []), cls
 
     def test_is_common_word_variant_helper(self):
         from src.consistency import _is_common_word_variant

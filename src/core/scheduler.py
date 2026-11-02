@@ -148,6 +148,14 @@ class TaskScheduler:
             self.conn.commit()
         except sqlite3.OperationalError:
             pass
+
+        # Round 135: PF 复活计数列（PERMANENTLY_FAILED → DIRTY 的独立预算，
+        # 不随质量计数/回溯计数清零）
+        try:
+            cursor.execute('ALTER TABLE chunk_tasks ADD COLUMN pf_requeues INTEGER DEFAULT 0')
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
         
         # 批处理支持索引
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_state ON chunk_tasks(state)')
@@ -443,26 +451,46 @@ class TaskScheduler:
         decision_engine.max_backtrack_rounds_per_chunk 即冻结，不再标记 DIRTY。
         0 = 不限制（旧行为，向后兼容）。
 
+        Round 135 PF 复活：被回溯登记触达的 PERMANENTLY_FAILED 终态块给一次重跑机会
+        （Round 134 白名单/软通过可治愈实体族死循环；预算 decision_engine.pf_requeue_max，
+        默认 1 次/块，0=关闭）。复活走同一 DIRTY 通道（final.json 自动转 backup，
+        重跑失败由 _restore_dirty_backups 恢复旧版）；预算由 pf_requeues 单独管控，
+        不受 backtrack_rounds 上限约束（终态块否则永久卡死）。
+
         Returns:
-            {"dirty": [...], "over_cap": [...], "skipped_state": [...]}
+            {"dirty": [...], "over_cap": [...], "skipped_state": [...],
+             "pf_requeued": [...], "pf_over_cap": [...]}
         """
         if not chunk_ids:
-            return {"dirty": [], "over_cap": [], "skipped_state": []}
+            return {"dirty": [], "over_cap": [], "skipped_state": [],
+                    "pf_requeued": [], "pf_over_cap": []}
         de_cfg = getattr(_config, "decision_engine", {}) or {}
         try:
             cap = int(de_cfg.get("max_backtrack_rounds_per_chunk", 2) or 0)
         except (TypeError, ValueError):
             cap = 2
+        try:
+            pf_cap = int(de_cfg.get("pf_requeue_max", 1) or 0)
+        except (TypeError, ValueError):
+            pf_cap = 1
         cursor = self.conn.cursor()
         placeholders = ','.join('?' for _ in chunk_ids)
         cursor.execute(f'''
-            SELECT chunk_id, state, COALESCE(backtrack_rounds, 0)
+            SELECT chunk_id, state, COALESCE(backtrack_rounds, 0), COALESCE(pf_requeues, 0)
             FROM chunk_tasks WHERE chunk_id IN ({placeholders})
         ''', tuple(chunk_ids))
         dirty: List[str] = []
         over_cap: List[str] = []
         skipped_state: List[str] = []
-        for cid, state, rounds in cursor.fetchall():
+        pf_requeued: List[str] = []
+        pf_over_cap: List[str] = []
+        for cid, state, rounds, pf_n in cursor.fetchall():
+            if state == TaskState.PERMANENTLY_FAILED.value:
+                if pf_cap > 0 and int(pf_n or 0) < pf_cap:
+                    pf_requeued.append(cid)
+                else:
+                    pf_over_cap.append(cid)
+                continue
             if state != TaskState.COMPLETED.value:
                 skipped_state.append(cid)
                 continue
@@ -478,14 +506,78 @@ class TaskScheduler:
                     updated_at = CURRENT_TIMESTAMP
                 WHERE chunk_id IN ({ph2})
             ''', (TaskState.DIRTY.value,) + tuple(dirty))
+        if pf_requeued:
+            ph3 = ','.join('?' for _ in pf_requeued)
+            cursor.execute(f'''
+                UPDATE chunk_tasks
+                SET state = ?, pf_requeues = COALESCE(pf_requeues, 0) + 1,
+                    backtrack_rounds = COALESCE(backtrack_rounds, 0) + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chunk_id IN ({ph3})
+            ''', (TaskState.DIRTY.value,) + tuple(pf_requeued))
         self.conn.commit()
-        msg = f"🔄 已触发 {len(dirty)} 个数据块的回溯重构（标记 DIRTY）"
+        msg = f"🔄 已触发 {len(dirty) + len(pf_requeued)} 个数据块的回溯重构（标记 DIRTY）"
+        if pf_requeued:
+            msg += f"（其中 PF 复活 {len(pf_requeued)} 个）"
         if skipped_state:
             msg += f"（跳过 {len(skipped_state)} 个非 COMPLETED 状态）"
         if over_cap:
             msg += f"（治理冻结 {len(over_cap)} 个超单块预算）"
+        if pf_over_cap:
+            msg += f"（PF 复活预算用尽 {len(pf_over_cap)} 个）"
         print(msg + "。")
-        return {"dirty": dirty, "over_cap": over_cap, "skipped_state": skipped_state}
+        return {"dirty": dirty + pf_requeued, "over_cap": over_cap,
+                "skipped_state": skipped_state, "pf_requeued": pf_requeued,
+                "pf_over_cap": pf_over_cap}
+
+    def requeue_permanently_failed(self, chapter_id: str,
+                                   chunk_ids: Optional[List[str]] = None,
+                                   force: bool = False) -> Dict[str, List[str]]:
+        """Round 135: 把 PERMANENTLY_FAILED 终态块恢复为 DIRTY（显式重跑通道，CLI 用）。
+
+        预算：decision_engine.pf_requeue_max（默认 1 次/块；0=禁止自动，但 force 仍可）。
+        复活后走 DIRTY 批处理：final.json → final_backup.json（重跑失败由
+        _restore_dirty_backups 恢复旧版），质量计数在 DIRTY 批次入口清零。
+
+        Returns:
+            {"requeued": [...], "over_cap": [...], "skipped": [...]}
+        """
+        cursor = self.conn.cursor()
+        if chunk_ids is None:
+            chunk_ids = [t["chunk_id"] for t in self.get_all_tasks_by_chapter(chapter_id)]
+        if not chunk_ids:
+            return {"requeued": [], "over_cap": [], "skipped": []}
+        de_cfg = getattr(_config, "decision_engine", {}) or {}
+        try:
+            pf_cap = int(de_cfg.get("pf_requeue_max", 1) or 0)
+        except (TypeError, ValueError):
+            pf_cap = 1
+        ph = ','.join('?' for _ in chunk_ids)
+        cursor.execute(f'''
+            SELECT chunk_id, state, COALESCE(pf_requeues, 0)
+            FROM chunk_tasks WHERE chunk_id IN ({ph})
+        ''', tuple(chunk_ids))
+        requeued: List[str] = []
+        over_cap: List[str] = []
+        skipped: List[str] = []
+        for cid, state, pf_n in cursor.fetchall():
+            if state != TaskState.PERMANENTLY_FAILED.value:
+                skipped.append(cid)
+                continue
+            if force or (pf_cap > 0 and int(pf_n or 0) < pf_cap):
+                requeued.append(cid)
+            else:
+                over_cap.append(cid)
+        if requeued:
+            ph2 = ','.join('?' for _ in requeued)
+            cursor.execute(f'''
+                UPDATE chunk_tasks
+                SET state = ?, pf_requeues = COALESCE(pf_requeues, 0) + 1,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE chunk_id IN ({ph2})
+            ''', (TaskState.DIRTY.value,) + tuple(requeued))
+        self.conn.commit()
+        return {"requeued": requeued, "over_cap": over_cap, "skipped": skipped}
 
     def find_chunks_containing(
         self,

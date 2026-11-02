@@ -86,7 +86,7 @@ class TestConfig:
         cfg = _config.pipeline["difficulty_routing"]
         assert cfg["enabled"] is True
         assert cfg["hard_role"] == "primary"
-        assert cfg["hard_effort"] == "max"
+        assert cfg["hard_effort"] == "xhigh"  # Round 138 降档（润色 A/B 无增益 + R132 max 推理失控）
         assert float(cfg["hard_threshold"]) <= 2.0
 
 
@@ -124,7 +124,7 @@ class TestRouting:
         assert len(hard_client.calls) == 1
         assert p.llm.calls == []
         call = hard_client.calls[0]
-        assert call["effort"] == "max"
+        assert call["effort"] == "xhigh"  # Round 138: max→xhigh（A/B 无增益）
         assert call["model_name"]  # primary 角色模型（MiniMax-M3）
 
     def test_easy_chunk_uses_literal_and_thinking_off(self, monkeypatch):
@@ -149,4 +149,4 @@ class TestRouting:
         p = _make_pipeline(ta.TranslationPipeline, refs=["wild-cat", "morganatic"])
         p._run_raw_translator(HARD_TEXT)
         assert len(hard_client.calls) == 1
-        assert hard_client.calls[0]["effort"] == "max"
+        assert hard_client.calls[0]["effort"] == "xhigh"  # Round 138

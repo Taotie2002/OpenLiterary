@@ -1,0 +1,23 @@
+{
+ "none": {
+  "ok": true,
+  "stripped": false,
+  "reasoning_chars": 0,
+  "latency": 1.3,
+  "out_len": 171
+ },
+ "max": {
+  "ok": true,
+  "stripped": false,
+  "reasoning_chars": 323,
+  "latency": 1.9,
+  "out_len": 88
+ },
+ "xhigh": {
+  "ok": true,
+  "stripped": false,
+  "reasoning_chars": 197,
+  "latency": 1.5,
+  "out_len": 71
+ }
+}
