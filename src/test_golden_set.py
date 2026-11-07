@@ -8,7 +8,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,6 +20,8 @@ from src.agents.reference_agent import ReferenceAgent
 from src.agents.rewriter_agent import LiteraryRewriterAgent
 from src.agents.critic_agent import CriticAgent
 from src.agents.judge_agent import JudgeAgent
+from src.judgment_layer import atomic_write_json, build_judgment_context
+from src.style_profiler import segment_chapter_text
 from src.utils.chunker import SmartChunker
 from src.utils.llm_adapter import (
     get_llm_client,
@@ -122,12 +126,20 @@ def _levenshtein_distance(s1: str, s2: str) -> int:
 def run_golden_test(
     ab_override: Optional[Dict[str, Any]] = None,
     report_path: Optional[Any] = None,
+    source_text: Optional[str] = None,
+    source_id: str = "golden",
+    judgment_context_provider: Optional[Any] = None,
+    db_path: Optional[Any] = None,
 ):
-    """运行黄金测试集（需要 input/golden/hyperion_5k.md）.
+    """运行黄金测试集（默认读取 input/golden/hyperion_5k.md）.
 
     Round 118 P2-7 / Round 128: ab_override={"name","role","effort"} 时按 A/B 组合
     覆盖直译阶段的模型与 effort 档位；report_path 可指定本轮报告输出路径
-    （默认 output/golden_test_report.json）。
+    （默认 output/golden_test_report.json）。source_text/source_id 允许把同一
+    段代表章节喂入两个对照臂；judgment_context_provider 只在本次运行临时注入
+    Round 131 判断层切片，不改变 profile 或 config。``db_path`` lets a
+    diagnostic caller point the evaluator at an isolated snapshot instead of
+    the production decision DB.
     """
     ab = dict(ab_override or {})
     print("=" * 60)
@@ -136,12 +148,12 @@ def run_golden_test(
 
     root_dir = Path(__file__).resolve().parent.parent
     test_file = root_dir / "input" / "golden" / "hyperion_5k.md"
-    if not test_file.exists():
-        print(f"❌ 测试文件不存在: {test_file}")
-        return []
-
-    with open(test_file, "r", encoding="utf-8") as f:
-        source_text = f.read()
+    if source_text is None:
+        if not test_file.exists():
+            print(f"❌ 测试文件不存在: {test_file}")
+            return []
+        with open(test_file, "r", encoding="utf-8") as f:
+            source_text = f.read()
 
     print(f"📖 测试文本长度: {len(source_text)} 字符")
 
@@ -156,7 +168,7 @@ def run_golden_test(
 
     literal_role = ab.get("role") or _config.get_task_role("literal_translation")
     evaluator = GoldenSetEvaluator(
-        db_path=str(root_dir / "db" / "decision_db.sqlite"),
+        db_path=str(db_path) if db_path else str(root_dir / "db" / "decision_db.sqlite"),
         literal_role=literal_role,
     )
     if ab:
@@ -170,7 +182,7 @@ def run_golden_test(
     style_guide = _config.style_guide
 
     for i, chunk in enumerate(chunks):
-        chunk_id = f"golden_chunk{i:03d}"
+        chunk_id = f"{source_id}_chunk{i:03d}"
         try:
             print(f"\n📦 处理第 {i+1}/{len(chunks)} 块 ({len(chunk)} 字符)...")
 
@@ -178,9 +190,20 @@ def run_golden_test(
 
             genre = (_config.style_guide or {}).get("genre") or "文学小说"
             gloss = evaluator.db.format_prompt_context(source_text=chunk)
+            judgment_ctx = judgment_context_provider(chunk_id, chunk) if judgment_context_provider else None
+            if isinstance(judgment_ctx, str):
+                judgment_block = judgment_ctx
+                judgment_note_ids = []
+            else:
+                judgment_block = getattr(judgment_ctx, "block", "") if judgment_ctx is not None else ""
+                judgment_note_ids = [
+                    str(n.get("id")) for n in (getattr(judgment_ctx, "selected", []) or [])
+                    if isinstance(n, dict) and n.get("id")
+                ]
+            judgment_section = f"{judgment_block}\n\n" if judgment_block else ""
             raw_prompt = (
                 f"请将以下{genre}片段进行直译。要求：字面忠实，不丢失任何细节，不进行文学润色。\n\n"
-                f"{gloss}\n\n【原文】\n{chunk}"
+                f"{gloss}\n\n{judgment_section}【原文】\n{chunk}"
             )
             # 使用配置路由 literal_translation（A/B 时按组合覆盖 role + effort）
             model_key, params = _config.resolve_task_model("literal_translation")
@@ -194,7 +217,10 @@ def run_golden_test(
             model_name = get_role_model_name(literal_role) or model_key
             raw_text = evaluator.llm.generate(raw_prompt, model_name=model_name, **params)
 
-            raw_result = evaluator.rewriter_agent.process_chunk(chunk_id, raw_text, style_guide, chunk)
+            raw_result = evaluator.rewriter_agent.process_chunk(
+                chunk_id, raw_text, style_guide, chunk,
+                judgment_context=judgment_block,
+            )
             lit_text, _ = raw_result if isinstance(raw_result, tuple) else (raw_result, None)
 
             critic_report = evaluator.critic_agent.process_chunk(chunk_id, chunk, raw_text, lit_text, style_guide)
@@ -214,6 +240,8 @@ def run_golden_test(
                 "literal_role": literal_role,
                 "literal_effort": params.get("effort"),
                 "ab": ab.get("name") if ab else None,
+                "judgment_block_chars": len(judgment_block),
+                "judgment_note_ids": judgment_note_ids,
                 "style_collapse_rate": style_eval["style_collapse_rate"],
                 "style_preservation": style_eval["average_preservation"],
                 "preservation_details": style_eval["preservation_per_dimension"]
@@ -377,6 +405,230 @@ def recommend_golden_combo(
         "reason": "best_calibrated_pass_rate",
         "calibrated_candidates": calibrated,
     }
+
+
+def compare_injection_arms(
+    off_results: List[Dict[str, Any]],
+    on_results: List[Dict[str, Any]],
+    min_calibrated: float = 0.5,
+    critic_tolerance: float = 0.05,
+    rate_tolerance: float = 0.01,
+) -> Dict[str, Any]:
+    """Compare two golden arms that differ only by judgment injection.
+
+    The runner deliberately refuses to call a winner when either arm lacks
+    calibrated judge samples.  That keeps a degraded/mock judge from turning
+    "no regression" into a production enablement decision.
+    """
+    off = summarize_golden_results(off_results or [])
+    on = summarize_golden_results(on_results or [])
+    injected = [r for r in (on_results or [])
+                if int(r.get("judgment_block_chars", 0) or 0) > 0]
+    note_ids = []
+    for row in injected:
+        for nid in row.get("judgment_note_ids") or []:
+            if nid not in note_ids:
+                note_ids.append(nid)
+
+    delta = {
+        "pass_rate": round(float(on["pass_rate"]) - float(off["pass_rate"]), 6),
+        "avg_critic_score": round(float(on["avg_critic_score"]) - float(off["avg_critic_score"]), 6),
+        "avg_style_preservation": round(
+            float(on["avg_style_preservation"]) - float(off["avg_style_preservation"]), 6
+        ),
+    }
+    reasons = []
+    if not injected:
+        reasons.append("no_injectable_chunks")
+    if off["valid_count"] <= 0 or on["valid_count"] <= 0:
+        reasons.append("no_valid_samples")
+    if off["calibrated_ratio"] < min_calibrated or on["calibrated_ratio"] < min_calibrated:
+        reasons.append("calibrated_ratio_below_threshold")
+    regressions = [
+        key for key, value in delta.items()
+        if (key == "avg_critic_score" and value < -critic_tolerance)
+        or (key != "avg_critic_score" and value < -rate_tolerance)
+    ]
+    if regressions:
+        reasons.append("regression:" + ",".join(regressions))
+    improvement = (
+        delta["pass_rate"] > rate_tolerance
+        or delta["avg_critic_score"] > critic_tolerance
+    )
+    if reasons:
+        decision = "insufficient_data" if any(
+            r in ("no_valid_samples", "calibrated_ratio_below_threshold")
+            for r in reasons
+        ) else "keep_disabled"
+    elif improvement:
+        decision = "enable"
+    else:
+        decision = "keep_disabled"
+        reasons.append("no_measured_gain")
+
+    return {
+        "off": off,
+        "on": on,
+        "delta": delta,
+        "injected_chunks": len(injected),
+        "injected_note_ids": note_ids,
+        "min_calibrated_ratio": float(min_calibrated),
+        "critic_tolerance": float(critic_tolerance),
+        "rate_tolerance": float(rate_tolerance),
+        "decision": decision,
+        "reasons": reasons,
+    }
+
+
+def _snapshot_sqlite_database(source: Path, dest: Path) -> Path:
+    """Make a consistent, independent SQLite snapshot for one A/B arm.
+
+    ``ReferenceAgent.process_chunk`` writes decisions and entities while the
+    golden harness runs.  An injection A/B is a diagnostic, so both arms must
+    start from the same production state and any writes must land in private
+    copies.  SQLite's backup API reads a consistent snapshot including WAL.
+    """
+    source = Path(source)
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    if not source.exists():
+        return dest
+    src_con = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    try:
+        dst_con = sqlite3.connect(str(dest))
+        try:
+            src_con.backup(dst_con)
+        finally:
+            dst_con.close()
+    finally:
+        src_con.close()
+    return dest
+
+
+def run_injection_ab(
+    chapter_id: str,
+    profile: Optional[Dict[str, Any]],
+    excerpt_chars: int = 6000,
+    report_path: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Run a single-dimension A/B: same chapter excerpt, injection off vs on.
+
+    This is intentionally not folded into ``run_golden_ab``'s model × effort
+    matrix.  It makes one decision only (advisory judgment injection) and
+    writes a dedicated report.  A profile with no validated notes covering the
+    chapter exits before any model call.
+    """
+    root_dir = Path(__file__).resolve().parent.parent
+    src_path = root_dir / "input" / f"{chapter_id}.md"
+    if not src_path.exists():
+        return {"ok": False, "error": f"chapter_not_found: {src_path}", "decision": "insufficient_data"}
+    try:
+        source_full = src_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "error": f"chapter_unreadable: {exc}", "decision": "insufficient_data"}
+
+    excerpt = segment_chapter_text(
+        source_full, max_chars=max(500, int(excerpt_chars or 6000)), overlap_chars=0
+    )[0]["text"]
+
+    cfg = dict(_config.get("judgment_injection", {}) or {})
+
+    def _provider(_chunk_id: str, chunk: str):
+        return build_judgment_context(
+            profile, chapter_id, chunk_text=chunk,
+            budget_chars=int(cfg.get("max_chars", 300) or 300),
+            min_confidence=float(cfg.get("min_confidence", 0.55) or 0.55),
+            max_notes=int(cfg.get("max_notes", 6) or 6),
+            prompt_version=str(cfg.get("prompt_version", "r131")),
+        )
+
+    chunker_cfg = _config.chunker
+    preflight_chunks = SmartChunker(
+        soft_limit=chunker_cfg.get("soft_limit", 1000),
+        hard_limit=chunker_cfg.get("hard_limit", 2500),
+    ).split_markdown(excerpt)
+    preflight_contexts = [_provider(f"{chapter_id}_pre{i}", c)
+                          for i, c in enumerate(preflight_chunks)]
+    injectable = sum(1 for ctx in preflight_contexts if getattr(ctx, "block", ""))
+    out_path = Path(report_path) if report_path else (
+        root_dir / "output" / "judgment_injection_ab_report.json"
+    )
+    if injectable == 0:
+        report = {
+            "ok": False,
+            "chapter": chapter_id,
+            "source_chars": len(excerpt),
+            "preflight_chunks": len(preflight_chunks),
+            "injectable_chunks": 0,
+            "decision": "keep_disabled",
+            "reasons": ["no_injectable_notes"],
+            "message": "章节没有覆盖当前 chunk 的 active L1∧L2 注记；未调用模型。",
+        }
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"⚠️ [JudgmentA/B] {chapter_id}: 无可注入注记，未调用模型 → {out_path}")
+        return report
+
+    min_calibrated = float(
+        (_config.pipeline.get("golden_ab", {}) or {}).get("min_calibrated_ratio", 0.5)
+    )
+    production_db = root_dir / "db" / "decision_db.sqlite"
+    with tempfile.TemporaryDirectory(prefix="sagatrans_judgment_ab_") as tmpdir:
+        try:
+            off_db = _snapshot_sqlite_database(
+                production_db, Path(tmpdir) / "off_decision_db.sqlite")
+            on_db = _snapshot_sqlite_database(
+                production_db, Path(tmpdir) / "on_decision_db.sqlite")
+        except Exception as exc:  # noqa: BLE001 - diagnostics must fail closed
+            report = {
+                "ok": False,
+                "chapter": chapter_id,
+                "decision": "insufficient_data",
+                "reasons": ["decision_db_snapshot_failed"],
+                "error": f"decision_db_snapshot_failed: {type(exc).__name__}: {exc}",
+                "message": "无法隔离决策库；未调用模型，生产库未被写入。",
+            }
+            atomic_write_json(out_path, report)
+            print(f"❌ [JudgmentA/B] 决策库快照失败，未调用模型 → {out_path}")
+            return report
+
+        off_results = run_golden_test(
+            source_text=excerpt,
+            source_id=f"{chapter_id}_off",
+            report_path=out_path.with_name("judgment_injection_off.json"),
+            db_path=off_db,
+        )
+        on_results = run_golden_test(
+            source_text=excerpt,
+            source_id=f"{chapter_id}_on",
+            report_path=out_path.with_name("judgment_injection_on.json"),
+            judgment_context_provider=_provider,
+            db_path=on_db,
+        )
+    comparison = compare_injection_arms(
+        off_results, on_results, min_calibrated=min_calibrated
+    )
+    report = {
+        "ok": True,
+        "chapter": chapter_id,
+        "source_chars": len(excerpt),
+        "preflight_chunks": len(preflight_chunks),
+        "injectable_chunks": injectable,
+        "profile_schema": (profile or {}).get("schema_version") if isinstance(profile, dict) else None,
+        "decision_db_isolation": "snapshot_per_arm",
+        "off_report": str(out_path.with_name("judgment_injection_off.json")),
+        "on_report": str(out_path.with_name("judgment_injection_on.json")),
+        "comparison": comparison,
+        "decision": comparison["decision"],
+        "reasons": comparison["reasons"],
+    }
+    atomic_write_json(out_path, report)
+    print(f"🧪 [JudgmentA/B] {chapter_id}: {comparison['decision']} "
+          f"(pass Δ={comparison['delta']['pass_rate']:+.1%}, "
+          f"critic Δ={comparison['delta']['avg_critic_score']:+.2f}) → {out_path}")
+    return report
 
 
 def run_golden_ab(

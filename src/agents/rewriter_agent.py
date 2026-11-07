@@ -142,6 +142,8 @@ class LiteraryRewriterAgent:
         narrative_memory: str = "",
         entity_registry: Optional[Dict[str, str]] = None,  # 回路修复
         verse_note: Optional[str] = None,  # Round 119 L1 韵文协议
+        judgment_context: str = "",  # Round 131 advisory slice
+        review_fix_context: str = "",  # Round 131 Phase 3 structural P0 feedback
     ) -> str:
         few_shot = self._few_shot_examples
         genre = (_config.style_guide or {}).get("genre") or "文学小说"
@@ -201,6 +203,10 @@ class LiteraryRewriterAgent:
         #          (3) 在 output 前要求 self-check，确保所有登记实体都已呈现
         # Round 119 L1: 韵文 chunk 注入逐行对应/复沓保留协议
         verse_section = verse_note if verse_note else ""
+        judgment_section = (judgment_context.rstrip() + "\n\n") if judgment_context else ""
+        review_fix_section = (
+            review_fix_context.rstrip() + "\n\n" if review_fix_context else ""
+        )
         return f"""你是一位{persona}。
 你的任务是对提供的【直译底稿】进行最高水准的文学润色。
 
@@ -212,7 +218,7 @@ class LiteraryRewriterAgent:
 【风格基准 (Style Guide)】
 {style_guide}
 
-【⚠️ 实体译名一致性 (CRITICAL — 译文将被自动校验)】
+{judgment_section}{review_fix_section}【⚠️ 实体译名一致性 (CRITICAL — 译文将被自动校验)】
 完成润色后必须 self-check：源文中出现的每个登记实体，译文中都必须能找到对应的规范中文译名。
 如有遗漏（如 "Codders" 漏译），即使文学质量再高也会被 reject。
 
@@ -264,6 +270,8 @@ class LiteraryRewriterAgent:
         # Round 64: 上轮被 Jev uncertain zone 跳过的维度，避免对边界判断维度做无效重写
         skipped_dimensions: Optional[List[str]] = None,
         verse_note: Optional[str] = None,  # Round 119 L1 韵文协议
+        judgment_context: str = "",  # Round 131 advisory slice
+        review_fix_context: str = "",  # Round 131 Phase 3 structural P0 feedback
     ) -> str:
         # Round 10: 重试场景下也强化 entity section 的位置 + MUST 语言
         # 重试时 entity_feedback 已具体列出问题项，本轮必须 100% 修复
@@ -495,6 +503,10 @@ class LiteraryRewriterAgent:
         genre = (_config.style_guide or {}).get("genre") or "文学小说"
         # Round 119 L1: 韵文 chunk 注入逐行对应/复沓保留协议（retry 轮同样携带）
         verse_section = verse_note if verse_note else ""
+        judgment_section = (judgment_context.rstrip() + "\n\n") if judgment_context else ""
+        review_fix_section = (
+            review_fix_context.rstrip() + "\n\n" if review_fix_context else ""
+        )
         return f"""你是一位{persona}。
 这是第 {retry_count + 1} 次修订。上一版译文因以下原因被终审拒绝。
 
@@ -518,7 +530,7 @@ class LiteraryRewriterAgent:
 【风格基准 (Style Guide)】
 {style_guide}
 
-{verse_section}【排版与脚注协议 (CRITICAL)】
+{judgment_section}{review_fix_section}{verse_section}【排版与脚注协议 (CRITICAL)】
 1. 严禁改变 Markdown 的物理段落结构。
 2. {footnote_instruction}
 3. 脚注仅限于参考提取阶段（Reference Agent）生成的必要考据注释，润色阶段不得新增。
@@ -705,6 +717,8 @@ class LiteraryRewriterAgent:
         # Round 64: 让 rewriter 感知被 Jev uncertain zone 跳过的维度
         skipped_dimensions: Optional[List[str]] = None,
         verse_note: Optional[str] = None,  # Round 119 L1 韵文协议
+        judgment_context: str = "",  # Round 131 advisory slice
+        review_fix_context: str = "",  # Round 131 Phase 3 structural P0 feedback
         model_role: Optional[str] = None,  # Round 116: 停滞换模型覆盖角色
         model_effort: Optional[str] = None,  # Round 129: 换模型时覆盖 effort（如 primary→max）
     ):
@@ -750,6 +764,8 @@ class LiteraryRewriterAgent:
                 low_dims=low_dims,
                 skipped_dimensions=skipped_dimensions,  # Round 64
                 verse_note=verse_note,
+                judgment_context=judgment_context,
+                review_fix_context=review_fix_context,
             )
             temperature = self._calculate_retry_temperature(base_temp, retry_count)
         else:
@@ -758,6 +774,8 @@ class LiteraryRewriterAgent:
                 narrative_memory=narrative_memory,
                 entity_registry=entity_registry,            # 回路修复（首次润色也有登记表参考）
                 verse_note=verse_note,
+                judgment_context=judgment_context,
+                review_fix_context=review_fix_context,
             )
             temperature = base_temp
 

@@ -35,8 +35,13 @@ import time
 import random
 import gc
 import hashlib
+import difflib
+import tempfile
+import unicodedata
+import datetime as _dt
 import logging  # P4-1: 引入 logging 框架
 from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
 import sqlite3
 import psutil
@@ -44,7 +49,7 @@ import threading
 from collections import OrderedDict
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum
-from typing import Any, Dict, List, Optional, Set, Tuple, Callable
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Callable
 from urllib.parse import urlparse
 import argparse
 import traceback
@@ -168,10 +173,23 @@ if _config is None:
                            "context_max_reference": 20,
                            "context_max_style": 10,
                            "context_max_entities": 30}
+        judgment_injection = {"enabled": False, "max_chars": 300,
+                              "min_confidence": 0.55, "max_notes": 6,
+                              "prompt_version": "r131"}
+        review_fix = {"structural_p0_bypass_merit": True}
         critic_thresholds = {"fluency": 7.0, "readability": 7.0, "style_compliance": 6.5,
                             "voice_consistency": 7.0, "semantic_preservation": 7.0,
                             "literal_residue": 7.0,
                             "average_score_min": 7.0}
+
+        def get(self, key, default=None):
+            """Minimal dotted-key access used by pipeline/judgment code."""
+            cur = self
+            for part in str(key or "").split("."):
+                cur = getattr(cur, part, None)
+                if cur is None:
+                    return default
+            return cur
 
         def critic_thresholds_for_book(self, project_root=None):
             """通用默认 + book_profile 可选覆盖（与 src/config.py::Config 方法同语义；
@@ -2764,6 +2782,8 @@ class LiteraryRewriterAgent:
         narrative_memory: str = "",
         entity_registry: Optional[Dict[str, str]] = None,  # 回路修复
         verse_note: Optional[str] = None,  # Round 119 L1 韵文协议
+        judgment_context: str = "",  # Round 131 advisory slice
+        review_fix_context: str = "",  # Round 131 Phase 3 structural P0 feedback
     ) -> str:
         few_shot = self._few_shot_examples
         genre = (_config.style_guide or {}).get("genre") or "文学小说"
@@ -2823,6 +2843,10 @@ class LiteraryRewriterAgent:
         #          (3) 在 output 前要求 self-check，确保所有登记实体都已呈现
         # Round 119 L1: 韵文 chunk 注入逐行对应/复沓保留协议
         verse_section = verse_note if verse_note else ""
+        judgment_section = (judgment_context.rstrip() + "\n\n") if judgment_context else ""
+        review_fix_section = (
+            review_fix_context.rstrip() + "\n\n" if review_fix_context else ""
+        )
         return f"""你是一位{persona}。
 你的任务是对提供的【直译底稿】进行最高水准的文学润色。
 
@@ -2834,7 +2858,7 @@ class LiteraryRewriterAgent:
 【风格基准 (Style Guide)】
 {style_guide}
 
-【⚠️ 实体译名一致性 (CRITICAL — 译文将被自动校验)】
+{judgment_section}{review_fix_section}【⚠️ 实体译名一致性 (CRITICAL — 译文将被自动校验)】
 完成润色后必须 self-check：源文中出现的每个登记实体，译文中都必须能找到对应的规范中文译名。
 如有遗漏（如 "Codders" 漏译），即使文学质量再高也会被 reject。
 
@@ -2886,6 +2910,8 @@ class LiteraryRewriterAgent:
         # Round 64: 上轮被 Jev uncertain zone 跳过的维度，避免对边界判断维度做无效重写
         skipped_dimensions: Optional[List[str]] = None,
         verse_note: Optional[str] = None,  # Round 119 L1 韵文协议
+        judgment_context: str = "",  # Round 131 advisory slice
+        review_fix_context: str = "",  # Round 131 Phase 3 structural P0 feedback
     ) -> str:
         # Round 10: 重试场景下也强化 entity section 的位置 + MUST 语言
         # 重试时 entity_feedback 已具体列出问题项，本轮必须 100% 修复
@@ -3117,6 +3143,10 @@ class LiteraryRewriterAgent:
         genre = (_config.style_guide or {}).get("genre") or "文学小说"
         # Round 119 L1: 韵文 chunk 注入逐行对应/复沓保留协议（retry 轮同样携带）
         verse_section = verse_note if verse_note else ""
+        judgment_section = (judgment_context.rstrip() + "\n\n") if judgment_context else ""
+        review_fix_section = (
+            review_fix_context.rstrip() + "\n\n" if review_fix_context else ""
+        )
         return f"""你是一位{persona}。
 这是第 {retry_count + 1} 次修订。上一版译文因以下原因被终审拒绝。
 
@@ -3140,7 +3170,7 @@ class LiteraryRewriterAgent:
 【风格基准 (Style Guide)】
 {style_guide}
 
-{verse_section}【排版与脚注协议 (CRITICAL)】
+{judgment_section}{review_fix_section}{verse_section}【排版与脚注协议 (CRITICAL)】
 1. 严禁改变 Markdown 的物理段落结构。
 2. {footnote_instruction}
 3. 脚注仅限于参考提取阶段（Reference Agent）生成的必要考据注释，润色阶段不得新增。
@@ -3327,6 +3357,8 @@ class LiteraryRewriterAgent:
         # Round 64: 让 rewriter 感知被 Jev uncertain zone 跳过的维度
         skipped_dimensions: Optional[List[str]] = None,
         verse_note: Optional[str] = None,  # Round 119 L1 韵文协议
+        judgment_context: str = "",  # Round 131 advisory slice
+        review_fix_context: str = "",  # Round 131 Phase 3 structural P0 feedback
         model_role: Optional[str] = None,  # Round 116: 停滞换模型覆盖角色
         model_effort: Optional[str] = None,  # Round 129: 换模型时覆盖 effort（如 primary→max）
     ):
@@ -3372,6 +3404,8 @@ class LiteraryRewriterAgent:
                 low_dims=low_dims,
                 skipped_dimensions=skipped_dimensions,  # Round 64
                 verse_note=verse_note,
+                judgment_context=judgment_context,
+                review_fix_context=review_fix_context,
             )
             temperature = self._calculate_retry_temperature(base_temp, retry_count)
         else:
@@ -3380,6 +3414,8 @@ class LiteraryRewriterAgent:
                 narrative_memory=narrative_memory,
                 entity_registry=entity_registry,            # 回路修复（首次润色也有登记表参考）
                 verse_note=verse_note,
+                judgment_context=judgment_context,
+                review_fix_context=review_fix_context,
             )
             temperature = base_temp
 
@@ -3439,6 +3475,11 @@ class CriticAgent:
         self.role = _config.get_task_role("critic_scoring")
 
     def _build_prompt(self, source_text: str, raw_translation: str, literary_translation: str, style_guide_stats: dict) -> str:
+        try:
+            from src.judgment_layer import sanitize_style_guide_for_scoring
+            style_guide_stats = sanitize_style_guide_for_scoring(style_guide_stats)
+        except Exception:
+            pass
         return f"""你是一位极其严苛的文学编辑与翻译评论家。
 你的任务是对提供的【文学润色稿】进行深度审计，并依据【风格基准】进行打分。
 
@@ -3575,8 +3616,9 @@ Schema 要求：
                             answers = backend.primary.evaluate(state, questions, timeout=backend.timeout)
                             backend_path = "jev"
                         except Exception as e_jev:
-                            backend_diagnostics["jev"] = _classify_backend_error(e_jev)
-                            if type(e_jev).__name__ == "TypeSafeAuthenticationError":
+                            diag = _classify_backend_error(e_jev)
+                            backend_diagnostics["jev"] = diag
+                            if diag["category"] in ("auth", "dependency"):
                                 backend._jev_auth_dead = True
                     if not answers and backend.allow_openai_fallback:
                         try:
@@ -4052,6 +4094,7 @@ class TranslationPipeline:
         # 剖面由 `python3 -m src.translator_agent style-profile` 生成并落盘 input/book_profile.json;
         # 缺失/损坏时安静跳过（保持 config.yaml 基线, 不注入任何作品特定先验）。
         self.book_profile = None
+        self.judgment_cfg = dict(_config.get("judgment_injection", {}) or {})
         try:
             from src.style_profiler import load_profile, profile_to_style_guide
             _prof_path = self._root_dir / "input" / "book_profile.json"
@@ -4061,6 +4104,13 @@ class TranslationPipeline:
                 _config.set_runtime_style_guide(profile_to_style_guide(_prof, chapter_id=chapter_id))
                 print(f"🎨 [StyleProfiler] 已加载作品风格剖面 ← {_prof_path.name} "
                       f"(source={_prof.get('source')}, confidence={_prof.get('confidence')})")
+                try:
+                    from src.judgment_layer import active_notes
+                    _active = active_notes(_prof, float(self.judgment_cfg.get("min_confidence", 0.55)))
+                    if _active:
+                        print(f"🧭 [Judgment] 已加载 {len(_active)} 条 active 注记（L1∧L2 通过）")
+                except Exception:
+                    pass
         except Exception as _prof_err:
             print(f"⚠️ [StyleProfiler] 剖面加载失败，忽略: {_prof_err}", file=sys.stderr)
 
@@ -4903,6 +4953,8 @@ class TranslationPipeline:
                 low_dims=low_dims,
                 skipped_dimensions=skipped_dimensions,
                 verse_note=self._verse_note_for(chunk_id, source_text),
+                judgment_context=getattr(self._judgment_context_for(chunk_id, source_text), "block", ""),
+                review_fix_context=self._review_fix_context_for(chunk_id),
                 model_role=alt_role,
                 model_effort=cfg.get("alternate_effort"),
             )
@@ -4947,13 +4999,312 @@ class TranslationPipeline:
         genre = (_config.style_guide or {}).get("genre") or "文学小说"
         glossary = self.decision_engine.format_prompt_context(source_text=source_text)
         verse_note = self._verse_note_for(chunk_id, source_text) if chunk_id else ""
+        register_block = ""
+        reg = (_config.style_guide or {}).get("register_default")
+        prof = getattr(self, "book_profile", None) or {}
+        cid = getattr(self, "chapter_id", "")
+        cmap = prof.get("chapter_register_map") if isinstance(prof, dict) else None
+        if isinstance(cmap, dict) and cid and cmap.get(cid):
+            reg = cmap.get(cid)
+        if reg:
+            register_block = f"【本章语域底线（直译同样遵循）】{reg}\n\n"
+        judgment_block = ""
+        if chunk_id:
+            _jctx = self._judgment_context_for(chunk_id, source_text)
+            if _jctx is not None and _jctx.block:
+                judgment_block = _jctx.block + "\n\n"
         return (
             f"请将以下{genre}片段进行直译。要求：字面忠实，不丢失任何细节，不进行文学润色。\n\n"
             f"{glossary}\n\n"
             f"{self._build_translation_hints_block()}"
+            f"{register_block}"
+            f"{judgment_block}"
             f"{verse_note}"
             f"【原文】\n{source_text}"
         )
+
+    def _judgment_context_for(self, chunk_id: str, source_text: str):
+        """Return a deterministic judgment slice; never raises into translation."""
+        cfg = getattr(self, "judgment_cfg", None)
+        if cfg is None:
+            cfg = dict(_config.get("judgment_injection", {}) or {})
+        if not cfg.get("enabled", True):
+            return None
+        prof = getattr(self, "book_profile", None)
+        if not prof:
+            return None
+        try:
+            from src.judgment_layer import build_judgment_context
+            return build_judgment_context(
+                prof, getattr(self, "chapter_id", ""), chunk_text=source_text,
+                budget_chars=int(cfg.get("max_chars", 300) or 300),
+                min_confidence=float(cfg.get("min_confidence", 0.55) or 0.55),
+                max_notes=int(cfg.get("max_notes", 6) or 6),
+                prompt_version=str(cfg.get("prompt_version", "r131")),
+            )
+        except Exception as exc:  # noqa: BLE001 - advisory layer must fail open
+            print(f"⚠️ [Judgment] {chunk_id} 注记切片失败，忽略: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            return None
+
+    def _review_fix_context_for(self, chunk_id: str) -> str:
+        """Load the structural P0 sidecar only for its exact base final text.
+
+        The sidecar accompanies a COMPLETED -> DIRTY transition.  During the
+        rerun the old final lives at ``*_final_backup.json``; comparing its
+        hash prevents a stale review instruction from leaking into a later,
+        unrelated rerun.  All failures are fail-open (no injection).
+        """
+        payload = self._read_review_fix_sidecar(chunk_id)
+        if not payload or not self._review_fix_sidecar_is_bound(chunk_id, payload):
+            return ""
+        try:
+            from src.judgment_layer import render_review_fix_feedback
+            return render_review_fix_feedback(payload.get("issues") or [])
+        except Exception as exc:  # noqa: BLE001 - advisory repair must fail open
+            print(f"⚠️ [ReviewFix] {chunk_id} 修复反馈渲染失败，忽略: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            return ""
+
+    def _review_fix_path(self, chunk_id: str) -> Path:
+        return self.output_dir / f"{chunk_id}_review_fix.json"
+
+    @staticmethod
+    def _final_text_from_path(path: Path) -> str:
+        """Read final.json text without making a malformed file fatal."""
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return ""
+        if isinstance(data, dict):
+            return str(data.get("text") or "")
+        return str(data) if isinstance(data, str) else ""
+
+    def _load_final_texts_for_chapter(self) -> Dict[str, str]:
+        """Current final texts keyed by chunk id; used for fresh quote mapping."""
+        out: Dict[str, str] = {}
+        if not getattr(self, "output_dir", None):
+            return out
+        for path in sorted(self.output_dir.glob("*_final.json")):
+            chunk_id = path.name[:-len("_final.json")]
+            text = self._final_text_from_path(path)
+            if chunk_id and text:
+                out[chunk_id] = text
+        return out
+
+    def _read_review_fix_sidecar(self, chunk_id: str) -> Optional[Dict[str, Any]]:
+        """Parse and schema-check a repair sidecar (direct read, no cache)."""
+        try:
+            payload = json.loads(self._review_fix_path(chunk_id).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            from src.judgment_layer import (
+                REVIEW_FIX_SCHEMA_VERSION, STRUCTURAL_P0_CATEGORIES,
+            )
+        except Exception:
+            return None
+        if payload.get("schema_version") != REVIEW_FIX_SCHEMA_VERSION:
+            return None
+        if str(payload.get("chunk_id") or "") != str(chunk_id):
+            return None
+        if not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("original_final_sha256") or "")):
+            return None
+        issues = payload.get("issues")
+        if not isinstance(issues, list) or not issues:
+            return None
+        for issue in issues:
+            if not isinstance(issue, dict):
+                return None
+            if issue.get("severity") != "P0":
+                return None
+            if str(issue.get("category") or "") not in STRUCTURAL_P0_CATEGORIES:
+                return None
+            if len(str(issue.get("quote") or "").strip()) < 2:
+                return None
+        return payload
+
+    def _review_fix_sidecar_is_bound(self, chunk_id: str,
+                                     payload: Optional[Dict[str, Any]] = None) -> bool:
+        """True only when the pre-rerun backup still matches the sidecar hash."""
+        sidecar = payload or self._read_review_fix_sidecar(chunk_id)
+        if not sidecar:
+            return False
+        backup = self.output_dir / f"{chunk_id}_final_backup.json"
+        if not backup.exists():
+            return False
+        try:
+            from src.judgment_layer import sha256_text
+            return sha256_text(self._final_text_from_path(backup)) == \
+                str(sidecar.get("original_final_sha256") or "")
+        except Exception:
+            return False
+
+    def _cleanup_review_fix_sidecar(self, chunk_id: str) -> None:
+        path = self._review_fix_path(chunk_id)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"  ⚠️ 清理 {path.name} 失败: {exc}")
+        try:
+            if getattr(self, "_intermediate_cache", None) is not None:
+                self._intermediate_cache.pop((chunk_id, "review_fix"), None)
+        except Exception:
+            pass
+
+    def apply_review_fixes(self, review_dirty_path: Path) -> Dict[str, Any]:
+        """Validate review_dirty.json and steer only its structural P0 chunks.
+
+        No issue is trusted from the artifact: every anchor is re-mapped to the
+        *current* final text, required to be unique inside exactly one chunk,
+        and bound to that chunk's final-text hash.  Task state changes happen
+        only through ``TaskScheduler.trigger_backtrack`` so the existing
+        per-chunk/backtrack budgets and final_backup rollback remain canonical.
+        """
+        result: Dict[str, Any] = {
+            "ok": False, "mapped_issues": 0, "chunks": 0,
+            "scheduled_chunks": [], "skipped": [],
+            "scheduler": {}, "path": str(review_dirty_path),
+        }
+        try:
+            from src.judgment_layer import (
+                REVIEW_FIX_SCHEMA_VERSION, STRUCTURAL_P0_CATEGORIES,
+                atomic_write_json, map_quote_to_chunks, sha256_text,
+            )
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = f"judgment_layer_unavailable: {exc}"
+            return result
+
+        path = Path(review_dirty_path)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        try:
+            artifact = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            result["error"] = f"review_dirty_unreadable: {type(exc).__name__}: {exc}"
+            return result
+        entries = artifact.get("entries") if isinstance(artifact, dict) else None
+        if not isinstance(entries, list):
+            result["error"] = "review_dirty_missing_entries"
+            return result
+
+        final_texts = self._load_final_texts_for_chapter()
+        if not final_texts:
+            result["error"] = "no_current_final_texts"
+            return result
+        chapter = str(getattr(self, "chapter_id", "") or "")
+        verified: Dict[str, List[Dict[str, Any]]] = {}
+        for idx, raw in enumerate(entries):
+            if not isinstance(raw, dict):
+                result["skipped"].append({"index": idx, "reason": "entry_not_object"})
+                continue
+            base = {
+                "index": idx,
+                "chapter": str(raw.get("chapter") or ""),
+                "chunk_id": str(raw.get("chunk_id") or ""),
+                "category": str(raw.get("category") or ""),
+                "quote": str(raw.get("quote") or "").strip(),
+            }
+            if base["chapter"] != chapter:
+                result["skipped"].append({**base, "reason": "wrong_chapter"})
+                continue
+            if base["category"] not in STRUCTURAL_P0_CATEGORIES:
+                result["skipped"].append({**base, "reason": "not_structural_p0"})
+                continue
+            mapped = map_quote_to_chunks(final_texts, base["quote"])
+            if not mapped.get("ok"):
+                result["skipped"].append({
+                    **base, "reason": str(mapped.get("reason") or "unmapped"),
+                    "hits": mapped.get("hits") or [],
+                })
+                continue
+            if not mapped.get("unique_in_chunk"):
+                result["skipped"].append({**base, "reason": "quote_not_unique_in_chunk"})
+                continue
+            mapped_cid = str(mapped.get("chunk_id") or "")
+            if base["chunk_id"] and base["chunk_id"] != mapped_cid:
+                result["skipped"].append({**base, "reason": "chunk_mapping_changed",
+                                          "mapped_chunk_id": mapped_cid})
+                continue
+            issue = {
+                "severity": "P0",
+                "category": base["category"],
+                "quote": base["quote"],
+                "matched_quote": mapped.get("matched_quote") or base["quote"],
+                "match_kind": mapped.get("match_kind") or "",
+                "match_score": mapped.get("match_score"),
+                "offset": mapped.get("offset"),
+                "unique_in_chunk": True,
+                "note": str(raw.get("note") or ""),
+                "suggestion": str(raw.get("suggestion") or ""),
+                "section_id": str(raw.get("section_id") or ""),
+            }
+            verified.setdefault(mapped_cid, []).append(issue)
+
+        result["mapped_issues"] = sum(len(v) for v in verified.values())
+        result["chunks"] = len(verified)
+        if not verified:
+            result["ok"] = True
+            return result
+
+        try:
+            stats = self.scheduler.trigger_backtrack(sorted(verified))
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = f"trigger_backtrack_failed: {type(exc).__name__}: {exc}"
+            return result
+        if not isinstance(stats, dict):
+            stats = {}
+        result["scheduler"] = stats
+        scheduled = set(stats.get("dirty") or []) | set(stats.get("pf_requeued") or [])
+        result["scheduled_chunks"] = sorted(scheduled)
+        reason_by_chunk: Dict[str, str] = {}
+        for key, reason in (("over_cap", "backtrack_budget_exhausted"),
+                            ("pf_over_cap", "pf_requeue_budget_exhausted"),
+                            ("skipped_state", "state_not_rerunnable")):
+            for chunk_id in stats.get(key) or []:
+                reason_by_chunk[str(chunk_id)] = reason
+        created_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        written_sidecars = 0
+        for chunk_id in sorted(verified):
+            if chunk_id in scheduled:
+                text = final_texts.get(chunk_id) or ""
+                if not text:
+                    result["skipped"].append({"chunk_id": chunk_id,
+                                              "reason": "final_text_disappeared"})
+                    continue
+                sidecar = {
+                    "schema_version": REVIEW_FIX_SCHEMA_VERSION,
+                    "kind": "structural_p0_review_fix",
+                    "chapter_id": chapter,
+                    "chunk_id": chunk_id,
+                    "created_at": created_at,
+                    "source_artifact": str(path),
+                    "original_final_sha256": sha256_text(text),
+                    "issues": verified[chunk_id],
+                }
+                try:
+                    # Write only after the DIRTY transition succeeded.  A crash
+                    # before this point loses the hint (safe); it cannot create
+                    # a hint that later contaminates an unrelated rerun.
+                    atomic_write_json(self._review_fix_path(chunk_id), sidecar)
+                    written_sidecars += 1
+                except Exception as exc:  # noqa: BLE001
+                    result["skipped"].append({
+                        "chunk_id": chunk_id,
+                        "reason": f"sidecar_write_failed: {type(exc).__name__}: {exc}",
+                    })
+                continue
+            result["skipped"].append({
+                "chunk_id": chunk_id,
+                "reason": reason_by_chunk.get(chunk_id, "not_scheduled"),
+            })
+        result["written_sidecars"] = written_sidecars
+        result["ok"] = True
+        print(f"🧹 [ReviewFix] {chapter}: {result['mapped_issues']} 条结构 P0 → "
+              f"{len(scheduled)} 个 chunk 进入 DIRTY；skipped={len(result['skipped'])}")
+        return result
 
     @staticmethod
     def _build_translation_hints_block() -> str:
@@ -6377,6 +6728,7 @@ class TranslationPipeline:
                 # Round 130: 版本择优 — 新版 critic 均分低于旧版(超出 tolerance)时
                 # 用备份版覆盖 final.json（保留更优旧版），返回 True。
                 if self._apply_version_merit(chunk_id, backup, final_path):
+                    self._cleanup_review_fix_sidecar(chunk_id)
                     continue
                 # 新版至少不差 → 清理无用 backup（含 critic 备份）
                 try:
@@ -6384,6 +6736,7 @@ class TranslationPipeline:
                 except OSError:
                     pass
                 self._cleanup_critic_backup(chunk_id)
+                self._cleanup_review_fix_sidecar(chunk_id)
                 continue
             # 重跑失败, 恢复 backup
             try:
@@ -6401,6 +6754,7 @@ class TranslationPipeline:
                     print(f"♻️ [Pipeline] {chunk_id} 回溯重跑失败, 已恢复之前的 final.json (COMPLETED)")
                 else:
                     print(f"⚠️ [Pipeline] {chunk_id} 已恢复 final.json，但状态恢复被拒绝（状态未变，请人工核查 chunk 状态）")
+                self._cleanup_review_fix_sidecar(chunk_id)
             except OSError as e:
                 print(f"  ⚠️ 恢复 {chunk_id} backup 失败: {e}")
         return restored
@@ -6421,10 +6775,23 @@ class TranslationPipeline:
         并把备份 critic 报告归位为 critic_report.json；返回 True。
         其余情况返回 False（调用方按"无用 backup"清理）。
         旧版/新版评分缺失（无 critic 文件，如 legacy chunk）时不做裁决。
+
+        Round 131: a hash-bound structural P0 repair is evaluated by the
+        downstream gate/lint/dangling checks, not by the old-vs-new critic
+        average.  The repair may deliberately trade a small critic-mean change
+        for fixing a missing segment or dangling note, so reverting it by score
+        would silently undo the only feedback channel that knew about the P0.
         """
         vm_cfg = _config.pipeline.get("version_merit", {}) or {}
         if not vm_cfg.get("enabled", True):
             return False
+        rf_cfg = _config.get("review_fix", {}) or {}
+        if rf_cfg.get("structural_p0_bypass_merit", True):
+            sidecar = self._read_review_fix_sidecar(chunk_id)
+            if sidecar and self._review_fix_sidecar_is_bound(chunk_id, sidecar):
+                print(f"🛡️ [Version Merit] {chunk_id} 结构 P0 修复受哈希绑定，跳过 critic 均分回滚"
+                      f"（交由后续 gate/lint 复核）")
+                return False
         critic_new = self.output_dir / f"{chunk_id}_critic_report.json"
         critic_old = self.output_dir / f"{chunk_id}_critic_report_backup.json"
         old_score = self._critic_avg_from_file(critic_old)
@@ -7205,6 +7572,14 @@ class TranslationPipeline:
                     model_effort or self._task_default_effort("literary_rewrite"),
                     get_role_model_name(model_role),
                 )
+                _jctx = self._judgment_context_for(chunk_id, source_text)
+                _jblock = _jctx.block if _jctx is not None else ""
+                _review_fix_block = self._review_fix_context_for(chunk_id)
+                if _jctx is not None and (_jctx.selected or _jctx.skipped):
+                    try:
+                        self._save_intermediate(chunk_id, "judgment_injection", _jctx.as_dict())
+                    except Exception:
+                        pass
                 raw_result = self.rewriter_agent.process_chunk(
                     chunk_id, raw_text, self.style_guide, source_text,
                     prev_lit_text=prev_lit_text,
@@ -7219,6 +7594,8 @@ class TranslationPipeline:
                     low_dims=low_dims,
                     skipped_dimensions=skipped_dimensions,  # Round 64
                     verse_note=self._verse_note_for(chunk_id, source_text),  # Round 119 L1
+                    judgment_context=_jblock,
+                    review_fix_context=_review_fix_block,
                     model_role=model_role,  # Round 116: 停滞换模型
                     model_effort=model_effort,  # Round 129: 换模型加档
                 )
@@ -8984,12 +9361,20 @@ def _levenshtein_distance(s1: str, s2: str) -> int:
 def run_golden_test(
     ab_override: Optional[Dict[str, Any]] = None,
     report_path: Optional[Any] = None,
+    source_text: Optional[str] = None,
+    source_id: str = "golden",
+    judgment_context_provider: Optional[Any] = None,
+    db_path: Optional[Any] = None,
 ):
-    """运行黄金测试集（需要 input/golden/hyperion_5k.md）.
+    """运行黄金测试集（默认读取 input/golden/hyperion_5k.md）.
 
     Round 118 P2-7 / Round 128: ab_override={"name","role","effort"} 时按 A/B 组合
     覆盖直译阶段的模型与 effort 档位；report_path 可指定本轮报告输出路径
-    （默认 output/golden_test_report.json）。
+    （默认 output/golden_test_report.json）。source_text/source_id 允许把同一
+    段代表章节喂入两个对照臂；judgment_context_provider 只在本次运行临时注入
+    Round 131 判断层切片，不改变 profile 或 config。``db_path`` lets a
+    diagnostic caller point the evaluator at an isolated snapshot instead of
+    the production decision DB.
     """
     ab = dict(ab_override or {})
     print("=" * 60)
@@ -8998,12 +9383,12 @@ def run_golden_test(
 
     root_dir = Path(__file__).resolve().parent.parent
     test_file = root_dir / "input" / "golden" / "hyperion_5k.md"
-    if not test_file.exists():
-        print(f"❌ 测试文件不存在: {test_file}")
-        return []
-
-    with open(test_file, "r", encoding="utf-8") as f:
-        source_text = f.read()
+    if source_text is None:
+        if not test_file.exists():
+            print(f"❌ 测试文件不存在: {test_file}")
+            return []
+        with open(test_file, "r", encoding="utf-8") as f:
+            source_text = f.read()
 
     print(f"📖 测试文本长度: {len(source_text)} 字符")
 
@@ -9018,7 +9403,7 @@ def run_golden_test(
 
     literal_role = ab.get("role") or _config.get_task_role("literal_translation")
     evaluator = GoldenSetEvaluator(
-        db_path=str(root_dir / "db" / "decision_db.sqlite"),
+        db_path=str(db_path) if db_path else str(root_dir / "db" / "decision_db.sqlite"),
         literal_role=literal_role,
     )
     if ab:
@@ -9032,7 +9417,7 @@ def run_golden_test(
     style_guide = _config.style_guide
 
     for i, chunk in enumerate(chunks):
-        chunk_id = f"golden_chunk{i:03d}"
+        chunk_id = f"{source_id}_chunk{i:03d}"
         try:
             print(f"\n📦 处理第 {i+1}/{len(chunks)} 块 ({len(chunk)} 字符)...")
 
@@ -9040,9 +9425,20 @@ def run_golden_test(
 
             genre = (_config.style_guide or {}).get("genre") or "文学小说"
             gloss = evaluator.db.format_prompt_context(source_text=chunk)
+            judgment_ctx = judgment_context_provider(chunk_id, chunk) if judgment_context_provider else None
+            if isinstance(judgment_ctx, str):
+                judgment_block = judgment_ctx
+                judgment_note_ids = []
+            else:
+                judgment_block = getattr(judgment_ctx, "block", "") if judgment_ctx is not None else ""
+                judgment_note_ids = [
+                    str(n.get("id")) for n in (getattr(judgment_ctx, "selected", []) or [])
+                    if isinstance(n, dict) and n.get("id")
+                ]
+            judgment_section = f"{judgment_block}\n\n" if judgment_block else ""
             raw_prompt = (
                 f"请将以下{genre}片段进行直译。要求：字面忠实，不丢失任何细节，不进行文学润色。\n\n"
-                f"{gloss}\n\n【原文】\n{chunk}"
+                f"{gloss}\n\n{judgment_section}【原文】\n{chunk}"
             )
             # 使用配置路由 literal_translation（A/B 时按组合覆盖 role + effort）
             model_key, params = _config.resolve_task_model("literal_translation")
@@ -9056,7 +9452,10 @@ def run_golden_test(
             model_name = get_role_model_name(literal_role) or model_key
             raw_text = evaluator.llm.generate(raw_prompt, model_name=model_name, **params)
 
-            raw_result = evaluator.rewriter_agent.process_chunk(chunk_id, raw_text, style_guide, chunk)
+            raw_result = evaluator.rewriter_agent.process_chunk(
+                chunk_id, raw_text, style_guide, chunk,
+                judgment_context=judgment_block,
+            )
             lit_text, _ = raw_result if isinstance(raw_result, tuple) else (raw_result, None)
 
             critic_report = evaluator.critic_agent.process_chunk(chunk_id, chunk, raw_text, lit_text, style_guide)
@@ -9076,6 +9475,8 @@ def run_golden_test(
                 "literal_role": literal_role,
                 "literal_effort": params.get("effort"),
                 "ab": ab.get("name") if ab else None,
+                "judgment_block_chars": len(judgment_block),
+                "judgment_note_ids": judgment_note_ids,
                 "style_collapse_rate": style_eval["style_collapse_rate"],
                 "style_preservation": style_eval["average_preservation"],
                 "preservation_details": style_eval["preservation_per_dimension"]
@@ -9300,6 +9701,203 @@ def run_golden_ab(
     else:
         print(f"⚠️ 无推荐: {recommendation.get('note')}")
     print(f"📄 A/B 报告已保存: {out}")
+    return report
+
+
+def compare_injection_arms(
+    off_results: List[Dict[str, Any]],
+    on_results: List[Dict[str, Any]],
+    min_calibrated: float = 0.5,
+    critic_tolerance: float = 0.05,
+    rate_tolerance: float = 0.01,
+) -> Dict[str, Any]:
+    """Compare two golden arms that differ only by judgment injection.
+
+    The runner deliberately refuses to call a winner when either arm lacks
+    calibrated judge samples.  That keeps a degraded/mock judge from turning
+    "no regression" into a production enablement decision.
+    """
+    off = summarize_golden_results(off_results or [])
+    on = summarize_golden_results(on_results or [])
+    injected = [r for r in (on_results or [])
+                if int(r.get("judgment_block_chars", 0) or 0) > 0]
+    note_ids = []
+    for row in injected:
+        for nid in row.get("judgment_note_ids") or []:
+            if nid not in note_ids:
+                note_ids.append(nid)
+
+    delta = {
+        "pass_rate": round(float(on["pass_rate"]) - float(off["pass_rate"]), 6),
+        "avg_critic_score": round(float(on["avg_critic_score"]) - float(off["avg_critic_score"]), 6),
+        "avg_style_preservation": round(
+            float(on["avg_style_preservation"]) - float(off["avg_style_preservation"]), 6
+        ),
+    }
+    reasons = []
+    if not injected:
+        reasons.append("no_injectable_chunks")
+    if off["valid_count"] <= 0 or on["valid_count"] <= 0:
+        reasons.append("no_valid_samples")
+    if off["calibrated_ratio"] < min_calibrated or on["calibrated_ratio"] < min_calibrated:
+        reasons.append("calibrated_ratio_below_threshold")
+    regressions = [
+        key for key, value in delta.items()
+        if (key == "avg_critic_score" and value < -critic_tolerance)
+        or (key != "avg_critic_score" and value < -rate_tolerance)
+    ]
+    if regressions:
+        reasons.append("regression:" + ",".join(regressions))
+    improvement = (
+        delta["pass_rate"] > rate_tolerance
+        or delta["avg_critic_score"] > critic_tolerance
+    )
+    if reasons:
+        decision = "insufficient_data" if any(
+            r in ("no_valid_samples", "calibrated_ratio_below_threshold")
+            for r in reasons
+        ) else "keep_disabled"
+    elif improvement:
+        decision = "enable"
+    else:
+        decision = "keep_disabled"
+        reasons.append("no_measured_gain")
+
+    return {
+        "off": off,
+        "on": on,
+        "delta": delta,
+        "injected_chunks": len(injected),
+        "injected_note_ids": note_ids,
+        "min_calibrated_ratio": float(min_calibrated),
+        "critic_tolerance": float(critic_tolerance),
+        "rate_tolerance": float(rate_tolerance),
+        "decision": decision,
+        "reasons": reasons,
+    }
+
+
+def run_injection_ab(
+    chapter_id: str,
+    profile: Optional[Dict[str, Any]],
+    excerpt_chars: int = 6000,
+    report_path: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Run a single-dimension A/B: same chapter excerpt, injection off vs on.
+
+    This is intentionally not folded into ``run_golden_ab``'s model × effort
+    matrix.  It makes one decision only (advisory judgment injection) and
+    writes a dedicated report.  A profile with no validated notes covering the
+    chapter exits before any model call.
+    """
+    root_dir = Path(__file__).resolve().parent.parent
+    src_path = root_dir / "input" / f"{chapter_id}.md"
+    if not src_path.exists():
+        return {"ok": False, "error": f"chapter_not_found: {src_path}", "decision": "insufficient_data"}
+    try:
+        source_full = src_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "error": f"chapter_unreadable: {exc}", "decision": "insufficient_data"}
+
+    excerpt = segment_chapter_text(
+        source_full, max_chars=max(500, int(excerpt_chars or 6000)), overlap_chars=0
+    )[0]["text"]
+
+    cfg = dict(_config.get("judgment_injection", {}) or {})
+
+    def _provider(_chunk_id: str, chunk: str):
+        return build_judgment_context(
+            profile, chapter_id, chunk_text=chunk,
+            budget_chars=int(cfg.get("max_chars", 300) or 300),
+            min_confidence=float(cfg.get("min_confidence", 0.55) or 0.55),
+            max_notes=int(cfg.get("max_notes", 6) or 6),
+            prompt_version=str(cfg.get("prompt_version", "r131")),
+        )
+
+    chunker_cfg = _config.chunker
+    preflight_chunks = SmartChunker(
+        soft_limit=chunker_cfg.get("soft_limit", 1000),
+        hard_limit=chunker_cfg.get("hard_limit", 2500),
+    ).split_markdown(excerpt)
+    preflight_contexts = [_provider(f"{chapter_id}_pre{i}", c)
+                          for i, c in enumerate(preflight_chunks)]
+    injectable = sum(1 for ctx in preflight_contexts if getattr(ctx, "block", ""))
+    out_path = Path(report_path) if report_path else (
+        root_dir / "output" / "judgment_injection_ab_report.json"
+    )
+    if injectable == 0:
+        report = {
+            "ok": False,
+            "chapter": chapter_id,
+            "source_chars": len(excerpt),
+            "preflight_chunks": len(preflight_chunks),
+            "injectable_chunks": 0,
+            "decision": "keep_disabled",
+            "reasons": ["no_injectable_notes"],
+            "message": "章节没有覆盖当前 chunk 的 active L1∧L2 注记；未调用模型。",
+        }
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"⚠️ [JudgmentA/B] {chapter_id}: 无可注入注记，未调用模型 → {out_path}")
+        return report
+
+    min_calibrated = float(
+        (_config.pipeline.get("golden_ab", {}) or {}).get("min_calibrated_ratio", 0.5)
+    )
+    production_db = root_dir / "db" / "decision_db.sqlite"
+    with tempfile.TemporaryDirectory(prefix="sagatrans_judgment_ab_") as tmpdir:
+        try:
+            off_db = _snapshot_sqlite_database(
+                production_db, Path(tmpdir) / "off_decision_db.sqlite")
+            on_db = _snapshot_sqlite_database(
+                production_db, Path(tmpdir) / "on_decision_db.sqlite")
+        except Exception as exc:  # noqa: BLE001 - diagnostics must fail closed
+            report = {
+                "ok": False,
+                "chapter": chapter_id,
+                "decision": "insufficient_data",
+                "reasons": ["decision_db_snapshot_failed"],
+                "error": f"decision_db_snapshot_failed: {type(exc).__name__}: {exc}",
+                "message": "无法隔离决策库；未调用模型，生产库未被写入。",
+            }
+            atomic_write_json(out_path, report)
+            print(f"❌ [JudgmentA/B] 决策库快照失败，未调用模型 → {out_path}")
+            return report
+
+        off_results = run_golden_test(
+            source_text=excerpt,
+            source_id=f"{chapter_id}_off",
+            report_path=out_path.with_name("judgment_injection_off.json"),
+            db_path=off_db,
+        )
+        on_results = run_golden_test(
+            source_text=excerpt,
+            source_id=f"{chapter_id}_on",
+            report_path=out_path.with_name("judgment_injection_on.json"),
+            judgment_context_provider=_provider,
+            db_path=on_db,
+        )
+    comparison = compare_injection_arms(
+        off_results, on_results, min_calibrated=min_calibrated
+    )
+    report = {
+        "ok": True,
+        "chapter": chapter_id,
+        "source_chars": len(excerpt),
+        "preflight_chunks": len(preflight_chunks),
+        "injectable_chunks": injectable,
+        "profile_schema": (profile or {}).get("schema_version") if isinstance(profile, dict) else None,
+        "decision_db_isolation": "snapshot_per_arm",
+        "off_report": str(out_path.with_name("judgment_injection_off.json")),
+        "on_report": str(out_path.with_name("judgment_injection_on.json")),
+        "comparison": comparison,
+        "decision": comparison["decision"],
+        "reasons": comparison["reasons"],
+    }
+    atomic_write_json(out_path, report)
+    print(f"🧪 [JudgmentA/B] {chapter_id}: {comparison['decision']} "
+          f"(pass Δ={comparison['delta']['pass_rate']:+.1%}, "
+          f"critic Δ={comparison['delta']['avg_critic_score']:+.2f}) → {out_path}")
     return report
 
 
@@ -9622,16 +10220,31 @@ def debug_db():
 # ────────────────────────────────────────────────────────────────────
 
 def main():
+    _install_sigint_guard()
     print_banner()
 
     import argparse
     parser = argparse.ArgumentParser(description="SagaTrans — AI 文学语义编译系统")
     parser.add_argument("command", nargs="?", default="pipeline",
-                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "drift-audit", "notes-normalize", "requeue"],
-                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, drift-audit, notes-normalize, requeue")
+                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "story-graph", "drift-audit", "notes-normalize", "requeue"],
+                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, story-graph, drift-audit, notes-normalize, requeue")
     parser.add_argument("--chapter", default="ch01", help="章节 ID (默认: ch01)")
     parser.add_argument("--chapters", default=None,
                         help="style-profile 命令：抽样章节，逗号分隔（默认均匀抽 5 章）")
+    parser.add_argument("--deep", action="store_true",
+                        help="style-profile 命令：全书分段深读 + 跨段合并 + L1/L2 验证（Round 131）")
+    parser.add_argument("--deep-max-chars", type=int, default=60000,
+                        help="style-profile --deep：单段原文字符上限（默认 60000）")
+    parser.add_argument("--deep-overlap-chars", type=int, default=2000,
+                        help="style-profile --deep：相邻分段重叠字符数（默认 2000）")
+    parser.add_argument("--graph-path", default=None,
+                        help="story-graph 命令：输出路径（默认读取 config.story_graph.path）")
+    parser.add_argument("--require-answerable", action="store_true",
+                        help="story-graph 命令：实体覆盖率不可答时返回 2")
+    parser.add_argument("--fix-from-review", action="store_true",
+                        help="pipeline 命令：读取 review_dirty.json，二次校验锚句后定向重跑结构 P0 chunk")
+    parser.add_argument("--review-dirty-path", default="output/review_dirty.json",
+                        help="pipeline --fix-from-review：review_dirty JSON 路径（默认 output/review_dirty.json）")
     parser.add_argument("--force", action="store_true", help="强制重新初始化（覆盖已存在的 chunk，重置状态和重试计数）")
     # 新增：split 命令专用参数
     parser.add_argument("--input", help="split 命令：输入文件路径（EPUB/TXT/MD）")
@@ -9649,9 +10262,11 @@ def main():
     parser.add_argument("--jev", action="store_true",
                         help="drift-audit 命令：附加 Jev 窗口配对检查（需要 Jev 可用）")
     parser.add_argument("--json-out", default=None,
-                        help="drift-audit 命令：报告 JSON 输出路径")
+                        help="drift-audit / golden --judgment-ab 命令：报告 JSON 输出路径")
     parser.add_argument("--ab", action="store_true",
                         help="golden/golden-gate 命令：运行 直译模型×thinking 4 组合 A/B 对比")
+    parser.add_argument("--judgment-ab", action="store_true",
+                        help="golden 命令：仅比较判断层注记注入 on/off（同章同摘录，不乘模型×effort 矩阵）")
     parser.add_argument("--max-rounds", type=int, default=3,
                         help="consolidate 命令：最大收敛轮数（默认 3）")
 
@@ -9673,6 +10288,20 @@ def main():
     try:
         if args.command == "pipeline":
             pipeline = TranslationPipeline(chapter_id=args.chapter)
+            if args.fix_from_review:
+                fix_res = pipeline.apply_review_fixes(Path(args.review_dirty_path))
+                if not fix_res.get("ok"):
+                    print(f"❌ [ReviewFix] 无法应用终审修复: {fix_res.get('error')}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                skipped = fix_res.get("skipped") or []
+                if skipped:
+                    reasons: dict = {}
+                    for item in skipped:
+                        reason = str(item.get("reason") or "unknown")
+                        reasons[reason] = reasons.get(reason, 0) + 1
+                    detail = ", ".join(f"{k}={v}" for k, v in sorted(reasons.items()))
+                    print(f"ℹ️ [ReviewFix] {len(skipped)} 条未应用（{detail}）")
             if not pipeline.run():
                 sys.exit(1)
         elif args.command == "init":
@@ -9681,7 +10310,12 @@ def main():
         elif args.command == "style-profile":
             from src.style_profiler import generate_book_profile, summary_line
             _chapters = [c.strip() for c in args.chapters.split(",") if c.strip()] if args.chapters else None
-            res = generate_book_profile(Path.cwd(), chapters=_chapters, force=args.force)
+            res = generate_book_profile(
+                Path.cwd(), chapters=_chapters, force=args.force,
+                deep=args.deep,
+                deep_max_chars=args.deep_max_chars,
+                deep_overlap_chars=args.deep_overlap_chars,
+            )
             if not res.get("ok"):
                 print(f"❌ style-profile 失败: {res.get('error')}", file=sys.stderr)
                 sys.exit(1)
@@ -9694,6 +10328,42 @@ def main():
                 else:
                     print(f"⚠️ 风格剖面未写入（LLM 不可用，未注入作品特定先验）: {_prof.get('note', '')}")
                 print(f"   {summary_line(_prof)}")
+                if res.get("deep"):
+                    _cov = res.get("coverage") or {}
+                    print(f"   deep: merge_mode={res.get('merge_mode') or '-'} "
+                          f"chapters={_cov.get('chapters_with_active_notes', 0)}/{_cov.get('chapters_total', 0)} "
+                          f"segments={_cov.get('segments_ok', 0)}/{_cov.get('segments_total', 0)} "
+                          f"notes={res.get('active_notes', 0)} active/"
+                          f"{_cov.get('active_after_limits', res.get('notes_after_limits', 0))} after-limits "
+                          f"setup={_cov.get('setup_payoff_active', 0)}")
+                    if res.get("graph_path"):
+                        _gc = res.get("graph_coverage") or {}
+                        print(f"   story_graph: {res.get('graph_path')} "
+                              f"entity_coverage={_gc.get('entity_coverage', '-')} "
+                              f"answerable={_gc.get('answerable', '-')}")
+        elif args.command == "story-graph":
+            from src.story_graph import build_and_save_story_graph
+            from src.style_profiler import load_profile
+            _root = Path.cwd()
+            _prof = load_profile(_root / "input" / "book_profile.json")
+            _graph = build_and_save_story_graph(
+                _root, profile=_prof,
+                path=Path(args.graph_path) if args.graph_path else None,
+            )
+            _cov = _graph.get("coverage") or {}
+            _out = Path(args.graph_path) if args.graph_path else \
+                _root / str((_config.get("story_graph", {}) or {}).get("path") or "input/story_graph.json")
+            print(f"🧭 story-graph: {_out}")
+            print(f"   entities={_cov.get('entities_with_appearance', 0)}/{_cov.get('entities_total', 0)} "
+                  f"entity_coverage={_cov.get('entity_coverage', 0):.1%} "
+                  f"chapters={_cov.get('chapters_with_entities', 0)}/{_cov.get('chapters_total', 0)} "
+                  f"answerable={_cov.get('answerable')}")
+            if _cov.get("uncovered_entities"):
+                print(f"   uncovered_entities={len(_cov.get('uncovered_entities') or [])}")
+            if _cov.get("uncovered_chapters"):
+                print(f"   uncovered_chapters={','.join(_cov.get('uncovered_chapters') or [])}")
+            if args.require_answerable and not _cov.get("answerable"):
+                sys.exit(2)
         elif args.command == "drift-audit":
             from src.drift_audit import (
                 audit_chapter,
@@ -9721,7 +10391,24 @@ def main():
                 print(f"[out] {args.json_out}")
             sys.exit(0 if not _report.get("drift_flags") else 2)
         elif args.command == "golden":
-            if args.ab:
+            if args.judgment_ab:
+                from src.style_profiler import load_profile
+                _root = Path.cwd()
+                _prof = load_profile(_root / "input" / "book_profile.json")
+                if _prof is None:
+                    print("⚠️ [JudgmentA/B] 未找到可读的 input/book_profile.json；"
+                          "将只生成 keep_disabled 报告，不调用模型", file=sys.stderr)
+                _ab_res = run_injection_ab(
+                    args.chapter, _prof,
+                    report_path=Path(args.json_out) if args.json_out else None,
+                )
+                if _ab_res.get("error"):
+                    print(f"❌ [JudgmentA/B] {_ab_res.get('error')}", file=sys.stderr)
+                    sys.exit(1)
+                # Exit 2 means "no injected notes / no model call", matching
+                # story-graph --require-answerable's explicit not-ready signal.
+                sys.exit(0 if _ab_res.get("ok") else 2)
+            elif args.ab:
                 run_golden_ab()
             else:
                 run_golden_test()
@@ -9788,7 +10475,11 @@ def main():
                 target_chars=args.chapter_size,
                 min_chars=args.min_chapter_size,
             )
-    except (KeyboardInterrupt, SystemExit):
+    except KeyboardInterrupt:
+        print("⛔ 已确认中止（Ctrl+C x2）。进度已保存；重新运行命令会从数据库断点续跑。",
+              file=sys.stderr, flush=True)
+        sys.exit(130)
+    except SystemExit:
         raise
     except Exception as e:
         # P4-9: 顶层异常统一退出（保留 KeyboardInterrupt/SystemExit 上抛）
@@ -12609,6 +13300,15 @@ def _classify_backend_error(exc: Exception) -> Dict[str, Any]:
     # 只用消息文本匹配（不含 repr/类名）：类名如 TypeSafeAuthenticationError
     # 会让 "authentication" 关键字在 SDK 不可用的退化路径上误命中（Round 53 测试锁定）。
     combined = str(exc).lower()
+    if "typesafe_sdk" in combined and any(
+        k in combined for k in ("no module named", "modulenotfound", "not installed")
+    ):
+        return {
+            "category": "dependency",
+            "retryable": False,
+            "msg": str(exc)[:200],
+            "action": "安装 typesafe_sdk，或关闭 typesafe 并显式启用 OpenAICompat 降级",
+        }
     if any(k in combined for k in ("429", "rate limit", "rate_limit", "quota", "too many requests")):
         return {"category": "rate_limit", "retryable": True, "msg": str(exc)[:200], "action": "wait or upgrade quota"}
     if any(k in combined for k in ("timeout", "timed out", "connection reset", "connection aborted")):
@@ -12621,12 +13321,21 @@ def _classify_backend_error(exc: Exception) -> Dict[str, Any]:
     _auth_phrase = any(k in combined for k in (
         "unauthorized", "forbidden", "api key", "invalid api",
         "authentication", "authenticate", "authorization",
+        "无权访问模型", "无权访问", "无权限", "鉴权", "认证失败",
     ))
     _auth_code_ctx = bool(re.search(r"\b(401|403)\b", combined)) and any(
-        k in combined for k in ("client error", "url:", "url ", "http", "status")
+        k in combined for k in (
+            "client error", "url:", "url ", "http", "status",
+            "客户端错误", "token", "model", "模型",
+        )
     )
     if _auth_phrase or _auth_code_ctx:
-        return {"category": "auth", "retryable": False, "msg": str(exc)[:200], "action": "check TYPESAFE_API_KEY"}
+        return {
+            "category": "auth",
+            "retryable": False,
+            "msg": str(exc)[:200],
+            "action": "检查当前任务角色的 API key 与模型访问权限（403），或修正 task_routing",
+        }
     if any(k in combined for k in ("500", "502", "503", "504", "internal server", "bad gateway", "service unavailable")):
         return {"category": "server", "retryable": True, "msg": str(exc)[:200], "action": "check typesafe status page"}
     if any(k in combined for k in ("connection", "dns", "network", "unreachable", "ssl", "certificate")):
@@ -13296,8 +14005,11 @@ def run_final_gate(
 _INSTANCE_LOCK_FD: Optional[int] = None
 
 
-_MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile",
+_MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile", "story-graph",
                       "consolidate", "finalize", "notes-normalize", "requeue"}
+
+
+_SIGINT_WARNED = False
 
 
 def acquire_instance_lock(lock_path: Optional[Path] = None) -> bool:
@@ -13347,6 +14059,30 @@ def acquire_instance_lock(lock_path: Optional[Path] = None) -> bool:
         pass
     _INSTANCE_LOCK_FD = fd  # 进程存活期间保持打开；fd 随进程退出关闭 → 自动释放锁
     return True
+
+
+def _install_sigint_guard():
+    """安装两段式 SIGINT 处理器；返回 handler 供测试直接调用。"""
+    global _SIGINT_WARNED
+    _SIGINT_WARNED = False
+    import signal
+
+    def _handler(_signum, _frame):
+        global _SIGINT_WARNED
+        if not _SIGINT_WARNED:
+            _SIGINT_WARNED = True
+            print("\n⚠️ 检测到 Ctrl+C：当前任务尚未完成。", file=sys.stderr, flush=True)
+            print("   若只是误触，无需操作，程序会继续当前步骤。", file=sys.stderr, flush=True)
+            print("   若确认中止，请再按一次 Ctrl+C；已完成 chunk 与 DB 状态会保留，可断点续跑。",
+                  file=sys.stderr, flush=True)
+            return
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGINT, _handler)
+    except (ValueError, OSError):
+        return None
+    return _handler
 
 
 _AUDIT_CHAPTER_FLOOR = 0.90
@@ -14204,7 +14940,20 @@ _SUP_REF_RE = re.compile(r'[¹²³⁴⁵⁶⁷⁸⁹]+')
 _TR_BLOCK_RE = re.compile(r'^\s*>\s*\*\*译者注[:：]\*\*\s*(.*)$')
 
 
-def _audit_text(text: str) -> dict:
+_PART_HEAD_RE = re.compile(r'^\s*#\s*第[一二三四五六七八九十百千零〇\d]+\s*[部卷篇节]')
+
+
+_HEADING_STYLE_RE = re.compile(
+    r'^#\s*第[一二三四五六七八九十百千零〇\d]+\s*(?:章|部|卷|篇|节)(?:\s|$|[（(])')
+
+
+_NOTE_MERGE_STOP = {
+    "这", "那", "它", "他", "她", "本文", "本章", "此处", "这里",
+    "上述", "以下", "其中", "因此", "所以", "但是", "不过", "同时", "另外",
+}
+
+
+def _audit_text(text: str, check_same_key: bool = True) -> dict:
     """单文本 lint 审计（返回 problems 与统计）。"""
     problems = []
     straight = text.count('"')
@@ -14225,15 +14974,16 @@ def _audit_text(text: str) -> dict:
     meta = sum(text.count(t) for t in _META_TOKENS)
     if meta:
         problems.append(f"策略元语 {meta} 处")
-    keys = {}
-    dups = []
-    for d in defs:
-        k = _def_key(d['content'])
-        if k in keys and keys[k] != d['content']:
-            dups.append(k)
-        keys[k] = d['content']
-    if dups:
-        problems.append(f"同键重复注释: {dups}")
+    if check_same_key:
+        keys = {}
+        dups = []
+        for d in defs:
+            k = _def_key(d['content'])
+            if k in keys and keys[k] != d['content']:
+                dups.append(k)
+            keys[k] = d['content']
+        if dups:
+            problems.append(f"同键重复注释: {dups}")
     return {"problems": problems, "defs": defs, "orphan_count": len(orphans),
             "dangling_refs": dangling_refs, "meta_count": meta}
 
@@ -14253,8 +15003,194 @@ def _book_style_config() -> dict:
         return {}
 
 
-def _chapter_dup_notes(entries) -> list:
-    """entries: [(label, text)]（同章）。返回重复注 failures/warnings。"""
+_BOOK_GENERIC_TITLE_RE = re.compile(
+    r'^(?:第[一二三四五六七八九十百千零〇\d]+\s*[部卷篇章节]'
+    r'|(?:book|part|chapter|volume|section)\s+[\divxlcdm]+)(?:\s|$|[（(])',
+    re.IGNORECASE)
+
+
+_BOOK_NON_TITLE_RE = re.compile(
+    r'^(?:目录|contents|前言|序言|序|后记|附录|书名页|版权页|译者序|译后记)$',
+    re.IGNORECASE)
+
+
+_BOOK_FILENAME_MAX = 80
+
+
+def _natural_name_key(path: Path):
+    """章节/分块文件名自然排序键（ch2 < ch10）。"""
+    return [(0, int(p)) if p.isdigit() else (1, p.lower())
+            for p in re.split(r'(\d+)', Path(path).name)]
+
+
+def _clean_book_title(value) -> str:
+    """把标题候选归一为可用的中文书名；不像书名时返回空串。"""
+    import unicodedata
+    s = unicodedata.normalize('NFC', os.path.expandvars(str(value or ''))).strip()
+    if not s:
+        return ''
+    s = re.sub(r'^\s*#+\s*', '', s)
+    s = s.strip().strip('*_`"\'“”‘’「」『』《》 \t')
+    s = re.sub(r'[（(]\s*[A-Za-z][^）)]*[）)]', '', s)
+    s = re.sub(r'\s+', ' ', s).strip(' .-_—–·:：;；,，')
+    if not s or _BOOK_NON_TITLE_RE.match(s) or _BOOK_GENERIC_TITLE_RE.match(s):
+        return ''
+    if len(s) > _BOOK_FILENAME_MAX:
+        return ''
+    cjk = re.findall(r'[\u4e00-\u9fff]', s)
+    if len(cjk) < 2:
+        return ''
+    return s
+
+
+def _safe_book_filename(title: str) -> str:
+    """标题 → 跨平台安全文件名主体（不含 .md）；失败返回空串。"""
+    import unicodedata
+    s = unicodedata.normalize('NFC', str(title or ''))
+    s = re.sub(r'[\x00-\x1f\x7f]+', ' ', s)
+    s = re.sub(r'[/\\:*?"<>|／＼：＊？＂＜＞｜]+', '', s)
+    s = re.sub(r'\.(?:markdown|md)$', '', s.strip(), flags=re.IGNORECASE)
+    s = re.sub(r'\s+', ' ', s).strip(' .-_—–·')
+    s = s.replace('..', '')
+    s = s[:_BOOK_FILENAME_MAX].strip(' .-_—–·')
+    return s
+
+
+def _book_config_for_root(root: Path) -> dict:
+    """读取指定项目根的 book 配置；不借用当前仓库配置污染临时项目。"""
+    path = Path(root) / 'config.yaml'
+    if not path.exists():
+        return {}
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+        book = data.get('book') if isinstance(data, dict) else None
+        return book if isinstance(book, dict) else {}
+    except Exception:
+        return {}
+
+
+def _profile_title_zh(root: Path) -> str:
+    path = Path(root) / 'input' / 'book_profile.json'
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return ''
+    if not isinstance(data, dict):
+        return ''
+    wg = data.get('work_guess') if isinstance(data.get('work_guess'), dict) else {}
+    for value in (data.get('title_zh'), data.get('book_title_zh'),
+                  data.get('book_title'), wg.get('title_zh'), wg.get('title')):
+        title = _clean_book_title(value)
+        if title:
+            return title
+    return ''
+
+
+def _title_from_headings(path: Path, limit_lines: int = 80) -> str:
+    """从 Markdown 前若干行 H1 提取中文书名（跳过部/卷/章标题）。"""
+    try:
+        lines = path.read_text(encoding='utf-8').splitlines()[:limit_lines]
+    except OSError:
+        return ''
+    for line in lines:
+        m = re.match(r'^\s*#\s+(.+?)\s*$', line)
+        if not m:
+            continue
+        title = _clean_book_title(m.group(1))
+        if title:
+            return title
+    return ''
+
+
+def _infer_title_zh(root: Path, out_root: Path) -> str:
+    """按 final.json → merged → input 的顺序寻找首个可信中文书名。"""
+    dirs = sorted((p for p in out_root.glob('ch*') if p.is_dir()),
+                  key=_natural_name_key)[:2]
+    for ch_dir in dirs:
+        finals = sorted(ch_dir.glob('*_final.json'), key=_natural_name_key)[:3]
+        for fp in finals:
+            try:
+                data = json.loads(fp.read_text(encoding='utf-8'))
+            except (OSError, json.JSONDecodeError):
+                continue
+            text = data.get('text', '') if isinstance(data, dict) else str(data)
+            if not text:
+                continue
+            for line in text.splitlines()[:80]:
+                m = re.match(r'^\s*#\s+(.+?)\s*$', line)
+                if not m:
+                    continue
+                title = _clean_book_title(m.group(1))
+                if title:
+                    return title
+
+    for candidate in (out_root / 'translated_full.md',):
+        if candidate.exists():
+            title = _title_from_headings(candidate, limit_lines=120)
+            if title:
+                return title
+
+    inputs = sorted((root / 'input').glob('ch*.md'), key=_natural_name_key)[:3]
+    for fp in inputs:
+        title = _title_from_headings(fp, limit_lines=30)
+        if title:
+            return title
+    return ''
+
+
+def book_title_zh(project_root=None, output_dir=None) -> str:
+    """解析成书中文题名（config > 剖面 > 首块译文 H1 > merged/input H1）。"""
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    out_root = Path(output_dir) if output_dir else root / 'output'
+    book_cfg = _book_config_for_root(root)
+    env_values = [
+        os.environ.get('SAGATRANS__BOOK__TITLE_ZH'),
+        os.environ.get('SAGATRANS_BOOK_TITLE_ZH'),
+        os.environ.get('SAGATRANS_BOOK_OUTPUT_NAME'),
+    ]
+    candidates = env_values + [
+        book_cfg.get('title_zh') if isinstance(book_cfg, dict) else None,
+        book_cfg.get('book_title_zh') if isinstance(book_cfg, dict) else None,
+        book_cfg.get('output_name') if isinstance(book_cfg, dict) else None,
+    ]
+    for value in candidates:
+        title = _clean_book_title(value)
+        if title:
+            return title
+    title = _profile_title_zh(root)
+    if title:
+        return title
+    return _infer_title_zh(root, out_root)
+
+
+def resolve_book_output_path(project_root=None, output_dir=None,
+                             prefer_existing: bool = True) -> Path:
+    """成品译稿路径：中文书名.md；无中文题名时兼容旧名 translated_full.md。
+
+    prefer_existing=True 时，若中文名尚未生成而旧名已存在，读命令继续使用旧文件，
+    避免升级后首次 lint/notes-normalize 找不到既有成品；merge 写入时传 False。
+    """
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    out_root = Path(output_dir) if output_dir else root / 'output'
+    legacy = out_root / 'translated_full.md'
+    safe = _safe_book_filename(book_title_zh(root, out_root))
+    target = out_root / (safe + '.md') if safe else legacy
+    if prefer_existing:
+        if target.exists():
+            return target
+        if legacy.exists():
+            return legacy
+    return target
+
+
+def _chapter_dup_notes(entries, cross_chunk_failure: bool = True) -> list:
+    """entries: [(label, text)]（同章）。返回重复注 failures/warnings。
+
+    同一 chunk 内重复是真正的生成缺陷，始终 failure。跨 chunk 同词条注释是分块
+    翻译的正常产物：merged 存在时 notes-normalize 会按章合并，故只作 warning；
+    merged 缺失时没有合并层兜底，仍按 failure 处理。
+    """
     failures, warnings = [], []
     seen = {}
     for label, text in entries:
@@ -14265,13 +15201,17 @@ def _chapter_dup_notes(entries) -> list:
                 continue
             if k in seen:
                 prev_label, prev_content = seen[k]
+                same_file = prev_label == label
                 if prev_content == d['content']:
-                    failures.append(f"重复注（同键同文）: {k} @ {prev_label} / {label}")
+                    msg = f"重复注（同键同文）: {k} @ {prev_label} / {label}"
+                    (failures if (same_file or cross_chunk_failure) else warnings).append(msg)
                 else:
                     import difflib as _dl
                     r = _dl.SequenceMatcher(None, prev_content, d['content']).ratio()
                     if r >= 0.8:
-                        failures.append(f"重复注（同键近似 r={r:.2f}）: {k} @ {prev_label} / {label}")
+                        msg = (f"重复注（同键近似 r={r:.2f}）: {k} @ "
+                               f"{prev_label} / {label}")
+                        (failures if (same_file or cross_chunk_failure) else warnings).append(msg)
                     else:
                         warnings.append(f"同键不同注: {k} @ {prev_label} / {label}")
             else:
@@ -14289,7 +15229,12 @@ def _chapter_note_dupes(text: str) -> list:
     _stop = _note_anchor_stop([c['content'] for c in cand])
     for i in range(len(cand)):
         for j in range(i + 1, len(cand)):
-            if _note_is_dup(cand[i]['content'], cand[j]['content'], stop=_stop):
+            ki = _note_merge_key(cand[i]['content'])
+            kj = _note_merge_key(cand[j]['content'])
+            if ki and ki == kj:
+                out.append("同键重复注: {0} ~ {1}".format(
+                    ki[:18], kj[:18]))
+            elif _note_is_dup(cand[i]['content'], cand[j]['content'], stop=_stop):
                 out.append("重复注: {0} ~ {1}".format(
                     _note_key(cand[i]['content'])[:18],
                     _note_key(cand[j]['content'])[:18]))
@@ -14356,6 +15301,15 @@ def _note_candidates(text: str):
         _ls = _b['seg'].split('\n')
         _body_ls = [l for l in _ls if l.strip()]
         if (len(_body_ls) > 1
+                and sum(1 for l in _body_ls if _MD_DEF_RE.match(l)) > 1):
+            # 章末脚注定义常被连续堆叠（无空行）。每行 [^n]: 必须独立成单元，
+            # 否则整段会被当成一条 md 注释，同键去重/重编号全部失效。
+            _pos = _b['start']
+            for _l in _ls:
+                if _l.strip():
+                    blocks.append({'start': _pos, 'end': _pos + len(_l), 'seg': _l})
+                _pos += len(_l) + 1
+        elif (len(_body_ls) > 1
                 and all(_TR_BLOCK_RE.match(l) for l in _body_ls)):
             _pos = _b['start']
             for _l in _ls:
@@ -14433,6 +15387,32 @@ def _note_key(content: str) -> str:
     if m:
         return m.group(1).strip()
     return _note_norm(content)[:12]
+
+
+def _note_merge_key(content: str) -> str:
+    """同词条合并键：从注释开头提取术语（不依赖作品先验）。
+
+    覆盖 `**牙鳕**：…`、`“门泰特”：…`、`门泰特指…`、`贝尼·杰瑟里特姐妹会是一…`
+    等常见写法；过短/泛指开头返回空串（不参与同键合并）。
+    """
+    t = _note_norm(content)
+    t = re.sub(r'^(?:译者注|译注|脚注|注释)[:：]?', '', t)
+    t = re.sub(r'[“”"「」『』]', '', t)
+    t = t.strip('“”"「」『』*`> ')
+    if not t:
+        return ""
+    cut = min((m.start() for m in re.finditer(r'[：:，,。；;（(]', t)), default=len(t))
+    for marker in ('是指', '指', '即', '是'):
+        pos = t.find(marker, 1)
+        if pos > 0:
+            cut = min(cut, pos)
+    key = t[:cut] if cut > 0 else t[:24]
+    key = re.sub(r'^[《【\[（(]+|[》】\]）)]+$', '', key)
+    key = key.strip(' ·・.-')
+    key = re.sub(r'\s+', '', key)
+    if len(key) < 2 or key in _NOTE_MERGE_STOP:
+        return ""
+    return key
 
 
 def _note_norm(content: str) -> str:
@@ -14553,10 +15533,13 @@ def chapter_heading(project_root, chapter_id: str, style: str = None) -> str:
         except Exception:
             text = ""
         for line in text.split('\n')[:20]:
-            m = re.match(r'^#?\s*(第[一二三四五六七八九十百千零〇\d]+\s*[章.。．]\s*\S.*)$', line.strip())
+            m = re.match(
+                r'^#?\s*(第[一二三四五六七八九十百千零〇\d]+\s*'
+                r'[章部卷篇节](?:\s+[^\n]{1,50})?)\s*$',
+                line.strip())
             if m and len(m.group(1)) <= 60:
-                zh = m.group(1).strip().rstrip('。．.')
-                zh = re.sub(r'\[\^[^\]]+\]', '', zh)
+                zh = re.sub(r'\[\^[^\]]+\]', '', m.group(1)).strip()
+                zh = zh.rstrip('。．.')
                 break
     if style == "keep":
         return orig_clean or chapter_id
@@ -14627,7 +15610,8 @@ def lint_book(project_root=None, output_dir=None, merged_path=None) -> dict:
     """成书级 lint：finals（逐 chunk）+ merged（整书）双跑；写 output/book_lint.md。"""
     root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
     out_root = Path(output_dir) if output_dir else root / "output"
-    merged = Path(merged_path) if merged_path else out_root / "translated_full.md"
+    default_merged = resolve_book_output_path(root, out_root)
+    merged = Path(merged_path) if merged_path else default_merged
     failures, warnings = [], []
     stats = {"finals": 0}
 
@@ -14648,7 +15632,7 @@ def lint_book(project_root=None, output_dir=None, merged_path=None) -> dict:
         if a["dangling_refs"]:
             warnings.append(f"{label}: 无定义引用 {a['dangling_refs']}")
     for ch, entries in sorted(by_chapter.items()):
-        df, dw = _chapter_dup_notes(entries)
+        df, dw = _chapter_dup_notes(entries, cross_chunk_failure=not merged.exists())
         failures.extend(f"{ch}: {x}" for x in df)
         warnings.extend(f"{ch}: {x}" for x in dw)
 
@@ -14663,7 +15647,7 @@ def lint_book(project_root=None, output_dir=None, merged_path=None) -> dict:
         stats["headings"] = len(headings)
         if style in ("bilingual", "zh"):
             for h in headings[1:]:
-                if not re.match(r'^#\s*第[一二三四五六七八九十百千零〇\d]+\s*章', h):
+                if not _HEADING_STYLE_RE.match(h):
                     failures.append(f"merged: 章节标题不符合制式({style}): {h[:40]}")
         for h in headings:
             for name, pat in _FRONTMATTER_RESIDUE_RES:
@@ -14672,7 +15656,8 @@ def lint_book(project_root=None, output_dir=None, merged_path=None) -> dict:
         dangling = [ln.strip()[:60] for ln in mtext.split('\n') if _DANGLING_RE.search(ln)]
         for d in dangling:
             warnings.append(f"merged: 疑似悬空承诺: {d}")
-        a = _audit_text(mtext)
+        # 同键注释按章判定（跨章各留一条是成书体例）；全局只查其它制式问题。
+        a = _audit_text(mtext, check_same_key=False)
         for p in a["problems"]:
             failures.append(f"merged: {p}")
         machine_ids = _MACHINE_FN_ID_RE.findall(mtext)
@@ -14686,7 +15671,7 @@ def lint_book(project_root=None, output_dir=None, merged_path=None) -> dict:
             if len(dups) > 5:
                 failures.append(f"merged/{label}: 另有 {len(dups) - 5} 组重复注未列出")
     else:
-        warnings.append("merged 未生成（translated_full.md 缺失），跳过整书级检查")
+        warnings.append("merged 未生成（{0} 缺失），跳过整书级检查".format(default_merged.name))
 
     result = {"ok": not failures, "failures": failures, "warnings": warnings, "stats": stats}
     lines = ["# 成书 lint 报告 (book_lint)", ""]
@@ -14733,7 +15718,8 @@ def normalize_chapter_notes(text: str, start_num: int = 1):
     """
     blocks, units = _note_candidates(text)
     _group_title_units(units)
-    changes = {"merged_dups": 0, "orphans_attached": 0, "md_relocated": 0,
+    changes = {"merged_dups": 0, "same_key_merges": 0,
+               "dangling_refs_removed": 0, "orphans_attached": 0, "md_relocated": 0,
                "num_relocated": 0, "title_blocks_moved": 0, "renumbered": 0,
                "title_shells_dropped": 0,
                "machine_ids": len(_MACHINE_FN_ID_RE.findall(text))}
@@ -14748,6 +15734,24 @@ def normalize_chapter_notes(text: str, start_num: int = 1):
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
+
+    # 1a) 同词条合并：同一章内同一术语的多种注释写法只保留一条。
+    # 分块翻译会在不同 chunk 各自加注；merge 后再按章归并，避免成书出现
+    # "门泰特 ×17" 这类重复条目。跨章各留一条，保持章内自包含。
+    key_groups = {}
+    for i, u in enumerate(cand):
+        k = _note_merge_key(u['content'])
+        if k:
+            key_groups.setdefault(k, []).append(i)
+    for members in key_groups.values():
+        if len(members) < 2:
+            continue
+        base = _root(members[0])
+        for mi in members[1:]:
+            ri = _root(mi)
+            if ri != base:
+                parent[ri] = base
+                changes["same_key_merges"] += 1
 
     _stop = _note_anchor_stop([c['content'] for c in cand])
     for i in range(len(cand)):
@@ -15027,6 +16031,21 @@ def normalize_chapter_notes(text: str, start_num: int = 1):
             kept_lines.pop()
         assembled = ('\n'.join(kept_lines).rstrip('\n') + '\n\n---\n\n'
                      + '\n'.join(def_lines[k] for k in sorted(def_lines)) + '\n')
+
+    # 6.6) 悬空引用清理：引用存在但定义已被合并/搬走 → 去掉断链标记。
+    # 不静默保留坏链接；数量写进报告，便于回溯是哪一步产生的。
+    def_ids = set(re.findall(r'^\[\^([^\]]+)\]:', assembled, re.M))
+    ref_ids = {m.group(1) for m in re.finditer(r'\[\^([^\]]+)\](?!:)', assembled)}
+    dangling = sorted(ref_ids - def_ids)
+    if dangling:
+        for uid in dangling:
+            assembled = re.sub(r'\[\^' + re.escape(uid) + r'\](?!:)', '', assembled)
+        changes["dangling_refs_removed"] = len(dangling)
+
+    # 6.7) 孤儿定义（有定义无引用）→ 章末译者注；复用 finalize 的同一判定。
+    assembled, _style_changes = normalize_final_style(assembled)
+    if _style_changes.get("orphans_relocated"):
+        changes["md_relocated"] += _style_changes["orphans_relocated"]
     return assembled, changes, start_num + len(order)
 
 
@@ -15087,7 +16106,8 @@ def normalize_final_style(text: str):
 def normalize_notes_document(text: str):
     """全书：按 H1 切章逐章统一（编号全书连续）。→ (new_text, report)"""
     parts = re.split(r'(?m)^(# .*)$', text)
-    agg = {"merged_dups": 0, "orphans_attached": 0, "md_relocated": 0,
+    agg = {"merged_dups": 0, "same_key_merges": 0, "dangling_refs_removed": 0,
+           "orphans_attached": 0, "md_relocated": 0,
            "num_relocated": 0, "title_blocks_moved": 0, "renumbered": 0,
            "title_shells_dropped": 0,
            "machine_ids": 0}
@@ -15114,11 +16134,12 @@ def normalize_notes_document(text: str):
 
 
 def notes_normalize_outputs(project_root=None, output_dir=None, apply: bool = False) -> dict:
-    """对 translated_full.md 执行章级注释统一；默认 dry-run，写 output/note_policy_diff.md。"""
+    """对成品译稿执行章级注释统一；默认 dry-run，写 output/note_policy_diff.md。"""
     root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
     out_root = Path(output_dir) if output_dir else root / "output"
-    merged = out_root / "translated_full.md"
-    stats = {"files": 0, "changed": 0, "merged_dups": 0, "orphans_attached": 0,
+    merged = resolve_book_output_path(root, out_root)
+    stats = {"files": 0, "changed": 0, "merged_dups": 0, "same_key_merges": 0,
+             "dangling_refs_removed": 0, "orphans_attached": 0,
              "md_relocated": 0, "num_relocated": 0, "title_blocks_moved": 0,
              "renumbered": 0, "title_shells_dropped": 0, "machine_ids": 0}
     details = []
@@ -15128,7 +16149,8 @@ def notes_normalize_outputs(project_root=None, output_dir=None, apply: bool = Fa
         new_text, rep = normalize_notes_document(text)
         if new_text != text:
             stats["changed"] = 1
-            for key in ("merged_dups", "orphans_attached", "md_relocated",
+            for key in ("merged_dups", "same_key_merges", "dangling_refs_removed",
+                        "orphans_attached", "md_relocated",
                         "num_relocated", "title_blocks_moved", "renumbered",
                         "title_shells_dropped", "machine_ids"):
                 stats[key] = rep["stats"].get(key, 0)
@@ -15138,9 +16160,12 @@ def notes_normalize_outputs(project_root=None, output_dir=None, apply: bool = Fa
     lines = ["# 章级注释统一报告 (note_policy_diff)", "",
              "- 模式: {0}".format('APPLY (已写入)' if apply else 'DRY RUN (仅报告)'),
              "- 处理 file: {0} 个；需要变更: {1} 个".format(stats['files'], stats['changed']),
-             "- 去重合并: {0}；孤儿改锚: {1}；md 转译者注: {2}；编号注转译注块: {3}".format(
-                 stats['merged_dups'], stats['orphans_attached'],
-                 stats['md_relocated'], stats['num_relocated']),
+             "- 去重合并: {0}（同词条 {1}）；孤儿改锚: {2}；md 转译者注: {3}；"
+             "编号注转译注块: {4}；悬空引用清理: {5}".format(
+                 stats['merged_dups'], stats['same_key_merges'],
+                 stats['orphans_attached'],
+                 stats['md_relocated'], stats['num_relocated'],
+                 stats['dangling_refs_removed']),
              "- 标题块搬移: {0}；空壳标题清理: {1}；顺编号: {2}；机器 id 清除: {3}".format(
                  stats['title_blocks_moved'], stats['title_shells_dropped'],
                  stats['renumbered'], stats['machine_ids']),
@@ -15167,7 +16192,7 @@ def postprocess_chunk_text(text: str, chapter_id: str, chunk_idx: int) -> str:
         s = line.strip()
         if _FRONTMATTER_LINE_RE.match(s):
             continue
-        if _CHAPTER_HEAD_RE.match(s):
+        if _CHAPTER_HEAD_RE.match(s) or _PART_HEAD_RE.match(s):
             continue
         out.append(line)
     return '\n'.join(out)
@@ -15176,6 +16201,3723 @@ def postprocess_chunk_text(text: str, chapter_id: str, chunk_idx: int) -> str:
 def sup_run_to_int(run: str) -> int:
     """上标数字串 → 整数（"¹²" → 12）。"""
     return int(''.join(str(_SUPER.index(c) + 1) for c in run))
+
+
+
+
+# Section 13.6 — Round 131 全书判断层 / 故事图 / 深读剖面
+# ────────────────────────────────────────────────────────────────────
+
+JUDGMENT_SCHEMA_VERSION = 2
+VALID_NOTE_TYPES = ("voice", "setup_payoff", "arc")
+VALID_NOTE_STATUSES = ("active", "dormant", "dropped")
+PROFILE_NOTE_KEYS = {
+    "voice": "voice_notes",
+    "setup_payoff": "setup_payoff",
+    "arc": "narrative_arc",
+}
+TYPE_PRIORITY = {"voice": 3, "setup_payoff": 2, "arc": 1}
+
+# Output caps keep one deep read from producing an unverifiable note flood.
+NOTE_TYPE_LIMITS = {"voice": 50, "setup_payoff": 30, "arc": 20}
+VOICE_NOTES_PER_CHAPTER = 8
+
+# These belong to the judgment artifact/profile, never to critic scoring or
+# literal-translation style state.  profile_to_style_guide already omits them;
+# this list is the defensive boundary for other callers.
+ADVISORY_STYLE_KEYS = {
+    "narrative_arc", "setup_payoff", "voice_notes", "judgment_notes",
+    "judgment", "generation", "deep_read", "schema_version",
+}
+
+STRUCTURAL_P0_CATEGORIES = ("dangling", "dup_note")
+
+# Phase 3 repair sidecar.  The sidecar is valid only for the exact final text
+# that produced the review anchors; the pipeline binds it to the pre-rerun
+# final_backup.json hash before allowing the feedback into a prompt.
+REVIEW_FIX_SCHEMA_VERSION = 1
+REVIEW_FIX_SIDECAR_STEP = "review_fix"
+
+# A normative terminology assertion belongs to the decision DB, not here.
+# The pattern intentionally allows narrative clauses that merely name a
+# character ("保罗在第一章仍显得...").
+_PRESCRIPTIVE_RE = re.compile(
+    r"(?:术语|译名|名称|专名|人名|地名)\s*(?:应|应当|必须|须|一律|统一|固定|标准)"
+    r"|(?:应|应当|必须|须|一律|统一|固定|标准|建议)\s*(?:译作|译成|译为|采用|使用)"
+    r"|(?:统一|固定)(?:译名|术语|名称|译法)"
+    r"|(?:该|此)(?:词|术语|名称).{0,18}(?:译|作|采用)"
+    r"|should\s+be\s+translated|must\s+be\s+translated|standard\s+translation"
+    r"|preferred\s+term|canonical\s+(?:term|translation)",
+    re.IGNORECASE,
+)
+
+
+def _now() -> str:
+    return _dt.datetime.now().isoformat(timespec="seconds")
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
+
+
+def atomic_write_json(path: Path, payload: Any) -> None:
+    """Write JSON via replace so a crashed run never leaves a torn artifact."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(str(text or ""))
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def is_prescriptive_claim(claim: str) -> bool:
+    return bool(_PRESCRIPTIVE_RE.search(str(claim or "")))
+
+
+def _clean_chapter_id(value: Any) -> str:
+    s = str(value or "").strip()
+    return s if re.fullmatch(r"[a-zA-Z0-9_-]{1,32}", s) else ""
+
+
+def normalize_chapters(value: Any) -> List[str]:
+    """Normalize chapter ids/ranges while preserving first-seen order.
+
+    A two-element list is an inclusive narrative span.  Explicit dictionaries
+    such as ``{"start": "ch01", "end": "ch03"}`` are accepted for convenience.
+    """
+    out: List[str] = []
+    if isinstance(value, dict):
+        a = _clean_chapter_id(value.get("start") or value.get("from"))
+        b = _clean_chapter_id(value.get("end") or value.get("to"))
+        value = [a, b]
+    elif isinstance(value, str):
+        value = re.split(r"[,，\s]+", value)
+    if not isinstance(value, list):
+        return out
+    for item in value:
+        cid = _clean_chapter_id(item)
+        if cid and cid not in out:
+            out.append(cid)
+    return out
+
+
+def chapter_ids_between(chapters: Sequence[str]) -> List[str]:
+    """Return the lexicographic inclusive span for a note's chapter list.
+
+    Chapter ids in SagaTrans are fixed-width (ch01, ch02, ...).  Treating a
+    multi-chapter list as a span is what makes an arc visible to intermediate
+    chapters without exploding the profile into one record per chapter.
+    """
+    clean = normalize_chapters(list(chapters))
+    if len(clean) < 2:
+        return clean
+    try:
+        lo = min(clean)
+        hi = max(clean)
+        m_lo = re.fullmatch(r"([^\d]*)(\d+)", lo)
+        m_hi = re.fullmatch(r"([^\d]*)(\d+)", hi)
+        if m_lo and m_hi and m_lo.group(1) == m_hi.group(1):
+            width = max(len(m_lo.group(2)), len(m_hi.group(2)))
+            return [f"{m_lo.group(1)}{i:0{width}d}"
+                    for i in range(int(m_lo.group(2)), int(m_hi.group(2)) + 1)]
+    except Exception:
+        pass
+    return sorted(clean)
+
+
+def note_covers_chapter(note: Dict[str, Any], chapter_id: str) -> bool:
+    cid = _clean_chapter_id(chapter_id)
+    if not cid:
+        return False
+    return cid in chapter_ids_between(note.get("chapters") or [])
+
+
+def normalize_evidence(value: Any, default_chapters: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
+    if isinstance(value, dict):
+        value = [value]
+    elif isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    defaults = normalize_chapters(list(default_chapters or []))
+    for idx, item in enumerate(value):
+        chapter = ""
+        quote = ""
+        offset: Optional[int] = None
+        if isinstance(item, str):
+            quote = item.strip()
+            chapter = defaults[min(idx, len(defaults) - 1)] if defaults else ""
+        elif isinstance(item, dict):
+            chapter = _clean_chapter_id(item.get("chapter") or item.get("chapter_id"))
+            quote = str(item.get("quote") or item.get("text") or "").strip()
+            try:
+                if item.get("offset") is not None:
+                    offset = max(0, int(item.get("offset")))
+            except (TypeError, ValueError):
+                offset = None
+        if not chapter and defaults:
+            chapter = defaults[0]
+        if not chapter or not quote:
+            continue
+        ev = {"chapter": chapter, "quote": quote}
+        if offset is not None:
+            ev["offset"] = offset
+        for key in ("match_kind", "match_score", "matched_quote", "unique"):
+            if isinstance(item, dict) and key in item:
+                ev[key] = item[key]
+        out.append(ev)
+    return out
+
+
+def normalize_note(
+    raw: Any,
+    type_hint: str = "",
+    index: int = 1,
+    source_model: str = "",
+    created_at: str = "",
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    ntype = str(raw.get("type") or type_hint or "").strip().lower()
+    if ntype not in VALID_NOTE_TYPES:
+        return None
+    claim = re.sub(r"\s+", " ", str(
+        raw.get("claim") or raw.get("note") or raw.get("summary") or ""
+    )).strip()
+    if not claim:
+        return None
+    chapters = normalize_chapters(raw.get("chapters") or [])
+    # Evidence items may omit their chapter while the note carries the span.
+    # Normalize chapters first and use the span as a default, otherwise a valid
+    # evidence quote is silently discarded before L1 can validate it.
+    ev = normalize_evidence(raw.get("evidence") or raw.get("evidence_quotes"),
+                            default_chapters=chapters)
+    if not chapters:
+        seen = []
+        for e in ev:
+            if e["chapter"] not in seen:
+                seen.append(e["chapter"])
+        chapters = seen
+    if not chapters or not ev:
+        return None
+    try:
+        conf = float(raw.get("confidence", 0.5))
+    except (TypeError, ValueError):
+        conf = 0.5
+    conf = max(0.0, min(1.0, conf))
+    status = str(raw.get("status") or "active").strip().lower()
+    if status not in VALID_NOTE_STATUSES:
+        status = "dormant"
+    nid = str(raw.get("id") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", nid):
+        nid = f"{ntype}-{index:03d}"
+    note = {
+        "id": nid,
+        "type": ntype,
+        "chapters": chapters,
+        "claim": claim[:600],
+        "evidence": ev,
+        "confidence": conf,
+        "status": status,
+        "source_model": str(raw.get("source_model") or source_model or "").strip(),
+        "created_at": str(raw.get("created_at") or created_at or _now()).strip(),
+    }
+    meta = raw.get("meta")
+    if isinstance(meta, dict) and meta:
+        note["meta"] = meta
+    # Preserve validation/provenance fields across save -> load round-trips.
+    # Without these fields a persisted active note is indistinguishable from a
+    # hand-edited/unvalidated note, so note_is_validated() rejects it at runtime.
+    for key in ("l1_reject_reason", "l1_note", "l2_verdict", "l2_reason",
+                "l2_reject_reason", "schema_reject_reason",
+                "limit_reject_reason", "pairing_status"):
+        value = raw.get(key)
+        if isinstance(value, str) and value.strip():
+            note[key] = value.strip()
+    if is_prescriptive_claim(claim):
+        note["status"] = "dropped"
+        note["schema_reject_reason"] = "prescriptive_terminology_claim"
+    return note
+
+
+def dedupe_notes(notes: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Drop exact duplicate observations while preserving first-seen order."""
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for note in notes:
+        normalized = normalize_text_for_match(str(note.get("claim") or ""))
+        evidence = tuple(sorted(
+            (str(e.get("chapter") or ""), normalize_text_for_match(str(e.get("quote") or "")))
+            for e in (note.get("evidence") or [])
+        ))
+        sig = (str(note.get("type") or ""), normalized, evidence)
+        if not normalized or sig in seen:
+            continue
+        seen.add(sig)
+        out.append(note)
+    return out
+
+
+def ensure_unique_note_ids(notes: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Make note ids globally unique after merging independently extracted parts."""
+    out: List[Dict[str, Any]] = []
+    seen: Dict[str, int] = {}
+    for raw in notes:
+        note = dict(raw)
+        base = str(note.get("id") or "note").strip() or "note"
+        count = seen.get(base, 0)
+        if count:
+            note["id"] = f"{base}-{count + 1}"
+        seen[base] = count + 1
+        out.append(note)
+    return out
+
+
+def restrict_notes_to_candidate_quotes(
+    notes: Sequence[Dict[str, Any]],
+    candidate_notes: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Enforce merge-layer provenance: only quotes emitted by extraction survive.
+
+    L1 alone cannot catch this failure mode: a merge model may paste a real
+    sentence from a different part of the book and still pass substring
+    matching. The extraction stage is the candidate boundary, so merge output
+    may only re-use those exact quotes (whitespace/case normalized). Notes
+    whose evidence is entirely invented by the merge layer are retained as
+    ``dropped`` audit records instead of disappearing silently.
+    """
+    allowed = set()
+    for note in candidate_notes or []:
+        for ev in note.get("evidence") or []:
+            qn = normalize_text_for_match(str(ev.get("quote") or ""))
+            if qn:
+                allowed.add(qn)
+    out: List[Dict[str, Any]] = []
+    for raw in notes or []:
+        note = dict(raw)
+        kept = []
+        for ev in note.get("evidence") or []:
+            qn = normalize_text_for_match(str(ev.get("quote") or ""))
+            if qn and qn in allowed:
+                kept.append(dict(ev))
+        note["evidence"] = kept
+        if not kept and note.get("status") == "active":
+            note["status"] = "dropped"
+            note["schema_reject_reason"] = "merge_quote_not_from_extraction_candidates"
+        out.append(note)
+    return out
+
+
+def enforce_note_limits(notes: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Apply per-type and per-chapter voice caps deterministically.
+
+    Highest confidence wins; ties are broken by id so repeated runs are stable.
+    Notes beyond a cap are retained as ``dropped`` for audit, never silently
+    removed from the artifact.
+    """
+    ranked = sorted(
+        [dict(n) for n in notes],
+        key=lambda n: (-float(n.get("confidence", 0.0) or 0.0), str(n.get("id") or "")),
+    )
+    counts: Dict[str, int] = {k: 0 for k in VALID_NOTE_TYPES}
+    voice_chapter_counts: Dict[str, int] = {}
+    out: List[Dict[str, Any]] = []
+    for note in ranked:
+        # Non-active notes are audit-only and must not consume an injection
+        # quota before L2 has even run.
+        if str(note.get("status") or "") != "active":
+            out.append(note)
+            continue
+        ntype = str(note.get("type") or "")
+        if ntype not in counts:
+            note["status"] = "dropped"
+            note["limit_reject_reason"] = "unknown_type"
+            out.append(note)
+            continue
+        reason = ""
+        if counts[ntype] >= NOTE_TYPE_LIMITS[ntype]:
+            reason = f"cap:{ntype}"
+        if ntype == "voice":
+            for cid in normalize_chapters(note.get("chapters") or []):
+                if voice_chapter_counts.get(cid, 0) >= VOICE_NOTES_PER_CHAPTER:
+                    reason = f"cap:voice_per_chapter:{cid}"
+                    break
+        if reason:
+            note["status"] = "dropped"
+            note["limit_reject_reason"] = reason
+            out.append(note)
+            continue
+        counts[ntype] += 1
+        if ntype == "voice":
+            for cid in normalize_chapters(note.get("chapters") or []):
+                voice_chapter_counts[cid] = voice_chapter_counts.get(cid, 0) + 1
+        out.append(note)
+    out.sort(key=lambda n: str(n.get("id") or ""))
+    return {"notes": out, "counts": counts,
+            "voice_chapter_counts": voice_chapter_counts}
+
+
+def normalize_notes(value: Any, type_hint: str = "", source_model: str = "",
+                    created_at: str = "") -> List[Dict[str, Any]]:
+    if isinstance(value, dict):
+        # Accept {"notes": [...]} and grouped-by-chapter dictionaries.
+        if isinstance(value.get("notes"), list):
+            value = value["notes"]
+        else:
+            value = list(value.values())
+    if not isinstance(value, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    seen_ids: Dict[str, int] = {}
+    for idx, raw in enumerate(value, 1):
+        note = normalize_note(raw, type_hint=type_hint, index=idx,
+                              source_model=source_model, created_at=created_at)
+        if not note:
+            continue
+        base = note["id"]
+        n = seen_ids.get(base, 0)
+        if n:
+            note["id"] = f"{base}-{n + 1}"
+        seen_ids[base] = n + 1
+        out.append(note)
+    return out
+
+
+def normalize_judgment_fields(data: Dict[str, Any], source_model: str = "",
+                              created_at: str = "") -> Dict[str, List[Dict[str, Any]]]:
+    raw_by_type = {
+        "voice": data.get("voice_notes") or [],
+        "setup_payoff": data.get("setup_payoff") or [],
+        "arc": data.get("narrative_arc") or data.get("arc_notes") or [],
+    }
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for ntype in VALID_NOTE_TYPES:
+        out[PROFILE_NOTE_KEYS[ntype]] = normalize_notes(
+            raw_by_type[ntype], type_hint=ntype,
+            source_model=source_model, created_at=created_at,
+        )
+    return out
+
+
+def all_notes(profile: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(profile, dict):
+        return []
+    out: List[Dict[str, Any]] = []
+    for key in PROFILE_NOTE_KEYS.values():
+        val = profile.get(key) or []
+        if isinstance(val, list):
+            out.extend(n for n in val if isinstance(n, dict))
+    return out
+
+
+def note_is_validated(note: Dict[str, Any]) -> bool:
+    """True only when L1 matched every quote and L2 explicitly confirmed it.
+
+    A loaded v1 profile (or a hand-edited v2 file) may contain ``status:
+    active`` without ever passing the validation chain.  Status alone is not a
+    provenance proof, so runtime injection and graph certification require both
+    markers produced by the actual pipeline.
+    """
+    if not isinstance(note, dict) or note.get("status") != "active":
+        return False
+    if note.get("l2_verdict") != "confirmed":
+        return False
+    evidence = note.get("evidence") or []
+    return bool(evidence) and all(
+        isinstance(ev, dict) and bool(ev.get("match_kind")) for ev in evidence
+    )
+
+
+def active_notes(profile: Optional[Dict[str, Any]],
+                 min_confidence: float = 0.0,
+                 require_validated: bool = True) -> List[Dict[str, Any]]:
+    out = []
+    for note in all_notes(profile):
+        if note.get("status") != "active":
+            continue
+        if require_validated and not note_is_validated(note):
+            continue
+        try:
+            conf = float(note.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        if conf + 1e-9 < min_confidence:
+            continue
+        if is_prescriptive_claim(str(note.get("claim") or "")):
+            continue
+        out.append(note)
+    return out
+
+
+def sanitize_style_guide_for_scoring(style_guide: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return a scorer-safe style guide with all advisory judgment fields removed."""
+    if not isinstance(style_guide, dict):
+        return {}
+    return {k: v for k, v in style_guide.items() if k not in ADVISORY_STYLE_KEYS}
+
+
+# L1: mechanical evidence matching against split chapter files
+
+_REPLACEMENTS = {
+    "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+    "\u2013": "-", "\u2014": "-", "\u2026": "...",
+}
+
+
+def _normalized_with_map(text: str) -> Tuple[str, List[int]]:
+    """Whitespace-free normalized text plus a normalized->original index map."""
+    chars: List[str] = []
+    positions: List[int] = []
+    for i, ch in enumerate(str(text or "")):
+        if ch.isspace():
+            continue
+        rep = _REPLACEMENTS.get(ch, ch)
+        rep = unicodedata.normalize("NFKC", rep)
+        for rc in rep:
+            if rc.isspace():
+                continue
+            chars.append(rc.lower())
+            positions.append(i)
+    return "".join(chars), positions
+
+
+def normalize_text_for_match(text: str) -> str:
+    return _normalized_with_map(text)[0]
+
+
+def _ascii_alnum(ch: str) -> bool:
+    return bool(ch) and ch.isascii() and ch.isalnum()
+
+
+def _boundary_ok(text: str, start: int, end: int, quote: str) -> bool:
+    if start < 0 or end > len(text) or end <= start:
+        return False
+    q = str(quote or "")
+    if q and _ascii_alnum(q[0]) and start > 0 and _ascii_alnum(text[start - 1]):
+        return False
+    if q and _ascii_alnum(q[-1]) and end < len(text) and _ascii_alnum(text[end]):
+        return False
+    return True
+
+
+def _exact_spans(text: str, quote: str, limit: int = 50) -> List[Tuple[int, int]]:
+    if not quote:
+        return []
+    spans: List[Tuple[int, int]] = []
+    pos = 0
+    while len(spans) < limit:
+        idx = text.find(quote, pos)
+        if idx < 0:
+            break
+        end = idx + len(quote)
+        if _boundary_ok(text, idx, end, quote):
+            spans.append((idx, end))
+        pos = idx + 1
+    return spans
+
+
+def _normalized_spans(text: str, quote: str, limit: int = 50) -> List[Tuple[int, int]]:
+    qn = normalize_text_for_match(quote)
+    tn, pos = _normalized_with_map(text)
+    if not qn or not tn:
+        return []
+    spans: List[Tuple[int, int]] = []
+    start = 0
+    while len(spans) < limit:
+        idx = tn.find(qn, start)
+        if idx < 0:
+            break
+        end_norm = idx + len(qn) - 1
+        orig_start = pos[idx]
+        orig_end = pos[end_norm] + 1
+        if _boundary_ok(text, orig_start, orig_end, quote):
+            spans.append((orig_start, orig_end))
+        start = idx + 1
+    return spans
+
+
+def _quote_tokens(quote: str) -> List[str]:
+    toks = re.findall(r"[A-Za-z0-9]{3,}|[\u4e00-\u9fff]{2,}", quote)
+    toks.sort(key=len, reverse=True)
+    return toks
+
+
+def _similar_spans(text: str, quote: str, min_ratio: float = 0.9,
+                   limit: int = 12) -> List[Tuple[int, int, float]]:
+    qn = normalize_text_for_match(quote)
+    if len(qn) < 8:
+        return []
+    tokens = _quote_tokens(quote)
+    candidates: List[Tuple[int, str, int]] = []
+    if tokens:
+        for tok in tokens[:2]:
+            tok_n = normalize_text_for_match(tok)
+            relative = qn.find(tok_n)
+            if relative < 0:
+                continue
+            try:
+                for m in re.finditer(re.escape(tok), text, re.IGNORECASE):
+                    candidates.append((m.start(), tok_n, relative))
+                    if len(candidates) >= 30:
+                        break
+            except re.error:
+                pass
+            if len(candidates) >= 30:
+                break
+    if not candidates:
+        return []
+    margin = max(24, int(len(qn) * 0.6) + 12)
+    best: List[Tuple[int, int, float]] = []
+    seen: Dict[Tuple[int, int], float] = {}
+    # Compare quote-length slices anchored at a source token.  Comparing the
+    # quote with a fixed oversized context window dilutes a one-character
+    # punctuation/typo difference below the threshold; token anchoring keeps
+    # the comparison local while still allowing small insertions/deletions.
+    for cpos, tok_n, relative in candidates:
+        start = max(0, cpos - margin)
+        end = min(len(text), cpos + margin + len(qn))
+        window = text[start:end]
+        wn, wmap = _normalized_with_map(window)
+        tok_pos = wn.find(tok_n)
+        if tok_pos < 0:
+            continue
+        base = max(0, tok_pos - relative)
+        for offset in range(-3, 4):
+            nstart = max(0, base + offset)
+            for delta in (-2, 0, 2, 4, 8):
+                nend = min(len(wn), nstart + len(qn) + delta)
+                if nend <= nstart:
+                    continue
+                ratio = difflib.SequenceMatcher(
+                    None, qn, wn[nstart:nend], autojunk=False).ratio()
+                if ratio + 1e-9 < min_ratio:
+                    continue
+                orig_start = start + wmap[nstart]
+                orig_end = start + wmap[nend - 1] + 1
+                if not _boundary_ok(text, orig_start, orig_end, quote):
+                    continue
+                key = (orig_start, orig_end)
+                seen[key] = max(seen.get(key, 0.0), ratio)
+    for (orig_start, orig_end), ratio in seen.items():
+        best.append((orig_start, orig_end, ratio))
+    best.sort(key=lambda x: (-x[2], x[0]))
+    return best[:limit]
+
+
+def match_quote(text: str, quote: str, min_similarity: float = 0.9,
+                preferred_offset: Optional[int] = None) -> Dict[str, Any]:
+    """Match an evidence quote against one chapter source file.
+
+    Order: exact -> whitespace/quote-normalized exact -> anchored fuzzy.
+    A short ASCII token is never allowed to match inside a larger word.
+    """
+    src = str(text or "")
+    q = str(quote or "").strip()
+    if not src or len(q) < 2:
+        return {"ok": False, "reason": "empty_quote_or_text"}
+
+    def _choose(spans: List[Tuple[int, int]], kind: str, score: float) -> Dict[str, Any]:
+        if not spans:
+            return {}
+        if preferred_offset is not None:
+            spans = sorted(spans, key=lambda s: (abs(s[0] - preferred_offset), s[0]))
+        start, end = spans[0]
+        return {
+            "ok": True,
+            "match_kind": kind,
+            "match_score": float(score),
+            "offset": int(start),
+            "end": int(end),
+            "matched_quote": src[start:end],
+            "unique": len(spans) == 1,
+            "candidate_count": len(spans),
+        }
+
+    hit = _choose(_exact_spans(src, q), "exact", 1.0)
+    if hit:
+        return hit
+    hit = _choose(_normalized_spans(src, q), "normalized_exact", 1.0)
+    if hit:
+        return hit
+    fuzzy = _similar_spans(src, q, min_ratio=min_similarity)
+    if fuzzy:
+        spans = [(s, e) for s, e, _ in fuzzy]
+        chosen = _choose(spans, "fuzzy", fuzzy[0][2])
+        if chosen:
+            return chosen
+    return {"ok": False, "reason": "evidence_not_found", "quote": q}
+
+
+def map_quote_to_chunks(chunk_texts: Dict[str, str], quote: str,
+                        min_similarity: float = 0.9) -> Dict[str, Any]:
+    """Map one verified review quote to exactly one final chunk.
+
+    Exact/normalized matches are preferred over fuzzy matches.  When the same
+    quote occurs in more than one chunk the result is deliberately not
+    actionable: auto-DIRTY must never guess which chunk the editor meant.
+    """
+    hits: List[Dict[str, Any]] = []
+    for chunk_id, text in (chunk_texts or {}).items():
+        hit = match_quote(text or "", quote, min_similarity=min_similarity)
+        if hit.get("ok"):
+            hits.append({
+                "chunk_id": str(chunk_id),
+                "match_kind": hit.get("match_kind", ""),
+                "match_score": hit.get("match_score", 0.0),
+                "offset": hit.get("offset"),
+                "matched_quote": hit.get("matched_quote", ""),
+                "unique_in_chunk": bool(hit.get("unique")),
+            })
+    if not hits:
+        return {"ok": False, "reason": "quote_not_in_final_chunks", "hits": []}
+    if len(hits) > 1:
+        return {"ok": False, "reason": "ambiguous_across_chunks", "hits": hits}
+    out = dict(hits[0])
+    out.update({"ok": True, "reason": ""})
+    return out
+
+
+def validate_note_evidence(notes: Sequence[Dict[str, Any]],
+                           chapter_texts: Dict[str, str],
+                           min_similarity: float = 0.9) -> Dict[str, Any]:
+    """L1 validation.  A note with any unverifiable evidence is dropped.
+
+    Besides quote matching, L1 enforces two structural rules which an LLM merge
+    can otherwise violate: evidence must sit inside the note's declared chapter
+    span, and a setup/payoff note must actually carry evidence from at least
+    two distinct chapters.
+    """
+    validated: List[Dict[str, Any]] = []
+    audit_notes: List[Dict[str, Any]] = []
+    for note in notes:
+        n = dict(note)
+        n["evidence"] = [dict(e) for e in (note.get("evidence") or [])]
+        reason = ""
+        soft_reason = ""
+        ev_audit: List[Dict[str, Any]] = []
+        if is_prescriptive_claim(str(n.get("claim") or "")):
+            n["status"] = "dropped"
+            reason = "schema:prescriptive_terminology_claim"
+        else:
+            for ev in n["evidence"]:
+                cid = str(ev.get("chapter") or "")
+                txt = chapter_texts.get(cid)
+                if txt is None:
+                    reason = f"l1:chapter_missing:{cid or '?'}"
+                    ev_audit.append({"chapter": cid, "quote": ev.get("quote"), "ok": False,
+                                     "reason": reason})
+                    break
+                hit = match_quote(txt, str(ev.get("quote") or ""),
+                                  min_similarity=min_similarity,
+                                  preferred_offset=ev.get("offset"))
+                ev_audit.append({
+                    "chapter": cid,
+                    "quote": ev.get("quote"),
+                    "ok": bool(hit.get("ok")),
+                    "match_kind": hit.get("match_kind", ""),
+                    "match_score": hit.get("match_score", 0.0),
+                    "offset": hit.get("offset"),
+                    "unique": hit.get("unique", False),
+                    "matched_quote": hit.get("matched_quote", ""),
+                    "reason": hit.get("reason", ""),
+                })
+                if not hit.get("ok"):
+                    reason = f"l1:{hit.get('reason') or 'evidence_not_found'}:{cid}"
+                    break
+                ev["offset"] = hit["offset"]
+                ev["match_kind"] = hit["match_kind"]
+                ev["match_score"] = hit["match_score"]
+                ev["matched_quote"] = hit["matched_quote"]
+                ev["unique"] = hit["unique"]
+            if not n["evidence"]:
+                reason = reason or "l1:no_evidence"
+            if not reason:
+                evidence_chapters: List[str] = []
+                for ev in n["evidence"]:
+                    cid = str(ev.get("chapter") or "")
+                    if cid and cid not in evidence_chapters:
+                        evidence_chapters.append(cid)
+                span = set(chapter_ids_between(n.get("chapters") or []))
+                outside = [cid for cid in evidence_chapters if cid not in span]
+                if outside:
+                    reason = f"l1:evidence_outside_chapter_range:{outside[0]}"
+                elif n.get("type") == "setup_payoff" and len(evidence_chapters) < 2:
+                    # Merge marks a one-sided setup as dormant/unpaired when it
+                    # cannot find a payoff candidate.  That is an audit-only
+                    # knowledge gap, not a fabricated active claim: keep the
+                    # quote validation and leave it dormant.  An active
+                    # one-chapter setup is still invalid and must be dropped.
+                    if str(n.get("status") or "").lower() == "dormant":
+                        soft_reason = "l1:setup_payoff_unpaired"
+                    else:
+                        reason = "l1:setup_payoff_requires_two_chapters"
+            if reason:
+                n["status"] = "dropped"
+                n["l1_reject_reason"] = reason
+            elif soft_reason:
+                n["status"] = "dormant"
+                n["l1_note"] = soft_reason
+        validated.append(n)
+        audit_notes.append({
+            "id": n.get("id"), "type": n.get("type"), "status": n.get("status"),
+            "confidence": n.get("confidence"),
+            "reason": reason or n.get("l1_reject_reason", "") or n.get("l1_note", ""),
+            "evidence": ev_audit,
+        })
+
+    limited = enforce_note_limits(validated)
+    validated = limited["notes"]
+    counts = {"active": 0, "dormant": 0, "dropped": 0}
+    audit_by_id = {str(a.get("id") or ""): a for a in audit_notes}
+    for n in validated:
+        status = str(n.get("status") or "dormant")
+        counts[status] = counts.get(status, 0) + 1
+        item = audit_by_id.get(str(n.get("id") or ""))
+        if item is None:
+            item = {"id": n.get("id"), "type": n.get("type"), "evidence": []}
+            audit_notes.append(item)
+        item["status"] = status
+        if n.get("limit_reject_reason"):
+            item["reason"] = n["limit_reject_reason"]
+    return {
+        "notes": validated,
+        "audit": {
+            "stage": "l1",
+            "checked": len(notes),
+            "counts": counts,
+            "type_counts": limited.get("counts") or {},
+            "notes": audit_notes,
+        },
+    }
+
+
+# L2: cheap cross-model corroboration
+
+def _context_for_evidence(chapter_texts: Dict[str, str], evidence: Dict[str, Any],
+                          radius: int = 120) -> str:
+    text = chapter_texts.get(str(evidence.get("chapter") or "")) or ""
+    try:
+        off = int(evidence.get("offset", 0))
+    except (TypeError, ValueError):
+        off = 0
+    if not text:
+        return ""
+    start = max(0, off - radius)
+    end = min(len(text), off + len(str(evidence.get("quote") or "")) + radius)
+    return text[start:end].replace("\n", " ")
+
+
+def build_l2_prompt(notes: Sequence[Dict[str, Any]], chapter_texts: Dict[str, str]) -> str:
+    payload = []
+    for n in notes:
+        evs = []
+        for ev in (n.get("evidence") or [])[:4]:
+            evs.append({
+                "chapter": ev.get("chapter"),
+                "quote": ev.get("quote"),
+                "matched_quote": ev.get("matched_quote") or ev.get("quote"),
+                "context": _context_for_evidence(chapter_texts, ev),
+            })
+        payload.append({
+            "id": n.get("id"),
+            "type": n.get("type"),
+            "chapters": n.get("chapters"),
+            "claim": n.get("claim"),
+            "evidence": evs,
+        })
+    return f"""你是文学翻译项目的证据复核员。以下是从全书深读中抽出的“判断层注记”。
+你的任务只有一个：判断每条 claim 是否被 evidence 原文引文直接支撑。
+
+判定规则：
+- confirmed：引文/上下文确实支撑该叙事、伏笔或音色观察；
+- unsure：证据不足、范围过宽或无法判断；
+- rejected：claim 与引文矛盾，或引文不支持 claim。
+- 注记只允许描述语气、人物弧线、伏笔/回收、叙事视角。若 claim 规定“术语/译名应如何翻译”、
+  “统一译作”“标准译名”等规范性内容，必须 rejected（这些约束属于 decision DB）。
+- 仅因 claim 提到人名/地名（如“保罗在结尾更沉默”）不得 rejected；要看证据是否支撑叙述判断。
+
+只输出 JSON，不要 markdown：
+{{"decisions":[{{"id":"...","verdict":"confirmed|unsure|rejected","reason":"≤60字"}}]}}
+
+【待复核注记】
+{json.dumps(payload, ensure_ascii=False)}
+"""
+
+
+def default_l2_generate(prompt: str) -> str:
+    from src.config import get_config
+    from src.utils.llm_adapter import get_llm_client_for_task, get_role_model_name
+
+    cfg = get_config()
+    task = "judgment_verify" if "judgment_verify" in (cfg.task_routing or {}) else "literal_translation"
+    model_key, params = cfg.resolve_task_model(task)
+    role = cfg.get_task_role(task)
+    llm = get_llm_client_for_task(task)
+    model_name = get_role_model_name(role) or model_key
+    return llm.generate(prompt, model_name=model_name, **params)
+
+
+def _parse_l2_decisions(raw: str) -> Dict[str, Dict[str, str]]:
+    from src.utils.llm_adapter import robust_json_loads
+
+    try:
+        payload = robust_json_loads(raw)
+    except Exception:
+        payload = None
+    if isinstance(payload, dict) and isinstance(payload.get("decisions"), list):
+        items = payload["decisions"]
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        return {}
+    out: Dict[str, Dict[str, str]] = {}
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        nid = str(it.get("id") or "").strip()
+        verdict = str(it.get("verdict") or it.get("status") or "").strip().lower()
+        if not nid or verdict not in ("confirmed", "unsure", "rejected"):
+            continue
+        out[nid] = {"verdict": verdict,
+                    "reason": str(it.get("reason") or "").strip()[:160]}
+    return out
+
+
+def verify_notes_l2(notes: Sequence[Dict[str, Any]], chapter_texts: Dict[str, str],
+                    llm_generate: Optional[Callable[[str], str]] = None,
+                    batch_size: int = 10) -> Dict[str, Any]:
+    """Confirm notes in batches of <=10.  Unconfirmed notes become dormant.
+
+    L2 is advisory and fail-open: an API/parse failure never blocks translation;
+    it only prevents injection for that batch.
+    """
+    notes_out = [dict(n) for n in notes]
+    gen = llm_generate or default_l2_generate
+    audit: List[Dict[str, Any]] = []
+    batch_size = max(1, min(10, int(batch_size or 10)))
+    for base in range(0, len(notes_out), batch_size):
+        batch = notes_out[base:base + batch_size]
+        pending = [n for n in batch if n.get("status") == "active"]
+        if not pending:
+            continue
+        try:
+            raw = gen(build_l2_prompt(pending, chapter_texts))
+            decisions = _parse_l2_decisions(raw)
+            parse_error = "" if decisions else "empty_or_invalid_json"
+        except Exception as exc:  # noqa: BLE001
+            decisions = {}
+            parse_error = f"llm_error:{type(exc).__name__}: {exc}"
+        for n in pending:
+            nid = str(n.get("id") or "")
+            d = decisions.get(nid)
+            if not d:
+                n["status"] = "dormant"
+                n["l2_reject_reason"] = f"l2_missing_decision:{parse_error or 'id_not_returned'}"
+                audit.append({"id": nid, "verdict": "missing", "reason": n["l2_reject_reason"]})
+                continue
+            verdict = d["verdict"]
+            reason = d.get("reason", "")
+            if verdict == "confirmed" and not is_prescriptive_claim(str(n.get("claim") or "")):
+                n["status"] = "active"
+                n["l2_verdict"] = "confirmed"
+                n["l2_reason"] = reason
+            else:
+                n["status"] = "dormant"
+                if verdict == "confirmed" and is_prescriptive_claim(str(n.get("claim") or "")):
+                    reason = "prescriptive_terminology_claim"
+                    verdict = "rejected"
+                n["l2_verdict"] = verdict
+                n["l2_reject_reason"] = reason or verdict
+            audit.append({"id": nid, "verdict": verdict, "reason": reason})
+    counts = {"active": 0, "dormant": 0, "dropped": 0}
+    for n in notes_out:
+        st = str(n.get("status") or "dormant")
+        counts[st] = counts.get(st, 0) + 1
+    return {"notes": notes_out,
+            "audit": {"stage": "l2", "checked": len(notes_out), "counts": counts,
+                      "decisions": audit}}
+
+
+def replace_notes_in_profile(profile: Dict[str, Any], notes: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    prof = dict(profile)
+    for ntype, key in PROFILE_NOTE_KEYS.items():
+        prof[key] = [dict(n) for n in notes if n.get("type") == ntype]
+    return prof
+
+
+# Runtime slicing / injection
+
+@dataclass
+class JudgmentContext:
+    block: str = ""
+    selected: List[Dict[str, Any]] = field(default_factory=list)
+    skipped: List[Dict[str, Any]] = field(default_factory=list)
+    chars: int = 0
+    budget: int = 0
+    cache_key: str = ""
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "chars": self.chars,
+            "budget": self.budget,
+            "cache_key": self.cache_key,
+            "selected": [{k: n.get(k) for k in
+                          ("id", "type", "chapters", "claim", "confidence")}
+                         for n in self.selected],
+            "skipped": self.skipped,
+        }
+
+
+def _note_line(note: Dict[str, Any]) -> str:
+    typ = note.get("type")
+    chapters = "→".join(str(c) for c in (note.get("chapters") or []))
+    label = {"voice": "音色", "setup_payoff": "伏笔/回收", "arc": "叙事弧线"}.get(typ, "注记")
+    claim = re.sub(r"\s+", " ", str(note.get("claim") or "")).strip()
+    return f"- {label}[{chapters}] {claim}"
+
+
+def render_review_fix_feedback(issues: Sequence[Dict[str, Any]]) -> str:
+    """Render verified structural review issues as retry-prompt instructions."""
+    lines = ["【成书终审结构修复（P0，必须逐条落实）】"]
+    for idx, issue in enumerate(issues, 1):
+        category = str(issue.get("category") or "other")
+        quote = re.sub(r"\s+", " ", str(issue.get("quote") or "")).strip()
+        note = re.sub(r"\s+", " ", str(issue.get("note") or "")).strip()
+        suggestion = re.sub(r"\s+", " ", str(issue.get("suggestion") or "")).strip()
+        line = f"{idx}. [{category}] 锚句: {quote}"
+        if note:
+            line += f"；问题: {note}"
+        if suggestion:
+            line += f"；最小修复: {suggestion}"
+        lines.append(line)
+    lines.append("约束：保留未涉及段落；不得删除或改写锚句之外的正常内容；不得新增无原文依据的信息。")
+    return "\n".join(lines) + "\n"
+
+
+def _quote_present_in_chunk(note: Dict[str, Any], chunk_norm: str) -> bool:
+    for ev in note.get("evidence") or []:
+        # L1 stores the source slice it actually matched.  A note may carry a
+        # slightly different ``quote`` (typo/punctuation mismatch) that still
+        # passed the fuzzy branch; using the original quote here would then
+        # miss the very chunk the evidence points at and lose anchor priority.
+        qn = normalize_text_for_match(
+            str(ev.get("matched_quote") or ev.get("quote") or "")
+        )
+        if len(qn) >= 2 and qn in chunk_norm:
+            return True
+    return False
+
+
+def build_judgment_context(profile: Optional[Dict[str, Any]], chapter_id: str,
+                           chunk_text: str = "", budget_chars: int = 300,
+                           min_confidence: float = 0.55,
+                           include_types: Optional[Sequence[str]] = None,
+                           max_notes: int = 6,
+                           prompt_version: str = "r131") -> JudgmentContext:
+    """Select a deterministic, whole-note-only slice for one chunk.
+
+    Notes whose evidence quote occurs in this exact chunk are considered first;
+    among equally anchored (or equally unanchored) notes, selection is
+    confidence-first (ties: voice > setup_payoff > arc).  Without the anchor
+    gate, a high-confidence chapter-wide voice note can crowd out the setup or
+    payoff note that actually matches the chunk being translated.  Notes are
+    never cut mid-sentence; an over-budget note is skipped and recorded.
+    """
+    budget = max(0, int(budget_chars or 0))
+    ctx = JudgmentContext(budget=budget)
+    if isinstance(profile, dict) and profile.get("schema_version") not in (None, 1, 2):
+        ctx.skipped.append({"reason": "unsupported_schema_version",
+                            "value": profile.get("schema_version")})
+        return ctx
+    include = set(include_types or VALID_NOTE_TYPES)
+    chunk_norm = normalize_text_for_match(chunk_text)
+    candidates: List[Tuple[Tuple[float, int, int, int, str], Dict[str, Any], bool]] = []
+    for note in active_notes(profile, min_confidence=min_confidence):
+        if note.get("type") not in include:
+            continue
+        if not note_covers_chapter(note, chapter_id):
+            continue
+        anchor_hit = _quote_present_in_chunk(note, chunk_norm) if chunk_norm else False
+        exact_evidence_chapter = any(
+            str(ev.get("chapter") or "") == str(chapter_id)
+            for ev in (note.get("evidence") or [])
+        )
+        try:
+            conf = float(note.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            conf = 0.0
+        key = (int(anchor_hit), round(conf, 6), TYPE_PRIORITY.get(note.get("type"), 0),
+               int(exact_evidence_chapter), str(note.get("id") or ""))
+        candidates.append((key, note, anchor_hit))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+
+    header = "【全书判断层注记（仅作参考；术语/译名以决策库为准）】\n"
+    if budget <= len(header):
+        if candidates:
+            ctx.skipped.append({"reason": "budget_smaller_than_header", "count": len(candidates)})
+        return ctx
+    lines: List[str] = []
+    used = len(header)
+    for key, note, _ in candidates:
+        if len(ctx.selected) >= max(1, int(max_notes or 1)):
+            ctx.skipped.append({"id": note.get("id"), "reason": "max_notes",
+                                "confidence": note.get("confidence")})
+            continue
+        line = _note_line(note) + "\n"
+        if used + len(line) > budget:
+            ctx.skipped.append({"id": note.get("id"), "reason": "budget",
+                                "confidence": note.get("confidence"), "chars": len(line)})
+            continue
+        lines.append(line)
+        ctx.selected.append(note)
+        used += len(line)
+    if not lines:
+        return ctx
+    ctx.block = header + "".join(lines)
+    ctx.chars = len(ctx.block)
+    fingerprint = {
+        "schema_version": (profile or {}).get("schema_version") if isinstance(profile, dict) else None,
+        "generation": (profile or {}).get("generation") if isinstance(profile, dict) else None,
+        "chapter": chapter_id,
+        "notes": [n.get("id") for n in ctx.selected],
+        "prompt_version": prompt_version,
+        "budget": budget,
+    }
+    ctx.cache_key = hashlib.sha256(json.dumps(
+        fingerprint, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    return ctx
+
+
+def render_global_review_context(profile: Optional[Dict[str, Any]],
+                                 budget_chars: int = 4000,
+                                 min_confidence: float = 0.55) -> str:
+    """Compact global narrative context for editor_review --global."""
+    notes = active_notes(profile, min_confidence=min_confidence)
+    lines: List[str] = []
+    used = 0
+    header = "【全书判断层（供弧线/语气审读参考，不是硬约束）】\n"
+    used += len(header)
+    for n in sorted(notes, key=lambda x: (-float(x.get("confidence") or 0),
+                                           -TYPE_PRIORITY.get(x.get("type"), 0))):
+        line = _note_line(n) + "\n"
+        if used + len(line) > budget_chars:
+            continue
+        lines.append(line)
+        used += len(line)
+    return header + "".join(lines) if lines else ""
+
+
+def build_audit_payload(profile: Dict[str, Any], l1_audit: Optional[Dict[str, Any]] = None,
+                        l2_audit: Optional[Dict[str, Any]] = None,
+                        generation: Optional[Dict[str, Any]] = None,
+                        extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    notes = all_notes(profile)
+    counts = {"active": 0, "dormant": 0, "dropped": 0}
+    for n in notes:
+        st = str(n.get("status") or "dormant")
+        counts[st] = counts.get(st, 0) + 1
+    payload = {
+        "generated_at": _now(),
+        "schema_version": JUDGMENT_SCHEMA_VERSION,
+        "counts": counts,
+        "notes": notes,
+        "l1": l1_audit or {},
+        "l2": l2_audit or {},
+        "generation": generation or profile.get("generation") or {},
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def build_audit_markdown(audit: Dict[str, Any]) -> str:
+    counts = audit.get("counts") or {}
+    lines = [
+        "# 判断层注记审计（Round 131）",
+        "",
+        f"- 生成时间: {audit.get('generated_at', '')}",
+        f"- active: {counts.get('active', 0)} / dormant: {counts.get('dormant', 0)}"
+        f" / dropped: {counts.get('dropped', 0)}",
+    ]
+    gen = audit.get("generation") or {}
+    if gen:
+        lines.append(f"- 生成模型: {gen.get('model', '')}；参数: {json.dumps(gen.get('params') or {}, ensure_ascii=False)}")
+    lines += ["", "## 非 active 注记", ""]
+    rows = [n for n in (audit.get("notes") or []) if n.get("status") != "active"]
+    if not rows:
+        lines.append("- 无。")
+    else:
+        lines += ["| id | type | status | 原因 | claim |", "|---|---|---|---|---|"]
+        for n in rows:
+            reason = (n.get("l1_reject_reason") or n.get("l2_reject_reason")
+                      or n.get("schema_reject_reason") or n.get("pairing_status") or "")
+            claim = str(n.get("claim") or "").replace("|", "\\|")[:120]
+            lines.append(f"| {n.get('id', '')} | {n.get('type', '')} | {n.get('status', '')} "
+                         f"| {reason} | {claim} |")
+    lines += ["", "---", "*注记是 advisory 制品；L1/L2 未通过的注记只保留审计，不进入 prompt。*", ""]
+    return "\n".join(lines)
+
+
+def write_judgment_audit(project_root: Path, audit: Dict[str, Any],
+                         json_path: Optional[Path] = None,
+                         md_path: Optional[Path] = None) -> Dict[str, str]:
+    root = Path(project_root)
+    jp = Path(json_path) if json_path else root / "output" / "style_profile_audit.json"
+    mp = Path(md_path) if md_path else root / "output" / "style_profile_audit.md"
+    atomic_write_json(jp, audit)
+    atomic_write_text(mp, build_audit_markdown(audit))
+    return {"json": str(jp), "md": str(mp)}
+
+
+def judgment_cache_key(profile: Optional[Dict[str, Any]], chapter_id: str,
+                       chapter_text: str, prompt_version: str = "r131") -> str:
+    payload = {
+        "profile": sha256_text(json.dumps(profile or {}, ensure_ascii=False, sort_keys=True)),
+        "chapter_id": chapter_id,
+        "chapter_hash": sha256_text(chapter_text),
+        "prompt_version": prompt_version,
+        "schema_version": JUDGMENT_SCHEMA_VERSION,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+GRAPH_VERSION = 4
+DEFAULT_GRAPH_PATH = "input/story_graph.json"
+
+
+def _story_graph_config() -> Dict[str, Any]:
+    """Read optional graph settings without making config a hard dependency."""
+    try:
+        from src.config import get_config
+        cfg = get_config().get("story_graph", {}) or {}
+        return dict(cfg) if isinstance(cfg, dict) else {}
+    except Exception:
+        return {}
+
+_GENERIC_EN = {
+    "the", "and", "for", "with", "from", "that", "this", "they", "them",
+    "their", "there", "then", "than", "have", "has", "had", "were", "was",
+    "will", "would", "could", "should", "what", "when", "where", "which",
+    "who", "whom", "why", "how", "his", "her", "him", "she", "you", "your",
+    "our", "ours", "its", "it's", "not", "but", "are", "is", "be", "been",
+    "being", "one", "two", "all", "any", "some", "into", "about", "after",
+    "before", "over", "under", "again", "also", "more", "most", "very",
+}
+
+
+def _load_json_list(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    if isinstance(raw, dict):
+        out = []
+        for v in raw.values():
+            out.extend(_load_json_list(v))
+        return out
+    s = str(raw).strip()
+    if not s:
+        return []
+    if s[:1] in "[{":
+        try:
+            return _load_json_list(json.loads(s))
+        except Exception:
+            pass
+    for sep in ("\n", ";", "；", "|", "、"):
+        if sep in s:
+            return [p.strip() for p in s.split(sep) if p.strip()]
+    return [s]
+
+
+def _rows_fingerprint(rows: Sequence[Dict[str, Any]]) -> str:
+    """Content hash of the rows the graph actually consumed.
+
+    The database path alone is not a version: new entities can be added to the
+    same file, and a rebuilt graph must change its fingerprint when that
+    happens.  Hashing the selected registry rows keeps the check stable across
+    unrelated SQLite metadata/page changes.
+    """
+    canonical = json.dumps(list(rows or []), ensure_ascii=False,
+                           sort_keys=True, default=str, separators=(",", ":"))
+    return sha256_text(canonical)
+
+
+def _registry_rows(db_path: Path) -> List[Dict[str, Any]]:
+    if not Path(db_path).exists():
+        return []
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(entity_registry)")}
+        if not cols:
+            return []
+        wanted = ["id", "canonical_name", "source_names", "variant_names", "entity_type",
+                  "pronoun_gender", "confidence", "pending_review", "translation_strategy",
+                  "first_seen_chunk"]
+        select = ", ".join(c for c in wanted if c in cols)
+        rows = con.execute(f"SELECT {select} FROM entity_registry ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+
+def _entity_aliases(row: Dict[str, Any]) -> List[str]:
+    names: List[str] = []
+    canonical = str(row.get("canonical_name") or "").strip()
+    if canonical:
+        names.append(canonical)
+    for raw in (row.get("source_names"), row.get("variant_names")):
+        names.extend(_load_json_list(raw))
+    out: List[str] = []
+    seen: set = set()
+    for name in names:
+        name = str(name).strip()
+        if len(name) < 2:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        if name.isascii() and key in _GENERIC_EN:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out
+
+
+def _compile_alias_pattern(alias_map: Dict[str, List[str]]) -> Optional[re.Pattern]:
+    if not alias_map:
+        return None
+    tokens = sorted(alias_map, key=lambda s: (-len(s), s))
+    parts = []
+    for token in tokens:
+        escaped = re.escape(token)
+        left = r"(?<![A-Za-z0-9])" if token[0].isascii() and token[0].isalnum() else ""
+        right = r"(?![A-Za-z0-9])" if token[-1].isascii() and token[-1].isalnum() else ""
+        parts.append(left + escaped + right)
+    try:
+        return re.compile("(?:%s)" % "|".join(parts), re.IGNORECASE)
+    except re.error:
+        return None
+
+
+def _chapter_files(input_dir: Path) -> List[Path]:
+    return sorted(Path(input_dir).glob("ch*.md"))
+
+
+def _chapter_texts(input_dir: Path) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for p in _chapter_files(input_dir):
+        try:
+            out[p.stem] = p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+    return out
+
+
+def _first_quote(text: str, start: int, end: int, radius: int = 40) -> str:
+    a = max(0, start - radius)
+    b = min(len(text), end + radius)
+    return text[a:b].replace("\n", " ").strip()[:220]
+
+
+def _node_id(prefix: str, value: Any) -> str:
+    return f"{prefix}:{value}"
+
+
+def _note_certification(note: Dict[str, Any], validated: bool) -> str:
+    """Derive one certification value for a note and every edge it owns."""
+    if str(note.get("status") or "") == "dropped":
+        return "dropped"
+    return "l1_l2_verified" if validated else "pending"
+
+
+def _entity_confidence(row: Dict[str, Any]) -> Tuple[float, str]:
+    """Normalize the registry's text confidence without losing its label.
+
+    ``entity_registry.confidence`` is a TEXT column with the project-wide
+    values ``high|medium|low`` (see DecisionEngine.create_tables), not a
+    float.  The first story-graph implementation parsed it with ``float()``,
+    which made every production entity pending and left the chapter context
+    empty even though 286 entities were trusted by the rest of the project.
+    Keep numeric artifacts working too, and retain the original label for
+    auditability.
+    """
+    raw = row.get("confidence")
+    if isinstance(raw, bool):
+        return (1.0 if raw else 0.0), ""
+    if isinstance(raw, (int, float)):
+        try:
+            score = float(raw)
+        except (TypeError, ValueError):
+            score = 0.0
+        return max(0.0, min(1.0, score)), ""
+    label = str(raw or "").strip().casefold()
+    if label in ("high", "medium", "low"):
+        return {"high": 0.9, "medium": 0.6, "low": 0.3}[label], label
+    try:
+        score = float(label)
+    except (TypeError, ValueError):
+        return 0.0, label
+    return max(0.0, min(1.0, score)), ""
+
+
+def _entity_is_certified(confidence: float, label: str, pending: bool) -> bool:
+    """Match the project's existing trusted-entity rule.
+
+    ``query_high_confidence_entities`` and consistency checks treat only
+    ``confidence='high' AND pending_review=0`` as trusted.  Numeric test
+    fixtures use a >=0.8 threshold; medium/low labels stay pending even when
+    their numeric score would otherwise clear the threshold.
+    """
+    if pending:
+        return False
+    if label:
+        return label == "high"
+    return confidence >= 0.8
+
+
+def _structural_certification(*values: str) -> str:
+    """Roll endpoint facts up into one certification for a deterministic edge.
+
+    A surface occurrence is mechanical, but it is not an independently verified
+    identity.  If either endpoint is still pending, the edge is pending too.
+    This mirrors Auto Ontology's single certification rollup rather than letting
+    each consumer infer trust from a different field.
+    """
+    return "auto_verified" if values and all(
+        str(value or "") == "auto_verified" for value in values
+    ) else "pending"
+
+
+def _note_evidence_provenance(note: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Keep source quotes and offsets on narrative edges, not just the claim."""
+    out: List[Dict[str, Any]] = []
+    for ev in note.get("evidence") or []:
+        if not isinstance(ev, dict):
+            continue
+        out.append({
+            "chapter": ev.get("chapter"),
+            "offset": ev.get("offset"),
+            "quote": ev.get("quote"),
+            "matched_quote": ev.get("matched_quote"),
+            "match_kind": ev.get("match_kind"),
+            "match_score": ev.get("match_score"),
+            "unique": ev.get("unique"),
+        })
+    return out
+
+
+def _knowledge_gap(code: str, message: str, items: Sequence[Any],
+                   sample_key: str = "", sample_limit: int = 6) -> Dict[str, Any]:
+    """One actionable gap row; lists stay in coverage/diagnostics, samples here."""
+    sample: List[str] = []
+    for item in list(items)[:max(0, int(sample_limit))]:
+        if isinstance(item, dict):
+            value = item.get(sample_key) if sample_key else ""
+        else:
+            value = item
+        if value not in (None, ""):
+            sample.append(str(value))
+    return {"code": code, "count": len(items), "sample": sample,
+            "message": message}
+
+
+def build_story_graph(
+    project_root: Path = Path("."),
+    profile: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+    input_dir: Optional[Path] = None,
+    cooccur_window: int = 600,
+    max_cooccur_edges: int = 600,
+    entity_coverage_min: float = 0.5,
+) -> Dict[str, Any]:
+    root = Path(project_root)
+    dbp = Path(db_path) if db_path else root / "db" / "decision_db.sqlite"
+    indir = Path(input_dir) if input_dir else root / "input"
+    texts = _chapter_texts(indir)
+    rows = _registry_rows(dbp)
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+
+    for cid, text in texts.items():
+        nodes.append({
+            "id": _node_id("chapter", cid),
+            "type": "chapter",
+            "label": cid,
+            "attributes": {"chars": len(text), "hash": sha256_text(text)},
+            "provenance": [{"artifact": "input", "path": f"input/{cid}.md"}],
+        })
+
+    alias_map: Dict[str, List[str]] = {}
+    entity_by_id: Dict[str, Dict[str, Any]] = {}
+    aliases_by_entity: Dict[str, List[str]] = {}
+    entity_certification: Dict[str, str] = {}
+    for row in rows:
+        eid = f"entity-{row.get('id')}"
+        canonical = str(row.get("canonical_name") or "").strip()
+        if not canonical:
+            continue
+        aliases = _entity_aliases(row)
+        aliases_by_entity[eid] = aliases
+        entity_by_id[eid] = row
+        conf, conf_label = _entity_confidence(row)
+        pending = bool(row.get("pending_review"))
+        certification = "auto_verified" if _entity_is_certified(
+            conf, conf_label, pending) else "pending"
+        entity_certification[eid] = certification
+        nodes.append({
+            "id": _node_id("entity", eid),
+            "type": "entity",
+            "label": canonical,
+            "attributes": {
+                "canonical_name": canonical,
+                "aliases": aliases,
+                "entity_type": row.get("entity_type") or "",
+                "pronoun_gender": row.get("pronoun_gender") or "",
+                "confidence": conf,
+                "confidence_label": conf_label,
+                "raw_confidence": row.get("confidence"),
+                "pending_review": pending,
+                "certification": certification,
+                "translation_strategy": row.get("translation_strategy") or "",
+                "first_seen_chunk": row.get("first_seen_chunk") or "",
+            },
+            "provenance": [{"artifact": "decision_db", "table": "entity_registry",
+                            "row_id": row.get("id")}],
+        })
+        for alias in aliases:
+            if alias == canonical:
+                continue
+            aid = "alias-" + hashlib.sha1(
+                (eid + "\x00" + alias).encode("utf-8")).hexdigest()[:16]
+            nodes.append({
+                "id": _node_id("alias", aid),
+                "type": "alias",
+                "label": alias,
+                "attributes": {"canonical_node": _node_id("entity", eid)},
+                "provenance": [{"artifact": "decision_db", "table": "entity_registry",
+                                "row_id": row.get("id"), "field": "source_names/variant_names"}],
+            })
+            edges.append({
+                "id": f"edge:alias_of:{aid}",
+                "type": "alias_of",
+                "source": _node_id("alias", aid),
+                "target": _node_id("entity", eid),
+                "count": 1,
+                "provenance": [{"artifact": "decision_db", "row_id": row.get("id")}],
+                "certification": certification,
+            })
+        for alias in aliases:
+            alias_map.setdefault(alias.casefold(), []).append(eid)
+
+    # Never average two entities that merely share a surface alias.  A unique
+    # canonical owner wins (the decision DB is authoritative); otherwise the
+    # alias stays explicitly unresolved and contributes no occurrence edges.
+    canonical_owners: Dict[str, List[str]] = {}
+    for eid, row in entity_by_id.items():
+        canon = str(row.get("canonical_name") or "").strip().casefold()
+        if canon:
+            canonical_owners.setdefault(canon, []).append(eid)
+    unresolved_aliases: List[Dict[str, Any]] = []
+    resolved_by_canonical: List[Dict[str, Any]] = []
+    for alias_key, eids in list(alias_map.items()):
+        unique_eids = sorted(set(eids))
+        if len(unique_eids) <= 1:
+            alias_map[alias_key] = unique_eids
+            continue
+        owners = canonical_owners.get(alias_key) or []
+        if len(owners) == 1 and owners[0] in unique_eids:
+            alias_map[alias_key] = [owners[0]]
+            resolved_by_canonical.append({
+                "alias": alias_key, "entities": unique_eids,
+                "selected": owners[0], "reason": "unique_canonical_owner",
+            })
+            continue
+        alias_map.pop(alias_key, None)
+        unresolved_aliases.append({
+            "alias": alias_key, "entities": unique_eids,
+            "reason": "alias_collision_without_unique_canonical_owner",
+        })
+    unresolved_keys = {str(x.get("alias") or "") for x in unresolved_aliases}
+    # Certification is inherited from the entity, not copied blindly.  An alias
+    # collision that the decision DB resolves in favour of one canonical owner
+    # must leave the losing alias_of edges pending too; otherwise the graph still
+    # presents the old owner as verified even though its mapping was rejected.
+    node_by_id = {str(n.get("id")): n for n in nodes}
+    for edge in edges:
+        if edge.get("type") != "alias_of":
+            continue
+        alias_node = node_by_id.get(str(edge.get("source")))
+        if not alias_node:
+            continue
+        alias_key = str(alias_node.get("label") or "").casefold()
+        owners = alias_map.get(alias_key) or []
+        selected_owner = _node_id("entity", owners[0]) if len(owners) == 1 else ""
+        target = str(edge.get("target") or "")
+        target_entity = target.split(":", 1)[1] if target.startswith("entity:") else target
+        edge["certification"] = entity_certification.get(target_entity, "pending")
+        if alias_key in unresolved_keys:
+            edge["certification"] = "pending"
+            edge["ambiguous"] = True
+        elif selected_owner and target != selected_owner:
+            edge["certification"] = "pending"
+            edge["ambiguous"] = True
+            edge["collision_owner"] = selected_owner
+
+    pattern = _compile_alias_pattern(alias_map)
+    occurrences: Dict[str, List[Dict[str, Any]]] = {eid: [] for eid in entity_by_id}
+    chapter_occurrences: Dict[str, List[Tuple[int, int, str, str]]] = {}
+    if pattern:
+        for cid, text in texts.items():
+            co = chapter_occurrences.setdefault(cid, [])
+            for m in pattern.finditer(text):
+                matched = m.group(0)
+                eids = alias_map.get(matched.casefold()) or []
+                for eid in eids:
+                    occurrences[eid].append({
+                        "chapter": cid, "start": m.start(), "end": m.end(),
+                        "surface": matched,
+                    })
+                    co.append((m.start(), m.end(), eid, matched))
+
+    appeared = 0
+    for eid, occs in occurrences.items():
+        if not occs:
+            continue
+        appeared += 1
+        per_ch: Dict[str, List[Dict[str, Any]]] = {}
+        for o in occs:
+            per_ch.setdefault(o["chapter"], []).append(o)
+        for cid, items in sorted(per_ch.items()):
+            first = min(items, key=lambda x: x["start"])
+            src = texts.get(cid, "")
+            edges.append({
+                "id": f"edge:appears_in:{eid}:{cid}",
+                "type": "appears_in",
+                "source": _node_id("entity", eid),
+                "target": _node_id("chapter", cid),
+                "count": len(items),
+                "provenance": [{
+                    "chapter": cid,
+                    "offset": first["start"],
+                    "quote": _first_quote(src, first["start"], first["end"]),
+                    "surface": first["surface"],
+                }],
+                "certification": entity_certification.get(eid, "pending"),
+                "entity_certification": entity_certification.get(eid, "pending"),
+            })
+
+    pair_counts: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for cid, co in chapter_occurrences.items():
+        co.sort(key=lambda x: (x[0], x[1], x[2]))
+        # Deduplicate repeated mentions of the same entity at one offset.
+        uniq: List[Tuple[int, int, str, str]] = []
+        seen_occ: set = set()
+        for item in co:
+            key = (item[0], item[1], item[2])
+            if key not in seen_occ:
+                seen_occ.add(key)
+                uniq.append(item)
+        for i, (s1, e1, a, _) in enumerate(uniq):
+            for s2, e2, b, _ in uniq[i + 1:i + 21]:
+                if s2 - e1 > cooccur_window:
+                    break
+                if a == b:
+                    continue
+                lo, hi = (a, b) if a < b else (b, a)
+                key = (lo, hi)
+                rec = pair_counts.get(key)
+                if rec is None:
+                    rec = {"count": 0, "first": (cid, s1, e2), "chapters": set()}
+                    pair_counts[key] = rec
+                    if len(pair_counts) > max_cooccur_edges * 8:
+                        # Keep memory bounded; final pruning below is deterministic.
+                        pass
+                rec["count"] += 1
+                rec["chapters"].add(cid)
+                if (cid, s1) < (rec["first"][0], rec["first"][1]):
+                    rec["first"] = (cid, s1, e2)
+    ranked_pairs = sorted(pair_counts.items(),
+                          key=lambda kv: (-kv[1]["count"], kv[0][0], kv[0][1]))
+    for (a, b), rec in ranked_pairs[:max(0, int(max_cooccur_edges))]:
+        cid, s, e = rec["first"]
+        src = texts.get(cid, "")
+        edge_certification = _structural_certification(
+            entity_certification.get(a, "pending"),
+            entity_certification.get(b, "pending"),
+        )
+        edges.append({
+            "id": f"edge:co_occurs_with:{a}:{b}",
+            "type": "co_occurs_with",
+            "source": _node_id("entity", a),
+            "target": _node_id("entity", b),
+            "count": rec["count"],
+            "chapters": sorted(rec["chapters"]),
+            "provenance": [{"chapter": cid, "offset": s, "window": cooccur_window,
+                            "quote": _first_quote(src, s, e)}],
+            "certification": edge_certification,
+            "entity_certifications": [
+                {"entity": _node_id("entity", a),
+                 "certification": entity_certification.get(a, "pending")},
+                {"entity": _node_id("entity", b),
+                 "certification": entity_certification.get(b, "pending")},
+            ],
+        })
+
+    profile_notes = all_notes(profile)
+    active_ids = {str(n.get("id")) for n in active_notes(profile)}
+    for n in profile_notes:
+        nid = str(n.get("id") or "")
+        if not nid:
+            continue
+        note_node = _node_id("note", nid)
+        validated = nid in active_ids
+        certification = _note_certification(n, validated)
+        match_kinds = []
+        for ev in n.get("evidence") or []:
+            kind = str(ev.get("match_kind") or "")
+            if kind and kind not in match_kinds:
+                match_kinds.append(kind)
+        nodes.append({
+            "id": note_node,
+            "type": "judgment_note",
+            "label": str(n.get("claim") or "")[:120],
+            "attributes": {
+                "note_type": n.get("type"),
+                "chapters": n.get("chapters") or [],
+                "confidence": n.get("confidence"),
+                "status": n.get("status"),
+                "claim": n.get("claim"),
+                "validated": validated,
+                "certification": certification,
+                "l1_match_kinds": match_kinds,
+                "l2_verdict": n.get("l2_verdict", ""),
+            },
+            "certification": certification,
+            "provenance": [{"artifact": "book_profile", "note_id": nid,
+                            "source_model": n.get("source_model", ""),
+                            "created_at": n.get("created_at", "")}],
+        })
+        for ev in n.get("evidence") or []:
+            cid = str(ev.get("chapter") or "")
+            if cid not in texts:
+                continue
+            edges.append({
+                "id": f"edge:evidenced_in:{nid}:{cid}",
+                "type": "evidenced_in",
+                "source": note_node,
+                "target": _node_id("chapter", cid),
+                "count": 1,
+                "provenance": [{"chapter": cid, "offset": ev.get("offset"),
+                                "quote": ev.get("quote")}],
+                # ``auto_verified`` is reserved for deterministic extraction
+                # (registry aliases and chapter occurrences).  A narrative
+                # note is only verified after the L1 quote match and L2 model
+                # review, so keep that provenance visible in the artifact.
+                "certification": certification,
+            })
+        if n.get("type") == "setup_payoff" and validated:
+            ev_chs = []
+            for ev in n.get("evidence") or []:
+                c = str(ev.get("chapter") or "")
+                if c in texts and c not in ev_chs:
+                    ev_chs.append(c)
+            if len(ev_chs) >= 2:
+                ev_chs.sort()
+                edges.append({
+                    "id": f"edge:sets_up:{nid}",
+                    "type": "sets_up",
+                    "source": _node_id("chapter", ev_chs[0]),
+                    "target": _node_id("chapter", ev_chs[-1]),
+                    "count": 1,
+                    "note_id": nid,
+                    "provenance": [{"artifact": "book_profile", "note_id": nid,
+                                    "source_model": n.get("source_model", ""),
+                                    "created_at": n.get("created_at", ""),
+                                    "evidence": _note_evidence_provenance(n)}],
+                    "certification": certification,
+                })
+        elif n.get("type") == "arc" and validated:
+            span = chapter_ids_between(n.get("chapters") or [])
+            if len(span) >= 2 and span[0] in texts and span[-1] in texts:
+                edges.append({
+                    "id": f"edge:evolves_from:{nid}",
+                    "type": "evolves_from",
+                    "source": _node_id("chapter", span[-1]),
+                    "target": _node_id("chapter", span[0]),
+                    "count": 1,
+                    "note_id": nid,
+                    "provenance": [{"artifact": "book_profile", "note_id": nid,
+                                    "source_model": n.get("source_model", ""),
+                                    "created_at": n.get("created_at", ""),
+                                    "evidence": _note_evidence_provenance(n)}],
+                    "certification": certification,
+                })
+
+    total_entities = len(entity_by_id)
+    entity_coverage = (appeared / total_entities) if total_entities else 0.0
+    certified_entity_ids = {
+        eid for eid, value in entity_certification.items()
+        if value == "auto_verified"
+    }
+    appeared_certified = sum(
+        1 for eid, occs in occurrences.items()
+        if occs and eid in certified_entity_ids
+    )
+    certified_entity_coverage = (
+        appeared_certified / total_entities if total_entities else 0.0
+    )
+    certified_entity_coverage_of_trusted = (
+        appeared_certified / len(certified_entity_ids)
+        if certified_entity_ids else 0.0
+    )
+    chapters_with_entities = sorted({
+        str(e["target"]).split(":", 1)[-1]
+        for e in edges if e["type"] == "appears_in"
+    })
+    uncovered_chapters = sorted(set(texts) - set(chapters_with_entities))
+    chapter_coverage = (len(chapters_with_entities) / len(texts)) if texts else 0.0
+    entity_labels = {
+        eid: str((row or {}).get("canonical_name") or eid)
+        for eid, row in entity_by_id.items()
+    }
+    uncovered_entity_ids = sorted(
+        eid for eid, occs in occurrences.items() if not occs
+    )
+    uncovered_entities = [entity_labels.get(eid, eid) for eid in uncovered_entity_ids]
+    uncertified_entity_ids = sorted(
+        eid for eid in entity_by_id if eid not in certified_entity_ids
+    )
+    uncertified_entities = [
+        entity_labels.get(eid, eid) for eid in uncertified_entity_ids
+    ]
+    active_narrative = [n for n in profile_notes if str(n.get("id")) in active_ids]
+    unpaired_setup = [
+        n for n in profile_notes
+        if n.get("type") == "setup_payoff"
+        and ((n.get("meta") or {}).get("pairing_status") == "unpaired"
+             or n.get("pairing_status") == "unpaired")
+    ]
+    inactive_notes = [
+        n for n in profile_notes
+        if str(n.get("id")) not in active_ids
+    ]
+    narrative_cov = (len(active_narrative) / len(profile_notes)) if profile_notes else 0.0
+    narrative_chapters = set()
+    for note in active_narrative:
+        for cid in chapter_ids_between(note.get("chapters") or []):
+            if cid in texts:
+                narrative_chapters.add(cid)
+    uncovered_narrative_chapters = sorted(set(texts) - narrative_chapters)
+    narrative_chapter_coverage = (
+        len(narrative_chapters) / len(texts) if texts else 0.0
+    )
+    chapter_entity_ids: Dict[str, set] = {cid: set() for cid in texts}
+    for eid, occs in occurrences.items():
+        for occ in occs:
+            cid = str(occ.get("chapter") or "")
+            if cid in chapter_entity_ids:
+                chapter_entity_ids[cid].add(eid)
+    chapter_entity_coverage = {
+        cid: round(len(eids) / total_entities, 4) if total_entities else 0.0
+        for cid, eids in sorted(chapter_entity_ids.items())
+    }
+    chapter_certified_entity_coverage = {
+        cid: round(len(eids & certified_entity_ids) / total_entities, 4)
+        if total_entities else 0.0
+        for cid, eids in sorted(chapter_entity_ids.items())
+    }
+    narrative_answerable_reasons: List[str] = []
+    if not profile_notes:
+        narrative_answerable_reasons.append("no_narrative_notes")
+    elif not active_narrative:
+        narrative_answerable_reasons.append("no_validated_active_notes")
+    narrative_answerable = not narrative_answerable_reasons
+    narrative_partial_coverage = bool(
+        narrative_answerable
+        and (narrative_cov < 1.0 or narrative_chapter_coverage < 1.0)
+    )
+    answerable_reasons: List[str] = []
+    if not texts:
+        answerable_reasons.append("no_chapters")
+    if total_entities == 0:
+        answerable_reasons.append("no_registered_entities")
+    if appeared_certified <= 0:
+        answerable_reasons.append("no_certified_entity_occurrences")
+    # Coverage is an index over the entities we actually trust.  The registry
+    # also contains pending candidates and unresolved duplicate rows; letting
+    # those dilute the denominator would make a healthy certified index
+    # unanswerable forever.  Keep all-row coverage as a diagnostic instead.
+    if certified_entity_coverage_of_trusted < float(entity_coverage_min):
+        answerable_reasons.append("trusted_entity_coverage_below_threshold")
+    answerable = not answerable_reasons
+    knowledge_gaps = [
+        _knowledge_gap(
+            "uncertified_entities",
+            "实体未达到 high+pending_review=0，图谱不把它当作认证事实",
+            uncertified_entities,
+        ),
+        _knowledge_gap(
+            "uncovered_entities",
+            "实体已登记但未在已切分章节中找到任何出现",
+            uncovered_entities,
+        ),
+        _knowledge_gap(
+            "uncovered_chapters",
+            "章节没有任何已登记实体出现",
+            uncovered_chapters,
+        ),
+        _knowledge_gap(
+            "unresolved_aliases",
+            "别名存在多 owner 且无法由唯一 canonical owner 裁决；图谱不猜归属",
+            unresolved_aliases,
+            sample_key="alias",
+        ),
+        _knowledge_gap(
+            "unpaired_setup_payoff",
+            "伏笔候选没有找到可机械组装的回收侧候选，保留 dormant",
+            unpaired_setup,
+            sample_key="id",
+        ),
+        _knowledge_gap(
+            "inactive_judgment_notes",
+            "注记未通过 L1/L2 或已 dropped，运行时不会注入",
+            inactive_notes,
+            sample_key="id",
+        ),
+    ]
+    fingerprint_inputs = {
+        "chapters": {cid: sha256_text(t) for cid, t in sorted(texts.items())},
+        "decision_db": str(dbp),
+        "decision_db_hash": _rows_fingerprint(rows),
+        "entity_registry_rows": len(rows),
+        "profile_notes_hash": sha256_text(json.dumps(profile_notes, ensure_ascii=False,
+                                                     sort_keys=True)),
+    }
+    fingerprint_params = {
+        "cooccur_window": cooccur_window,
+        "max_cooccur_edges": max_cooccur_edges,
+        "entity_coverage_min": entity_coverage_min,
+    }
+    fingerprint = sha256_text(json.dumps(
+        {"graph_version": GRAPH_VERSION, "inputs": fingerprint_inputs,
+         "params": fingerprint_params},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+    generation_payload = {
+        "graph_version": GRAPH_VERSION,
+        "built_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "fingerprint": fingerprint,
+        "inputs": fingerprint_inputs,
+        "params": fingerprint_params,
+    }
+    return {
+        "schema_version": GRAPH_VERSION,
+        "generation": generation_payload,
+        "fingerprint": fingerprint,
+        "coverage": {
+            "entities_total": total_entities,
+            "entities_with_appearance": appeared,
+            "entity_coverage": round(entity_coverage, 4),
+            "certified_entities_total": len(certified_entity_ids),
+            "certified_entities_with_appearance": appeared_certified,
+            "certified_entity_coverage": round(certified_entity_coverage, 4),
+            "certified_entity_coverage_of_trusted": round(
+                certified_entity_coverage_of_trusted, 4
+            ),
+            "answerable_threshold_basis": "certified_entity_coverage_of_trusted",
+            "uncovered_entities": uncovered_entities,
+            "uncovered_entity_ids": uncovered_entity_ids,
+            "uncertified_entities": uncertified_entities,
+            "uncertified_entity_ids": uncertified_entity_ids,
+            "chapters_total": len(texts),
+            "chapters_with_entities": len(chapters_with_entities),
+            "chapter_coverage": round(chapter_coverage, 4),
+            "uncovered_chapters": uncovered_chapters,
+            "entities_per_chapter": {
+                cid: len(eids) for cid, eids in sorted(chapter_entity_ids.items())
+            },
+            "chapter_entity_coverage": chapter_entity_coverage,
+            "chapter_certified_entity_coverage": chapter_certified_entity_coverage,
+            "narrative_notes_total": len(profile_notes),
+            "narrative_notes_active": len(active_narrative),
+            "narrative_note_coverage": round(narrative_cov, 4),
+            "narrative_chapters_total": len(texts),
+            "narrative_chapters_with_active_notes": len(narrative_chapters),
+            "narrative_chapter_coverage": round(narrative_chapter_coverage, 4),
+            "uncovered_narrative_chapters": uncovered_narrative_chapters,
+            "narrative_answerable_for": "validated_note_index",
+            "narrative_answerable": narrative_answerable,
+            "narrative_answerable_reasons": narrative_answerable_reasons,
+            "narrative_partial_coverage": narrative_partial_coverage,
+            "narration_source": "decision_db+validated_book_profile",
+            "answerable_for": "entity_index",
+            "answerable": answerable,
+            "answerable_reasons": answerable_reasons,
+            # A graph can be answerable for the chapters it saw yet still be
+            # incomplete for the book.  Report either kind of hole instead of
+            # equating partial coverage with missing entities only.
+            "partial_coverage": bool(answerable and (
+                uncovered_entities or uncovered_chapters or uncertified_entities
+            )),
+            "threshold": float(entity_coverage_min),
+        },
+        "knowledge_gaps": knowledge_gaps,
+        "nodes": nodes,
+        "edges": edges,
+        "diagnostics": {
+            "alias_tokens": len(alias_map),
+            "entity_nodes": total_entities,
+            "chapter_nodes": len(texts),
+            "cooccurrence_pairs_kept": min(len(ranked_pairs), max(0, int(max_cooccur_edges))),
+            "unresolved_alias_count": len(unresolved_aliases),
+            "unresolved_aliases": unresolved_aliases,
+            "collisions_resolved_by_canonical": resolved_by_canonical,
+            "certified_entity_count": sum(
+                1 for value in entity_certification.values() if value == "auto_verified"
+            ),
+            "pending_entity_count": sum(
+                1 for value in entity_certification.values() if value != "auto_verified"
+            ),
+            "decision_db_hash": fingerprint_inputs["decision_db_hash"],
+        },
+    }
+
+
+def save_story_graph(graph: Dict[str, Any], path: Optional[Path] = None,
+                     project_root: Path = Path(".")) -> Path:
+    out = Path(path) if path else Path(project_root) / DEFAULT_GRAPH_PATH
+    atomic_write_json(out, graph)
+    return out
+
+
+def load_story_graph(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("nodes"), list):
+        return None
+    return data
+
+
+def build_and_save_story_graph(project_root: Path = Path("."),
+                               profile: Optional[Dict[str, Any]] = None,
+                               path: Optional[Path] = None,
+                               use_config: bool = True,
+                               **kwargs: Any) -> Dict[str, Any]:
+    root = Path(project_root)
+    cfg = _story_graph_config() if use_config else {}
+    for key in ("cooccur_window", "max_cooccur_edges", "entity_coverage_min"):
+        if key in cfg and key not in kwargs:
+            kwargs[key] = cfg[key]
+    graph = build_story_graph(root, profile=profile, **kwargs)
+    rel = str(cfg.get("path") or DEFAULT_GRAPH_PATH)
+    out = Path(path) if path else root / rel
+    save_story_graph(graph, path=out, project_root=root)
+    return graph
+
+
+def story_graph_context_for_chapter(graph: Optional[Dict[str, Any]], chapter_id: str,
+                                    max_entities: int = 12,
+                                    max_chars: int = 1200) -> str:
+    """Return top deterministic entities for a chapter, gated by coverage.
+
+    This is used by global review/aids, not as a terminology hard constraint.
+    """
+    if not isinstance(graph, dict):
+        return ""
+    cov = graph.get("coverage") or {}
+    if not cov.get("answerable"):
+        return ""
+    # ``chapters_with_entities`` is a count.  Use the per-chapter maps for the
+    # actual gate; keep a fallback for older graph artifacts.
+    chapter_counts = cov.get("chapter_certified_entity_coverage")
+    if not isinstance(chapter_counts, dict) or not chapter_counts:
+        chapter_counts = cov.get("chapter_entity_coverage") or \
+            cov.get("entities_per_chapter") or {}
+    if isinstance(chapter_counts, dict) and chapter_id in chapter_counts:
+        try:
+            if float(chapter_counts.get(chapter_id) or 0) <= 0:
+                return ""
+        except (TypeError, ValueError):
+            return ""
+    if chapter_id in set(str(x) for x in (cov.get("uncovered_chapters") or [])):
+        return ""
+    target = _node_id("chapter", chapter_id)
+    rows = [e for e in graph.get("edges") or []
+            if e.get("type") == "appears_in" and e.get("target") == target
+            and e.get("certification") == "auto_verified"]
+    rows.sort(key=lambda e: (-int(e.get("count") or 0), str(e.get("source"))))
+    entity_labels: Dict[str, str] = {}
+    for n in graph.get("nodes") or []:
+        if n.get("type") == "entity":
+            entity_labels[str(n.get("id"))] = str(n.get("label") or "")
+    lines = []
+    used = 0
+    header = "【确定性实体覆盖（仅定位参考；译名以决策库为准）】\n"
+    used += len(header)
+    for e in rows[:max_entities]:
+        label = entity_labels.get(str(e.get("source"))) or str(e.get("source"))
+        line = f"- {label}（本章出现 {int(e.get('count') or 0)} 次）\n"
+        if used + len(line) > max_chars:
+            break
+        lines.append(line)
+        used += len(line)
+    return header + "".join(lines) if lines else ""
+
+
+DEFAULT_PROFILE_PATH = "input/book_profile.json"
+PROFILE_VERSION = JUDGMENT_SCHEMA_VERSION
+
+NEUTRAL_REGISTER = "保持克制、平实、贴近原文的叙事语域"
+NEUTRAL_PERSONA = "忠实原著语域的职业文学译者"
+VALID_FOOTNOTE_POLICIES = ("none", "inline", "markdown_footnote")
+VALID_SOURCES = ("known_work", "sampled", "mixed", "fallback")
+
+
+def _split_anchors(source: str) -> List[str]:
+    """从 pun source 串（"tale/tail"、"draw = 拉/画"）派生审计锚点（保序去重）。"""
+    out: List[str] = []
+    normalized = str(source or "")
+    for sep in ("=", "，", ",", "、", ";", "；", "\n"):
+        normalized = normalized.replace(sep, "/")
+    for part in normalized.split("/"):
+        p = part.strip()
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+def _derive_src_anchors(source: str) -> List[str]:
+    """从 source 串派生源侧（英文）定位锚点：取括号插注前的英文片段，保序去重。
+
+    例: "whiting (fish vs. shoe-blacking)" → ["whiting"]；
+        "William the Conqueror ... Edgar Atheling (…) " → ["William the Conqueror", "Edgar Atheling"]。
+    """
+    out: List[str] = []
+    seen: set = set()
+    for frag in _split_anchors(source):
+        s = re.split(r"[（(]", str(frag))[0]
+        for part in re.split(r"[.…]+|--|—", s):
+            p = part.strip().strip('"\'‘’“”').strip(" ,;:。；：!?！？)）")
+            if len(p) < 2 or not re.search(r"[A-Za-z]{2,}", p):
+                continue
+            pk = p.lower()
+            if pk in seen:
+                continue
+            seen.add(pk)
+            out.append(p)
+    return out[:8]
+
+
+_CN_HINT_STOPWORDS = (
+    "双关", "谐音", "戏拟", "落点", "加注", "注释", "保留", "需要",
+    "建议", "呼应", "上文", "此处", "处理", "直译", "音译", "可以", "或者",
+)
+
+
+def _hint_cn_anchors(text: str, cap: int = 4) -> List[str]:
+    """从 hint 说明（中文）抽译文侧核销锚点：括号/引号内中文术语优先。"""
+    out: List[str] = []
+    for grp in re.findall(r'[（(「『“"]([^（()」』”"]{1,24})[）)」』”"]', str(text)):
+        g = grp.strip()
+        if 2 <= len(g) <= 6 and re.fullmatch(r"[\u4e00-\u9fff]+", g) and g not in out:
+            out.append(g)
+    if not out:
+        for seg in re.split(r"[，。、；：,.!?;:…\s]+", str(text)):
+            if re.search(r"[A-Za-z]", seg):
+                continue
+            for run in re.findall(r"[\u4e00-\u9fff]{2,}", seg):
+                for part in re.split(r"[与和或及等的]", run):
+                    p = part.strip()
+                    if len(p) < 2 or p in _CN_HINT_STOPWORDS or p in out:
+                        continue
+                    if any(stop in p for stop in ("双关", "谐音", "戏拟")):
+                        continue
+                    out.append(p)
+                    if len(out) >= cap:
+                        break
+                if len(out) >= cap:
+                    break
+            if len(out) >= cap:
+                break
+    return out[:cap]
+
+
+def _now() -> str:
+    return _dt.datetime.now().isoformat(timespec="seconds")
+
+
+# 抽样
+
+def spread_sample_chapters(files: Sequence[Path], limit: int = 5) -> List[Path]:
+    """从排序后的章节文件中均匀取 limit 个（覆盖首/中/尾）。"""
+    files = sorted(files)
+    if len(files) <= limit:
+        return list(files)
+    n = len(files)
+    idxs = {round(i * (n - 1) / (limit - 1)) for i in range(limit)}
+    return [files[i] for i in sorted(idxs)]
+
+
+def load_chapter_samples(
+    input_dir: Path,
+    chapters: Optional[Sequence[str]] = None,
+    limit: int = 5,
+    per_chapter_chars: int = 6000,
+) -> List[Dict[str, str]]:
+    """读取抽样章节。chapters 指定时按指定顺序取；否则均匀抽样。
+
+    返回 [{"chapter_id": "ch01", "text": "..."}]（每章截取前 per_chapter_chars）。
+    """
+    input_dir = Path(input_dir)
+    if chapters:
+        files = [input_dir / f"{c}.md" for c in chapters]
+        files = [f for f in files if f.exists()]
+    else:
+        files = spread_sample_chapters(sorted(input_dir.glob("ch*.md")), limit)
+    out: List[Dict[str, str]] = []
+    for f in files:
+        try:
+            text = f.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        out.append({"chapter_id": f.stem, "text": text[:per_chapter_chars]})
+    return out
+
+
+# LLM prompt / 解析
+
+_PROFILE_SCHEMA_BLOCK = """{
+  "work_guess": {"recognized": true|false, "title": "书名或空", "title_zh": "中文通行译名或空", "author": "作者或空", "year": "首版年或空"},
+  "source": "known_work | sampled",
+  "confidence": 0.0-1.0,
+  "genre": "体裁（从原文特征得出，如：侦探小说/儿童文学/科幻小说/荒诞童话）",
+  "era": "时代（如：1920s / 维多利亚时期；不确定给空）",
+  "region": "地域文化背景（如：英国；不确定给空）",
+  "persona": "翻译该作品应采用的译者人设（一句话）",
+  "register_default": "全书默认语域目标（一句话，指导润色时的文学度/口语度）",
+  "footnote_policy": "none | inline | markdown_footnote（依据典故密度与体裁推荐）",
+  "forbidden_modernisms": ["与作品时代/语域冲突、应禁用的现代用词", "..."] ,
+  "translation_hints": ["确实出现在抽样文本中的年代/地域用词、行话、引用，格式：英文原词 = 含义与处理建议", "..."],
+  "pun_watchlist": [
+    {"source": "英文原词/词组（如 tale/tail、draw）", "kind": "homophone|polysemy|allusion|name-pun", "src_anchors": ["源侧定位锚点：英文原词/短句片段（供在原文中定位，≥1 个）"], "anchors": ["审计锚点：译文正文或注释中应出现的中/英关键词（≥1 个）"], "strategy": "建议处理策略（双关落点/正文兼顾/尾注说明）", "hint": "位置提示（如 ch07 茶会）"},
+    "..."
+  ],
+  "chapter_register_map": {"ch01": "该章语域目标（仅针对抽样章）", "..."},
+  "evidence_quotes": ["支撑你风格判断的抽样原文英文短句（每章至少 1 条）", "..."],
+  "narrative_arc": [],
+  "setup_payoff": [],
+  "voice_notes": [],
+  "generation": {"model": "生成模型或空", "params": {}, "time": "ISO 时间"}
+}"""
+
+
+def build_profile_prompt(
+    samples: Sequence[Dict[str, str]],
+    extra_meta: Optional[Dict[str, Any]] = None,
+) -> str:
+    meta_block = ""
+    if extra_meta:
+        meta_block = f"\n【可用元数据】\n{json.dumps(extra_meta, ensure_ascii=False)}\n"
+    samples_block = "\n\n".join(
+        f"===== {s['chapter_id']}（抽样节选）=====\n{s['text']}" for s in samples
+    )
+    return f"""你是一位文学翻译项目的风格分析专家。项目即将翻译一部英文文学作品，
+你需要先阅读抽样章节，产出一份【作品风格剖面】JSON，供直译/润色/评论/终审四个环节共享。
+
+【第一步：判定作品是否知名】
+- 若你根据抽样文本与元数据认出这是知名已出版作品：genre/era/region/persona/register_default
+  以该作品在文学史上的公认风格为准（可参考抽样文本核对），source 填 "known_work"，
+  work_guess 填写书名/中文通行译名/作者/首版年，confidence 给高；不确认中文译名时 title_zh 留空。
+- 若认不出：完全依据抽样文本特征归纳（语言年代感、句式、对话风格、体裁特征），
+  source 填 "sampled"，work_guess.recognized=false，confidence 按证据充分度给。
+- 严禁臆造：不确定的作品名/年份给空字符串；不确定的字段给保守值。
+
+【第二步：归纳风格要素】
+- translation_hints 只登记确实出现在抽样文本中的词句（英文原词 = 含义/处理建议），
+  不要为任何未在抽样中出现的词编造提示。
+- pun_watchlist 登记抽样文本（含 translation_hints）中的双关/谐音/一词多义笑点；
+  每条必须给 src_anchors（英文原词片段，供在原文中定位）与 anchors（审计据此在译文正文/注释中找落点），
+  确实没有双关时给空数组。
+- forbidden_modernisms 列出与作品时代/语域明显冲突的现代中文用词（网络用语等）。
+- footnote_policy：典故/引用密度高 → inline 或 markdown_footnote；几乎无典故 → none。
+- chapter_register_map 只覆盖抽样章（章 ID 见下）。
+- evidence_quotes 必须给出抽样原文中的英文短句作为判断依据（每抽样章至少 1 条）。
+
+【输出 JSON Schema — 严格遵守】
+{_PROFILE_SCHEMA_BLOCK}
+{meta_block}
+【抽样原文】
+{samples_block}
+
+请输出纯 JSON（无 markdown 代码块，无额外说明）："""
+
+
+def normalize_profile(data: Dict[str, Any]) -> Dict[str, Any]:
+    """校验/归一 LLM 返回的剖面 dict（缺失字段补默认值）。"""
+    if not isinstance(data, dict):
+        raise ValueError("profile must be a dict")
+
+    def _str(key: str, default: str = "") -> str:
+        v = data.get(key)
+        return str(v).strip() if isinstance(v, (str, int, float)) and str(v).strip() else default
+
+    def _str_list(key: str, cap: int = 50) -> List[str]:
+        v = data.get(key) or []
+        if isinstance(v, dict):
+            v = [f"{k} = {val}" for k, val in v.items()]
+        if not isinstance(v, list):
+            return []
+        out: List[str] = []
+        for item in v:
+            if isinstance(item, dict):
+                term = item.get("term") or item.get("phrase") or ""
+                note = item.get("meaning") or item.get("note") or item.get("explanation") or ""
+                item = f"{term} = {note}" if term else json.dumps(item, ensure_ascii=False)
+            s = str(item).strip()
+            if s:
+                out.append(s)
+        return out[:cap]
+
+    def _pun_list(key: str, cap: int = 40) -> List[Dict[str, Any]]:
+        v = data.get(key) or []
+        if isinstance(v, dict):
+            v = [v]
+        if not isinstance(v, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for item in v:
+            if isinstance(item, str):
+                s = item.strip()
+                if s:
+                    out.append({"source": s, "kind": "",
+                                "src_anchors": _derive_src_anchors(s),
+                                "anchors": _split_anchors(s),
+                                "strategy": "", "hint": ""})
+                continue
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source") or item.get("term") or item.get("phrase") or "").strip()
+            if not source:
+                continue
+            anchors_raw = item.get("anchors") or item.get("keywords") or []
+            if isinstance(anchors_raw, str):
+                anchors = _split_anchors(anchors_raw)
+            elif isinstance(anchors_raw, list):
+                anchors = [str(a).strip() for a in anchors_raw if str(a).strip()]
+            else:
+                anchors = []
+            if not anchors:
+                anchors = _split_anchors(source)
+            src_raw = item.get("src_anchors") or item.get("source_anchors") or []
+            if isinstance(src_raw, str):
+                src_anchors = [x.strip() for x in _split_anchors(src_raw) if x.strip()]
+            elif isinstance(src_raw, list):
+                src_anchors = [str(a).strip() for a in src_raw if str(a).strip()]
+            else:
+                src_anchors = []
+            if not src_anchors:
+                src_anchors = _derive_src_anchors(source)
+            out.append({
+                "source": source,
+                "kind": str(item.get("kind") or item.get("type") or "").strip(),
+                "src_anchors": src_anchors[:8],
+                "anchors": anchors[:8],
+                "strategy": str(item.get("strategy") or item.get("suggestion") or item.get("note") or "").strip(),
+                "hint": str(item.get("hint") or item.get("location") or item.get("position") or "").strip(),
+            })
+        return out[:cap]
+
+    fp = _str("footnote_policy", "inline").lower()
+    if fp not in VALID_FOOTNOTE_POLICIES:
+        fp = "inline"
+    src = _str("source", "sampled").lower()
+    if src not in VALID_SOURCES:
+        src = "sampled"
+    try:
+        conf = float(data.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
+
+    cmap_raw = data.get("chapter_register_map") or {}
+    cmap: Dict[str, str] = {}
+    if isinstance(cmap_raw, dict):
+        for k, v in cmap_raw.items():
+            k, v = str(k).strip(), str(v).strip()
+            if k and v:
+                cmap[k] = v
+
+    wg_raw = data.get("work_guess") or {}
+    work_guess = {
+        "recognized": bool(wg_raw.get("recognized", False)) if isinstance(wg_raw, dict) else False,
+        "title": str(wg_raw.get("title") or "").strip() if isinstance(wg_raw, dict) else "",
+        "title_zh": str(wg_raw.get("title_zh") or "").strip() if isinstance(wg_raw, dict) else "",
+        "author": str(wg_raw.get("author") or "").strip() if isinstance(wg_raw, dict) else "",
+        "year": str(wg_raw.get("year") or "").strip() if isinstance(wg_raw, dict) else "",
+    }
+
+    def _thresholds(key: str) -> Dict[str, float]:
+        """可选评分阈值覆盖块（Round 130 审计④：值随剖面落盘、
+        load_profile 的重归一不再吞掉它；仅接受 0-10 数值，其他丢弃）。"""
+        blk = data.get(key)
+        out: Dict[str, float] = {}
+        if isinstance(blk, dict):
+            for k, v in blk.items():
+                if (isinstance(v, (int, float)) and not isinstance(v, bool)
+                        and 0.0 <= float(v) <= 10.0):
+                    out[str(k)] = float(v)
+        return out
+
+    generated_at = str(data.get("generated_at") or "").strip() or _now()
+    generation_raw = data.get("generation") if isinstance(data.get("generation"), dict) else {}
+    generation = {
+        "model": str(generation_raw.get("model") or data.get("source_model") or "").strip(),
+        "params": generation_raw.get("params") if isinstance(generation_raw.get("params"), dict) else {},
+        "time": str(generation_raw.get("time") or generated_at).strip(),
+    }
+    for key, value in generation_raw.items():
+        if key not in generation:
+            generation[key] = value
+    source_model = generation.get("model") or ""
+
+    prof = {
+        "schema_version": PROFILE_VERSION,
+        "source": src,
+        "confidence": conf,
+        "genre": _str("genre", "文学小说"),
+        "era": _str("era"),
+        "region": _str("region"),
+        "persona": _str("persona", NEUTRAL_PERSONA),
+        "register_default": _str("register_default", NEUTRAL_REGISTER),
+        "footnote_policy": fp,
+        "forbidden_modernisms": _str_list("forbidden_modernisms"),
+        "translation_hints": _str_list("translation_hints"),
+        "pun_watchlist": _pun_list("pun_watchlist"),
+        "chapter_register_map": cmap,
+        "evidence_quotes": _str_list("evidence_quotes", cap=12),
+        "critic_thresholds": _thresholds("critic_thresholds"),
+        "work_guess": work_guess,
+        "samples_used": [str(s) for s in (data.get("samples_used") or [])] if isinstance(data.get("samples_used"), list) else [],
+        "generated_at": generated_at,
+        "generation": generation,
+    }
+    prof.update(normalize_judgment_fields(data, source_model=source_model,
+                                          created_at=generated_at))
+    # load_profile() runs this normalizer before the pipeline sees the
+    # artifact.  Preserve the deep-read coverage/diagnostics block so a v2
+    # profile does not lose its provenance and coverage story on every load.
+    if isinstance(data.get("deep_read"), dict):
+        prof["deep_read"] = dict(data["deep_read"])
+    # L2: translation_hints 中提及双关/谐音/戏拟的条目并入 pun_watchlist（LLM 漏报兜底；
+    #     与既有条目同词（结构化已登记）时不重复合成）
+    _GENERIC_EN = {
+        "would", "could", "should", "their", "there", "these", "those",
+        "which", "while", "about", "after", "before", "where", "little",
+        "other", "every", "first", "still", "being", "under", "never",
+        "always", "thing", "things", "with", "from",
+    }
+
+    def _key_tokens(*texts: str) -> set:
+        toks: set = set()
+        for t in texts:
+            toks.update(w.lower() for w in re.findall(r"[A-Za-z]{4,}", str(t))
+                        if w.lower() not in _GENERIC_EN)
+        return toks
+
+    seen_pun = {str(it.get("source") or "").strip().strip('"\'').lower()
+                for it in prof["pun_watchlist"]}
+    seen_tokens: set = set()
+    for it in prof["pun_watchlist"]:
+        seen_tokens |= _key_tokens(it.get("source") or "",
+                                   " ".join(it.get("src_anchors") or []),
+                                   " ".join(it.get("anchors") or []))
+    for hint in list(prof["translation_hints"]):
+        s = str(hint)
+        if not ("双关" in s or "谐音" in s or "戏拟" in s or "pun" in s.lower()):
+            continue
+        head, _, tail = s.partition("=")
+        key = head.strip().strip('"\'').lower()
+        if not key or key in seen_pun:
+            continue
+        if _key_tokens(head) & seen_tokens:
+            continue
+        prof["pun_watchlist"].append({
+            "source": head.strip() or s[:32],
+            "kind": "hint",
+            "src_anchors": _derive_src_anchors(head.strip()) or [head.strip()[:40]],
+            "anchors": _hint_cn_anchors(tail or s),
+            "strategy": tail.strip() or s,
+            "hint": "translation_hints",
+        })
+        seen_pun.add(key)
+        seen_tokens |= _key_tokens(head)
+
+    # L2: 清理历史 profile 中与结构化条目同词的 hint 合成项；hint 锚点若全非中文，
+    #     从 strategy 说明重新派生中文核销锚点（否则无法在译文中核销）。
+    structured_tokens: set = set()
+    for it in prof["pun_watchlist"]:
+        if str(it.get("kind") or "") != "hint":
+            structured_tokens |= _key_tokens(it.get("source") or "",
+                                             " ".join(it.get("src_anchors") or []),
+                                             " ".join(it.get("anchors") or []))
+    cleaned: List[Dict[str, Any]] = []
+    for it in prof["pun_watchlist"]:
+        if str(it.get("kind") or "") == "hint":
+            if _key_tokens(it.get("source") or "") & structured_tokens:
+                continue
+            anchors = it.get("anchors") or []
+            if not any(re.search(r"[\u4e00-\u9fff]", str(a)) for a in anchors):
+                cn = _hint_cn_anchors(str(it.get("strategy") or ""))
+                if cn:
+                    it = dict(it, anchors=cn)
+        cleaned.append(it)
+    prof["pun_watchlist"] = cleaned
+    return prof
+
+
+def heuristic_profile(
+    samples: Optional[Sequence[Dict[str, str]]] = None,
+    note: str = "",
+) -> Dict[str, Any]:
+    """LLM 不可用时的中性回退剖面（不注入任何作品特定先验）。"""
+    return {
+        "schema_version": PROFILE_VERSION,
+        "source": "fallback",
+        "confidence": 0.0,
+        "genre": "文学小说",
+        "era": "",
+        "region": "",
+        "persona": NEUTRAL_PERSONA,
+        "register_default": NEUTRAL_REGISTER,
+        "footnote_policy": "inline",
+        "forbidden_modernisms": [],
+        "translation_hints": [],
+        "pun_watchlist": [],
+        "chapter_register_map": {},
+        "evidence_quotes": [],
+        "critic_thresholds": {},
+        "work_guess": {"recognized": False, "title": "", "title_zh": "",
+                       "author": "", "year": ""},
+        "samples_used": [s["chapter_id"] for s in (samples or [])],
+        "note": note,
+        "generated_at": _now(),
+        "narrative_arc": [],
+        "setup_payoff": [],
+        "voice_notes": [],
+        "generation": {"model": "", "params": {}, "time": _now()},
+    }
+
+
+def parse_profile_response(
+    raw: str,
+    samples: Optional[Sequence[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    """解析 LLM 输出 → 规范化剖面；失败回退 heuristic_profile。"""
+    from src.utils.llm_adapter import robust_json_loads
+
+    try:
+        data = robust_json_loads(raw)
+    except Exception:
+        data = {}
+    if isinstance(data, dict) and isinstance(data.get("profile"), dict):
+        data = data["profile"]
+    if not isinstance(data, dict) or not data:
+        return heuristic_profile(samples, note="parse_failed")
+    try:
+        prof = normalize_profile(data)
+    except Exception as exc:  # noqa: BLE001 - 任何归一失败都回退中性
+        return heuristic_profile(samples, note=f"normalize_failed: {type(exc).__name__}: {exc}")
+    if samples and not prof.get("samples_used"):
+        prof["samples_used"] = [s["chapter_id"] for s in samples]
+    return prof
+
+
+# LLM 调用（task_routing: style_profiling）
+
+def default_style_profiler_generate(prompt: str, task_name: str = "style_profiling") -> str:
+    from src.config import get_config
+    from src.utils.llm_adapter import (
+        get_llm_client_for_task,
+        get_role_model_name,
+    )
+
+    cfg = get_config()
+    if task_name not in (cfg.task_routing or {}):
+        task_name = "style_profiling"
+    model_key, params = cfg.resolve_task_model(task_name)
+    role = cfg.get_task_role(task_name)
+    llm = get_llm_client_for_task(task_name)
+    model_name = get_role_model_name(role) or model_key
+    return llm.generate(prompt, model_name=model_name, **params)
+
+
+def build_profile(
+    samples: Sequence[Dict[str, str]],
+    llm_generate: Optional[Callable[[str], str]] = None,
+    extra_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """抽样章节 → LLM → 剖面 dict。LLM 异常/解析失败时回退 heuristic。"""
+    if not samples:
+        return heuristic_profile(None, note="no_samples")
+    gen = llm_generate or default_style_profiler_generate
+    prompt = build_profile_prompt(samples, extra_meta)
+    try:
+        raw = gen(prompt)
+    except Exception as exc:  # noqa: BLE001
+        return heuristic_profile(samples, note=f"llm_error: {type(exc).__name__}: {exc}")
+    return parse_profile_response(raw, samples)
+
+
+# Round 131 deep mode: all chapters -> segment extraction -> merge -> L1/L2
+
+def load_chapter_documents(
+    input_dir: Path,
+    chapters: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Load complete chapter sources (not samples)."""
+    in_dir = Path(input_dir)
+    if chapters:
+        files = [in_dir / f"{c}.md" for c in chapters]
+        files = [p for p in files if p.exists()]
+    else:
+        files = sorted(in_dir.glob("ch*.md"))
+    out: List[Dict[str, Any]] = []
+    for p in files:
+        try:
+            text = p.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        out.append({"chapter_id": p.stem, "text": text, "path": str(p)})
+    return out
+
+
+def segment_chapter_text(
+    text: str,
+    max_chars: int = 60000,
+    overlap_chars: int = 2000,
+) -> List[Dict[str, Any]]:
+    """Paragraph-aware windows.  Every source character is reviewed at least once."""
+    src = str(text or "")
+    limit = max(1000, int(max_chars or 60000))
+    overlap = max(0, min(int(overlap_chars or 0), limit // 2))
+    if len(src) <= limit:
+        return [{"text": src, "char_start": 0, "char_end": len(src),
+                 "part_index": 1, "part_total": 1}]
+    raw: List[Dict[str, Any]] = []
+    start = 0
+    while start < len(src):
+        end = min(len(src), start + limit)
+        if end < len(src):
+            floor = start + int(limit * 0.65)
+            best = -1
+            for marker in ("\n\n", "\n", ". ", "。", "! ", "? "):
+                idx = src.rfind(marker, floor, end)
+                if idx > best:
+                    best = idx + (len(marker) if marker in ("\n\n", ". ", "! ", "? ") else 1)
+            if best > start + 200:
+                end = best
+        raw.append({"text": src[start:end], "char_start": start,
+                    "char_end": end, "part_index": len(raw) + 1,
+                    "part_total": 0})
+        if end >= len(src):
+            break
+        next_start = max(0, end - overlap)
+        if next_start <= start:
+            next_start = start + 1
+        start = next_start
+    if len(raw) > 1 and len(raw[-1]["text"]) < max(500, overlap // 2):
+        prev = raw[-2]
+        prev["text"] = src[prev["char_start"]:]
+        prev["char_end"] = len(src)
+        raw.pop()
+    for i, seg in enumerate(raw, 1):
+        seg["part_index"] = i
+        seg["part_total"] = len(raw)
+    return raw
+
+
+def build_deep_extract_prompt(chapter_id: str, segment: Dict[str, Any],
+                              chapter_chars: int) -> str:
+    return f"""你是文学翻译项目的全书深读分析员。现在只阅读第 {chapter_id} 章的一个分段，
+目标是抽取能指导后续章节翻译的“判断层注记”。不要翻译正文，不要改写原文。
+
+【分段位置】
+- 章节总字符: {chapter_chars}
+- 分段 {segment['part_index']}/{segment['part_total']}
+- 本章字符区间: {segment['char_start']}–{segment['char_end']}
+
+抽取规则：
+1. notes 只能包含三类：voice（叙述/角色音色）、arc（人物/符号/主题的阶段性变化）、
+   setup_payoff（本段出现的伏笔或回收线索）。
+2. 每条 note 的 claim 用中文写 1–2 句，只描述叙事/语气/弧线；禁止规定术语或译名
+   （不得出现“应译作”“统一译为”“标准译名”等）。
+3. evidence 至少 1 条，quote 必须从下面【分段原文】中逐字复制一段连续英文，
+   不得翻译、改写、补标点或拼接跨段文字。chapter 固定为 {chapter_id}。
+4. setup_payoff 在单段内无法确定回收时，只登记 setup 线索为 setup_payoff，confidence 给低值；
+   后续合并阶段再配对。不要为了配对而虚构尾章内容。
+5. 每段上限：voice ≤4、arc ≤3、setup_payoff ≤4。没有可靠内容就输出空数组。
+6. register_summary 用一句话描述本段语域；synopsis 用 1–2 句概括本段叙事功能。
+
+只输出 JSON，不要 markdown：
+{{
+  "part_id": "{chapter_id}:{segment['part_index']}",
+  "register_summary": "≤60字",
+  "synopsis": "≤120字",
+  "notes": [
+    {{"id": "voice-{chapter_id}-p{segment['part_index']}-001", "type": "voice|arc|setup_payoff",
+      "chapters": ["{chapter_id}"], "claim": "中文判断（≤160字）",
+      "evidence": [{{"chapter": "{chapter_id}", "quote": "原文逐字引文（≤200字符）"}}],
+      "confidence": 0.0-1.0}}
+  ]
+}}
+
+【分段原文】
+{segment['text']}
+"""
+
+
+def parse_deep_extract_response(raw: str) -> Dict[str, Any]:
+    from src.utils.llm_adapter import robust_json_loads
+
+    try:
+        data = robust_json_loads(raw)
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        return {"notes": [], "register_summary": "", "synopsis": "",
+                "parse_error": "not_a_json_object"}
+    return {
+        "part_id": str(data.get("part_id") or ""),
+        "register_summary": str(data.get("register_summary") or "").strip()[:180],
+        "synopsis": str(data.get("synopsis") or "").strip()[:400],
+        "notes": data.get("notes") if isinstance(data.get("notes"), list) else [],
+        "parse_error": "",
+    }
+
+
+def build_deep_merge_prompt(
+    chapter_ids: Sequence[str],
+    segment_payloads: Sequence[Dict[str, Any]],
+    candidates: Sequence[Dict[str, Any]],
+    base_profile: Optional[Dict[str, Any]],
+    partial: bool = False,
+) -> str:
+    compact_profile = {}
+    if isinstance(base_profile, dict):
+        compact_profile = {k: base_profile.get(k) for k in (
+            "genre", "era", "region", "persona", "register_default",
+            "footnote_policy", "translation_hints", "forbidden_modernisms",
+            "work_guess", "source", "confidence",
+        )}
+    summaries = [{
+        "part_id": p.get("part_id"),
+        "register_summary": p.get("register_summary"),
+        "synopsis": p.get("synopsis"),
+        "notes": len(p.get("notes") or []),
+    } for p in segment_payloads]
+    # Keep the merge prompt bounded without systematically starving the tail
+    # chapters: setup/payoff evidence often only becomes pairable there.
+    cands_all = sorted(
+        candidates,
+        key=lambda n: (-float(n.get("confidence") or 0.0), str(n.get("id") or "")),
+    )
+    cap = 400
+    if len(cands_all) <= cap:
+        cands = cands_all
+    else:
+        chapter_order = sorted({str(c) for n in cands_all
+                               for c in (n.get("chapters") or []) if c})
+        tail = set(chapter_order[-max(2, len(chapter_order) // 4):])
+        tail_cands = [n for n in cands_all
+                      if any(str(c) in tail for c in (n.get("chapters") or []))]
+        tail_quota = min(len(tail_cands), max(80, cap // 3))
+        chosen = tail_cands[:tail_quota]
+        chosen_ids = {str(n.get("id") or "") for n in chosen}
+        for n in cands_all:
+            if len(chosen) >= cap:
+                break
+            if str(n.get("id") or "") not in chosen_ids:
+                chosen.append(n)
+        cands = chosen
+    compact_cands = [{
+        "id": n.get("id"),
+        "type": n.get("type"),
+        "chapters": n.get("chapters"),
+        "claim": n.get("claim"),
+        "confidence": n.get("confidence"),
+        "evidence": [{"chapter": e.get("chapter"), "quote": e.get("quote")}
+                     for e in (n.get("evidence") or [])],
+    } for n in cands]
+    scope_label = "本批章节" if partial else "全部章节"
+    setup_rule = (
+        "3. setup_payoff 只有在候选证据同时包含较早章与较晚章时才配成一条；chapters 按 [最早章, 最晚章]，\n"
+        "   evidence 至少包含两章各一条。若本批只看到较早的 setup、尚不能确定回收，仍保留为 setup_payoff，\n"
+        "   chapters 只写已见章、confidence ≤0.55，交由下一层合并配对；不得虚构后文。"
+        if partial else
+        "3. setup_payoff 只有在候选证据同时包含较早章与较晚章时才配成一条；chapters 按 [最早章, 最晚章]，\n"
+        "   evidence 至少包含两章各一条。无法确定回收时不要输出 setup_payoff（可降为 arc 或丢弃）。"
+    )
+    return f"""你是全书深读的合并编辑。输入是逐段抽取结果（含摘要与候选注记），
+不是原文。请合并重复项、消除互相矛盾的判断，并把可确定的伏笔与后文回收配成一对。
+
+硬性规则：
+1. 不得新增任何 evidence quote；只能逐字复用候选中已有的 quote。没有候选证据就丢弃该判断。
+2. {scope_label} id：{", ".join(chapter_ids)}。chapter_register_map 必须覆盖{scope_label}每一个章节。
+{setup_rule}
+4. arc 上限 20 条、setup_payoff 上限 30 条、voice 上限 50 条（每章最多 8 条）。
+5. claim 只描述语气/人物弧线/伏笔回收/叙事视角；禁止规定术语、译名、统一译法。
+6. status 一律输出 active；后续机械与交叉模型校验会决定是否降级。
+
+只输出 JSON：
+{{
+  "chapter_register_map": {{"ch01": "该章语域目标", "...": "..."}},
+  "narrative_arc": [统一 envelope...],
+  "setup_payoff": [统一 envelope...],
+  "voice_notes": [统一 envelope...]
+}}
+
+【基础剖面（v1 字段只作上下文，不在此重复输出）】
+{json.dumps(compact_profile, ensure_ascii=False)}
+
+【分段摘要】
+{json.dumps(summaries, ensure_ascii=False)}
+
+【候选注记（quote 逐字复用）】
+{json.dumps(compact_cands, ensure_ascii=False)}
+"""
+
+
+def parse_deep_merge_response(raw: str) -> Dict[str, Any]:
+    from src.utils.llm_adapter import robust_json_loads
+
+    try:
+        data = robust_json_loads(raw)
+    except Exception:
+        data = None
+    if isinstance(data, dict) and isinstance(data.get("profile"), dict):
+        data = data["profile"]
+    if not isinstance(data, dict):
+        return {"parse_error": "not_a_json_object"}
+    return data
+
+
+def build_setup_pairing_prompt(
+    chapter_ids: Sequence[str],
+    setup_candidates: Sequence[Dict[str, Any]],
+) -> str:
+    """Ask only for candidate-id pairs; code assembles evidence deterministically."""
+    compact = [{
+        "id": n.get("id"),
+        "type": n.get("type"),
+        "chapters": n.get("chapters") or [],
+        "claim": n.get("claim"),
+        "confidence": n.get("confidence"),
+        "evidence": [{"chapter": e.get("chapter"), "quote": e.get("quote")}
+                     for e in (n.get("evidence") or [])[:2]],
+    } for n in setup_candidates]
+    return f"""你是全书伏笔配对编辑。输入是逐段抽取后保留的单章 setup_payoff 候选。
+请只判断哪些候选共同构成同一叙事线的“较早埋线 → 较晚回收”。
+
+硬性规则：
+1. 只能从候选 id 中选择 setup_id 与 payoff_id，不得发明 id、quote 或新 claim。
+2. setup_id 的章节必须早于 payoff_id；证据不足或不在同一叙事线时省略该对。
+3. 同一候选最多进入一对；宁可少配，不得为了覆盖率硬配。
+4. 输出只含 pair 的 id 与简短 reason，不要复制 evidence。
+
+章节顺序：{", ".join(chapter_ids)}
+只输出 JSON：
+{{"pairs": [{{"setup_id": "候选 id", "payoff_id": "候选 id", "reason": "≤60字"}}]}}
+
+【setup_payoff 候选】
+{json.dumps(compact, ensure_ascii=False)}
+"""
+
+
+def parse_setup_pairing_response(raw: str) -> Dict[str, Any]:
+    from src.utils.llm_adapter import robust_json_loads
+
+    try:
+        data = robust_json_loads(raw)
+    except Exception:
+        data = None
+    if not isinstance(data, dict):
+        return {"parse_error": "not_a_json_object", "pairs": []}
+    pairs = data.get("pairs")
+    if not isinstance(pairs, list):
+        return {"parse_error": "pairs_not_a_list", "pairs": []}
+    return {"parse_error": "", "pairs": pairs}
+
+
+def apply_setup_pairs(
+    pairs: Sequence[Dict[str, Any]],
+    setup_candidates: Sequence[Dict[str, Any]],
+    chapter_ids: Sequence[str],
+    source_model: str = "",
+    created_at: str = "",
+) -> List[Dict[str, Any]]:
+    """Build validated-envelope candidates from model-selected candidate ids."""
+    by_id = {str(n.get("id") or ""): n for n in setup_candidates}
+    order = {cid: idx for idx, cid in enumerate(chapter_ids)}
+    seen_pairs: set = set()
+    used: set = set()
+    out: List[Dict[str, Any]] = []
+    for item in pairs or []:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("setup_id") or "").strip()
+        pid = str(item.get("payoff_id") or "").strip()
+        if not sid or not pid or sid == pid or (sid, pid) in seen_pairs:
+            continue
+        early = by_id.get(sid)
+        late = by_id.get(pid)
+        if not early or not late or sid in used or pid in used:
+            continue
+        early_ev = (early.get("evidence") or [{}])[0]
+        late_ev = (late.get("evidence") or [{}])[0]
+        early_ch = str(early_ev.get("chapter") or "")
+        late_ch = str(late_ev.get("chapter") or "")
+        if not early_ch or not late_ch or early_ch == late_ch:
+            continue
+        if order.get(early_ch, len(order)) >= order.get(late_ch, len(order)):
+            continue
+        claim = (f"{str(early.get('claim') or '').strip()}；后文回收："
+                 f"{str(late.get('claim') or '').strip()}").strip("；")[:600]
+        if not claim:
+            continue
+        try:
+            conf_early = float(early.get("confidence") or 0.0)
+            conf_late = float(late.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            conf_early = conf_late = 0.0
+        pair_id = "setup-pair-" + hashlib.sha1(
+            (sid + "\x00" + pid).encode("utf-8")).hexdigest()[:16]
+        out.append({
+            "id": pair_id,
+            "type": "setup_payoff",
+            "chapters": [early_ch, late_ch],
+            "claim": claim,
+            "evidence": [dict(early_ev), dict(late_ev)],
+            "confidence": round((min(1.0, max(0.0, conf_early))
+                                 + min(1.0, max(0.0, conf_late))) / 2.0, 3),
+            "status": "active",
+            "pairing_status": "paired",
+            "source_model": source_model,
+            "created_at": created_at,
+            "meta": {"setup_id": sid, "payoff_id": pid,
+                     "pair_reason": str(item.get("reason") or "")[:160]},
+        })
+        seen_pairs.add((sid, pid))
+        used.add(sid)
+        used.add(pid)
+    return out
+
+
+def pair_setup_candidates(
+    chapter_ids: Sequence[str],
+    setup_candidates: Sequence[Dict[str, Any]],
+    gen: Callable[[str], str],
+    merge_max_chars: int = 45000,
+    source_model: str = "",
+    created_at: str = "",
+) -> Dict[str, Any]:
+    """Candidate-id-only global setup pairing (Auto Ontology-style commit)."""
+    prompt = build_setup_pairing_prompt(chapter_ids, setup_candidates)
+    out: Dict[str, Any] = {"pairs": [], "notes": [], "error": "",
+                           "prompt_chars": len(prompt), "called": False}
+    if merge_max_chars > 0 and len(prompt) > merge_max_chars:
+        out["error"] = f"pair_prompt_too_large:{len(prompt)}>{merge_max_chars}"
+        return out
+    out["called"] = True
+    try:
+        parsed = parse_setup_pairing_response(gen(prompt) or "")
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"llm_error:{type(exc).__name__}: {exc}"
+        return out
+    if parsed.get("parse_error"):
+        out["error"] = str(parsed["parse_error"])
+        return out
+    notes = apply_setup_pairs(
+        parsed.get("pairs") or [], setup_candidates, chapter_ids,
+        source_model=source_model, created_at=created_at)
+    out["pairs"] = parsed.get("pairs") or []
+    out["notes"] = notes
+    return out
+
+
+def _candidate_chapters(note: Dict[str, Any]) -> List[str]:
+    out: List[str] = []
+    for raw in note.get("chapters") or []:
+        cid = str(raw or "").strip()
+        if cid and cid not in out:
+            out.append(cid)
+    for ev in note.get("evidence") or []:
+        cid = str(ev.get("chapter") or "").strip()
+        if cid and cid not in out:
+            out.append(cid)
+    return out
+
+
+def _invoke_deep_merge(
+    chapter_ids: Sequence[str],
+    segment_payloads: Sequence[Dict[str, Any]],
+    candidates: Sequence[Dict[str, Any]],
+    base_profile: Optional[Dict[str, Any]],
+    gen: Callable[[str], str],
+    merge_max_chars: int,
+    partial: bool,
+    source_model: str,
+    created_at: str,
+) -> Dict[str, Any]:
+    """Run one bounded merge call and mechanically enforce candidate quotes."""
+    prompt = build_deep_merge_prompt(
+        chapter_ids, segment_payloads, candidates, base_profile, partial=partial)
+    out: Dict[str, Any] = {
+        "called": False, "ok": False, "parsed": False, "notes": [],
+        "chapter_register_map": {}, "error": "", "prompt_chars": len(prompt),
+    }
+    if merge_max_chars > 0 and len(prompt) > merge_max_chars:
+        out["error"] = f"merge_prompt_too_large:{len(prompt)}>{merge_max_chars}"
+        return out
+    out["called"] = True
+    try:
+        merged = parse_deep_merge_response(gen(prompt) or "")
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"llm_error:{type(exc).__name__}: {exc}"
+        return out
+    parse_error = str(merged.get("parse_error") or "")
+    if parse_error or not merged:
+        out["error"] = parse_error or "empty_merge_response"
+        return out
+    out["parsed"] = True
+    cmap = merged.get("chapter_register_map")
+    if isinstance(cmap, dict):
+        wanted = set(chapter_ids)
+        for cid in chapter_ids:
+            val = str(cmap.get(cid) or "").strip()
+            if cid in wanted and val:
+                out["chapter_register_map"][cid] = val
+    notes: List[Dict[str, Any]] = []
+    for key, hint in (("voice_notes", "voice"), ("setup_payoff", "setup_payoff"),
+                      ("narrative_arc", "arc"), ("arc_notes", "arc")):
+        notes.extend(normalize_notes(
+            merged.get(key) or [], type_hint=hint,
+            source_model=source_model, created_at=created_at,
+        ))
+    # Enforce the candidate boundary at every merge level, not only at the
+    # final call.  Otherwise an invented quote from a partial merge would
+    # become an allowed "candidate" for the next level.
+    notes = restrict_notes_to_candidate_quotes(notes, candidates)
+    notes = ensure_unique_note_ids(dedupe_notes(notes))
+    out["notes"] = notes
+    if not notes:
+        out["error"] = "merge_returned_no_usable_notes"
+        return out
+    out["ok"] = True
+    return out
+
+
+def _split_deep_merge_batches(
+    chapter_ids: Sequence[str],
+    segment_payloads: Sequence[Dict[str, Any]],
+    candidates: Sequence[Dict[str, Any]],
+    base_profile: Optional[Dict[str, Any]],
+    merge_max_chars: int,
+    merge_batch_max_candidates: int = 80,
+) -> List[List[Dict[str, Any]]]:
+    """Greedily partition candidates by chapter order under a prompt budget."""
+    order = {cid: idx for idx, cid in enumerate(chapter_ids)}
+
+    def sort_key(note: Dict[str, Any]):
+        chapters = _candidate_chapters(note)
+        first = min((order.get(c, len(order)) for c in chapters), default=len(order))
+        try:
+            conf = float(note.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        return (first, -conf, str(note.get("id") or ""))
+
+    ordered = sorted(candidates, key=sort_key)
+    payload_by_chapter: Dict[str, List[Dict[str, Any]]] = {}
+    for payload in segment_payloads:
+        cid = str(payload.get("chapter_id") or "")
+        if cid:
+            payload_by_chapter.setdefault(cid, []).append(payload)
+
+    batches: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    for note in ordered:
+        if current and merge_batch_max_candidates > 0 \
+                and len(current) >= merge_batch_max_candidates:
+            batches.append(current)
+            current = []
+        trial = current + [note]
+        trial_chapters = [cid for cid in chapter_ids
+                          if any(cid in _candidate_chapters(n) for n in trial)]
+        trial_payloads = [p for cid in trial_chapters
+                          for p in payload_by_chapter.get(cid, [])]
+        prompt = build_deep_merge_prompt(
+            trial_chapters, trial_payloads, trial, base_profile, partial=True)
+        if current and merge_max_chars > 0 and len(prompt) > merge_max_chars:
+            batches.append(current)
+            current = [note]
+        else:
+            current = trial
+    if current:
+        batches.append(current)
+    return batches
+
+
+def merge_deep_candidates(
+    chapter_ids: Sequence[str],
+    segment_payloads: Sequence[Dict[str, Any]],
+    candidates: Sequence[Dict[str, Any]],
+    base_profile: Optional[Dict[str, Any]],
+    gen: Callable[[str], str],
+    merge_max_chars: int = 45000,
+    merge_batch_max_candidates: int = 80,
+    source_model: str = "",
+    created_at: str = "",
+) -> Dict[str, Any]:
+    """Merge candidates once, or hierarchically when one prompt is too large.
+
+    The single-call path is retained for small books.  Large books split by
+    chapter order into partial merges which may keep unresolved setup notes;
+    a final merge pairs them across the whole book.  Every layer is fail-open
+    and deterministic in chapter/id order.
+    """
+    chapter_ids = list(chapter_ids)
+    candidates = [dict(n) for n in candidates]
+    prompts: List[int] = []
+    errors: List[str] = []
+    merge_calls = 0
+    if not candidates:
+        return {"notes": [], "chapter_register_map": {}, "mode": "no_candidate_notes",
+                "merge_called": False, "merge_calls": 0, "prompt_chars": [],
+                "batch_count": 0, "errors": []}
+
+    full_prompt = build_deep_merge_prompt(
+        chapter_ids, segment_payloads, candidates, base_profile, partial=False)
+    prompts.append(len(full_prompt))
+    if merge_max_chars <= 0 or len(full_prompt) <= merge_max_chars:
+        res = _invoke_deep_merge(
+            chapter_ids, segment_payloads, candidates, base_profile, gen,
+            merge_max_chars, False, source_model, created_at)
+        merge_calls += int(bool(res.get("called")))
+        if res.get("ok"):
+            return {"notes": res["notes"], "chapter_register_map": res["chapter_register_map"],
+                    "mode": "merged", "merge_called": merge_calls > 0,
+                    "merge_calls": merge_calls, "prompt_chars": prompts,
+                    "batch_count": 1, "errors": errors}
+        mode = "merge_empty_fallback" if res.get("parsed") else "candidate_fallback"
+        if res.get("error"):
+            errors.append(str(res["error"]))
+        return {"notes": candidates, "chapter_register_map": {},
+                "mode": mode, "merge_called": merge_calls > 0,
+                "merge_calls": merge_calls, "prompt_chars": prompts,
+                "batch_count": 1, "errors": errors}
+
+    batches = _split_deep_merge_batches(
+        chapter_ids, segment_payloads, candidates, base_profile, merge_max_chars,
+        merge_batch_max_candidates=merge_batch_max_candidates)
+    partial_active: List[Dict[str, Any]] = []
+    audit_notes: List[Dict[str, Any]] = []
+    merged_cmap: Dict[str, str] = {}
+    fallback_batches = 0
+    payload_by_chapter: Dict[str, List[Dict[str, Any]]] = {}
+    for payload in segment_payloads:
+        cid = str(payload.get("chapter_id") or "")
+        if cid:
+            payload_by_chapter.setdefault(cid, []).append(payload)
+    for batch in batches:
+        batch_chapters = [cid for cid in chapter_ids
+                          if any(cid in _candidate_chapters(n) for n in batch)]
+        batch_payloads = [p for cid in batch_chapters
+                          for p in payload_by_chapter.get(cid, [])]
+        res = _invoke_deep_merge(
+            batch_chapters, batch_payloads, batch, base_profile, gen,
+            merge_max_chars, True, source_model, created_at)
+        merge_calls += int(bool(res.get("called")))
+        prompts.append(int(res.get("prompt_chars") or 0))
+        if res.get("ok"):
+            merged_cmap.update(res.get("chapter_register_map") or {})
+            for note in res.get("notes") or []:
+                if note.get("status") == "active":
+                    partial_active.append(note)
+                else:
+                    audit_notes.append(note)
+        else:
+            fallback_batches += 1
+            partial_active.extend(dict(n) for n in batch)
+            if res.get("error"):
+                errors.append(f"batch:{res.get('error')}")
+
+    combined = ensure_unique_note_ids(dedupe_notes(partial_active))
+    final_prompt = build_deep_merge_prompt(
+        chapter_ids, segment_payloads, combined, base_profile, partial=False)
+    prompts.append(len(final_prompt))
+    if merge_max_chars <= 0 or len(final_prompt) <= merge_max_chars:
+        res = _invoke_deep_merge(
+            chapter_ids, segment_payloads, combined, base_profile, gen,
+            merge_max_chars, False, source_model, created_at)
+        merge_calls += int(bool(res.get("called")))
+        if res.get("ok"):
+            merged_cmap.update(res.get("chapter_register_map") or {})
+            active = [n for n in res.get("notes") or [] if n.get("status") == "active"]
+            audit_notes.extend(n for n in res.get("notes") or []
+                               if n.get("status") != "active")
+            mode = ("hierarchical_merged" if not fallback_batches
+                    else "hierarchical_partial_merged")
+            return {"notes": active + audit_notes, "chapter_register_map": merged_cmap,
+                    "mode": mode, "merge_called": True,
+                    "merge_calls": merge_calls, "prompt_chars": prompts,
+                    "batch_count": len(batches), "errors": errors}
+        if res.get("error"):
+            errors.append(f"final:{res.get('error')}")
+        return {"notes": combined + audit_notes, "chapter_register_map": merged_cmap,
+                "mode": "hierarchical_candidate_fallback", "merge_called": True,
+                "merge_calls": merge_calls, "prompt_chars": prompts,
+                "batch_count": len(batches), "errors": errors}
+
+    # Very long serials can still exceed the window after partial merges.  Pair
+    # only the compact setup candidates globally, and keep the already-merged
+    # voice/arc notes rather than dropping the whole artifact.  The model picks
+    # candidate ids only; code assembles the two-chapter envelope and evidence.
+    setup_notes = [n for n in combined if n.get("type") == "setup_payoff"]
+    other_notes = [n for n in combined if n.get("type") != "setup_payoff"]
+    if setup_notes:
+        pair_res = pair_setup_candidates(
+            chapter_ids, setup_notes, gen, merge_max_chars=merge_max_chars,
+            source_model=source_model, created_at=created_at)
+        prompts.append(int(pair_res.get("prompt_chars") or 0))
+        merge_calls += int(bool(pair_res.get("called")))
+        if pair_res.get("notes"):
+            paired = list(pair_res["notes"])
+            used_ids = set()
+            for n in paired:
+                meta = n.get("meta") or {}
+                used_ids.add(str(meta.get("setup_id") or ""))
+                used_ids.add(str(meta.get("payoff_id") or ""))
+            unpaired = []
+            for n in setup_notes:
+                if str(n.get("id") or "") in used_ids:
+                    continue
+                item = dict(n)
+                item["status"] = "dormant"
+                item["pairing_status"] = "unpaired"
+                item.setdefault("meta", {})["pairing_status"] = "unpaired"
+                unpaired.append(item)
+            return {"notes": other_notes + paired + unpaired + audit_notes,
+                    "chapter_register_map": merged_cmap,
+                    "mode": "hierarchical_setup_pairing", "merge_called": True,
+                    "merge_calls": merge_calls, "prompt_chars": prompts,
+                    "batch_count": len(batches), "errors": errors}
+        if pair_res.get("error"):
+            errors.append(f"setup_pairing:{pair_res.get('error')}")
+    dormant_setup = []
+    for n in setup_notes:
+        item = dict(n)
+        item["status"] = "dormant"
+        item["pairing_status"] = "unpaired"
+        item.setdefault("meta", {})["pairing_status"] = "unpaired"
+        dormant_setup.append(item)
+    return {"notes": other_notes + dormant_setup + audit_notes,
+            "chapter_register_map": merged_cmap,
+            "mode": "hierarchical_combined_fallback", "merge_called": True,
+            "merge_calls": merge_calls, "prompt_chars": prompts,
+            "batch_count": len(batches), "errors": errors}
+
+
+def _task_model_label(task_name: str) -> str:
+    try:
+        from src.config import get_config
+        from src.utils.llm_adapter import get_role_model_name
+        cfg = get_config()
+        role = cfg.get_task_role(task_name)
+        model_key, _ = cfg.resolve_task_model(task_name)
+        return get_role_model_name(role) or model_key
+    except Exception:
+        return ""
+
+
+def build_deep_profile(
+    project_root: Path,
+    base_profile: Dict[str, Any],
+    chapters: Optional[Sequence[str]] = None,
+    input_dir: Optional[Path] = None,
+    llm_generate: Optional[Callable[[str], str]] = None,
+    merge_llm_generate: Optional[Callable[[str], str]] = None,
+    l2_generate: Optional[Callable[[str], str]] = None,
+    max_chars: int = 60000,
+    overlap_chars: int = 2000,
+    min_similarity: float = 0.9,
+    merge_max_chars: int = 45000,
+    merge_batch_max_candidates: int = 80,
+) -> Dict[str, Any]:
+    """Deep read all chapters, merge, then L1+L2.  Never edits chapter files."""
+    root = Path(project_root)
+    indir = Path(input_dir) if input_dir else root / "input"
+    docs = load_chapter_documents(indir, chapters=chapters)
+    if not docs:
+        return {"ok": False, "error": f"未在 {indir} 找到章节文件"}
+    chapter_texts = {d["chapter_id"]: d["text"] for d in docs}
+    chapter_ids = [d["chapter_id"] for d in docs]
+    extract_gen = llm_generate or (
+        lambda p: default_style_profiler_generate(p, "style_profiling_deep"))
+    # Extraction and merge have different failure modes: extraction needs long
+    # literary reasoning, while merge is a bounded normalization task.  Using
+    # the xhigh extraction role for merge repeatedly hit the gateway's 300s
+    # read timeout on real Dune candidates, so production uses a separate,
+    # cheaper task.  Injected test generators still drive both stages.
+    merge_gen = merge_llm_generate or llm_generate or (
+        lambda p: default_style_profiler_generate(p, "style_profiling_merge"))
+
+    segments: List[Tuple[str, Dict[str, Any]]] = []
+    for doc in docs:
+        for seg in segment_chapter_text(doc["text"], max_chars=max_chars,
+                                        overlap_chars=overlap_chars):
+            segments.append((doc["chapter_id"], seg))
+
+    payloads: List[Dict[str, Any]] = []
+    candidates: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    created_at = _now()
+    for cid, seg in segments:
+        prompt = build_deep_extract_prompt(cid, seg, len(chapter_texts[cid]))
+        try:
+            raw = extract_gen(prompt)
+            parsed = parse_deep_extract_response(raw)
+        except Exception as exc:  # noqa: BLE001
+            parsed = {"notes": [], "register_summary": "", "synopsis": "",
+                      "parse_error": f"llm_error:{type(exc).__name__}: {exc}"}
+        parsed["chapter_id"] = cid
+        if not parsed.get("part_id"):
+            parsed["part_id"] = f"{cid}:{seg['part_index']}"
+        parsed["char_start"] = seg["char_start"]
+        parsed["char_end"] = seg["char_end"]
+        if parsed.get("parse_error"):
+            errors.append({"part_id": parsed["part_id"], "error": parsed["parse_error"]})
+        payloads.append(parsed)
+        notes = normalize_notes(parsed.get("notes") or [], source_model=_task_model_label("style_profiling_deep"),
+                                created_at=created_at)
+        candidates.extend(notes)
+
+    # Per-segment register summaries are a deterministic fallback for chapters
+    # the merge model omits.  The deep artifact should cover every chapter even
+    # when one merge call returns a partial map.
+    register_by_chapter: Dict[str, List[str]] = {}
+    for p in payloads:
+        cid = str(p.get("chapter_id") or "")
+        rs = str(p.get("register_summary") or "").strip()
+        if cid and rs:
+            bucket = register_by_chapter.setdefault(cid, [])
+            if rs not in bucket:
+                bucket.append(rs)
+
+    merge_res = merge_deep_candidates(
+        chapter_ids, payloads, candidates, base_profile, merge_gen,
+        merge_max_chars=merge_max_chars,
+        merge_batch_max_candidates=merge_batch_max_candidates,
+        source_model=_task_model_label("style_profiling_merge"),
+        created_at=created_at,
+    )
+    merge_mode = str(merge_res.get("mode") or "candidate_fallback")
+    merge_called = bool(merge_res.get("merge_called"))
+    merge_calls = int(merge_res.get("merge_calls") or 0)
+    merge_batch_count = int(merge_res.get("batch_count") or 0)
+    merge_prompt_chars = list(merge_res.get("prompt_chars") or [])
+    merge_errors = list(merge_res.get("errors") or [])
+    merge_error = "; ".join(str(e) for e in merge_errors)
+    merged_cmap: Dict[str, str] = dict(merge_res.get("chapter_register_map") or {})
+    selected_notes: List[Dict[str, Any]] = [dict(n) for n in merge_res.get("notes") or []]
+
+    profile = dict(base_profile or heuristic_profile(note="deep_base_missing"))
+    final_cmap = dict(profile.get("chapter_register_map") or {})
+    final_cmap.update(merged_cmap)
+    for cid in chapter_ids:
+        if not str(final_cmap.get(cid) or "").strip() and register_by_chapter.get(cid):
+            final_cmap[cid] = "；".join(register_by_chapter[cid])[:240]
+    if final_cmap:
+        profile["chapter_register_map"] = final_cmap
+
+    # A merge model is allowed to recombine extraction quotes, never invent a
+    # quote that merely happens to exist elsewhere in the book.  This mirrors
+    # Auto Ontology's candidate-only extraction contract.
+    selected_notes = restrict_notes_to_candidate_quotes(selected_notes, candidates)
+    selected_notes = ensure_unique_note_ids(dedupe_notes(selected_notes))
+    limits = enforce_note_limits(selected_notes)
+    selected_notes = limits["notes"]
+
+    l1 = validate_note_evidence(selected_notes, chapter_texts, min_similarity=min_similarity)
+    l2 = verify_notes_l2(l1["notes"], chapter_texts, llm_generate=l2_generate)
+    profile = replace_notes_in_profile(profile, l2["notes"])
+    profile["schema_version"] = PROFILE_VERSION
+    _deep_model = _task_model_label("style_profiling_deep")
+    _merge_model = _task_model_label("style_profiling_merge")
+    profile["generation"] = {
+        "model": _deep_model,
+        "merge_model": _merge_model,
+        "params": {"mode": "deep", "max_chars": max_chars,
+                   "overlap_chars": overlap_chars,
+                   "segments": len(segments), "l1_min_similarity": min_similarity,
+                   "merge_max_chars": merge_max_chars,
+                   "merge_batch_max_candidates": merge_batch_max_candidates,
+                   "merge_calls": merge_calls,
+                   "merge_strategy": "hierarchical" if merge_batch_count > 1 else "single"},
+        "time": _now(),
+        "prompt_version": "r131.deep.v3",
+    }
+    profile["generated_at"] = _now()
+    active_notes_out = [n for n in l2["notes"] if n.get("status") == "active"]
+    covered_chapters = set()
+    for n in active_notes_out:
+        for cid in chapter_ids_between(n.get("chapters") or []):
+            if cid in chapter_texts:
+                covered_chapters.add(cid)
+    segments_total = len(segments)
+    segments_ok = sum(1 for p in payloads if not p.get("parse_error"))
+    register_covered = sum(1 for cid in chapter_ids
+                           if str(final_cmap.get(cid) or "").strip())
+    coverage = {
+        "chapters_total": len(chapter_ids),
+        "chapters_with_active_notes": len(covered_chapters),
+        "chapter_coverage": round(len(covered_chapters) / len(chapter_ids), 4)
+        if chapter_ids else 0.0,
+        "chapter_register_total": len(chapter_ids),
+        "chapter_register_covered": register_covered,
+        "chapter_register_coverage": round(register_covered / len(chapter_ids), 4)
+        if chapter_ids else 0.0,
+        "segments_total": segments_total,
+        "segments_ok": segments_ok,
+        "segment_coverage": round(segments_ok / segments_total, 4)
+        if segments_total else 0.0,
+        "extraction_candidates": len(candidates),
+        "notes_after_limits": len(selected_notes),
+        "active_after_limits": sum(1 for n in selected_notes if n.get("status") == "active"),
+        "notes_after_l1": len(l1["notes"]),
+        "active_notes": len(active_notes_out),
+        "setup_payoff_active": sum(1 for n in active_notes_out
+                                   if n.get("type") == "setup_payoff"),
+    }
+    deep_complete = bool(
+        segments_total
+        and segments_ok == segments_total
+        and bool(active_notes_out)
+    )
+    deep_status = (
+        "complete" if deep_complete
+        else ("empty" if not active_notes_out else "partial")
+    )
+    profile["deep_read"] = {
+        "chapters": chapter_ids,
+        "segments": len(segments),
+        "complete": deep_complete,
+        "status": deep_status,
+        "split_strategy": "chapter_segments_with_overlap_then_cross_segment_merge",
+        "merge_mode": merge_mode,
+        "merge_called": merge_called,
+        "merge_calls": merge_calls,
+        "merge_batch_count": merge_batch_count,
+        "merge_prompt_chars": merge_prompt_chars,
+        "merge_quality": ("ok" if merge_mode in (
+            "merged", "hierarchical_merged", "hierarchical_partial_merged",
+            "hierarchical_setup_pairing") else "degraded"),
+        "coverage": coverage,
+        "extract_errors": errors,
+        "merge_error": merge_error,
+    }
+    audit = build_audit_payload(
+        profile, l1_audit=l1["audit"], l2_audit=l2["audit"],
+        generation=profile.get("generation"),
+        extra={"segment_payloads": [{
+            "chapter_id": p.get("chapter_id"),
+            "part_id": p.get("part_id"), "char_start": p.get("char_start"),
+            "char_end": p.get("char_end"), "synopsis": p.get("synopsis"),
+            "register_summary": p.get("register_summary"),
+            "notes_emitted": len(p.get("notes") or []),
+            "parse_error": p.get("parse_error", ""),
+        } for p in payloads],
+        "merge_error": merge_error, "merge_mode": merge_mode,
+        "merge_called": merge_called, "merge_calls": merge_calls,
+        "merge_batch_count": merge_batch_count,
+        "merge_prompt_chars": merge_prompt_chars,
+        "merge_errors": merge_errors, "coverage": coverage},
+    )
+    return {"ok": True, "complete": deep_complete, "profile": profile, "audit": audit,
+            "chapter_texts": chapter_texts, "segments": len(segments),
+            "candidate_notes": len(candidates), "notes_after_limits": len(selected_notes),
+            "active_notes": len(active_notes_out), "merge_mode": merge_mode,
+            "coverage": coverage}
+
+
+# 剖面 → 运行时 style_guide 覆盖层
+
+def profile_to_style_guide(
+    profile: Optional[Dict[str, Any]],
+    chapter_id: Optional[str] = None,
+    base: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """把剖面映射为 config.style_guide 覆盖 dict（与 config.yaml 基线合并）。
+
+    chapter_id 命中 chapter_register_map 时，register_default 用该章目标；
+    其余通用键（avg_sentence_length 等）沿用 base（config.yaml 基线）。
+    """
+    if base is None:
+        try:
+            from src.config import get_config
+            base = dict(getattr(get_config(), "base_style_guide", {}) or {})
+        except Exception:
+            base = {}
+    guide = dict(base)
+    if not profile:
+        return guide
+
+    guide["genre"] = profile.get("genre") or guide.get("genre") or "文学小说"
+    guide["persona"] = profile.get("persona") or NEUTRAL_PERSONA
+    fp = profile.get("footnote_policy")
+    guide["footnote_policy"] = fp if fp in VALID_FOOTNOTE_POLICIES else "inline"
+
+    reg = profile.get("register_default") or NEUTRAL_REGISTER
+    cmap = profile.get("chapter_register_map") or {}
+    if chapter_id and isinstance(cmap, dict) and cmap.get(chapter_id):
+        reg = str(cmap[chapter_id])
+    guide["register_default"] = reg
+
+    guide["forbidden_modernisms"] = list(profile.get("forbidden_modernisms") or [])
+    guide["translation_hints"] = list(profile.get("translation_hints") or [])
+    guide["pun_watchlist"] = list(profile.get("pun_watchlist") or [])
+
+    era_region = "，".join(x for x in (profile.get("era"), profile.get("region")) if x)
+    if era_region:
+        guide["work_era_region"] = era_region
+    wg = profile.get("work_guess") or {}
+    if wg.get("title"):
+        guide["work_title"] = wg["title"]
+    guide["_profile_source"] = profile.get("source")
+    guide["_profile_confidence"] = profile.get("confidence")
+    return guide
+
+
+# 落盘 / 加载 / 顶层入口
+
+def save_profile(profile: Dict[str, Any], path: Path) -> None:
+    """Atomically publish a profile artifact.
+
+    A deep profile is consumed by a long-running translation pipeline and by
+    story-graph rebuilds.  A torn JSON file from a crashed write would make the
+    judgment layer disappear silently on the next load, so publish by rename.
+    """
+    atomic_write_json(Path(path), profile)
+
+
+def load_profile(path: Path) -> Optional[Dict[str, Any]]:
+    """加载剖面文件；不存在/损坏返回 None（调用方安静跳过）。"""
+    path = Path(path)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not data:
+        return None
+    try:
+        return normalize_profile(data)
+    except Exception:
+        return None
+
+
+def profile_is_deep(profile: Optional[Dict[str, Any]]) -> bool:
+    """Return True only for a completed deep-read artifact.
+
+    ``schema_version`` alone is not enough: shallow profiles generated after
+    Round 131 are schema v2 but carry no ``deep_read`` block.  The one-click
+    launcher must upgrade those instead of treating them as finished.
+    """
+    if not isinstance(profile, dict):
+        return False
+    deep_read = profile.get("deep_read")
+    if isinstance(deep_read, dict) and deep_read:
+        # New artifacts carry an explicit completion bit.  A failed/empty deep
+        # run remains useful as a fail-open partial artifact, but it must not
+        # suppress the one-click retry on the next invocation.
+        if "complete" in deep_read:
+            return bool(deep_read.get("complete"))
+        # Backward compatibility for early Round-131 artifacts that predate
+        # the completion bit.
+        return True
+    generation = profile.get("generation")
+    params = generation.get("params") if isinstance(generation, dict) else None
+    return isinstance(params, dict) and params.get("mode") == "deep"
+
+
+def summary_line(profile: Dict[str, Any]) -> str:
+    wg = profile.get("work_guess") or {}
+    title = wg.get("title") or "(未识别)"
+    notes = []
+    for key in ("narrative_arc", "setup_payoff", "voice_notes"):
+        val = profile.get(key) or []
+        notes.append(sum(1 for n in val if isinstance(n, dict)
+                         and n.get("status") == "active"))
+    return (
+        f"source={profile.get('source')} conf={profile.get('confidence')} "
+        f"genre={profile.get('genre')} era={profile.get('era') or '-'} work={title} "
+        f"hints={len(profile.get('translation_hints') or [])} "
+        f"pun={len(profile.get('pun_watchlist') or [])} "
+        f"notes_active={sum(notes)}"
+    )
+
+
+def _try_build_story_graph(root: Path, profile: Optional[Dict[str, Any]]) -> tuple:
+    """Build the deterministic graph artifact without ever blocking profiling."""
+    try:
+        from src.config import get_config
+        cfg = get_config().get("story_graph", {}) or {}
+        if isinstance(cfg, dict) and cfg.get("enabled", True) is False:
+            return "", {"enabled": False}
+        from src.story_graph import DEFAULT_GRAPH_PATH, build_and_save_story_graph
+        graph = build_and_save_story_graph(root, profile=profile)
+        rel = str((cfg or {}).get("path") or DEFAULT_GRAPH_PATH) if isinstance(cfg, dict) else DEFAULT_GRAPH_PATH
+        return str(Path(root) / rel), graph.get("coverage") or {}
+    except Exception as exc:  # noqa: BLE001 - graph is advisory
+        print(f"⚠️ [StoryGraph] 构建失败（不阻塞剖面生成）: {type(exc).__name__}: {exc}")
+        return "", {}
+
+
+def generate_book_profile(
+    project_root: Path = Path("."),
+    chapters: Optional[Sequence[str]] = None,
+    path: Optional[Path] = None,
+    force: bool = False,
+    dry_run: bool = False,
+    limit: int = 5,
+    llm_generate: Optional[Callable[[str], str]] = None,
+    input_dir: Optional[Path] = None,
+    deep: bool = False,
+    l2_generate: Optional[Callable[[str], str]] = None,
+    deep_max_chars: int = 60000,
+    deep_overlap_chars: int = 2000,
+) -> Dict[str, Any]:
+    """顶层入口：抽样（或全书深读）→ LLM → 落盘 input/book_profile.json。
+
+    返回 {"ok": bool, ...}。已存在且非 force 时 skipped=True（不重新生成）。
+    """
+    root = Path(project_root)
+    in_dir = Path(input_dir) if input_dir else root / "input"
+    out_path = Path(path) if path else root / DEFAULT_PROFILE_PATH
+
+    existing = load_profile(out_path) if out_path.exists() else None
+    # A shallow schema-v2 profile is not a completed deep artifact.  Only a
+    # profile carrying deep_read provenance may satisfy ``--deep``; otherwise
+    # the one-click launcher would silently keep a v1-quality profile forever.
+    if existing is not None and not force and (not deep or profile_is_deep(existing)):
+        prof = existing
+        graph_path, graph_stats = _try_build_story_graph(root, prof)
+        return {"ok": True, "skipped": True, "reason": "profile_exists", "profile": prof,
+                "path": str(out_path), "graph_path": graph_path,
+                "graph_coverage": graph_stats}
+
+    samples = load_chapter_samples(in_dir, chapters=chapters, limit=limit)
+    if not samples:
+        return {"ok": False, "error": f"未在 {in_dir} 找到章节样本（ch*.md）", "path": str(out_path)}
+
+    if dry_run:
+        prof = heuristic_profile(samples, note="dry_run")
+        return {"ok": True, "dry_run": True, "profile": prof, "path": str(out_path), "samples": [s["chapter_id"] for s in samples]}
+
+    if deep:
+        base_profile = existing
+        if not base_profile or base_profile.get("source") == "fallback":
+            base_profile = build_profile(samples, llm_generate=llm_generate)
+        if base_profile.get("source") == "fallback":
+            return {
+                "ok": True,
+                "profile": base_profile,
+                "path": str(out_path),
+                "saved": False,
+                "deep": True,
+                "error": "base_profile_fallback",
+                "note": base_profile.get("note", ""),
+            }
+        deep_res = build_deep_profile(
+            root, base_profile, chapters=chapters, input_dir=in_dir,
+            llm_generate=llm_generate, l2_generate=l2_generate,
+            max_chars=deep_max_chars, overlap_chars=deep_overlap_chars,
+        )
+        if not deep_res.get("ok"):
+            return {"ok": False, "error": deep_res.get("error"), "path": str(out_path)}
+        prof = deep_res["profile"]
+        saved = True
+        save_profile(prof, out_path)
+        audit_paths = write_judgment_audit(root, deep_res["audit"])
+        graph_path, graph_stats = _try_build_story_graph(root, prof)
+        return {
+            "ok": True,
+            "profile": prof,
+            "path": str(out_path),
+            "saved": saved,
+            "samples": [s["chapter_id"] for s in samples],
+            "source": prof.get("source"),
+            "confidence": prof.get("confidence"),
+            "deep": True,
+            "segments": deep_res.get("segments", 0),
+            "complete": bool(deep_res.get("complete", False)),
+            "candidate_notes": deep_res.get("candidate_notes", 0),
+            "notes_after_limits": deep_res.get("notes_after_limits", 0),
+            "active_notes": deep_res.get("active_notes", 0),
+            "merge_mode": deep_res.get("merge_mode", ""),
+            "coverage": deep_res.get("coverage") or {},
+            "audit_paths": audit_paths,
+            "graph_path": graph_path,
+            "graph_coverage": graph_stats,
+        }
+
+    prof = build_profile(samples, llm_generate=llm_generate)
+    # LLM 不可用时只回退中性 profile —— 不落盘，避免用空剖面遮蔽后续真实生成
+    saved = prof.get("source") != "fallback"
+    if saved:
+        save_profile(prof, out_path)
+    graph_path, graph_stats = _try_build_story_graph(root, prof) if (saved or out_path.exists()) else ("", {})
+    return {
+        "ok": True,
+        "profile": prof,
+        "path": str(out_path),
+        "saved": saved,
+        "samples": [s["chapter_id"] for s in samples],
+        "source": prof.get("source"),
+        "confidence": prof.get("confidence"),
+        "deep": False,
+        "graph_path": graph_path,
+        "graph_coverage": graph_stats,
+    }
 
 
 
@@ -15496,6 +20238,8 @@ class JevBackend(SystemOneBackend):
         return self._client
 
     def evaluate(self, state, questions, *, model=None, timeout=30.0):
+        if not _typesafe_sdk_available():
+            raise ModuleNotFoundError("No module named 'typesafe_sdk'")
         client = self._ensure_client()
         # typesafe_sdk 期望 Choice/Score/Noul 对象；我们 dict 入参则需要构造
         from typesafe_sdk import Choice, Score, Noul
@@ -15566,12 +20310,41 @@ class OpenAICompatBackend(SystemOneBackend):
 
     def __init__(
         self,
-        model_role: str = "primary",  # primary = MiniMax M3
+        model_role: Optional[str] = None,
         llm_client=None,
+        task_name: str = "critic_scoring",
     ):
-        from src.utils.llm_adapter import get_llm_client_for_task
-        self.model_role = model_role
-        self.llm = llm_client or get_llm_client_for_task("critic_scoring")
+        """绑定与客户端一致的任务路由（Round 140）。
+
+        旧实现从 `critic_scoring` 取 DeepSeek 客户端，却从
+        `typesafe.fallback_role: primary` 取 MiniMax 模型名，导致请求
+        `DeepSeek 客户端 + MiniMax-M3.1-Flash` 被网关 403。模型名必须和
+        客户端来自同一个 task 路由；`fallback_role` 仅保留为历史配置兼容。
+        """
+        from src.config import config as _cfg
+        from src.utils.llm_adapter import (
+            get_llm_client,
+            get_llm_client_for_task,
+            get_role_model_name,
+        )
+
+        self.task_name = task_name
+        # 显式 model_role 仍按旧语义工作；只有“不指定角色”的生产兜底才使用
+        # critic_scoring 任务路由，避免客户端与 model_name 来自不同角色。
+        self.model_role = model_role or _cfg.get_task_role(task_name)
+        _, params = _cfg.resolve_task_model(task_name)
+        self.params = dict(params)
+        if model_role and model_role != _cfg.get_task_role(task_name):
+            # task effort 是按 task 路由角色校验的；显式换角色时不能把
+            # 该角色的档位原样下发（例如 DeepSeek 的 none 发给 MiniMax）。
+            self.params.pop("effort", None)
+        self.model_name = get_role_model_name(self.model_role) or self.model_role
+        if llm_client is not None:
+            self.llm = llm_client
+        elif model_role:
+            self.llm = get_llm_client(model_role)
+        else:
+            self.llm = get_llm_client_for_task(task_name)
 
     def evaluate(self, state, questions, *, model=None, timeout=30.0):
         # 把 state 与 questions 拼成一个 prompt
@@ -15640,8 +20413,10 @@ class OpenAICompatBackend(SystemOneBackend):
 
         # 走完整 OpenAICompatibleAdapter.generate 签名（需要 model_name）
         # 但在网络层错误时快速失败，不消耗 3 次重试 budget
-        from src.utils.llm_adapter import get_role_model_name
-        model_name = get_role_model_name(self.model_role) or self.model_role
+        model_name = model or self.model_name
+        call_params = dict(self.params)
+        call_params.setdefault("temperature", 0.1)
+        call_params.setdefault("max_tokens", 2048)
         # 临时把 OpenAI 客户端的重试次数调成 1（默认 3 次 ×5s/10s 重试间隔太慢）
         original_max_retries = getattr(self.llm, "max_retries", 3)
         try:
@@ -15650,8 +20425,7 @@ class OpenAICompatBackend(SystemOneBackend):
             raw = self.llm.generate(
                 prompt=prompt,
                 model_name=model_name,
-                max_tokens=2048,
-                temperature=0.1,
+                **call_params,
             )
             return self._parse_answers(raw, questions)
         except (ConnectionError, OSError, requests.exceptions.ConnectionError) as e:
@@ -15921,7 +20695,10 @@ class FallbackBackend(SystemOneBackend):
         # test_05 静态探测），但默认不参与自动链（Jev → Mock）。
         # OpenAICompat 在 LLM-as-judge 模式下不返回校准概率，与 Jev 语义不等价，
         # 强行 fallback 会让 verdict 失去概率含义。详见 audit A3。
-        self.fallback = OpenAICompatBackend(model_role=fallback_role)
+        # 兜底的 LLM 客户端与模型名统一由 critic_scoring 任务路由解析。
+        # fallback_role 参数保留仅为旧配置/旧调用方兼容，不再参与模型绑定。
+        self.fallback_role = fallback_role
+        self.fallback = OpenAICompatBackend(task_name="critic_scoring")
         self.allow_openai_fallback = allow_openai_fallback
         self.allow_mock = allow_mock
         self.enabled = enabled
@@ -15931,6 +20708,7 @@ class FallbackBackend(SystemOneBackend):
         self.last_backend: str = "unknown"
         # Round 121: 401 鉴权失败缓存 —— key 修复须重启进程，本轮内不再反复试探 Jev
         self._jev_auth_dead = False
+        self._jev_disabled_reason = ""
 
     def evaluate(self, state, questions, *, model=None, timeout=None):
         # 有效 timeout：调用方传入优先，否则用 self.timeout（来自 config.yaml typesafe.timeout）
@@ -15950,11 +20728,19 @@ class FallbackBackend(SystemOneBackend):
                 self.last_backend = "jev"
                 return answers
             except Exception as e:
-                if type(e).__name__ == "TypeSafeAuthenticationError":
-                    # 401 鉴权失败：key 修复须重启进程；本进程内不再试探 Jev（避免每 chunk 白跑+刷屏）
+                missing_sdk = isinstance(e, (ImportError, ModuleNotFoundError)) or (
+                    "typesafe_sdk" in str(e)
+                )
+                auth_failed = _is_auth_failure(e)
+                if missing_sdk or auth_failed:
+                    # Jev 鉴权/依赖失败：修复须重启进程；本进程内不再试探 Jev
                     if not self._jev_auth_dead:
-                        logger.warning(f"Jev 鉴权失败（{e}）；本进程内不再尝试 Jev，改走降级链")
+                        reason = "typesafe_sdk 缺失" if missing_sdk else "Jev 鉴权失败"
+                        logger.warning(f"{reason}（{e}）；本进程内不再尝试 Jev，改走降级链")
                     self._jev_auth_dead = True
+                    self._jev_disabled_reason = (
+                        "typesafe_sdk 未安装" if missing_sdk else "Jev 鉴权失败"
+                    )
                 else:
                     logger.info(f"Jev 不可用: {type(e).__name__}: {e}")
                 if not self.allow_openai_fallback:
@@ -15970,7 +20756,10 @@ class FallbackBackend(SystemOneBackend):
                     except Exception as e2:
                         logger.info(f"OpenAICompat 不可用，降级到 Mock: {e2}")
         else:
-            logger.debug("Jev 跳过：无 TYPESAFE_API_KEY")
+            if self._jev_auth_dead:
+                logger.debug("Jev 跳过：%s", self._jev_disabled_reason or "鉴权/依赖不可用")
+            else:
+                logger.debug("Jev 跳过：无 TYPESAFE_API_KEY")
             if self.allow_openai_fallback:
                 # 无 Jev key 时仍可走 OpenAICompat（显式开启）
                 try:
@@ -16445,11 +21234,25 @@ def build_state(
             if entity_source_name_in_text(source_name, source_text):
                 relevant_variants[source_name] = list(variants) if variants else []
 
+    try:
+        from src.judgment_layer import sanitize_style_guide_for_scoring
+        scoring_style = sanitize_style_guide_for_scoring(style_guide_stats)
+    except Exception:
+        _advisory = {
+            "narrative_arc", "setup_payoff", "voice_notes", "judgment_notes",
+            "judgment", "generation", "deep_read", "schema_version",
+        }
+        scoring_style = {k: v for k, v in (style_guide_stats or {}).items()
+                         if k not in _advisory}
+
     return {
         "source_text": source_text,
         "raw_translation": raw_translation,
         "literary_translation": literary_translation,
-        "style_guide": style_guide_stats,
+        # Judgment-layer notes are advisory prompt context, never scoring
+        # targets.  Strip them at the single state-construction boundary so
+        # critic/Jev experiments cannot accidentally grade against them.
+        "style_guide": scoring_style,
         "entity_registry": relevant_entities,
         "entity_variants": relevant_variants,
     }
@@ -16954,7 +21757,11 @@ def _ensure_real_or_fake(_name: str) -> None:
 
 _ensure_real_or_fake("src.judges")
 # 其他 src.* 子包（如 critic 内部 from src.utils.llm_adapter import）
-for _sub in ("src.utils", "src.config", "src.agents", "src.core", "src.consistency", "src.splitters", "src.pipeline", "src.main"):
+for _sub in ("src.utils", "src.config", "src.agents", "src.core", "src.consistency", "src.splitters", "src.pipeline", "src.main",
+             # Round 131: prefer the real modules in repo mode.  A pre-created
+             # fake module otherwise hides private helpers (e.g. pun_audit's
+             # _split_anchors) from later imports in the same interpreter.
+             "src.judgment_layer", "src.story_graph", "src.style_profiler"):
     _ensure_real_or_fake(_sub)
 # Round 103 P2: src.judges.* shim 不覆盖真实模块, 仅补 attr.
 # R104 P1 修复: 旧条件 `_existing.__path__` 仅对父 package 有效, 子模块
@@ -17049,7 +21856,7 @@ _SRC_SUBMODULES = {
     # Round 119 (T5): 成书样式/lint 单源（散装 src/book_lint.py）
     "src.book_lint": ["normalize_final_style", "finalize_outputs", "lint_texts",
                       "lint_book", "postprocess_chunk_text", "chapter_heading",
-                      "sup_run_to_int",
+                      "sup_run_to_int", "book_title_zh", "resolve_book_output_path",
                       # L2/L6: pun_audit / literary_metrics 复用的私有 helper
                       "_scan_lines", "_def_key",
                       # Round 121: 注释统一新面（editor_review / 测试复用）
@@ -17097,12 +21904,53 @@ _SRC_SUBMODULES = {
         "_max_line_repeat", "_longest_short_line_run",
     ],
     "src.main": ["init_project", "debug_db", "print_banner", "main",
+                 "_install_sigint_guard", "_SIGINT_WARNED",
                  "detect_input_format", "split_input_to_chapters",
                  # R104 P4: detect_input_format (translator_agent.py:9433) 依赖此 table
                  "_INPUT_FORMAT_TABLE"],
+    # Round 131: inlined judgment/profile modules remain importable in
+    # single-file deployment through the same attr shim used above.
+    "src.judgment_layer": [
+        "JUDGMENT_SCHEMA_VERSION", "VALID_NOTE_TYPES", "VALID_NOTE_STATUSES",
+        "PROFILE_NOTE_KEYS", "TYPE_PRIORITY", "NOTE_TYPE_LIMITS",
+        "VOICE_NOTES_PER_CHAPTER", "ADVISORY_STYLE_KEYS",
+        "STRUCTURAL_P0_CATEGORIES", "REVIEW_FIX_SCHEMA_VERSION",
+        "REVIEW_FIX_SIDECAR_STEP", "JudgmentContext", "sha256_text",
+        "atomic_write_json", "atomic_write_text", "is_prescriptive_claim",
+        "normalize_chapters", "chapter_ids_between", "note_covers_chapter",
+        "normalize_evidence", "normalize_note", "dedupe_notes",
+        "ensure_unique_note_ids", "restrict_notes_to_candidate_quotes",
+        "enforce_note_limits", "normalize_notes", "normalize_judgment_fields",
+        "all_notes", "note_is_validated", "active_notes",
+        "sanitize_style_guide_for_scoring", "normalize_text_for_match",
+        "match_quote", "map_quote_to_chunks", "validate_note_evidence",
+        "build_l2_prompt", "default_l2_generate", "verify_notes_l2",
+        "replace_notes_in_profile", "render_review_fix_feedback",
+        "build_judgment_context", "render_global_review_context",
+        "build_audit_payload", "build_audit_markdown", "write_judgment_audit",
+        "judgment_cache_key",
+    ],
+    "src.story_graph": [
+        "GRAPH_VERSION", "DEFAULT_GRAPH_PATH", "build_story_graph",
+        "save_story_graph", "load_story_graph", "build_and_save_story_graph",
+        "story_graph_context_for_chapter",
+    ],
+    "src.style_profiler": [
+        "DEFAULT_PROFILE_PATH", "PROFILE_VERSION", "NEUTRAL_REGISTER",
+        "NEUTRAL_PERSONA", "VALID_FOOTNOTE_POLICIES", "VALID_SOURCES",
+        "spread_sample_chapters", "load_chapter_samples", "build_profile_prompt",
+        "normalize_profile", "heuristic_profile", "parse_profile_response",
+        "default_style_profiler_generate", "build_profile",
+        "load_chapter_documents", "segment_chapter_text",
+        "build_deep_extract_prompt", "parse_deep_extract_response",
+        "build_deep_merge_prompt", "parse_deep_merge_response",
+        "build_deep_profile", "profile_to_style_guide", "save_profile",
+        "load_profile", "profile_is_deep", "summary_line", "generate_book_profile",
+    ],
     "src.test_golden_set": ["GoldenSetEvaluator", "_levenshtein_distance", "run_golden_test",
                             "GOLDEN_AB_MATRIX", "_extract_confidence_source",
                             "summarize_golden_results", "recommend_golden_combo", "run_golden_ab",
+                            "compare_injection_arms", "run_injection_ab",
                             "run_golden_gate"],
     "src.test_memory_pressure": ["get_system_memory", "get_process_memory", "simulate_memory_load", "test_memory_pressure"],
 }

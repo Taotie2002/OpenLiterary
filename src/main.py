@@ -40,7 +40,7 @@ from src.config import config as _config
 from src.utils.chunker import SmartChunker
 from src.core.scheduler import TaskScheduler
 from src.pipeline import TranslationPipeline
-from src.test_golden_set import run_golden_ab, run_golden_test
+from src.test_golden_set import run_golden_ab, run_golden_test, run_injection_ab
 from src.test_memory_pressure import test_memory_pressure, run_golden_gate
 from src.splitters import (
     EpubSplitter, TextSplitter, MdSplitter,
@@ -184,8 +184,35 @@ def print_banner():
 # ────────────────────────────────────────────────────────────────────
 _INSTANCE_LOCK_FD: Optional[int] = None
 
-_MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile",
+_MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile", "story-graph",
                       "consolidate", "finalize", "notes-normalize", "requeue"}
+
+# Round 141: Ctrl+C 防误触。第一次只警告并继续，第二次才真正中止。
+_SIGINT_WARNED = False
+
+
+def _install_sigint_guard():
+    """安装两段式 SIGINT 处理器；返回 handler 供测试直接调用。"""
+    global _SIGINT_WARNED
+    _SIGINT_WARNED = False
+    import signal
+
+    def _handler(_signum, _frame):
+        global _SIGINT_WARNED
+        if not _SIGINT_WARNED:
+            _SIGINT_WARNED = True
+            print("\n⚠️ 检测到 Ctrl+C：当前任务尚未完成。", file=sys.stderr, flush=True)
+            print("   若只是误触，无需操作，程序会继续当前步骤。", file=sys.stderr, flush=True)
+            print("   若确认中止，请再按一次 Ctrl+C；已完成 chunk 与 DB 状态会保留，可断点续跑。",
+                  file=sys.stderr, flush=True)
+            return
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGINT, _handler)
+    except (ValueError, OSError):
+        return None
+    return _handler
 
 
 def acquire_instance_lock(lock_path: Optional[Path] = None) -> bool:
@@ -238,16 +265,31 @@ def acquire_instance_lock(lock_path: Optional[Path] = None) -> bool:
 
 
 def main():
+    _install_sigint_guard()
     print_banner()
 
     import argparse
     parser = argparse.ArgumentParser(description="SagaTrans — AI 文学语义编译系统")
     parser.add_argument("command", nargs="?", default="pipeline",
-                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "drift-audit", "notes-normalize", "requeue"],
-                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, drift-audit, notes-normalize, requeue")
+                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "story-graph", "drift-audit", "notes-normalize", "requeue"],
+                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, story-graph, drift-audit, notes-normalize, requeue")
     parser.add_argument("--chapter", default="ch01", help="章节 ID (默认: ch01)")
     parser.add_argument("--chapters", default=None,
                         help="style-profile 命令：抽样章节，逗号分隔（默认均匀抽 5 章）")
+    parser.add_argument("--deep", action="store_true",
+                        help="style-profile 命令：全书分段深读 + 跨段合并 + L1/L2 验证（Round 131）")
+    parser.add_argument("--deep-max-chars", type=int, default=60000,
+                        help="style-profile --deep：单段原文字符上限（默认 60000）")
+    parser.add_argument("--deep-overlap-chars", type=int, default=2000,
+                        help="style-profile --deep：相邻分段重叠字符数（默认 2000）")
+    parser.add_argument("--graph-path", default=None,
+                        help="story-graph 命令：输出路径（默认读取 config.story_graph.path）")
+    parser.add_argument("--require-answerable", action="store_true",
+                        help="story-graph 命令：实体覆盖率不可答时返回 2")
+    parser.add_argument("--fix-from-review", action="store_true",
+                        help="pipeline 命令：读取 review_dirty.json，二次校验锚句后定向重跑结构 P0 chunk")
+    parser.add_argument("--review-dirty-path", default="output/review_dirty.json",
+                        help="pipeline --fix-from-review：review_dirty JSON 路径（默认 output/review_dirty.json）")
     parser.add_argument("--force", action="store_true", help="强制重新初始化（覆盖已存在的 chunk，重置状态和重试计数）")
     # 新增：split 命令专用参数
     parser.add_argument("--input", help="split 命令：输入文件路径（EPUB/TXT/MD）")
@@ -265,9 +307,11 @@ def main():
     parser.add_argument("--jev", action="store_true",
                         help="drift-audit 命令：附加 Jev 窗口配对检查（需要 Jev 可用）")
     parser.add_argument("--json-out", default=None,
-                        help="drift-audit 命令：报告 JSON 输出路径")
+                        help="drift-audit / golden --judgment-ab 命令：报告 JSON 输出路径")
     parser.add_argument("--ab", action="store_true",
                         help="golden/golden-gate 命令：运行 直译模型×thinking 4 组合 A/B 对比")
+    parser.add_argument("--judgment-ab", action="store_true",
+                        help="golden 命令：仅比较判断层注记注入 on/off（同章同摘录，不乘模型×effort 矩阵）")
     parser.add_argument("--max-rounds", type=int, default=3,
                         help="consolidate 命令：最大收敛轮数（默认 3）")
 
@@ -289,6 +333,20 @@ def main():
     try:
         if args.command == "pipeline":
             pipeline = TranslationPipeline(chapter_id=args.chapter)
+            if args.fix_from_review:
+                fix_res = pipeline.apply_review_fixes(Path(args.review_dirty_path))
+                if not fix_res.get("ok"):
+                    print(f"❌ [ReviewFix] 无法应用终审修复: {fix_res.get('error')}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                skipped = fix_res.get("skipped") or []
+                if skipped:
+                    reasons: dict = {}
+                    for item in skipped:
+                        reason = str(item.get("reason") or "unknown")
+                        reasons[reason] = reasons.get(reason, 0) + 1
+                    detail = ", ".join(f"{k}={v}" for k, v in sorted(reasons.items()))
+                    print(f"ℹ️ [ReviewFix] {len(skipped)} 条未应用（{detail}）")
             if not pipeline.run():
                 sys.exit(1)
         elif args.command == "init":
@@ -297,7 +355,12 @@ def main():
         elif args.command == "style-profile":
             from src.style_profiler import generate_book_profile, summary_line
             _chapters = [c.strip() for c in args.chapters.split(",") if c.strip()] if args.chapters else None
-            res = generate_book_profile(Path.cwd(), chapters=_chapters, force=args.force)
+            res = generate_book_profile(
+                Path.cwd(), chapters=_chapters, force=args.force,
+                deep=args.deep,
+                deep_max_chars=args.deep_max_chars,
+                deep_overlap_chars=args.deep_overlap_chars,
+            )
             if not res.get("ok"):
                 print(f"❌ style-profile 失败: {res.get('error')}", file=sys.stderr)
                 sys.exit(1)
@@ -310,6 +373,42 @@ def main():
                 else:
                     print(f"⚠️ 风格剖面未写入（LLM 不可用，未注入作品特定先验）: {_prof.get('note', '')}")
                 print(f"   {summary_line(_prof)}")
+                if res.get("deep"):
+                    _cov = res.get("coverage") or {}
+                    print(f"   deep: merge_mode={res.get('merge_mode') or '-'} "
+                          f"chapters={_cov.get('chapters_with_active_notes', 0)}/{_cov.get('chapters_total', 0)} "
+                          f"segments={_cov.get('segments_ok', 0)}/{_cov.get('segments_total', 0)} "
+                          f"notes={res.get('active_notes', 0)} active/"
+                          f"{_cov.get('active_after_limits', res.get('notes_after_limits', 0))} after-limits "
+                          f"setup={_cov.get('setup_payoff_active', 0)}")
+                    if res.get("graph_path"):
+                        _gc = res.get("graph_coverage") or {}
+                        print(f"   story_graph: {res.get('graph_path')} "
+                              f"entity_coverage={_gc.get('entity_coverage', '-')} "
+                              f"answerable={_gc.get('answerable', '-')}")
+        elif args.command == "story-graph":
+            from src.story_graph import build_and_save_story_graph
+            from src.style_profiler import load_profile
+            _root = Path.cwd()
+            _prof = load_profile(_root / "input" / "book_profile.json")
+            _graph = build_and_save_story_graph(
+                _root, profile=_prof,
+                path=Path(args.graph_path) if args.graph_path else None,
+            )
+            _cov = _graph.get("coverage") or {}
+            _out = Path(args.graph_path) if args.graph_path else \
+                _root / str((_config.get("story_graph", {}) or {}).get("path") or "input/story_graph.json")
+            print(f"🧭 story-graph: {_out}")
+            print(f"   entities={_cov.get('entities_with_appearance', 0)}/{_cov.get('entities_total', 0)} "
+                  f"entity_coverage={_cov.get('entity_coverage', 0):.1%} "
+                  f"chapters={_cov.get('chapters_with_entities', 0)}/{_cov.get('chapters_total', 0)} "
+                  f"answerable={_cov.get('answerable')}")
+            if _cov.get("uncovered_entities"):
+                print(f"   uncovered_entities={len(_cov.get('uncovered_entities') or [])}")
+            if _cov.get("uncovered_chapters"):
+                print(f"   uncovered_chapters={','.join(_cov.get('uncovered_chapters') or [])}")
+            if args.require_answerable and not _cov.get("answerable"):
+                sys.exit(2)
         elif args.command == "drift-audit":
             from src.drift_audit import (
                 audit_chapter,
@@ -337,7 +436,24 @@ def main():
                 print(f"[out] {args.json_out}")
             sys.exit(0 if not _report.get("drift_flags") else 2)
         elif args.command == "golden":
-            if args.ab:
+            if args.judgment_ab:
+                from src.style_profiler import load_profile
+                _root = Path.cwd()
+                _prof = load_profile(_root / "input" / "book_profile.json")
+                if _prof is None:
+                    print("⚠️ [JudgmentA/B] 未找到可读的 input/book_profile.json；"
+                          "将只生成 keep_disabled 报告，不调用模型", file=sys.stderr)
+                _ab_res = run_injection_ab(
+                    args.chapter, _prof,
+                    report_path=Path(args.json_out) if args.json_out else None,
+                )
+                if _ab_res.get("error"):
+                    print(f"❌ [JudgmentA/B] {_ab_res.get('error')}", file=sys.stderr)
+                    sys.exit(1)
+                # Exit 2 means "no injected notes / no model call", matching
+                # story-graph --require-answerable's explicit not-ready signal.
+                sys.exit(0 if _ab_res.get("ok") else 2)
+            elif args.ab:
                 run_golden_ab()
             else:
                 run_golden_test()
@@ -404,7 +520,11 @@ def main():
                 target_chars=args.chapter_size,
                 min_chars=args.min_chapter_size,
             )
-    except (KeyboardInterrupt, SystemExit):
+    except KeyboardInterrupt:
+        print("⛔ 已确认中止（Ctrl+C x2）。进度已保存；重新运行命令会从数据库断点续跑。",
+              file=sys.stderr, flush=True)
+        sys.exit(130)
+    except SystemExit:
         raise
     except Exception as e:
         # P4-9: 顶层异常统一退出（保留 KeyboardInterrupt/SystemExit 上抛）

@@ -1,232 +1,259 @@
 # SagaTrans
 
+> **OpenLiterary · AI 文学语义编译系统**
+
+[GitHub Repository](https://github.com/Taotie2002/OpenLiterary) · [Quick Start](#快速开始) · [Architecture](#架构)
+
+SagaTrans 把长篇文学翻译实现为一条可检查、可回滚的编译流水线：
+
+**切分 → 直译 → 文学润色 → 多维批评 → 裁决 → 决策回溯 → 合并 → 终审 → 交付门禁**
+
+它面向的不是短文本翻译，而是整本书：需要统一术语、保持叙述声音、追踪伏笔回收，并在中断、限流和模型失败后继续运行。
+
+## 为什么是“编译”
+
+普通翻译流程把原文直接交给一个模型，得到译文；出现问题时只能重译或人工通读。SagaTrans 把这件事拆成带中间产物的编译过程：
+
+- **每个 chunk 都有可检查状态**：初译、润色稿、critic 报告、judge 裁决和回溯记录分别落盘。
+- **全局决策不依赖 prompt 记忆**：术语、译名、典故和风格决策写入 SQLite Decision DB，变化时定向重跑受影响片段。
+- **判断层与执行层分离**：全书深读只产出 advisory 注记制品；执行层继续按 chunk 工作，不被一次超长调用绑死。
+- **质量门禁是确定性的**：术语一致性、脚注、韵文、双关、文本完整性和交付检查不交给单一 LLM 自行判断。
+
+## 核心能力
+
+| 能力 | 说明 |
+| --- | --- |
+| 多 Agent 翻译闭环 | 直译、文学润色、五维 critic、最终裁决与回溯重译组成 chunk 级状态机 |
+| Decision DB | 全局维护术语、译名、典故和风格决策；冲突显式记录，变更触发定向回溯 |
+| 动态风格剖面 | 从当前作品原文生成，不硬编码任何书先验；支持 `style-profile --deep` 全书分段深读 |
+| 全书判断层 | v2 剖面保存 voice / arc / setup-payoff 注记，经 L1 原文匹配与 L2 交叉复核后作为 advisory 制品 |
+| 故事知识图谱 | `story-graph` 从实体注册表与章节原文确定性构建出现/共现边，叠加已验证的叙事边，并输出显式 `knowledge_gaps` |
+| 成书级终审 | `editor_review.py` 支持逐章与 `--global` 弧线审读；结构 P0 可经机械锚句校验后写入 `review_dirty` |
+| 可回滚治理 | 章末合并式回溯、chunk/章级预算、PF 复活、旧稿 merit 保护、哈希绑定的 review-fix sidecar |
+| 交付工具链 | 成书清洗、一致性校正、双关核销、文学指标、交付 gate 与 EPUB3 导出 |
+
+## 架构
+
+```text
+ EPUB / TXT / MD
+        │
+        ▼
+      split ───────────────► input/chXX.md
+        │                         │
+        ▼                         ▼
+  workflow DB  ◄──────────  chunk task state machine
+        │                         │
+        │        ┌────────────────┴────────────────┐
+        │        ▼                                 ▼
+        │   literal translation ──► literary rewrite
+        │        │                                 │
+        │        └──────────────► critic ◄─────────┘
+        │                           │
+        │                           ▼
+        └──────────────────────► judge / Jev
+                                    │
+                         decision change? ──► backtrack queue
+                                    │
+                                    ▼
+                           final chunk artifacts
+                                    │
+             consolidate ─► finalize ─► notes-normalize
+                                    │
+             lint / consistency / editor review / gate
+                                    │
+                                    ▼
+                         output/<中文书名>.md ─► EPUB3
 ```
-   _____                  ______
-  / ___/____ _____ _____ /_  __/________ _____  _____
-  \__ \/ __ `/ __ `/ __ `// / / ___/ __ `/ __ \/ ___/
- ___/ / /_/ / /_/ / /_/ // / / /  / /_/ / / / (__  )
-/____/\__,_/\__, /\__,_//_/ /_/   \__,_/_/ /_/____/
-           /____/
-```
 
-**AI 文学语义编译系统** —— 基于多 Agent 协同与增量回溯机制的长篇文学翻译系统，专为解决长篇文学翻译中的术语不一致、风格坍缩与典故缺失问题而设计。
+## 全书判断层
 
-> 翻译不是搬运，而是编译：**语义提取 → 中间表示 → 目标语言重构**。
+Round 131 的判断层是一条独立的离线制品链，不替代 Decision DB，也不直接修改译文：
 
-## 核心设计哲学
+1. `style-profile --deep` 按章分段读取全书，重叠窗口跨段合并，避免把整本书塞进一次调用。
+2. 注记统一为 `voice | arc | setup_payoff` envelope，包含章节范围、claim、原文证据、置信度、状态和来源模型。
+3. **L1** 对切分后的 `input/chXX.md` 做 exact → normalized → fuzzy 匹配；无证据即丢弃。
+4. **L2** 由低成本模型小批复核；术语/译名规范性断言直接拒绝，硬约束只属于 Decision DB。
+5. 通过验证的 active 注记用于全书故事图与 `editor_review --global`；运行时是否注入由 A/B 单独控制。
 
-- **文学编译而非翻译**：整本书被解构为编译流水线，每个阶段都有可检查的中间产物（chunk 初译 / 润色稿 / 维度评分 / 裁决记录），任何质量问题都能定位到具体阶段与片段。
-- **决策驱动**：`Decision DB`（SQLite）维护全局翻译决策（术语、典故、风格、注释策略）；决策变更会触发受影响 chunk 的增量回溯重译，保证全书一致。
-- **多模型分工路由**：`literal_translator`(Qwen) 承担直译与考据召回；`secondary`(DeepSeek) 承担文学润色（Round 138 起 xhigh：max 档 A/B 零胜、失败率 3×，证据见 docs/probes/round138_effort_ab/）、审计评分与考据确认；`primary`(MiniMax-M3.1) 保留最终裁决、风格剖面、成书审读与困难片段直译——三家族分工降低同源盲区。思考档位按任务配置（`task_routing.<task>.effort`，合法档位逐家校验、2026-10 实测；如 judge=max、rewrite=xhigh、critic=none、直译=none；`none`=显式关闭思考），高难度片段经难度路由切至主力模型并加档，停滞救稿/双稿第二稿同样加档。**配额韧性（Round 129）**：MiniMax 配额/限流持续耗尽时 primary 角色自动降级到 secondary，流水线不中断。
-- **动态风格剖面**：风格提示词由 `StyleProfiler` 从原文抽样动态生成（按作品隔离落盘 `input/book_profile.json`），不硬编码任何作品先验。
-- **Jev 仲裁核心**：TypeSafe System One 概率校准裁决；不可用时按 `confidence_source` 分档降级并标记未校准（绝不静默当作 Jev 结论使用）。
+> 当前 `judgment_injection.enabled: false`。真实 ch03 Jev 校准 A/B 中两臂均 5/5 PASS，
+> critic 均分 Δ=-0.07，按 L3 协议保持关闭。深读剖面仍供故事图和全书终审使用；只有新的
+> Jev 校准 A/B 没有回归时才应重新开启。
 
-## 流水线
+失败策略是不对称的：**注记验证失败 fail-open**（丢弃或 dormant，不阻塞翻译）；**交付门禁 fail-closed**（硬闸不通过则不交付）。
 
-```
-split → init → pipeline → style-profile → consolidate → finalize
-      → notes-normalize → lint → consistency → (golden-gate) → gate → build_epub
-```
+## 模型路由
 
-- **pipeline**：chunk 级「直译 → 文学润色 → 批评评分 → 裁决 → 回溯」闭环，状态机 + SQLite 持久化，可断点续跑。
-- **回溯治理（Round 130）**：决策变更默认**章末合并式回溯**（`decision_engine.backtrack_mode: deferred`）——先登记 `pending_backtrack` 队列，章节队列清空时合并应用一次；单块累计回溯轮数（`max_backtrack_rounds_per_chunk`）与章级合并轮数（`max_backtrack_sweeps_per_chapter`）超预算即冻结（明细见 `output/chXX/backtrack_frozen.md`）；重跑新版 critic 均分低于备份版时自动保留旧版（`pipeline.version_merit`）。设 `backtrack_mode: immediate` 可回退旧行为。
-- **PF 复活（Round 135）**：`PERMANENTLY_FAILED` 终态块被回溯登记触达时自动复活一次重跑（`decision_engine.pf_requeue_max`，默认 1 次/块，独立于回溯轮数上限；重跑失败由备份恢复旧稿，不劣化）；显式通道 `requeue --chapter chXX [--force]`（`--force` 绕预算强制复活）。
-- **consolidate / finalize**：跨 chunk 合并、章内衔接与终稿整合，产出 `output/ch*/ch*_chunk*_final.json` → `output/translated_full.md`。
-- **lint / consistency / gate**：脚注、引号、韵文、双关、术语一致性与交付门禁。
-- **实体名归一 / 音译漂移统一（Round 134）**：同人多译名自动合并（winner + 白名单），
-  语境称谓（公爵/简称）保留多样性；音译漂移（菲德-劳萨↔菲德-罗萨 类）全文统一，
-  扫描候选经 LLM 裁决后应用，LLM 不可用则保守不改。章节完成自动执行，
-  报告见 `output/name_unification_report.md`（`consistency` 子命令默认 dry-run 仅报告，`--apply` 落地）。
-  字面无交集的双译法（皮特/彼得 类）可用 `pipeline.name_unification.preferred_forms` 外挂统一。
-  **分量级一致性（Round 136）**：同一人物的同名分量（first/last name）用字必须一致，
-  但**粒度各自保留**——原文全名→译文全名，原文简称→译文简称（皮特→彼得，简称仍是简称；
-  绝不展开/收缩）。零字面交集分量按长度唯一匹配对齐；语境指称/敬语（孩子/少主/老巫婆/令尊
-  类）与头衔称谓不参与替换。另含「决策桥接」：winner 的英文指称在 decision_db 有译文 t
-  而 t 未登记为任何实体形式、且与 winner 分量对齐时，把正文 t 统一为对齐结果（证据链：
-  专名级来源 + person 实体 + 非关系指称）。
-  **非人名专名一致性（Round 137）**：一致性扩展从人物名推广到**全部实体类型**
-  （地名/组织/器物/概念术语）——①决策桥接放宽到非 person，低相似度证据
-  （Guildsman→公会成员 类）不替换、仅进报告；②新增长公共段漂移扫描（规范名 +
-  上下文窗口，护栏剔除「专名+谓语」句子片段），候选经 LLM 裁决后按分隔符不敏感
-  替换（戈姆·贾巴尔→戈姆刺 类，含无分隔写法兼容）；③同源语义别名
-  （官邸 vs 总督府，零字面交集）**不**强行替换——只在报告「同源语义别名」节列出，
-  交由人工/后续流程判断，保护文学性。
+所有模型均为 OpenAI-compatible HTTP 后端；模型定义在 `config.yaml` 的 `models` 段，任务到模型的映射在 `task_routing`。
 
-## 质量体系
+| 角色 | 默认后端 | 主要职责 |
+| --- | --- | --- |
+| `literal_translator` | Qwen | 字面直译、典故/实体召回、低成本结构化分类 |
+| `secondary` | DeepSeek | 文学润色、critic、考据确认、深读抽取/合并 |
+| `primary` | MiniMax | 最终裁决、风格剖面、成书审读、困难片段直译 |
+| Jev | TypeSafe（可选） | 概率校准裁决；不可用时降级并显式标记 `confidence_source` |
 
-- **交付门禁 gate（七项）**：状态机完成度 / 产物完整性 / QA_REPORT / lint / EPUB→MD 转换审计（覆盖率） / 韵文校验 / 双关核销。
-- **成书级审读** `scripts/editor_review.py`：P0/P1/P2 分级（悬空引语、翻译腔、语域漂移、注密、标点规范等），支持 `--chapters` 定点复审与 `--fail-on-p0` 门禁。
-- **文学指标** `scripts/literary_metrics.py`：AI 味密度 / 翻译腔计数 / 重复率。
-- **双关核销** `scripts/pun_audit.py`：全书双关点位登记与覆盖门禁（gate ⑦ 已内联自动运行，无需手动补跑）。
-- **Golden Set**：基准样本跑分（`python3 -m src.main golden`）。
+设计要点：
+
+- 三个模型家族分工，降低同源评分盲区；思考档位按任务配置，例如 `judge=max`、`rewrite=xhigh`、`critic=none`。
+- 困难 chunk 可路由到 `primary` 并提高思考档；停滞救稿和双稿第二稿也会加档。
+- MiniMax 配额持续耗尽时，`primary` 可在进程内单向降级到 `secondary`，流水线不中断。
+- 所有 API key 使用环境变量占位；`.env`、DB、译文和原文运行产物均不入库。
 
 ## 快速开始
 
-### 1. 安装
+### 环境
+
+- Python **3.10+**
+- 可访问的 OpenAI-compatible 模型端点
+- 可选：TypeSafe API key（用于 Jev 校准裁决）
 
 ```bash
-pip install -r requirements-core.txt   # 核心最小依赖
-pip install -r requirements.txt        # + EPUB 解析/打包等
+git clone https://github.com/Taotie2002/OpenLiterary.git
+cd OpenLiterary
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-core.txt   # 核心管线
+pip install -r requirements.txt        # 额外包含 EPUB 工具
 ```
 
-Python >= 3.10。
-
-### 2. 配置 key
+### 配置密钥
 
 ```bash
-cp .env.example .env   # 填入真实 key（.env 不入库）
+cp .env.example .env
+# 编辑 .env，填入 QWEN_API_KEY / DEEPSEEK_API_KEY / MINIMAX_API_KEY
+# TYPESAFE_API_KEY 可选
 ```
 
-| 变量 | 用途 |
-| --- | --- |
-| `DEEPSEEK_API_KEY` | 文学润色 / 审计评分 / 考据确认（`secondary`）：自建 DeepSeek 网关（默认 `api_base: token.ai-hf.cn`，模型 Deepseek-V4.1-Flash-1017-SS） |
-| `QWEN_API_KEY` | 直译 / 考据召回（`literal_translator`）：自建 Qwen 网关（默认同上 base；模型名在 `config.yaml`，可用探针 `--list-models` 核对） |
-| `MINIMAX_API_KEY` | 主力模型：最终裁决 / 风格剖面 / 成书审读 / 困难片段直译（api.minimax.cn）；配额耗尽时自动降级到 secondary |
-| `TYPESAFE_API_KEY` | TypeSafe Jev 仲裁（可选；缺失时自动降级并标记未校准） |
-
-### 3. 一键翻译
+模型地址、模型名、超时和质量阈值统一在 `config.yaml` 调整。临时切换模型无需改文件：
 
 ```bash
-./scripts/translate_book.sh book.epub            # 全自动：EPUB→MD→风格剖面→全流程→门禁
-./scripts/translate_book.sh book.epub --reset    # 重置后重跑
+export SAGATRANS__MODELS__PRIMARY__MODEL_NAME=your-model
+export SAGATRANS__MODELS__PRIMARY__API_BASE=https://your-endpoint/v1
+export SAGATRANS__MODELS__PRIMARY__API_KEY=$YOUR_KEY
 ```
 
-常用参数：
-
-| 参数 | 说明 |
-| --- | --- |
-| `--skip-epub` | 跳过 EPUB→MD 转换（`input/ch*.md` 已就绪时） |
-| `--merge-only` | 只重跑合并/终稿/门禁，不调用 LLM |
-| `--consistency` | 追加一致性校正 |
-| `--golden-gate` | 追加 Golden Set 门禁 |
-| `--dry-run` | 只走流程骨架（mock 后端） |
-
-> 切分自带清理（`config.yaml` → `input_prep`）：前页/目录/索引等非正文写入
-> `input/_skip/`（不参与翻译），文本伪影按修复表自动替换。`--reset` 重建
-> `input/` 后的效果与手工清理一致，无需再加 `--skip-epub`。
-
-### 3.1 维护：重跑单个章节
+### 一键翻译
 
 ```bash
-# 官方推荐（smart-force）：保留 COMPLETED，把 PERMANENTLY_FAILED / PENDING 重置重试
-python3 -m src.translator_agent init --chapter ch09 --force
-python3 -m src.translator_agent pipeline --chapter ch09   # 管线末尾自带章节级 consistency / 实体审计 / cost / 清理
-
-# 完全干净重跑：连 COMPLETED 一起重译，并清掉旧产物
-python3 - <<'EOF'
-import sqlite3
-c = sqlite3.connect('db/workflow.db')
-print('deleted', c.execute("DELETE FROM chunk_tasks WHERE chapter_id='ch09'").rowcount)
-c.commit()
-EOF
-rm -rf output/ch09
-python3 -m src.translator_agent init --chapter ch09
-python3 -m src.translator_agent pipeline --chapter ch09
-```
-
-> 单实例守卫已内置（Round 130）：`scripts/translate_book.sh` 与
-> `python3 -m src.translator_agent <写库命令>` 共用一把 flock（`db/.sagatrans.lock`），
-> 第二个实例会被直接拒绝并打印持有者 pid/启动时间；应急放行用
-> `SAGATRANS_ALLOW_CONCURRENT=1`（风险自担）。历史教训：双进程会让 MiniMax 配额
-> 瞬间打爆（日志特征：大量 `429 api.minimax.cn`、`非法转移`、chunk 状态互相覆盖，
-> 整章被重译两遍）；若在旧版本见到该特征请先停掉所有进程，再按本节 smart-force 重跑。
-> 若要用 Jev，确认正确的 `TYPESAFE_API_KEY` 且代理可用（`ALL_PROXY=socks5h://...`）。
-> Round 129 起单进程内 MiniMax 配额/限流持续耗尽会自动降级到 DeepSeek（stderr
-> 打 `[Quota Fallback]`），不会再长时间卡在 429 退避；配额 5 小时窗重置后重启恢复主力。
-
-### 4. 出书（EPUB3）
-
-```bash
-python3 scripts/build_epub.py --md output/translated_full.md --out output/book.epub
-```
-
-产物含：书名页、按 `# 标题` 切分的章节、目录（nav + NCX）、`[^n]` 尾注超链接、内置样式；书名/作者默认从文档头部抽取，可用 `--title/--author` 覆盖。
-
-## 目录结构
-
-```
-.
-├── config.yaml            # 全局配置：per-role 后端/模型、任务路由、质量阈值
-├── db/                    # 运行态：工作流 DB + Decision DB + chunk 标签（不入库）
-├── docs/                  # 本地工作文档（审读指南/审计/基线；默认不入库）
-├── input/                 # 原文 MD（EPUB 自动转换）与书级风格剖面
-├── output/                # 译文与 QA 报告（不入库）
-├── scripts/
-│   ├── translate_book.sh  # 一键全流程
-│   ├── build_epub.py      # EPUB3 出书
-│   ├── editor_review.py   # 成书级编辑审读
-│   ├── literary_metrics.py# 文学指标
-│   ├── pun_audit.py       # 双关核销
-│   └── build_integrated.py# 单体聚合构建器
-├── src/
-│   ├── translator_agent.py# 生产入口（单体聚合版）
-│   ├── main.py            # CLI 统一入口
-│   ├── pipeline.py        # 模块化流水线
-│   ├── core/              # 调度器 / 决策引擎
-│   ├── agents/            # 直译/润色/批评/裁决 4 个 Agent
-│   ├── judges/            # Jev / pairwise 裁决实现
-│   ├── utils/             # 切分 / 文本匹配 / LLM 适配
-│   ├── style_profiler.py  # 动态风格剖面
-│   ├── verse.py           # 韵文通道
-│   ├── consistency.py     # 一致性校正
-│   └── book_lint.py       # 成书 lint
-├── tests/                 # round 粒度回归测试
-└── tools/                 # 辅助脚本（epub_to_md 等）
-```
-
-## 环境变量覆盖（不改 config.yaml 切换模型）
-
-```bash
-export SAGATRANS__LLM_BACKEND=openai_api
-export SAGATRANS__MODELS__PRIMARY__MODEL_NAME=MiniMax-M3.1-Flash
-export SAGATRANS__MODELS__PRIMARY__API_BASE=https://api.minimax.cn/v1
-export SAGATRANS__MODELS__PRIMARY__API_KEY=$MINIMAX_API_KEY
 ./scripts/translate_book.sh book.epub
+./scripts/translate_book.sh book.epub --reset      # 清空状态后重跑
+./scripts/translate_book.sh book.epub --skip-epub  # 复用已切分的 input/chXX.md
 ```
 
-## 模型配置（config.yaml `models:` 段，唯一事实源）
+脚本依次完成 EPUB 转换、切分、初始化、逐章翻译、深读剖面、合并、终稿清洗、lint/gate 和故事图构建；任一步失败都会保留可恢复状态。
 
-每个角色一块，集中写连接 + 模型名（Effort 档位在 task_routing，见下）：
+### 手动流程
 
-```yaml
-models:
-  literal_translator:
-    api_base: https://token.ai-hf.cn/v1
-    api_key: ${QWEN_API_KEY}
-    model_name: Qwen3.8-Flash-Next-SS
-  primary:   { ... }    # MiniMax-M3.1-Flash
-  secondary: { ... }    # Deepseek-V4.1-Flash-1017-SS
+```bash
+python3 -m src.translator_agent split --input book.epub
+python3 -m src.translator_agent init --chapter ch01
+python3 -m src.translator_agent pipeline --chapter ch01
+python3 -m src.translator_agent style-profile --deep
+python3 -m src.translator_agent consolidate --max-rounds 3
+python3 -m src.translator_agent finalize --apply
+python3 -m src.translator_agent notes-normalize --apply
+python3 -m src.translator_agent lint
+python3 -m src.translator_agent gate
+python3 scripts/build_epub.py --out output/book.epub
 ```
 
-`primary` 可配 `fallback_role: secondary`（Round 129 配额韧性）：MiniMax 配额/限流
-持续耗尽（429 连续 / 配额类 402-403）时，primary 角色调用永久降级到 secondary，
-流水线不中断；降级为进程内单向（重启恢复主力）。
+## 常用命令
 
-思考档位是任务级配置（`task_routing.<task>.effort`；缺省=不下发参数）。
-合法档位逐家校验（2026-10 实测）：MiniMax `low/medium/high/xhigh/max`（服务端强制
-adaptive，无 none 档）；DeepSeek `none/low/high/xhigh/max`；Qwen `none/low/medium/xhigh`
-（`none` = 显式关闭思考；YAML 裸 `off` 会被归一为 `none`）。
-供应商特有透传参数可用任务级 `extra_body`（最后合并、同名覆盖）：
+| 命令 | 用途 |
+| --- | --- |
+| `pipeline --chapter chXX` | 跑一章的翻译/润色/critic/judge/回溯闭环 |
+| `golden` / `golden-gate` | Golden Set 跑分与质量门禁 |
+| `golden --judgment-ab --chapter chXX` | 只比较判断层注记 off/on，不乘入模型×effort 矩阵 |
+| `style-profile --deep` | 全书分段深读、L1/L2 验证并生成 v2 剖面 |
+| `story-graph --require-answerable` | 重建故事图；实体索引不可答时退出码 2 |
+| `editor_review.py --global --review-dirty` | 成书级全书审读并生成机械校验过的结构修复清单 |
+| `pipeline --fix-from-review` | 读取 `review_dirty.json`，定向重跑结构 P0 chunk |
+| `consistency` / `lint` / `gate` | 一致性、成书格式与交付门禁 |
+| `drift-audit --jev` | 翻译漂移与 Jev 窗口一致性诊断 |
+| `memory` | 长文内存压力自检 |
 
-```yaml
-task_routing:
-  judge_decision:
-    model: primary
-    effort: max
+## 质量体系
+
+- **Chunk 级**：五维 critic + judge 裁决；低分可触发救稿、双稿或回溯。
+- **章级**：实体名归一、音译漂移统一、术语/典故回溯和章末一致性报告。
+- **成书级**：`editor_review.py` 检查悬空承诺、重复注释、翻译腔、声音断裂、注释过密和弧线违背。
+- **结构修复**：只有机械锚定且唯一落块的 P0 才进入 `review_dirty`；sidecar 绑定原 final 哈希，旧反馈不会污染后续重跑。
+- **交付级**：状态机完成度、产物完整性、QA、book lint、EPUB→MD 审计、韵文、双关和最终 gate。
+
+长篇运行还有三条硬规则：
+
+1. `scripts/translate_book.sh` 与写库 CLI 共用 `db/.sagatrans.lock`，第二个实例会被拒绝。
+2. Ctrl+C 第一次只警告，第二次才中止；已完成 chunk 与 DB 状态保留。
+3. 修改散装 `src/` 后必须重建单体并校验：
+
+```bash
+python3 scripts/build_integrated.py
+python3 scripts/build_integrated.py --check
+python3 scripts/sync_book_lint_mirror.py --check
 ```
 
-本地推理（MLX）支持已移除；全部模型均为 OpenAI 兼容 HTTP 接口。
+## 产物
+
+| 路径 | 内容 |
+| --- | --- |
+| `output/chXX/chXX_chunk*_raw.json` | 直译中间稿 |
+| `output/chXX/chXX_chunk*_literary.json` | 润色稿 |
+| `output/chXX/chXX_chunk*_critic_report.json` | 五维评分与问题说明 |
+| `output/chXX/chXX_chunk*_final.json` | 最终 chunk 稿 |
+| `output/<中文书名>.md` | 合并、清洗后的成书文本 |
+| `output/style_profile_audit.*` | 深读注记验证、丢弃与状态明细 |
+| `input/book_profile.json` | 书级风格/叙事剖面（运行产物，不入库） |
+| `input/story_graph.json` | 全书实体/故事图（运行产物，不入库） |
+| `output/editor_review*.json` | 成书审读结果与锚点校验信息 |
+| `output/review_dirty.json` | 可定向修复的结构 P0 清单 |
+| `output/book.epub` | EPUB3 成品 |
 
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q     # 回归测试
-python3 -m src.main golden      # Golden Set 跑分
-python3 -m src.main gate        # 交付门禁
+python3 -m pytest -q tests/
+python3 -m pytest -q tests/test_round131_*.py
+python3 -m pytest -q tests/test_round119_mirror_parity.py
 ```
 
-## 说明
+当前工作树已在 Python 3.10 与 3.13 下通过全量回归，并在单体镜像、book_lint 镜像和真实模型样本上完成验收。涉及付费模型的 A/B 与终审必须使用校准后的 judge 结果；mock 或降级结果不会被当作启用依据。
 
-- 请仅对**公有领域或已获授权**的作品使用本系统，翻译产物版权责任由使用者承担。
-- `.env`、`db/`、`output/`、`input/ch*.md` 等运行态文件默认不入库（见 `.gitignore`）；`docs/` 下的本地工作文档同样不上传。
-- 网络受限环境可在 shell 层配置代理（如 `ALL_PROXY=socks5://127.0.0.1:10808`）。
+## 目录
+
+```text
+.
+├── config.yaml              # 模型、任务路由、流水线与质量门槛
+├── scripts/
+│   ├── translate_book.sh    # 一键全流程
+│   ├── build_epub.py        # EPUB3 导出
+│   ├── editor_review.py     # 成书级终审 / review_dirty
+│   ├── build_integrated.py  # 散装 src → 单体入口
+│   └── sync_book_lint_mirror.py
+├── src/
+│   ├── translator_agent.py  # 生产单体入口（由 src/ 生成）
+│   ├── main.py              # 模块化 CLI
+│   ├── pipeline.py          # chunk 状态机与质量闭环
+│   ├── judgment_layer.py    # 注记 schema、L1/L2、切片注入
+│   ├── story_graph.py       # 实体/叙事知识图谱
+│   ├── style_profiler.py    # 抽样与全书深读剖面
+│   ├── core/                # scheduler / decision engine
+│   ├── agents/              # 直译 / 润色 / critic / rewriter
+│   ├── judges/              # Jev / pairwise 裁决
+│   └── utils/               # LLM、切分、文本匹配
+├── tests/                   # round 粒度回归测试
+└── tools/                   # EPUB 转换等辅助工具
+```
+
+## 运行说明
+
+- 本系统只应处理**公有领域或已获授权**的作品；使用者承担译文版权责任。
+- 外部代理、模型端点和配额策略因部署环境而异；网络受限时在 shell 层配置 `ALL_PROXY`。
+- `input/ch*.md`、`input/book_profile.json`、`input/story_graph.json`、`db/`、`output/` 和 `docs/*.md` 中的本地工作文档默认不入库。
+- `src/` 是事实源，`src/translator_agent.py` 是生成产物；不要直接编辑单体文件。
+
+## 设计原则
+
+**可观测优先，确定性优先，失败可恢复。**
+
+LLM 负责提出语言与叙事判断；代码负责约束候选、验证证据、维护状态、执行回溯并决定是否交付。模型可以失败，流水线不应因此丢失已完成的工作。

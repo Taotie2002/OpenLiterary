@@ -63,6 +63,7 @@ class TranslationPipeline:
         # 剖面由 `python3 -m src.translator_agent style-profile` 生成并落盘 input/book_profile.json;
         # 缺失/损坏时安静跳过（保持 config.yaml 基线, 不注入任何作品特定先验）。
         self.book_profile = None
+        self.judgment_cfg = dict(_config.get("judgment_injection", {}) or {})
         try:
             from src.style_profiler import load_profile, profile_to_style_guide
             _prof_path = self._root_dir / "input" / "book_profile.json"
@@ -72,6 +73,13 @@ class TranslationPipeline:
                 _config.set_runtime_style_guide(profile_to_style_guide(_prof, chapter_id=chapter_id))
                 print(f"🎨 [StyleProfiler] 已加载作品风格剖面 ← {_prof_path.name} "
                       f"(source={_prof.get('source')}, confidence={_prof.get('confidence')})")
+                try:
+                    from src.judgment_layer import active_notes
+                    _active = active_notes(_prof, float(self.judgment_cfg.get("min_confidence", 0.55)))
+                    if _active:
+                        print(f"🧭 [Judgment] 已加载 {len(_active)} 条 active 注记（L1∧L2 通过）")
+                except Exception:
+                    pass
         except Exception as _prof_err:
             print(f"⚠️ [StyleProfiler] 剖面加载失败，忽略: {_prof_err}", file=sys.stderr)
 
@@ -914,6 +922,8 @@ class TranslationPipeline:
                 low_dims=low_dims,
                 skipped_dimensions=skipped_dimensions,
                 verse_note=self._verse_note_for(chunk_id, source_text),
+                judgment_context=getattr(self._judgment_context_for(chunk_id, source_text), "block", ""),
+                review_fix_context=self._review_fix_context_for(chunk_id),
                 model_role=alt_role,
                 model_effort=cfg.get("alternate_effort"),
             )
@@ -958,13 +968,312 @@ class TranslationPipeline:
         genre = (_config.style_guide or {}).get("genre") or "文学小说"
         glossary = self.decision_engine.format_prompt_context(source_text=source_text)
         verse_note = self._verse_note_for(chunk_id, source_text) if chunk_id else ""
+        register_block = ""
+        reg = (_config.style_guide or {}).get("register_default")
+        prof = getattr(self, "book_profile", None) or {}
+        cid = getattr(self, "chapter_id", "")
+        cmap = prof.get("chapter_register_map") if isinstance(prof, dict) else None
+        if isinstance(cmap, dict) and cid and cmap.get(cid):
+            reg = cmap.get(cid)
+        if reg:
+            register_block = f"【本章语域底线（直译同样遵循）】{reg}\n\n"
+        judgment_block = ""
+        if chunk_id:
+            _jctx = self._judgment_context_for(chunk_id, source_text)
+            if _jctx is not None and _jctx.block:
+                judgment_block = _jctx.block + "\n\n"
         return (
             f"请将以下{genre}片段进行直译。要求：字面忠实，不丢失任何细节，不进行文学润色。\n\n"
             f"{glossary}\n\n"
             f"{self._build_translation_hints_block()}"
+            f"{register_block}"
+            f"{judgment_block}"
             f"{verse_note}"
             f"【原文】\n{source_text}"
         )
+
+    def _judgment_context_for(self, chunk_id: str, source_text: str):
+        """Return a deterministic judgment slice; never raises into translation."""
+        cfg = getattr(self, "judgment_cfg", None)
+        if cfg is None:
+            cfg = dict(_config.get("judgment_injection", {}) or {})
+        if not cfg.get("enabled", True):
+            return None
+        prof = getattr(self, "book_profile", None)
+        if not prof:
+            return None
+        try:
+            from src.judgment_layer import build_judgment_context
+            return build_judgment_context(
+                prof, getattr(self, "chapter_id", ""), chunk_text=source_text,
+                budget_chars=int(cfg.get("max_chars", 300) or 300),
+                min_confidence=float(cfg.get("min_confidence", 0.55) or 0.55),
+                max_notes=int(cfg.get("max_notes", 6) or 6),
+                prompt_version=str(cfg.get("prompt_version", "r131")),
+            )
+        except Exception as exc:  # noqa: BLE001 - advisory layer must fail open
+            print(f"⚠️ [Judgment] {chunk_id} 注记切片失败，忽略: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            return None
+
+    def _review_fix_context_for(self, chunk_id: str) -> str:
+        """Load the structural P0 sidecar only for its exact base final text.
+
+        The sidecar accompanies a COMPLETED -> DIRTY transition.  During the
+        rerun the old final lives at ``*_final_backup.json``; comparing its
+        hash prevents a stale review instruction from leaking into a later,
+        unrelated rerun.  All failures are fail-open (no injection).
+        """
+        payload = self._read_review_fix_sidecar(chunk_id)
+        if not payload or not self._review_fix_sidecar_is_bound(chunk_id, payload):
+            return ""
+        try:
+            from src.judgment_layer import render_review_fix_feedback
+            return render_review_fix_feedback(payload.get("issues") or [])
+        except Exception as exc:  # noqa: BLE001 - advisory repair must fail open
+            print(f"⚠️ [ReviewFix] {chunk_id} 修复反馈渲染失败，忽略: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            return ""
+
+    def _review_fix_path(self, chunk_id: str) -> Path:
+        return self.output_dir / f"{chunk_id}_review_fix.json"
+
+    @staticmethod
+    def _final_text_from_path(path: Path) -> str:
+        """Read final.json text without making a malformed file fatal."""
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return ""
+        if isinstance(data, dict):
+            return str(data.get("text") or "")
+        return str(data) if isinstance(data, str) else ""
+
+    def _load_final_texts_for_chapter(self) -> Dict[str, str]:
+        """Current final texts keyed by chunk id; used for fresh quote mapping."""
+        out: Dict[str, str] = {}
+        if not getattr(self, "output_dir", None):
+            return out
+        for path in sorted(self.output_dir.glob("*_final.json")):
+            chunk_id = path.name[:-len("_final.json")]
+            text = self._final_text_from_path(path)
+            if chunk_id and text:
+                out[chunk_id] = text
+        return out
+
+    def _read_review_fix_sidecar(self, chunk_id: str) -> Optional[Dict[str, Any]]:
+        """Parse and schema-check a repair sidecar (direct read, no cache)."""
+        try:
+            payload = json.loads(self._review_fix_path(chunk_id).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            from src.judgment_layer import (
+                REVIEW_FIX_SCHEMA_VERSION, STRUCTURAL_P0_CATEGORIES,
+            )
+        except Exception:
+            return None
+        if payload.get("schema_version") != REVIEW_FIX_SCHEMA_VERSION:
+            return None
+        if str(payload.get("chunk_id") or "") != str(chunk_id):
+            return None
+        if not re.fullmatch(r"[0-9a-f]{64}", str(payload.get("original_final_sha256") or "")):
+            return None
+        issues = payload.get("issues")
+        if not isinstance(issues, list) or not issues:
+            return None
+        for issue in issues:
+            if not isinstance(issue, dict):
+                return None
+            if issue.get("severity") != "P0":
+                return None
+            if str(issue.get("category") or "") not in STRUCTURAL_P0_CATEGORIES:
+                return None
+            if len(str(issue.get("quote") or "").strip()) < 2:
+                return None
+        return payload
+
+    def _review_fix_sidecar_is_bound(self, chunk_id: str,
+                                     payload: Optional[Dict[str, Any]] = None) -> bool:
+        """True only when the pre-rerun backup still matches the sidecar hash."""
+        sidecar = payload or self._read_review_fix_sidecar(chunk_id)
+        if not sidecar:
+            return False
+        backup = self.output_dir / f"{chunk_id}_final_backup.json"
+        if not backup.exists():
+            return False
+        try:
+            from src.judgment_layer import sha256_text
+            return sha256_text(self._final_text_from_path(backup)) == \
+                str(sidecar.get("original_final_sha256") or "")
+        except Exception:
+            return False
+
+    def _cleanup_review_fix_sidecar(self, chunk_id: str) -> None:
+        path = self._review_fix_path(chunk_id)
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"  ⚠️ 清理 {path.name} 失败: {exc}")
+        try:
+            if getattr(self, "_intermediate_cache", None) is not None:
+                self._intermediate_cache.pop((chunk_id, "review_fix"), None)
+        except Exception:
+            pass
+
+    def apply_review_fixes(self, review_dirty_path: Path) -> Dict[str, Any]:
+        """Validate review_dirty.json and steer only its structural P0 chunks.
+
+        No issue is trusted from the artifact: every anchor is re-mapped to the
+        *current* final text, required to be unique inside exactly one chunk,
+        and bound to that chunk's final-text hash.  Task state changes happen
+        only through ``TaskScheduler.trigger_backtrack`` so the existing
+        per-chunk/backtrack budgets and final_backup rollback remain canonical.
+        """
+        result: Dict[str, Any] = {
+            "ok": False, "mapped_issues": 0, "chunks": 0,
+            "scheduled_chunks": [], "skipped": [],
+            "scheduler": {}, "path": str(review_dirty_path),
+        }
+        try:
+            from src.judgment_layer import (
+                REVIEW_FIX_SCHEMA_VERSION, STRUCTURAL_P0_CATEGORIES,
+                atomic_write_json, map_quote_to_chunks, sha256_text,
+            )
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = f"judgment_layer_unavailable: {exc}"
+            return result
+
+        path = Path(review_dirty_path)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        try:
+            artifact = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            result["error"] = f"review_dirty_unreadable: {type(exc).__name__}: {exc}"
+            return result
+        entries = artifact.get("entries") if isinstance(artifact, dict) else None
+        if not isinstance(entries, list):
+            result["error"] = "review_dirty_missing_entries"
+            return result
+
+        final_texts = self._load_final_texts_for_chapter()
+        if not final_texts:
+            result["error"] = "no_current_final_texts"
+            return result
+        chapter = str(getattr(self, "chapter_id", "") or "")
+        verified: Dict[str, List[Dict[str, Any]]] = {}
+        for idx, raw in enumerate(entries):
+            if not isinstance(raw, dict):
+                result["skipped"].append({"index": idx, "reason": "entry_not_object"})
+                continue
+            base = {
+                "index": idx,
+                "chapter": str(raw.get("chapter") or ""),
+                "chunk_id": str(raw.get("chunk_id") or ""),
+                "category": str(raw.get("category") or ""),
+                "quote": str(raw.get("quote") or "").strip(),
+            }
+            if base["chapter"] != chapter:
+                result["skipped"].append({**base, "reason": "wrong_chapter"})
+                continue
+            if base["category"] not in STRUCTURAL_P0_CATEGORIES:
+                result["skipped"].append({**base, "reason": "not_structural_p0"})
+                continue
+            mapped = map_quote_to_chunks(final_texts, base["quote"])
+            if not mapped.get("ok"):
+                result["skipped"].append({
+                    **base, "reason": str(mapped.get("reason") or "unmapped"),
+                    "hits": mapped.get("hits") or [],
+                })
+                continue
+            if not mapped.get("unique_in_chunk"):
+                result["skipped"].append({**base, "reason": "quote_not_unique_in_chunk"})
+                continue
+            mapped_cid = str(mapped.get("chunk_id") or "")
+            if base["chunk_id"] and base["chunk_id"] != mapped_cid:
+                result["skipped"].append({**base, "reason": "chunk_mapping_changed",
+                                          "mapped_chunk_id": mapped_cid})
+                continue
+            issue = {
+                "severity": "P0",
+                "category": base["category"],
+                "quote": base["quote"],
+                "matched_quote": mapped.get("matched_quote") or base["quote"],
+                "match_kind": mapped.get("match_kind") or "",
+                "match_score": mapped.get("match_score"),
+                "offset": mapped.get("offset"),
+                "unique_in_chunk": True,
+                "note": str(raw.get("note") or ""),
+                "suggestion": str(raw.get("suggestion") or ""),
+                "section_id": str(raw.get("section_id") or ""),
+            }
+            verified.setdefault(mapped_cid, []).append(issue)
+
+        result["mapped_issues"] = sum(len(v) for v in verified.values())
+        result["chunks"] = len(verified)
+        if not verified:
+            result["ok"] = True
+            return result
+
+        try:
+            stats = self.scheduler.trigger_backtrack(sorted(verified))
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = f"trigger_backtrack_failed: {type(exc).__name__}: {exc}"
+            return result
+        if not isinstance(stats, dict):
+            stats = {}
+        result["scheduler"] = stats
+        scheduled = set(stats.get("dirty") or []) | set(stats.get("pf_requeued") or [])
+        result["scheduled_chunks"] = sorted(scheduled)
+        reason_by_chunk: Dict[str, str] = {}
+        for key, reason in (("over_cap", "backtrack_budget_exhausted"),
+                            ("pf_over_cap", "pf_requeue_budget_exhausted"),
+                            ("skipped_state", "state_not_rerunnable")):
+            for chunk_id in stats.get(key) or []:
+                reason_by_chunk[str(chunk_id)] = reason
+        created_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        written_sidecars = 0
+        for chunk_id in sorted(verified):
+            if chunk_id in scheduled:
+                text = final_texts.get(chunk_id) or ""
+                if not text:
+                    result["skipped"].append({"chunk_id": chunk_id,
+                                              "reason": "final_text_disappeared"})
+                    continue
+                sidecar = {
+                    "schema_version": REVIEW_FIX_SCHEMA_VERSION,
+                    "kind": "structural_p0_review_fix",
+                    "chapter_id": chapter,
+                    "chunk_id": chunk_id,
+                    "created_at": created_at,
+                    "source_artifact": str(path),
+                    "original_final_sha256": sha256_text(text),
+                    "issues": verified[chunk_id],
+                }
+                try:
+                    # Write only after the DIRTY transition succeeded.  A crash
+                    # before this point loses the hint (safe); it cannot create
+                    # a hint that later contaminates an unrelated rerun.
+                    atomic_write_json(self._review_fix_path(chunk_id), sidecar)
+                    written_sidecars += 1
+                except Exception as exc:  # noqa: BLE001
+                    result["skipped"].append({
+                        "chunk_id": chunk_id,
+                        "reason": f"sidecar_write_failed: {type(exc).__name__}: {exc}",
+                    })
+                continue
+            result["skipped"].append({
+                "chunk_id": chunk_id,
+                "reason": reason_by_chunk.get(chunk_id, "not_scheduled"),
+            })
+        result["written_sidecars"] = written_sidecars
+        result["ok"] = True
+        print(f"🧹 [ReviewFix] {chapter}: {result['mapped_issues']} 条结构 P0 → "
+              f"{len(scheduled)} 个 chunk 进入 DIRTY；skipped={len(result['skipped'])}")
+        return result
 
     @staticmethod
     def _build_translation_hints_block() -> str:
@@ -2388,6 +2697,7 @@ class TranslationPipeline:
                 # Round 130: 版本择优 — 新版 critic 均分低于旧版(超出 tolerance)时
                 # 用备份版覆盖 final.json（保留更优旧版），返回 True。
                 if self._apply_version_merit(chunk_id, backup, final_path):
+                    self._cleanup_review_fix_sidecar(chunk_id)
                     continue
                 # 新版至少不差 → 清理无用 backup（含 critic 备份）
                 try:
@@ -2395,6 +2705,7 @@ class TranslationPipeline:
                 except OSError:
                     pass
                 self._cleanup_critic_backup(chunk_id)
+                self._cleanup_review_fix_sidecar(chunk_id)
                 continue
             # 重跑失败, 恢复 backup
             try:
@@ -2412,6 +2723,7 @@ class TranslationPipeline:
                     print(f"♻️ [Pipeline] {chunk_id} 回溯重跑失败, 已恢复之前的 final.json (COMPLETED)")
                 else:
                     print(f"⚠️ [Pipeline] {chunk_id} 已恢复 final.json，但状态恢复被拒绝（状态未变，请人工核查 chunk 状态）")
+                self._cleanup_review_fix_sidecar(chunk_id)
             except OSError as e:
                 print(f"  ⚠️ 恢复 {chunk_id} backup 失败: {e}")
         return restored
@@ -2432,10 +2744,23 @@ class TranslationPipeline:
         并把备份 critic 报告归位为 critic_report.json；返回 True。
         其余情况返回 False（调用方按"无用 backup"清理）。
         旧版/新版评分缺失（无 critic 文件，如 legacy chunk）时不做裁决。
+
+        Round 131: a hash-bound structural P0 repair is evaluated by the
+        downstream gate/lint/dangling checks, not by the old-vs-new critic
+        average.  The repair may deliberately trade a small critic-mean change
+        for fixing a missing segment or dangling note, so reverting it by score
+        would silently undo the only feedback channel that knew about the P0.
         """
         vm_cfg = _config.pipeline.get("version_merit", {}) or {}
         if not vm_cfg.get("enabled", True):
             return False
+        rf_cfg = _config.get("review_fix", {}) or {}
+        if rf_cfg.get("structural_p0_bypass_merit", True):
+            sidecar = self._read_review_fix_sidecar(chunk_id)
+            if sidecar and self._review_fix_sidecar_is_bound(chunk_id, sidecar):
+                print(f"🛡️ [Version Merit] {chunk_id} 结构 P0 修复受哈希绑定，跳过 critic 均分回滚"
+                      f"（交由后续 gate/lint 复核）")
+                return False
         critic_new = self.output_dir / f"{chunk_id}_critic_report.json"
         critic_old = self.output_dir / f"{chunk_id}_critic_report_backup.json"
         old_score = self._critic_avg_from_file(critic_old)
@@ -3216,6 +3541,14 @@ class TranslationPipeline:
                     model_effort or self._task_default_effort("literary_rewrite"),
                     get_role_model_name(model_role),
                 )
+                _jctx = self._judgment_context_for(chunk_id, source_text)
+                _jblock = _jctx.block if _jctx is not None else ""
+                _review_fix_block = self._review_fix_context_for(chunk_id)
+                if _jctx is not None and (_jctx.selected or _jctx.skipped):
+                    try:
+                        self._save_intermediate(chunk_id, "judgment_injection", _jctx.as_dict())
+                    except Exception:
+                        pass
                 raw_result = self.rewriter_agent.process_chunk(
                     chunk_id, raw_text, self.style_guide, source_text,
                     prev_lit_text=prev_lit_text,
@@ -3230,6 +3563,8 @@ class TranslationPipeline:
                     low_dims=low_dims,
                     skipped_dimensions=skipped_dimensions,  # Round 64
                     verse_note=self._verse_note_for(chunk_id, source_text),  # Round 119 L1
+                    judgment_context=_jblock,
+                    review_fix_context=_review_fix_block,
                     model_role=model_role,  # Round 116: 停滞换模型
                     model_effort=model_effort,  # Round 129: 换模型加档
                 )

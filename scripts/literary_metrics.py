@@ -3,7 +3,7 @@
 """L6 literary_metrics — 文学度量（AI 味/翻译腔/标点/注释/重复/诗体）。
 
 用法：
-  python3 scripts/literary_metrics.py [--merged output/translated_full.md]
+  python3 scripts/literary_metrics.py [--merged output/<中文书名>.md]
       [--json output/literary_metrics.json] [--baseline docs/baselines/literary_metrics_2026-10-14.json]
       [--input-dir input] [--print]
 
@@ -168,7 +168,11 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     root = Path(args.project_root)
-    merged = Path(args.merged) if args.merged else root / "output" / "translated_full.md"
+    if args.merged:
+        merged = Path(args.merged)
+    else:
+        from src.book_lint import resolve_book_output_path
+        merged = resolve_book_output_path(root, root / "output")
     json_path = Path(args.json_out) if args.json_out else root / "output" / "literary_metrics.json"
     input_dir = Path(args.input_dir) if args.input_dir else root / "input"
 

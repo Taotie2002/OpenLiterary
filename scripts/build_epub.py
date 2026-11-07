@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""build_epub.py — 由 output/translated_full.md 生成交付用 EPUB3。
+"""build_epub.py — 由 output/<中文书名>.md 生成交付用 EPUB3。
 
 用法:
-  python3 scripts/build_epub.py [--md output/translated_full.md] [--out output/book.epub]
+  python3 scripts/build_epub.py [--md output/<中文书名>.md] [--out output/book.epub]
                                 [--title 书名] [--author 作者] [--lang zh-CN]
 
 规则:
@@ -20,6 +20,11 @@ import hashlib
 import html
 import re
 import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from ebooklib import epub
 
@@ -175,13 +180,19 @@ def build(md_path: str, out_path: str, title: str | None = None,
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="SagaTrans EPUB3 出书")
-    ap.add_argument("--md", default="output/translated_full.md")
+    ap.add_argument("--md", default=None,
+                    help="默认自动解析 output/<中文书名>.md（兼容旧名 translated_full.md）")
     ap.add_argument("--out", default="output/book.epub")
     ap.add_argument("--title", default=None, help="覆盖书名（默认取文档头部）")
     ap.add_argument("--author", default=None, help="覆盖作者（默认取文档头部）")
     ap.add_argument("--lang", default="zh-CN")
     a = ap.parse_args()
-    r = build(a.md, a.out, a.title, a.author, a.lang)
+    if a.md:
+        md_path = a.md
+    else:
+        from src.book_lint import resolve_book_output_path
+        md_path = str(resolve_book_output_path(_ROOT, _ROOT / "output"))
+    r = build(md_path, a.out, a.title, a.author, a.lang)
     print(f"[build_epub] 《{r['title']}》 chapters={r['chapters']} notes={r['notes']} "
           f"refs={r['refs']} missing={r['missing_defs']} -> {r['out']}")
     sys.exit(0 if not r["missing_defs"] else 1)

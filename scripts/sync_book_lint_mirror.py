@@ -23,18 +23,25 @@ FUNCS = [
     'finalize_outputs', '_def_key', '_audit_text', 'lint_texts',
     '_chapter_dup_notes', '_book_style_config', 'lint_book',
     'postprocess_chunk_text', 'chapter_heading',
-    '_note_norm', '_note_key', '_note_anchor_stop', '_note_is_dup', '_note_terms', '_note_candidates',
+    '_natural_name_key', '_clean_book_title', '_safe_book_filename',
+    '_book_config_for_root', '_profile_title_zh', '_title_from_headings',
+    '_infer_title_zh', 'book_title_zh', 'resolve_book_output_path',
+    '_note_norm', '_note_key', '_note_merge_key', '_note_anchor_stop',
+    '_note_is_dup', '_note_terms', '_note_candidates',
     '_group_title_units', '_split_h1_sections', 'normalize_chapter_notes',
     'normalize_notes_document', 'notes_normalize_outputs', '_chapter_note_dupes',
 ]
 CONSTS = [
     '_SUPER', '_FOOTNOTE_HEADER_RE', '_SUP_DEF_RE', '_MD_DEF_RE',
     '_NUM_DEF_RE', '_NUM_DEF_START_RE', '_SUP_REF_RE', '_MD_REF_RE',
-    '_META_TOKENS', '_FRONTMATTER_LINE_RE', '_CHAPTER_HEAD_RE',
+    '_META_TOKENS', '_FRONTMATTER_LINE_RE', '_CHAPTER_HEAD_RE', '_PART_HEAD_RE',
+    '_HEADING_STYLE_RE',
     '_FRONTMATTER_RESIDUE_RES', '_DANGLING_RE',
     '_NOTE_TITLE_RE', '_NOTE_TITLE_END_RE', '_TR_BLOCK_RE', '_BRACKET_DEF_RE',
     '_PAREN_DEF_RE', '_BOLD_LEAD_RE', '_SEP_LINE_RE', '_MACHINE_FN_ID_RE',
     '_NOTE_LABEL_RE', '_QUOTED_TERM_RE', '_NOTE_DUP_RATIO', '_NOTE_DUP_RATIO_HARD',
+    '_NOTE_MERGE_STOP',
+    '_BOOK_GENERIC_TITLE_RE', '_BOOK_NON_TITLE_RE', '_BOOK_FILENAME_MAX',
 ]
 
 

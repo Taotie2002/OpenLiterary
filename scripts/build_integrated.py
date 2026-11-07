@@ -84,8 +84,13 @@ import time
 import random
 import gc
 import hashlib
+import difflib
+import tempfile
+import unicodedata
+import datetime as _dt
 import logging  # P4-1: 引入 logging 框架
 from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
 import sqlite3
 import psutil
@@ -93,7 +98,7 @@ import threading
 from collections import OrderedDict
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum
-from typing import Any, Dict, List, Optional, Set, Tuple, Callable
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Callable
 from urllib.parse import urlparse
 import argparse
 import traceback
@@ -217,10 +222,23 @@ if _config is None:
                            "context_max_reference": 20,
                            "context_max_style": 10,
                            "context_max_entities": 30}
+        judgment_injection = {"enabled": False, "max_chars": 300,
+                              "min_confidence": 0.55, "max_notes": 6,
+                              "prompt_version": "r131"}
+        review_fix = {"structural_p0_bypass_merit": True}
         critic_thresholds = {"fluency": 7.0, "readability": 7.0, "style_compliance": 6.5,
                             "voice_consistency": 7.0, "semantic_preservation": 7.0,
                             "literal_residue": 7.0,
                             "average_score_min": 7.0}
+
+        def get(self, key, default=None):
+            """Minimal dotted-key access used by pipeline/judgment code."""
+            cur = self
+            for part in str(key or "").split("."):
+                cur = getattr(cur, part, None)
+                if cur is None:
+                    return default
+            return cur
 
         def critic_thresholds_for_book(self, project_root=None):
             """通用默认 + book_profile 可选覆盖（与 src/config.py::Config 方法同语义；
@@ -367,12 +385,15 @@ def strip_module_extras(src: str) -> str:
                     docstring_quote = stripped[:3]
                     if stripped.endswith(docstring_quote) and len(stripped) > 3:
                         in_docstring = False
-                        past_header = True
+                        # Stay in header mode: the module import block follows the
+                        # docstring and must be stripped as a whole.
                     continue
                 if in_docstring:
                     if docstring_quote in stripped:
                         in_docstring = False
-                        past_header = True
+                        # Do not mark past_header here; imports come next.
+                    continue
+                if stripped.startswith("from __future__ import "):
                     continue
                 if (stripped.startswith("from ") or stripped.startswith("import ")) and stripped.endswith("("):
                     in_multiline_import = True
@@ -386,7 +407,6 @@ def strip_module_extras(src: str) -> str:
             elif in_docstring:
                 if docstring_quote in stripped:
                     in_docstring = False
-                    past_header = True
                 continue
             elif in_multiline_import:
                 if stripped == ")" or stripped == "),":
@@ -615,6 +635,7 @@ def build_section_8() -> str:
         "_levenshtein_distance", "run_golden_test",
         "_extract_confidence_source", "summarize_golden_results",
         "recommend_golden_combo", "run_golden_ab",
+        "compare_injection_arms", "run_injection_ab",
     ]]
     # run_golden_gate 实际定义在 test_memory_pressure.py（散装历史：原 §8.2 拆出去时迁过去的）
     mp_fns = [extract_function(mp_src, f) for f in ["get_system_memory", "get_process_memory", "simulate_memory_load", "run_golden_gate", "test_memory_pressure"]]
@@ -995,7 +1016,11 @@ def _ensure_real_or_fake(_name: str) -> None:
 
 _ensure_real_or_fake("src.judges")
 # 其他 src.* 子包（如 critic 内部 from src.utils.llm_adapter import）
-for _sub in ("src.utils", "src.config", "src.agents", "src.core", "src.consistency", "src.splitters", "src.pipeline", "src.main"):
+for _sub in ("src.utils", "src.config", "src.agents", "src.core", "src.consistency", "src.splitters", "src.pipeline", "src.main",
+             # Round 131: prefer the real modules in repo mode.  A pre-created
+             # fake module otherwise hides private helpers (e.g. pun_audit's
+             # _split_anchors) from later imports in the same interpreter.
+             "src.judgment_layer", "src.story_graph", "src.style_profiler"):
     _ensure_real_or_fake(_sub)
 # Round 103 P2: src.judges.* shim 不覆盖真实模块, 仅补 attr.
 # R104 P1 修复: 旧条件 `_existing.__path__` 仅对父 package 有效, 子模块
@@ -1090,7 +1115,7 @@ _SRC_SUBMODULES = {
     # Round 119 (T5): 成书样式/lint 单源（散装 src/book_lint.py）
     "src.book_lint": ["normalize_final_style", "finalize_outputs", "lint_texts",
                       "lint_book", "postprocess_chunk_text", "chapter_heading",
-                      "sup_run_to_int",
+                      "sup_run_to_int", "book_title_zh", "resolve_book_output_path",
                       # L2/L6: pun_audit / literary_metrics 复用的私有 helper
                       "_scan_lines", "_def_key",
                       # Round 121: 注释统一新面（editor_review / 测试复用）
@@ -1138,12 +1163,53 @@ _SRC_SUBMODULES = {
         "_max_line_repeat", "_longest_short_line_run",
     ],
     "src.main": ["init_project", "debug_db", "print_banner", "main",
+                 "_install_sigint_guard", "_SIGINT_WARNED",
                  "detect_input_format", "split_input_to_chapters",
                  # R104 P4: detect_input_format (translator_agent.py:9433) 依赖此 table
                  "_INPUT_FORMAT_TABLE"],
+    # Round 131: inlined judgment/profile modules remain importable in
+    # single-file deployment through the same attr shim used above.
+    "src.judgment_layer": [
+        "JUDGMENT_SCHEMA_VERSION", "VALID_NOTE_TYPES", "VALID_NOTE_STATUSES",
+        "PROFILE_NOTE_KEYS", "TYPE_PRIORITY", "NOTE_TYPE_LIMITS",
+        "VOICE_NOTES_PER_CHAPTER", "ADVISORY_STYLE_KEYS",
+        "STRUCTURAL_P0_CATEGORIES", "REVIEW_FIX_SCHEMA_VERSION",
+        "REVIEW_FIX_SIDECAR_STEP", "JudgmentContext", "sha256_text",
+        "atomic_write_json", "atomic_write_text", "is_prescriptive_claim",
+        "normalize_chapters", "chapter_ids_between", "note_covers_chapter",
+        "normalize_evidence", "normalize_note", "dedupe_notes",
+        "ensure_unique_note_ids", "restrict_notes_to_candidate_quotes",
+        "enforce_note_limits", "normalize_notes", "normalize_judgment_fields",
+        "all_notes", "note_is_validated", "active_notes",
+        "sanitize_style_guide_for_scoring", "normalize_text_for_match",
+        "match_quote", "map_quote_to_chunks", "validate_note_evidence",
+        "build_l2_prompt", "default_l2_generate", "verify_notes_l2",
+        "replace_notes_in_profile", "render_review_fix_feedback",
+        "build_judgment_context", "render_global_review_context",
+        "build_audit_payload", "build_audit_markdown", "write_judgment_audit",
+        "judgment_cache_key",
+    ],
+    "src.story_graph": [
+        "GRAPH_VERSION", "DEFAULT_GRAPH_PATH", "build_story_graph",
+        "save_story_graph", "load_story_graph", "build_and_save_story_graph",
+        "story_graph_context_for_chapter",
+    ],
+    "src.style_profiler": [
+        "DEFAULT_PROFILE_PATH", "PROFILE_VERSION", "NEUTRAL_REGISTER",
+        "NEUTRAL_PERSONA", "VALID_FOOTNOTE_POLICIES", "VALID_SOURCES",
+        "spread_sample_chapters", "load_chapter_samples", "build_profile_prompt",
+        "normalize_profile", "heuristic_profile", "parse_profile_response",
+        "default_style_profiler_generate", "build_profile",
+        "load_chapter_documents", "segment_chapter_text",
+        "build_deep_extract_prompt", "parse_deep_extract_response",
+        "build_deep_merge_prompt", "parse_deep_merge_response",
+        "build_deep_profile", "profile_to_style_guide", "save_profile",
+        "load_profile", "profile_is_deep", "summary_line", "generate_book_profile",
+    ],
     "src.test_golden_set": ["GoldenSetEvaluator", "_levenshtein_distance", "run_golden_test",
                             "GOLDEN_AB_MATRIX", "_extract_confidence_source",
                             "summarize_golden_results", "recommend_golden_combo", "run_golden_ab",
+                            "compare_injection_arms", "run_injection_ab",
                             "run_golden_gate"],
     "src.test_memory_pressure": ["get_system_memory", "get_process_memory", "simulate_memory_load", "test_memory_pressure"],
 }
@@ -1245,7 +1311,8 @@ def build_section_13() -> str:
         ]),
         # Round 130: 单实例守卫（main() 引用，须随 Section 10 一并进入单体）
         ("main.py", [
-            "_INSTANCE_LOCK_FD", "_MUTATING_COMMANDS", "acquire_instance_lock",
+            "_INSTANCE_LOCK_FD", "_MUTATING_COMMANDS", "_SIGINT_WARNED",
+            "acquire_instance_lock", "_install_sigint_guard",
         ]),
         ("splitters.py", [
             "_AUDIT_CHAPTER_FLOOR", "_AUDIT_COVERAGE_THRESHOLD", "_AUDIT_MAX_MISSING_SPANS", "_AUDIT_TOC_SCAN_LINES",
@@ -1270,9 +1337,15 @@ def build_section_13() -> str:
             "_NOTE_DUP_RATIO", "_NOTE_DUP_RATIO_HARD", "_NOTE_LABEL_RE", "_NOTE_TITLE_END_RE",
             "_NOTE_TITLE_RE", "_NUM_DEF_RE", "_NUM_DEF_START_RE", "_PAREN_DEF_RE",
             "_QUOTED_TERM_RE", "_SEP_LINE_RE", "_SUPER", "_SUP_DEF_RE",
-            "_SUP_REF_RE", "_TR_BLOCK_RE", "_audit_text", "_book_style_config",
+            "_SUP_REF_RE", "_TR_BLOCK_RE", "_PART_HEAD_RE", "_HEADING_STYLE_RE",
+            "_NOTE_MERGE_STOP", "_audit_text", "_book_style_config",
+            "_BOOK_GENERIC_TITLE_RE", "_BOOK_NON_TITLE_RE", "_BOOK_FILENAME_MAX",
+            "_natural_name_key", "_clean_book_title", "_safe_book_filename",
+            "_book_config_for_root", "_profile_title_zh", "_title_from_headings",
+            "_infer_title_zh", "book_title_zh", "resolve_book_output_path",
             "_chapter_dup_notes", "_chapter_note_dupes", "_def_key", "_find_finals",
-            "_group_title_units", "_note_anchor_stop", "_note_candidates", "_note_is_dup", "_note_key",
+            "_group_title_units", "_note_anchor_stop", "_note_candidates", "_note_is_dup",
+            "_note_key", "_note_merge_key",
             "_note_norm", "_note_terms", "_scan_lines", "_split_h1_sections",
             "chapter_heading", "finalize_outputs", "lint_book", "lint_texts",
             "normalize_chapter_notes", "normalize_final_style", "normalize_notes_document", "notes_normalize_outputs",
@@ -1291,6 +1364,16 @@ def build_section_13() -> str:
             out += seg.rstrip("\n") + "\n\n\n"
     if missing:
         raise SystemExit(f"❌ Section 13 镜像缺源: {missing}")
+    # Round 131: judgment/story/profile are one coherent dependency chain.
+    # Inline all three top-level definitions verbatim (their imports are stripped
+    # by load_module); runtime cross-module imports are satisfied by the shim
+    # below.  Keeping whole modules avoids another hand-maintained symbol list.
+    out += section_comment("13.6", "Round 131 全书判断层 / 故事图 / 深读剖面")
+    for rel in ("judgment_layer.py", "story_graph.py", "style_profiler.py"):
+        body = load_module(rel).strip("\n")
+        if not body:
+            raise SystemExit(f"❌ Section 13.6 空模块: {rel}")
+        out += body + "\n\n\n"
     # typesafe 异常分类用导入块（src/agents/critic_agent.py 逐字镜像；
     # 单文件部署无 src 包时走 except 分支，靠异常名字字符串兜底分类）
     out += r'''
@@ -1520,7 +1603,7 @@ def main():
             return 1
     
     OUTPUT.write_text(generated, encoding="utf-8")
-    print(f"✅ {OUTPUT.name} 已重新生成（{len(generated.splitlines())} 行 / {len(generated):,} 字节）")
+    print(f"✅ {OUTPUT.name} 已重新生成（{len(generated.splitlines())} 行 / {len(generated):,} 字符）")
     return 0
 
 

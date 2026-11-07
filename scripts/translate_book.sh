@@ -44,6 +44,7 @@ AUTO_MERGE_ON_FAILURE=false
 YES_MODE=false
 ALLOW_INCOMPLETE=false
 NO_NORMALIZE=false
+SKIP_DEEP_PROFILE=false
 CHAPTERS_DIR="input"
 
 # 颜色输出
@@ -57,6 +58,46 @@ log_info() { echo -e "${BLUE}[INFO]${NC} $*" >&2; }
 log_ok()   { echo -e "${GREEN}[OK]${NC} $*" >&2; }
 log_warn() { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
 log_err()  { echo -e "${RED}[ERR]${NC} $*" >&2; }
+
+# ===========================
+# Ctrl+C 防误触（Round 141）
+# ===========================
+PY_CHILD_ACTIVE=0
+SIGINT_COUNT=0
+
+handle_sigint() {
+    # Python 子进程有同一套两段式保护：第一次警告并继续，第二次退出 130。
+    # 子进程运行期间让 Python 独占处理，避免 shell/Python 重复告警。
+    if [[ "${PY_CHILD_ACTIVE:-0}" == "1" ]]; then
+        return 0
+    fi
+    SIGINT_COUNT=$((SIGINT_COUNT + 1))
+    if [[ $SIGINT_COUNT -eq 1 ]]; then
+        log_warn "检测到 Ctrl+C：当前任务尚未完成。若只是误触，请继续等待。"
+        log_warn "若确认中止，请再按一次 Ctrl+C。已完成 chunk 与 DB 状态会保留，可断点续跑，不必从头重译。"
+        return 0
+    fi
+    log_err "已确认中止（Ctrl+C x2）。进度已保存；再次运行本脚本会从数据库断点续跑。"
+    exit 130
+}
+
+run_cmd() {
+    # 长时间 Python 子命令统一走这里：rc=130 表示用户第二次 Ctrl+C，
+    # 必须立即终止整个批次，不能把该章当普通失败后继续下一章。
+    PY_CHILD_ACTIVE=1
+    set +e
+    "$@"
+    local rc=$?
+    set -e
+    PY_CHILD_ACTIVE=0
+    if [[ $rc -eq 130 ]]; then
+        log_err "Python 任务已确认中止（exit=130）；已完成进度已保存，可断点续跑。"
+        exit 130
+    fi
+    return $rc
+}
+
+trap 'handle_sigint' INT
 
 # ===========================
 # 帮助信息
@@ -76,6 +117,7 @@ usage() {
   --golden-gate           翻译+合并后跑 golden-gate 质量门禁（参考人工基线，不通过时仅 WARN）
   --allow-incomplete       放行硬闸：DIRTY 未收敛合并 / lint 未通过 / gate 未通过（默认全硬闸中止）
   --no-normalize           跳过成书样式规范化（finalize；引号/脚注制式/策略元语）
+  --skip-deep-profile      跳过全书深读剖面（只生成/沿用抽样 v1 剖面；默认缺 v2 时自动深读）
   --clean-only             独立模式：仅清理中间产物后退出，无需输入文件
   --merge-only             跳过翻译，直接合并现有 final.json
   --auto-merge-on-failure  API 耗尽时自动合并已完成章节 (提示确认)
@@ -87,7 +129,11 @@ usage() {
   SAGATRANS__MODELS__<ROLE>__MODEL_NAME
   SAGATRANS__MODELS__<ROLE>__API_BASE
   SAGATRANS__MODELS__<ROLE>__API_KEY
+  SAGATRANS__BOOK__TITLE_ZH
   其中 <ROLE> ∈ literal_translator | primary
+
+ 成品文件: output/<中文书名>.md（如 output/沙丘.md；未识别时回退 translated_full.md）
+ Ctrl+C : 第一次警示并继续；再按一次才中止。DB 保留，可断点续跑。
 
 示例:
   # 使用 config.yaml 默认配置 (推荐先编辑 config.yaml 选定后端/模型)
@@ -129,6 +175,7 @@ parse_args() {
             --golden-gate) RUN_GOLDEN_GATE=true; shift ;;
             --allow-incomplete) ALLOW_INCOMPLETE=true; shift ;;
             --no-normalize) NO_NORMALIZE=true; shift ;;
+            --skip-deep-profile) SKIP_DEEP_PROFILE=true; shift ;;
             --clean-only) CLEAN_ONLY=true; shift ;;
             --auto-merge-on-failure) AUTO_MERGE_ON_FAILURE=true; shift ;;
             --yes|-y) YES_MODE=true; shift ;;
@@ -242,7 +289,7 @@ run_chapter() {
 
     # 1. 初始化（检查退出码）
     log_info "  初始化任务数据库..."
-    if ! python3 -m src.translator_agent init --chapter "$ch_id" $force_flag; then
+    if ! run_cmd python3 -m src.translator_agent init --chapter "$ch_id" $force_flag; then
         log_err "  初始化失败: $ch_id"
         return 1
     fi
@@ -253,10 +300,10 @@ run_chapter() {
     if [[ "$DRY_RUN" == "true" ]]; then
         log_warn "  [DRY RUN] 跳过实际 LLM 调用"
         # 可以用 mock 后端快速跑完
-        SAGATRANS__LLM_BACKEND=mock python3 -m src.translator_agent pipeline --chapter "$ch_id"
+        run_cmd env SAGATRANS__LLM_BACKEND=mock python3 -m src.translator_agent pipeline --chapter "$ch_id"
         pipe_rc=$?
     else
-        python3 -m src.translator_agent pipeline --chapter "$ch_id"
+        run_cmd python3 -m src.translator_agent pipeline --chapter "$ch_id"
         pipe_rc=$?
     fi
 
@@ -374,10 +421,135 @@ chapter_title() {
     echo "$ch_id"
 }
 
+book_output_path() {
+    # 成品主文件名由统一解析器决定（中文书名.md；无中文题名时回退旧名）。
+    local prefer_existing="${1:-false}"
+    (
+        cd "$PROJECT_ROOT" || exit 1
+        python3 -c 'import sys; from src.book_lint import resolve_book_output_path; print(resolve_book_output_path(project_root=sys.argv[1], output_dir=sys.argv[2], prefer_existing=(sys.argv[3] == "true")))' \
+            "$PROJECT_ROOT" "$PROJECT_ROOT/$OUTPUT_DIR" "$prefer_existing"
+    )
+}
+
+profile_schema_version() {
+    # Read only the schema integer; corrupt/missing profiles are treated as 0.
+    python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    print(int(data.get("schema_version") or 0))
+except Exception:
+    print(0)
+' "$1"
+}
+
+profile_is_deep() {
+# schema_version=2 alone is not enough: shallow Round 131 profiles are also
+# v2 but have no deep_read block.  New deep artifacts must explicitly say
+# complete=true; failed/empty deep runs are fail-open for translation but still
+# request an upgrade next time.  Early artifacts without the bit stay accepted.
+    python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    deep = data.get("deep_read")
+    gen = data.get("generation")
+    params = gen.get("params") if isinstance(gen, dict) else None
+    if isinstance(deep, dict) and deep:
+        ok = bool(deep.get("complete")) if "complete" in deep else True
+    else:
+        ok = isinstance(params, dict) and params.get("mode") == "deep"
+    print("true" if ok else "false")
+except Exception:
+    print("false")
+' "$1"
+}
+
+ensure_book_profile() {
+    local profile_file="$PROJECT_ROOT/input/book_profile.json"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        [[ -f "$profile_file" ]] && log_info "Dry-run: 检测到风格剖面 input/book_profile.json" \
+            || log_info "Dry-run: 跳过风格剖面生成（无 LLM 调用）"
+        return 0
+    fi
+
+    local schema=0
+    local deep=false
+    [[ -f "$profile_file" ]] && schema=$(profile_schema_version "$profile_file" 2>/dev/null || echo 0)
+    [[ -f "$profile_file" ]] && deep=$(profile_is_deep "$profile_file" 2>/dev/null || echo false)
+    if [[ "$SKIP_DEEP_PROFILE" == "true" ]]; then
+        if [[ -f "$profile_file" ]]; then
+            log_info "跳过全书深读剖面（--skip-deep-profile），沿用现有 input/book_profile.json"
+        else
+            log_info "跳过全书深读剖面（--skip-deep-profile），抽样生成 v1 input/book_profile.json ..."
+            if ! run_cmd python3 -m src.translator_agent style-profile; then
+                log_warn "  style-profile 失败 — 本次使用 config.yaml 中性基线（不注入作品特定先验）"
+            fi
+        fi
+        return 0
+    fi
+
+    if [[ -f "$profile_file" && "$schema" -ge 2 && "$deep" == "true" ]]; then
+        log_info "检测到已完成深读的 v${schema} 剖面 input/book_profile.json；跳过深读（重建图谱仍会执行）"
+        return 0
+    fi
+    if [[ -f "$profile_file" ]]; then
+        log_info "检测到 v${schema} 剖面（deep_read=${deep}）；升级为全书深读 v2（L1/L2 校验，失败则保留旧剖面）..."
+    else
+        log_info "未找到风格剖面；先抽样建立基础剖面，再全书分段深读生成 v2 ..."
+    fi
+
+    if run_cmd python3 -m src.translator_agent style-profile --deep; then
+        local new_schema=0
+        local new_deep=false
+        [[ -f "$profile_file" ]] && new_schema=$(profile_schema_version "$profile_file" 2>/dev/null || echo 0)
+        [[ -f "$profile_file" ]] && new_deep=$(profile_is_deep "$profile_file" 2>/dev/null || echo false)
+        if [[ -f "$profile_file" && "$new_schema" -ge 2 && "$new_deep" == "true" ]]; then
+            log_ok "全书深读剖面已生成：input/book_profile.json"
+        else
+            log_warn "style-profile --deep 返回成功，但未检测到 deep_read 完成标记（schema=${new_schema}, deep=${new_deep}）；保留现有剖面并继续"
+        fi
+        return 0
+    fi
+    log_warn "全书深读失败（fail-open）；保留已有剖面或回退抽样剖面"
+    if [[ ! -f "$profile_file" ]]; then
+        if ! run_cmd python3 -m src.translator_agent style-profile; then
+            log_warn "  抽样 style-profile 亦失败 — 本次使用 config.yaml 中性基线（不注入作品特定先验）"
+        fi
+    fi
+    return 0
+}
+
+rebuild_story_graph() {
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "Dry-run: 跳过 story-graph 重建"
+        return 0
+    fi
+    log_info "重建全书确定性故事图 (story-graph)..."
+    if run_cmd python3 -m src.translator_agent story-graph; then
+        log_ok "故事图已更新：input/story_graph.json"
+    else
+        log_warn "story-graph 构建失败（fail-open：翻译/交付流程继续）"
+    fi
+    return 0
+}
+
 merge_output() {
     local chapters_dir="$1"
     # 注意：$OUTPUT_DIR 仅控制最终合并文件路径，中间产物始终写入 output/<chapter_id>/
-    local output_file="$PROJECT_ROOT/$OUTPUT_DIR/translated_full.md"
+    local legacy_output_file="$PROJECT_ROOT/$OUTPUT_DIR/translated_full.md"
+    local output_file
+    output_file=$(book_output_path) || {
+        log_err "无法解析成品译稿文件名"
+        return 1
+    }
+    local output_name
+    output_name=$(basename "$output_file")
+    if [[ "$output_file" == "$legacy_output_file" ]]; then
+        log_warn "未识别到中文书名，成品沿用 translated_full.md；可在 config.yaml 的 book.title_zh 显式指定。"
+    fi
     local missing_count=0
     local incomplete_count=0
     local total_chapters=0
@@ -391,7 +563,7 @@ merge_output() {
     : > "$qa_report_file"
     echo "# 译文质量验收报告 (QA Report)" > "$qa_report_file"
     echo "" >> "$qa_report_file"
-    echo "本文件记录未通过自动化验收、以 fallback 最后一版润色稿收录的章节。译文正文 (translated_full.md) 不含本告警。" >> "$qa_report_file"
+    echo "本文件记录未通过自动化验收、以 fallback 最后一版润色稿收录的章节。译文正文 ($output_name) 不含本告警。" >> "$qa_report_file"
     echo "" >> "$qa_report_file"
     export QA_REPORT_FILE="$qa_report_file"
 
@@ -473,6 +645,10 @@ print()
         log_err "合并残缺：共 $total_chapters 章，缺失 $missing_count 章，不完整 $incomplete_count 章（译文不完整）"
         return 1
     fi
+    if [[ "$output_file" != "$legacy_output_file" && -f "$legacy_output_file" ]]; then
+        rm -f "$legacy_output_file"
+        log_info "已移除旧文件名 translated_full.md（成品主文件: $output_name）"
+    fi
     return 0
 }
 
@@ -486,6 +662,9 @@ clean_intermediate() {
     local deleted_count=0
     local saved_count=0
     local saved_size=0
+    local final_output
+    local legacy_output="$PROJECT_ROOT/$OUTPUT_DIR/translated_full.md"
+    final_output=$(book_output_path true) || final_output="$legacy_output"
 
     for pattern in "*_raw.json" "*_literary.json" "*_literary_v*.json" \
                    "*_critic_report.json" "*_rewrite_meta_v*.json"; do
@@ -496,7 +675,7 @@ clean_intermediate() {
     done
 
     for f in "$PROJECT_ROOT/db/workflow.db" "$PROJECT_ROOT/db/decision_db.sqlite" \
-             "$PROJECT_ROOT/$OUTPUT_DIR/translated_full.md"; do
+             "$final_output" "$legacy_output"; do
         if [[ -f "$f" ]]; then
             saved_count=$((saved_count + 1))
             saved_size=$((saved_size + $(stat -c%s "$f" 2>/dev/null || stat -f%z "$f")))
@@ -506,7 +685,7 @@ clean_intermediate() {
     saved_count=$((saved_count + final_count))
 
     log_ok "已清理 $deleted_count 个中间文件"
-    log_ok "保留: DB (workflow.db + decision_db.sqlite) + $final_count 个 final.json + translated_full.md (~${saved_size} bytes)"
+    log_ok "保留: DB (workflow.db + decision_db.sqlite) + $final_count 个 final.json + $(basename "$final_output") (~${saved_size} bytes)"
 }
 
 
@@ -535,8 +714,10 @@ reset_state() {
     rm -rf "$PROJECT_ROOT/db/decision_db.sqlite" "$PROJECT_ROOT/db/decision_db.sqlite-shm" "$PROJECT_ROOT/db/decision_db.sqlite-wal"
     # verse chunk 标签（db/chunk_tags.json）是作品级状态，旧书残留会污染新书 verse 通道
     rm -f "$PROJECT_ROOT/db/chunk_tags.json"
+    local final_output
+    final_output=$(book_output_path true 2>/dev/null) || final_output="$PROJECT_ROOT/$OUTPUT_DIR/translated_full.md"
     rm -rf "$PROJECT_ROOT/output"
-    rm -f "$PROJECT_ROOT/$OUTPUT_DIR/translated_full.md"
+    rm -f "$PROJECT_ROOT/$OUTPUT_DIR/translated_full.md" "$final_output"
     rm -rf "$PROJECT_ROOT/$CHAPTERS_DIR"
 
     log_ok "历史状态已清空（input/ 已删除，下次运行会自动从 EPUB 重新切分）"
@@ -632,19 +813,8 @@ main() {
             [[ ${#chapter_files[@]} -eq 0 ]] && { log_err "章节切分未产出任何文件，终止。"; exit 1; }
         fi
 
-        # 1.5 Round 117 P0: 动态风格剖面（作品隔离）— 缺失时生成一次，全章子进程共享
-        local profile_file="$PROJECT_ROOT/input/book_profile.json"
-        if [[ "$DRY_RUN" == "true" ]]; then
-            [[ -f "$profile_file" ]] && log_info "Dry-run: 检测到风格剖面 input/book_profile.json" \
-                || log_info "Dry-run: 跳过风格剖面生成（无 LLM 调用）"
-        elif [[ -f "$profile_file" ]]; then
-            log_info "检测到风格剖面: input/book_profile.json（如需重生成: 删除后重跑或 --force 前先运行 style-profile --force）"
-        else
-            log_info "未找到风格剖面，抽样章节生成 input/book_profile.json ..."
-            if ! python3 -m src.translator_agent style-profile; then
-                log_warn "  style-profile 失败 — 本次使用 config.yaml 中性基线（不注入作品特定先验）"
-            fi
-        fi
+        # 1.5 Round 117/131: 动态风格剖面；缺 v2 时自动全书深读，失败 fail-open。
+        ensure_book_profile
 
         # 2. 并行翻译所有章节
         if ! run_all_chapters "${chapter_files[@]}"; then
@@ -663,7 +833,7 @@ main() {
         log_info "Dry-run: 跳过 consolidate（避免真实 LLM 调用）"
     else
         log_info "运行全书决策收敛 (consolidate)..."
-        if python3 -m src.translator_agent consolidate --max-rounds "${SAGATRANS_CONSOLIDATE_MAX_ROUNDS:-3}"; then
+        if run_cmd python3 -m src.translator_agent consolidate --max-rounds "${SAGATRANS_CONSOLIDATE_MAX_ROUNDS:-3}"; then
             log_ok "consolidate 收敛（DIRTY=0）"
         else
             if [[ "$ALLOW_INCOMPLETE" == "true" ]]; then
@@ -693,12 +863,15 @@ except Exception:
         fi
     fi
 
+    # 2.55 Round 131: 在实体注册和译稿稳定后重建全书图谱（纯确定性，无 LLM）。
+    rebuild_story_graph
+
     # 2.6 T5: 成书样式规范化（finalize，作用于 final.json；无 LLM 调用）
     if [[ "$NO_NORMALIZE" == "true" ]]; then
         log_warn "跳过样式规范化（--no-normalize）"
     else
         log_info "运行成书样式规范化 (finalize)..."
-        if python3 -m src.translator_agent finalize --apply; then
+        if run_cmd python3 -m src.translator_agent finalize --apply; then
             log_ok "样式规范化完成（详见 output/finalize_diff.md）"
         else
             log_err "finalize 失败"
@@ -714,7 +887,7 @@ except Exception:
 
     # 3.2 Round 121 L5: 章级注释统一（去重/孤儿改锚/顺编号；无 LLM 调用）
     log_info "运行章级注释统一 (notes-normalize)..."
-    if python3 -m src.translator_agent notes-normalize --apply; then
+    if run_cmd python3 -m src.translator_agent notes-normalize --apply; then
         log_ok "注释统一完成（详见 output/note_policy_diff.md）"
     else
         log_err "注释统一失败"
@@ -723,7 +896,7 @@ except Exception:
 
     # 3.5 T5: 成书级 lint（finals + merged 双跑）
     log_info "运行成书级 lint..."
-    if python3 -m src.translator_agent lint; then
+    if run_cmd python3 -m src.translator_agent lint; then
         log_ok "lint 全绿"
     else
         if [[ "$ALLOW_INCOMPLETE" == "true" ]]; then
@@ -737,7 +910,7 @@ except Exception:
     # 4. 译后命名一致性校验（可选 --consistency）
     if [[ "$RUN_CONSISTENCY" == "true" ]]; then
         log_info "运行译后命名一致性校验 (consistency)..."
-        python3 -m src.translator_agent consistency || {
+        run_cmd python3 -m src.translator_agent consistency || {
             log_warn "consistency 检出命名不一致（详见 output/consistency_diff.md），未自动修正"
         }
     fi
@@ -746,7 +919,7 @@ except Exception:
     # 参考人工评分基线的动态阈值，仅 WARN 不阻断（与 consistency 同模式）
     if [[ "$RUN_GOLDEN_GATE" == "true" ]]; then
         log_info "运行 Golden Gate 质量门禁..."
-        if python3 -m src.translator_agent golden-gate; then
+        if run_cmd python3 -m src.translator_agent golden-gate; then
             log_ok "golden-gate 通过（pipeline pass_rate 满足人工基线动态阈值）"
         else
             log_warn "golden-gate 未通过（pipeline 质量低于人工基线阈值），详见 output/golden_test_report.json"
@@ -764,7 +937,7 @@ except Exception:
         log_info "Dry-run: 跳过 gate"
     else
         log_info "运行交付门禁 (gate)..."
-        if python3 -m src.translator_agent gate; then
+        if run_cmd python3 -m src.translator_agent gate; then
             log_ok "gate 全绿"
         else
             gate_ok=false
@@ -780,7 +953,9 @@ except Exception:
         [[ "$ALLOW_INCOMPLETE" == "true" ]] || exit 1
         log_warn "--allow-incomplete 放行：产出保留，请人工复核失败项"
     fi
-    log_info "最终译文: $PROJECT_ROOT/$OUTPUT_DIR/translated_full.md"
+    local final_output
+    final_output=$(book_output_path true 2>/dev/null) || final_output="$PROJECT_ROOT/$OUTPUT_DIR/translated_full.md"
+    log_info "最终译文: $final_output"
     log_info "Decision DB: $PROJECT_ROOT/db/decision_db.sqlite"
     log_info "========================================"
 }

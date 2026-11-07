@@ -14,7 +14,9 @@ tests/test_round119_mirror_parity.py）。
 from __future__ import annotations
 
 import json
+import os
 import re
+import unicodedata
 from pathlib import Path
 
 _SUPER = "¹²³⁴⁵⁶⁷⁸⁹"
@@ -42,6 +44,12 @@ _FRONTMATTER_LINE_RE = re.compile(
     r'^\s*#?\s*(?:The Project Gutenberg eBook\b.*|THE MILLENNIUM FULCRUM EDITION\b.*'
     r'|古腾堡计划.*|千[禧年]*年支点版.*|目录|Contents)\s*$')
 _CHAPTER_HEAD_RE = re.compile(r'^\s*#?\s*第[一二三四五六七八九十百千零〇\d]+\s*[章.。．]')
+# 部/卷/篇/节标题只在带 `#` 时剥离：避免误删正文里的“第一部 山间小屋”这类普通行。
+_PART_HEAD_RE = re.compile(r'^\s*#\s*第[一二三四五六七八九十百千零〇\d]+\s*[部卷篇节]')
+
+# merged 章节标题制式：第N章 / 第N部 / 第N卷 / 第N篇 / 第N节，标题文字可省略。
+_HEADING_STYLE_RE = re.compile(
+    r'^#\s*第[一二三四五六七八九十百千零〇\d]+\s*(?:章|部|卷|篇|节)(?:\s|$|[（(])')
 
 # merged 页眉残留（lint）
 _FRONTMATTER_RESIDUE_RES = [
@@ -53,6 +61,16 @@ _FRONTMATTER_RESIDUE_RES = [
 ]
 # 悬空承诺（D9 类，先报不修）
 _DANGLING_RE = re.compile(r'[：:]\s*——\s*$')
+
+# 成品文件名（Round 141）：书名提取/清洗。
+_BOOK_GENERIC_TITLE_RE = re.compile(
+    r'^(?:第[一二三四五六七八九十百千零〇\d]+\s*[部卷篇章节]'
+    r'|(?:book|part|chapter|volume|section)\s+[\divxlcdm]+)(?:\s|$|[（(])',
+    re.IGNORECASE)
+_BOOK_NON_TITLE_RE = re.compile(
+    r'^(?:目录|contents|前言|序言|序|后记|附录|书名页|版权页|译者序|译后记)$',
+    re.IGNORECASE)
+_BOOK_FILENAME_MAX = 80
 
 
 def sup_run_to_int(run: str) -> int:
@@ -229,7 +247,7 @@ def _def_key(content: str) -> str:
     return content.strip()[:12]
 
 
-def _audit_text(text: str) -> dict:
+def _audit_text(text: str, check_same_key: bool = True) -> dict:
     """单文本 lint 审计（返回 problems 与统计）。"""
     problems = []
     straight = text.count('"')
@@ -250,15 +268,16 @@ def _audit_text(text: str) -> dict:
     meta = sum(text.count(t) for t in _META_TOKENS)
     if meta:
         problems.append(f"策略元语 {meta} 处")
-    keys = {}
-    dups = []
-    for d in defs:
-        k = _def_key(d['content'])
-        if k in keys and keys[k] != d['content']:
-            dups.append(k)
-        keys[k] = d['content']
-    if dups:
-        problems.append(f"同键重复注释: {dups}")
+    if check_same_key:
+        keys = {}
+        dups = []
+        for d in defs:
+            k = _def_key(d['content'])
+            if k in keys and keys[k] != d['content']:
+                dups.append(k)
+            keys[k] = d['content']
+        if dups:
+            problems.append(f"同键重复注释: {dups}")
     return {"problems": problems, "defs": defs, "orphan_count": len(orphans),
             "dangling_refs": dangling_refs, "meta_count": meta}
 
@@ -276,8 +295,13 @@ def lint_texts(items) -> dict:
     return {"ok": not failures, "failures": failures, "warnings": warnings}
 
 
-def _chapter_dup_notes(entries) -> list:
-    """entries: [(label, text)]（同章）。返回重复注 failures/warnings。"""
+def _chapter_dup_notes(entries, cross_chunk_failure: bool = True) -> list:
+    """entries: [(label, text)]（同章）。返回重复注 failures/warnings。
+
+    同一 chunk 内重复是真正的生成缺陷，始终 failure。跨 chunk 同词条注释是分块
+    翻译的正常产物：merged 存在时 notes-normalize 会按章合并，故只作 warning；
+    merged 缺失时没有合并层兜底，仍按 failure 处理。
+    """
     failures, warnings = [], []
     seen = {}
     for label, text in entries:
@@ -288,13 +312,17 @@ def _chapter_dup_notes(entries) -> list:
                 continue
             if k in seen:
                 prev_label, prev_content = seen[k]
+                same_file = prev_label == label
                 if prev_content == d['content']:
-                    failures.append(f"重复注（同键同文）: {k} @ {prev_label} / {label}")
+                    msg = f"重复注（同键同文）: {k} @ {prev_label} / {label}"
+                    (failures if (same_file or cross_chunk_failure) else warnings).append(msg)
                 else:
                     import difflib as _dl
                     r = _dl.SequenceMatcher(None, prev_content, d['content']).ratio()
                     if r >= 0.8:
-                        failures.append(f"重复注（同键近似 r={r:.2f}）: {k} @ {prev_label} / {label}")
+                        msg = (f"重复注（同键近似 r={r:.2f}）: {k} @ "
+                               f"{prev_label} / {label}")
+                        (failures if (same_file or cross_chunk_failure) else warnings).append(msg)
                     else:
                         warnings.append(f"同键不同注: {k} @ {prev_label} / {label}")
             else:
@@ -317,11 +345,179 @@ def _book_style_config() -> dict:
         return {}
 
 
+def _natural_name_key(path: Path):
+    """章节/分块文件名自然排序键（ch2 < ch10）。"""
+    return [(0, int(p)) if p.isdigit() else (1, p.lower())
+            for p in re.split(r'(\d+)', Path(path).name)]
+
+
+def _clean_book_title(value) -> str:
+    """把标题候选归一为可用的中文书名；不像书名时返回空串。"""
+    import unicodedata
+    s = unicodedata.normalize('NFC', os.path.expandvars(str(value or ''))).strip()
+    if not s:
+        return ''
+    s = re.sub(r'^\s*#+\s*', '', s)
+    s = s.strip().strip('*_`"\'“”‘’「」『』《》 \t')
+    s = re.sub(r'[（(]\s*[A-Za-z][^）)]*[）)]', '', s)
+    s = re.sub(r'\s+', ' ', s).strip(' .-_—–·:：;；,，')
+    if not s or _BOOK_NON_TITLE_RE.match(s) or _BOOK_GENERIC_TITLE_RE.match(s):
+        return ''
+    if len(s) > _BOOK_FILENAME_MAX:
+        return ''
+    cjk = re.findall(r'[\u4e00-\u9fff]', s)
+    if len(cjk) < 2:
+        return ''
+    return s
+
+
+def _safe_book_filename(title: str) -> str:
+    """标题 → 跨平台安全文件名主体（不含 .md）；失败返回空串。"""
+    import unicodedata
+    s = unicodedata.normalize('NFC', str(title or ''))
+    s = re.sub(r'[\x00-\x1f\x7f]+', ' ', s)
+    s = re.sub(r'[/\\:*?"<>|／＼：＊？＂＜＞｜]+', '', s)
+    s = re.sub(r'\.(?:markdown|md)$', '', s.strip(), flags=re.IGNORECASE)
+    s = re.sub(r'\s+', ' ', s).strip(' .-_—–·')
+    s = s.replace('..', '')
+    s = s[:_BOOK_FILENAME_MAX].strip(' .-_—–·')
+    return s
+
+
+def _book_config_for_root(root: Path) -> dict:
+    """读取指定项目根的 book 配置；不借用当前仓库配置污染临时项目。"""
+    path = Path(root) / 'config.yaml'
+    if not path.exists():
+        return {}
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding='utf-8')) or {}
+        book = data.get('book') if isinstance(data, dict) else None
+        return book if isinstance(book, dict) else {}
+    except Exception:
+        return {}
+
+
+def _profile_title_zh(root: Path) -> str:
+    path = Path(root) / 'input' / 'book_profile.json'
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return ''
+    if not isinstance(data, dict):
+        return ''
+    wg = data.get('work_guess') if isinstance(data.get('work_guess'), dict) else {}
+    for value in (data.get('title_zh'), data.get('book_title_zh'),
+                  data.get('book_title'), wg.get('title_zh'), wg.get('title')):
+        title = _clean_book_title(value)
+        if title:
+            return title
+    return ''
+
+
+def _title_from_headings(path: Path, limit_lines: int = 80) -> str:
+    """从 Markdown 前若干行 H1 提取中文书名（跳过部/卷/章标题）。"""
+    try:
+        lines = path.read_text(encoding='utf-8').splitlines()[:limit_lines]
+    except OSError:
+        return ''
+    for line in lines:
+        m = re.match(r'^\s*#\s+(.+?)\s*$', line)
+        if not m:
+            continue
+        title = _clean_book_title(m.group(1))
+        if title:
+            return title
+    return ''
+
+
+def _infer_title_zh(root: Path, out_root: Path) -> str:
+    """按 final.json → merged → input 的顺序寻找首个可信中文书名。"""
+    dirs = sorted((p for p in out_root.glob('ch*') if p.is_dir()),
+                  key=_natural_name_key)[:2]
+    for ch_dir in dirs:
+        finals = sorted(ch_dir.glob('*_final.json'), key=_natural_name_key)[:3]
+        for fp in finals:
+            try:
+                data = json.loads(fp.read_text(encoding='utf-8'))
+            except (OSError, json.JSONDecodeError):
+                continue
+            text = data.get('text', '') if isinstance(data, dict) else str(data)
+            if not text:
+                continue
+            for line in text.splitlines()[:80]:
+                m = re.match(r'^\s*#\s+(.+?)\s*$', line)
+                if not m:
+                    continue
+                title = _clean_book_title(m.group(1))
+                if title:
+                    return title
+
+    for candidate in (out_root / 'translated_full.md',):
+        if candidate.exists():
+            title = _title_from_headings(candidate, limit_lines=120)
+            if title:
+                return title
+
+    inputs = sorted((root / 'input').glob('ch*.md'), key=_natural_name_key)[:3]
+    for fp in inputs:
+        title = _title_from_headings(fp, limit_lines=30)
+        if title:
+            return title
+    return ''
+
+
+def book_title_zh(project_root=None, output_dir=None) -> str:
+    """解析成书中文题名（config > 剖面 > 首块译文 H1 > merged/input H1）。"""
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    out_root = Path(output_dir) if output_dir else root / 'output'
+    book_cfg = _book_config_for_root(root)
+    env_values = [
+        os.environ.get('SAGATRANS__BOOK__TITLE_ZH'),
+        os.environ.get('SAGATRANS_BOOK_TITLE_ZH'),
+        os.environ.get('SAGATRANS_BOOK_OUTPUT_NAME'),
+    ]
+    candidates = env_values + [
+        book_cfg.get('title_zh') if isinstance(book_cfg, dict) else None,
+        book_cfg.get('book_title_zh') if isinstance(book_cfg, dict) else None,
+        book_cfg.get('output_name') if isinstance(book_cfg, dict) else None,
+    ]
+    for value in candidates:
+        title = _clean_book_title(value)
+        if title:
+            return title
+    title = _profile_title_zh(root)
+    if title:
+        return title
+    return _infer_title_zh(root, out_root)
+
+
+def resolve_book_output_path(project_root=None, output_dir=None,
+                             prefer_existing: bool = True) -> Path:
+    """成品译稿路径：中文书名.md；无中文题名时兼容旧名 translated_full.md。
+
+    prefer_existing=True 时，若中文名尚未生成而旧名已存在，读命令继续使用旧文件，
+    避免升级后首次 lint/notes-normalize 找不到既有成品；merge 写入时传 False。
+    """
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    out_root = Path(output_dir) if output_dir else root / 'output'
+    legacy = out_root / 'translated_full.md'
+    safe = _safe_book_filename(book_title_zh(root, out_root))
+    target = out_root / (safe + '.md') if safe else legacy
+    if prefer_existing:
+        if target.exists():
+            return target
+        if legacy.exists():
+            return legacy
+    return target
+
+
 def lint_book(project_root=None, output_dir=None, merged_path=None) -> dict:
     """成书级 lint：finals（逐 chunk）+ merged（整书）双跑；写 output/book_lint.md。"""
     root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
     out_root = Path(output_dir) if output_dir else root / "output"
-    merged = Path(merged_path) if merged_path else out_root / "translated_full.md"
+    default_merged = resolve_book_output_path(root, out_root)
+    merged = Path(merged_path) if merged_path else default_merged
     failures, warnings = [], []
     stats = {"finals": 0}
 
@@ -342,7 +538,7 @@ def lint_book(project_root=None, output_dir=None, merged_path=None) -> dict:
         if a["dangling_refs"]:
             warnings.append(f"{label}: 无定义引用 {a['dangling_refs']}")
     for ch, entries in sorted(by_chapter.items()):
-        df, dw = _chapter_dup_notes(entries)
+        df, dw = _chapter_dup_notes(entries, cross_chunk_failure=not merged.exists())
         failures.extend(f"{ch}: {x}" for x in df)
         warnings.extend(f"{ch}: {x}" for x in dw)
 
@@ -357,7 +553,7 @@ def lint_book(project_root=None, output_dir=None, merged_path=None) -> dict:
         stats["headings"] = len(headings)
         if style in ("bilingual", "zh"):
             for h in headings[1:]:
-                if not re.match(r'^#\s*第[一二三四五六七八九十百千零〇\d]+\s*章', h):
+                if not _HEADING_STYLE_RE.match(h):
                     failures.append(f"merged: 章节标题不符合制式({style}): {h[:40]}")
         for h in headings:
             for name, pat in _FRONTMATTER_RESIDUE_RES:
@@ -366,7 +562,8 @@ def lint_book(project_root=None, output_dir=None, merged_path=None) -> dict:
         dangling = [ln.strip()[:60] for ln in mtext.split('\n') if _DANGLING_RE.search(ln)]
         for d in dangling:
             warnings.append(f"merged: 疑似悬空承诺: {d}")
-        a = _audit_text(mtext)
+        # 同键注释按章判定（跨章各留一条是成书体例）；全局只查其它制式问题。
+        a = _audit_text(mtext, check_same_key=False)
         for p in a["problems"]:
             failures.append(f"merged: {p}")
         machine_ids = _MACHINE_FN_ID_RE.findall(mtext)
@@ -380,7 +577,7 @@ def lint_book(project_root=None, output_dir=None, merged_path=None) -> dict:
             if len(dups) > 5:
                 failures.append(f"merged/{label}: 另有 {len(dups) - 5} 组重复注未列出")
     else:
-        warnings.append("merged 未生成（translated_full.md 缺失），跳过整书级检查")
+        warnings.append("merged 未生成（{0} 缺失），跳过整书级检查".format(default_merged.name))
 
     result = {"ok": not failures, "failures": failures, "warnings": warnings, "stats": stats}
     lines = ["# 成书 lint 报告 (book_lint)", ""]
@@ -414,7 +611,7 @@ def postprocess_chunk_text(text: str, chapter_id: str, chunk_idx: int) -> str:
         s = line.strip()
         if _FRONTMATTER_LINE_RE.match(s):
             continue
-        if _CHAPTER_HEAD_RE.match(s):
+        if _CHAPTER_HEAD_RE.match(s) or _PART_HEAD_RE.match(s):
             continue
         out.append(line)
     return '\n'.join(out)
@@ -449,10 +646,13 @@ def chapter_heading(project_root, chapter_id: str, style: str = None) -> str:
         except Exception:
             text = ""
         for line in text.split('\n')[:20]:
-            m = re.match(r'^#?\s*(第[一二三四五六七八九十百千零〇\d]+\s*[章.。．]\s*\S.*)$', line.strip())
+            m = re.match(
+                r'^#?\s*(第[一二三四五六七八九十百千零〇\d]+\s*'
+                r'[章部卷篇节](?:\s+[^\n]{1,50})?)\s*$',
+                line.strip())
             if m and len(m.group(1)) <= 60:
-                zh = m.group(1).strip().rstrip('。．.')
-                zh = re.sub(r'\[\^[^\]]+\]', '', zh)
+                zh = re.sub(r'\[\^[^\]]+\]', '', m.group(1)).strip()
+                zh = zh.rstrip('。．.')
                 break
     if style == "keep":
         return orig_clean or chapter_id
@@ -506,6 +706,38 @@ def _note_key(content: str) -> str:
     if m:
         return m.group(1).strip()
     return _note_norm(content)[:12]
+
+
+_NOTE_MERGE_STOP = {
+    "这", "那", "它", "他", "她", "本文", "本章", "此处", "这里",
+    "上述", "以下", "其中", "因此", "所以", "但是", "不过", "同时", "另外",
+}
+
+
+def _note_merge_key(content: str) -> str:
+    """同词条合并键：从注释开头提取术语（不依赖作品先验）。
+
+    覆盖 `**牙鳕**：…`、`“门泰特”：…`、`门泰特指…`、`贝尼·杰瑟里特姐妹会是一…`
+    等常见写法；过短/泛指开头返回空串（不参与同键合并）。
+    """
+    t = _note_norm(content)
+    t = re.sub(r'^(?:译者注|译注|脚注|注释)[:：]?', '', t)
+    t = re.sub(r'[“”"「」『』]', '', t)
+    t = t.strip('“”"「」『』*`> ')
+    if not t:
+        return ""
+    cut = min((m.start() for m in re.finditer(r'[：:，,。；;（(]', t)), default=len(t))
+    for marker in ('是指', '指', '即', '是'):
+        pos = t.find(marker, 1)
+        if pos > 0:
+            cut = min(cut, pos)
+    key = t[:cut] if cut > 0 else t[:24]
+    key = re.sub(r'^[《【\[（(]+|[》】\]）)]+$', '', key)
+    key = key.strip(' ·・.-')
+    key = re.sub(r'\s+', '', key)
+    if len(key) < 2 or key in _NOTE_MERGE_STOP:
+        return ""
+    return key
 
 
 def _note_anchor_stop(contents) -> set:
@@ -591,6 +823,15 @@ def _note_candidates(text: str):
         _ls = _b['seg'].split('\n')
         _body_ls = [l for l in _ls if l.strip()]
         if (len(_body_ls) > 1
+                and sum(1 for l in _body_ls if _MD_DEF_RE.match(l)) > 1):
+            # 章末脚注定义常被连续堆叠（无空行）。每行 [^n]: 必须独立成单元，
+            # 否则整段会被当成一条 md 注释，同键去重/重编号全部失效。
+            _pos = _b['start']
+            for _l in _ls:
+                if _l.strip():
+                    blocks.append({'start': _pos, 'end': _pos + len(_l), 'seg': _l})
+                _pos += len(_l) + 1
+        elif (len(_body_ls) > 1
                 and all(_TR_BLOCK_RE.match(l) for l in _body_ls)):
             _pos = _b['start']
             for _l in _ls:
@@ -664,7 +905,8 @@ def normalize_chapter_notes(text: str, start_num: int = 1):
     """
     blocks, units = _note_candidates(text)
     _group_title_units(units)
-    changes = {"merged_dups": 0, "orphans_attached": 0, "md_relocated": 0,
+    changes = {"merged_dups": 0, "same_key_merges": 0,
+               "dangling_refs_removed": 0, "orphans_attached": 0, "md_relocated": 0,
                "num_relocated": 0, "title_blocks_moved": 0, "renumbered": 0,
                "title_shells_dropped": 0,
                "machine_ids": len(_MACHINE_FN_ID_RE.findall(text))}
@@ -679,6 +921,24 @@ def normalize_chapter_notes(text: str, start_num: int = 1):
             parent[x] = parent[parent[x]]
             x = parent[x]
         return x
+
+    # 1a) 同词条合并：同一章内同一术语的多种注释写法只保留一条。
+    # 分块翻译会在不同 chunk 各自加注；merge 后再按章归并，避免成书出现
+    # "门泰特 ×17" 这类重复条目。跨章各留一条，保持章内自包含。
+    key_groups = {}
+    for i, u in enumerate(cand):
+        k = _note_merge_key(u['content'])
+        if k:
+            key_groups.setdefault(k, []).append(i)
+    for members in key_groups.values():
+        if len(members) < 2:
+            continue
+        base = _root(members[0])
+        for mi in members[1:]:
+            ri = _root(mi)
+            if ri != base:
+                parent[ri] = base
+                changes["same_key_merges"] += 1
 
     _stop = _note_anchor_stop([c['content'] for c in cand])
     for i in range(len(cand)):
@@ -958,13 +1218,29 @@ def normalize_chapter_notes(text: str, start_num: int = 1):
             kept_lines.pop()
         assembled = ('\n'.join(kept_lines).rstrip('\n') + '\n\n---\n\n'
                      + '\n'.join(def_lines[k] for k in sorted(def_lines)) + '\n')
+
+    # 6.6) 悬空引用清理：引用存在但定义已被合并/搬走 → 去掉断链标记。
+    # 不静默保留坏链接；数量写进报告，便于回溯是哪一步产生的。
+    def_ids = set(re.findall(r'^\[\^([^\]]+)\]:', assembled, re.M))
+    ref_ids = {m.group(1) for m in re.finditer(r'\[\^([^\]]+)\](?!:)', assembled)}
+    dangling = sorted(ref_ids - def_ids)
+    if dangling:
+        for uid in dangling:
+            assembled = re.sub(r'\[\^' + re.escape(uid) + r'\](?!:)', '', assembled)
+        changes["dangling_refs_removed"] = len(dangling)
+
+    # 6.7) 孤儿定义（有定义无引用）→ 章末译者注；复用 finalize 的同一判定。
+    assembled, _style_changes = normalize_final_style(assembled)
+    if _style_changes.get("orphans_relocated"):
+        changes["md_relocated"] += _style_changes["orphans_relocated"]
     return assembled, changes, start_num + len(order)
 
 
 def normalize_notes_document(text: str):
     """全书：按 H1 切章逐章统一（编号全书连续）。→ (new_text, report)"""
     parts = re.split(r'(?m)^(# .*)$', text)
-    agg = {"merged_dups": 0, "orphans_attached": 0, "md_relocated": 0,
+    agg = {"merged_dups": 0, "same_key_merges": 0, "dangling_refs_removed": 0,
+           "orphans_attached": 0, "md_relocated": 0,
            "num_relocated": 0, "title_blocks_moved": 0, "renumbered": 0,
            "title_shells_dropped": 0,
            "machine_ids": 0}
@@ -991,11 +1267,12 @@ def normalize_notes_document(text: str):
 
 
 def notes_normalize_outputs(project_root=None, output_dir=None, apply: bool = False) -> dict:
-    """对 translated_full.md 执行章级注释统一；默认 dry-run，写 output/note_policy_diff.md。"""
+    """对成品译稿执行章级注释统一；默认 dry-run，写 output/note_policy_diff.md。"""
     root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
     out_root = Path(output_dir) if output_dir else root / "output"
-    merged = out_root / "translated_full.md"
-    stats = {"files": 0, "changed": 0, "merged_dups": 0, "orphans_attached": 0,
+    merged = resolve_book_output_path(root, out_root)
+    stats = {"files": 0, "changed": 0, "merged_dups": 0, "same_key_merges": 0,
+             "dangling_refs_removed": 0, "orphans_attached": 0,
              "md_relocated": 0, "num_relocated": 0, "title_blocks_moved": 0,
              "renumbered": 0, "title_shells_dropped": 0, "machine_ids": 0}
     details = []
@@ -1005,7 +1282,8 @@ def notes_normalize_outputs(project_root=None, output_dir=None, apply: bool = Fa
         new_text, rep = normalize_notes_document(text)
         if new_text != text:
             stats["changed"] = 1
-            for key in ("merged_dups", "orphans_attached", "md_relocated",
+            for key in ("merged_dups", "same_key_merges", "dangling_refs_removed",
+                        "orphans_attached", "md_relocated",
                         "num_relocated", "title_blocks_moved", "renumbered",
                         "title_shells_dropped", "machine_ids"):
                 stats[key] = rep["stats"].get(key, 0)
@@ -1015,9 +1293,12 @@ def notes_normalize_outputs(project_root=None, output_dir=None, apply: bool = Fa
     lines = ["# 章级注释统一报告 (note_policy_diff)", "",
              "- 模式: {0}".format('APPLY (已写入)' if apply else 'DRY RUN (仅报告)'),
              "- 处理 file: {0} 个；需要变更: {1} 个".format(stats['files'], stats['changed']),
-             "- 去重合并: {0}；孤儿改锚: {1}；md 转译者注: {2}；编号注转译注块: {3}".format(
-                 stats['merged_dups'], stats['orphans_attached'],
-                 stats['md_relocated'], stats['num_relocated']),
+             "- 去重合并: {0}（同词条 {1}）；孤儿改锚: {2}；md 转译者注: {3}；"
+             "编号注转译注块: {4}；悬空引用清理: {5}".format(
+                 stats['merged_dups'], stats['same_key_merges'],
+                 stats['orphans_attached'],
+                 stats['md_relocated'], stats['num_relocated'],
+                 stats['dangling_refs_removed']),
              "- 标题块搬移: {0}；空壳标题清理: {1}；顺编号: {2}；机器 id 清除: {3}".format(
                  stats['title_blocks_moved'], stats['title_shells_dropped'],
                  stats['renumbered'], stats['machine_ids']),
@@ -1047,7 +1328,12 @@ def _chapter_note_dupes(text: str) -> list:
     _stop = _note_anchor_stop([c['content'] for c in cand])
     for i in range(len(cand)):
         for j in range(i + 1, len(cand)):
-            if _note_is_dup(cand[i]['content'], cand[j]['content'], stop=_stop):
+            ki = _note_merge_key(cand[i]['content'])
+            kj = _note_merge_key(cand[j]['content'])
+            if ki and ki == kj:
+                out.append("同键重复注: {0} ~ {1}".format(
+                    ki[:18], kj[:18]))
+            elif _note_is_dup(cand[i]['content'], cand[j]['content'], stop=_stop):
                 out.append("重复注: {0} ~ {1}".format(
                     _note_key(cand[i]['content'])[:18],
                     _note_key(cand[j]['content'])[:18]))

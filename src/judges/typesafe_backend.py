@@ -14,6 +14,7 @@ typesafe.ai System One 后端 — Jev 优先，MiniMax/DeepSeek fallback
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import time
@@ -28,6 +29,34 @@ from src.judges.typesafe_spec import (
 )
 
 logger = __import__("logging").getLogger("sagatrans.judges")
+
+
+def _typesafe_sdk_available() -> bool:
+    """类型化后端依赖探测（不触发 import，避免每 chunk 重复失败）。"""
+    try:
+        return importlib.util.find_spec("typesafe_sdk") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _is_auth_failure(exc: Exception) -> bool:
+    """识别 Jev 的鉴权/权限类失败，供进程内熔断使用。"""
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    if "authentication" in name or "auth" in name or "permission" in name:
+        return True
+    phrases = (
+        "unauthorized", "forbidden", "invalid api", "api key",
+        "authentication", "authorization", "无权访问", "无权限", "鉴权",
+        "认证失败",
+    )
+    if any(p in text for p in phrases):
+        return True
+    return bool(("401" in text or "403" in text) and any(
+        p in text for p in (
+            "http", "status", "client error", "客户端错误", "url", "token", "model"
+        )
+    ))
 
 
 def _confidence_from_probs(probs: Dict[Any, float]) -> float:
@@ -121,6 +150,8 @@ class JevBackend(SystemOneBackend):
         return self._client
 
     def evaluate(self, state, questions, *, model=None, timeout=30.0):
+        if not _typesafe_sdk_available():
+            raise ModuleNotFoundError("No module named 'typesafe_sdk'")
         client = self._ensure_client()
         # typesafe_sdk 期望 Choice/Score/Noul 对象；我们 dict 入参则需要构造
         from typesafe_sdk import Choice, Score, Noul
@@ -194,12 +225,41 @@ class OpenAICompatBackend(SystemOneBackend):
 
     def __init__(
         self,
-        model_role: str = "primary",  # primary = MiniMax M3
+        model_role: Optional[str] = None,
         llm_client=None,
+        task_name: str = "critic_scoring",
     ):
-        from src.utils.llm_adapter import get_llm_client_for_task
-        self.model_role = model_role
-        self.llm = llm_client or get_llm_client_for_task("critic_scoring")
+        """绑定与客户端一致的任务路由（Round 140）。
+
+        旧实现从 `critic_scoring` 取 DeepSeek 客户端，却从
+        `typesafe.fallback_role: primary` 取 MiniMax 模型名，导致请求
+        `DeepSeek 客户端 + MiniMax-M3.1-Flash` 被网关 403。模型名必须和
+        客户端来自同一个 task 路由；`fallback_role` 仅保留为历史配置兼容。
+        """
+        from src.config import config as _cfg
+        from src.utils.llm_adapter import (
+            get_llm_client,
+            get_llm_client_for_task,
+            get_role_model_name,
+        )
+
+        self.task_name = task_name
+        # 显式 model_role 仍按旧语义工作；只有“不指定角色”的生产兜底才使用
+        # critic_scoring 任务路由，避免客户端与 model_name 来自不同角色。
+        self.model_role = model_role or _cfg.get_task_role(task_name)
+        _, params = _cfg.resolve_task_model(task_name)
+        self.params = dict(params)
+        if model_role and model_role != _cfg.get_task_role(task_name):
+            # task effort 是按 task 路由角色校验的；显式换角色时不能把
+            # 该角色的档位原样下发（例如 DeepSeek 的 none 发给 MiniMax）。
+            self.params.pop("effort", None)
+        self.model_name = get_role_model_name(self.model_role) or self.model_role
+        if llm_client is not None:
+            self.llm = llm_client
+        elif model_role:
+            self.llm = get_llm_client(model_role)
+        else:
+            self.llm = get_llm_client_for_task(task_name)
 
     def evaluate(self, state, questions, *, model=None, timeout=30.0):
         # 把 state 与 questions 拼成一个 prompt
@@ -268,8 +328,10 @@ class OpenAICompatBackend(SystemOneBackend):
 
         # 走完整 OpenAICompatibleAdapter.generate 签名（需要 model_name）
         # 但在网络层错误时快速失败，不消耗 3 次重试 budget
-        from src.utils.llm_adapter import get_role_model_name
-        model_name = get_role_model_name(self.model_role) or self.model_role
+        model_name = model or self.model_name
+        call_params = dict(self.params)
+        call_params.setdefault("temperature", 0.1)
+        call_params.setdefault("max_tokens", 2048)
         # 临时把 OpenAI 客户端的重试次数调成 1（默认 3 次 ×5s/10s 重试间隔太慢）
         original_max_retries = getattr(self.llm, "max_retries", 3)
         try:
@@ -278,8 +340,7 @@ class OpenAICompatBackend(SystemOneBackend):
             raw = self.llm.generate(
                 prompt=prompt,
                 model_name=model_name,
-                max_tokens=2048,
-                temperature=0.1,
+                **call_params,
             )
             return self._parse_answers(raw, questions)
         except (ConnectionError, OSError, requests.exceptions.ConnectionError) as e:
@@ -555,7 +616,10 @@ class FallbackBackend(SystemOneBackend):
         # test_05 静态探测），但默认不参与自动链（Jev → Mock）。
         # OpenAICompat 在 LLM-as-judge 模式下不返回校准概率，与 Jev 语义不等价，
         # 强行 fallback 会让 verdict 失去概率含义。详见 audit A3。
-        self.fallback = OpenAICompatBackend(model_role=fallback_role)
+        # 兜底的 LLM 客户端与模型名统一由 critic_scoring 任务路由解析。
+        # fallback_role 参数保留仅为旧配置/旧调用方兼容，不再参与模型绑定。
+        self.fallback_role = fallback_role
+        self.fallback = OpenAICompatBackend(task_name="critic_scoring")
         self.allow_openai_fallback = allow_openai_fallback
         self.allow_mock = allow_mock
         self.enabled = enabled
@@ -565,6 +629,7 @@ class FallbackBackend(SystemOneBackend):
         self.last_backend: str = "unknown"
         # Round 121: 401 鉴权失败缓存 —— key 修复须重启进程，本轮内不再反复试探 Jev
         self._jev_auth_dead = False
+        self._jev_disabled_reason = ""
 
     def evaluate(self, state, questions, *, model=None, timeout=None):
         # 有效 timeout：调用方传入优先，否则用 self.timeout（来自 config.yaml typesafe.timeout）
@@ -584,11 +649,19 @@ class FallbackBackend(SystemOneBackend):
                 self.last_backend = "jev"
                 return answers
             except Exception as e:
-                if type(e).__name__ == "TypeSafeAuthenticationError":
-                    # 401 鉴权失败：key 修复须重启进程；本进程内不再试探 Jev（避免每 chunk 白跑+刷屏）
+                missing_sdk = isinstance(e, (ImportError, ModuleNotFoundError)) or (
+                    "typesafe_sdk" in str(e)
+                )
+                auth_failed = _is_auth_failure(e)
+                if missing_sdk or auth_failed:
+                    # Jev 鉴权/依赖失败：修复须重启进程；本进程内不再试探 Jev
                     if not self._jev_auth_dead:
-                        logger.warning(f"Jev 鉴权失败（{e}）；本进程内不再尝试 Jev，改走降级链")
+                        reason = "typesafe_sdk 缺失" if missing_sdk else "Jev 鉴权失败"
+                        logger.warning(f"{reason}（{e}）；本进程内不再尝试 Jev，改走降级链")
                     self._jev_auth_dead = True
+                    self._jev_disabled_reason = (
+                        "typesafe_sdk 未安装" if missing_sdk else "Jev 鉴权失败"
+                    )
                 else:
                     logger.info(f"Jev 不可用: {type(e).__name__}: {e}")
                 if not self.allow_openai_fallback:
@@ -604,7 +677,10 @@ class FallbackBackend(SystemOneBackend):
                     except Exception as e2:
                         logger.info(f"OpenAICompat 不可用，降级到 Mock: {e2}")
         else:
-            logger.debug("Jev 跳过：无 TYPESAFE_API_KEY")
+            if self._jev_auth_dead:
+                logger.debug("Jev 跳过：%s", self._jev_disabled_reason or "鉴权/依赖不可用")
+            else:
+                logger.debug("Jev 跳过：无 TYPESAFE_API_KEY")
             if self.allow_openai_fallback:
                 # 无 Jev key 时仍可走 OpenAICompat（显式开启）
                 try:

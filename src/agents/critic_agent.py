@@ -69,6 +69,15 @@ def _classify_backend_error(exc: Exception) -> Dict[str, Any]:
     # 只用消息文本匹配（不含 repr/类名）：类名如 TypeSafeAuthenticationError
     # 会让 "authentication" 关键字在 SDK 不可用的退化路径上误命中（Round 53 测试锁定）。
     combined = str(exc).lower()
+    if "typesafe_sdk" in combined and any(
+        k in combined for k in ("no module named", "modulenotfound", "not installed")
+    ):
+        return {
+            "category": "dependency",
+            "retryable": False,
+            "msg": str(exc)[:200],
+            "action": "安装 typesafe_sdk，或关闭 typesafe 并显式启用 OpenAICompat 降级",
+        }
     if any(k in combined for k in ("429", "rate limit", "rate_limit", "quota", "too many requests")):
         return {"category": "rate_limit", "retryable": True, "msg": str(exc)[:200], "action": "wait or upgrade quota"}
     if any(k in combined for k in ("timeout", "timed out", "connection reset", "connection aborted")):
@@ -81,12 +90,21 @@ def _classify_backend_error(exc: Exception) -> Dict[str, Any]:
     _auth_phrase = any(k in combined for k in (
         "unauthorized", "forbidden", "api key", "invalid api",
         "authentication", "authenticate", "authorization",
+        "无权访问模型", "无权访问", "无权限", "鉴权", "认证失败",
     ))
     _auth_code_ctx = bool(re.search(r"\b(401|403)\b", combined)) and any(
-        k in combined for k in ("client error", "url:", "url ", "http", "status")
+        k in combined for k in (
+            "client error", "url:", "url ", "http", "status",
+            "客户端错误", "token", "model", "模型",
+        )
     )
     if _auth_phrase or _auth_code_ctx:
-        return {"category": "auth", "retryable": False, "msg": str(exc)[:200], "action": "check TYPESAFE_API_KEY"}
+        return {
+            "category": "auth",
+            "retryable": False,
+            "msg": str(exc)[:200],
+            "action": "检查当前任务角色的 API key 与模型访问权限（403），或修正 task_routing",
+        }
     if any(k in combined for k in ("500", "502", "503", "504", "internal server", "bad gateway", "service unavailable")):
         return {"category": "server", "retryable": True, "msg": str(exc)[:200], "action": "check typesafe status page"}
     if any(k in combined for k in ("connection", "dns", "network", "unreachable", "ssl", "certificate")):
@@ -101,6 +119,11 @@ class CriticAgent:
         self.role = _config.get_task_role("critic_scoring")
 
     def _build_prompt(self, source_text: str, raw_translation: str, literary_translation: str, style_guide_stats: dict) -> str:
+        try:
+            from src.judgment_layer import sanitize_style_guide_for_scoring
+            style_guide_stats = sanitize_style_guide_for_scoring(style_guide_stats)
+        except Exception:
+            pass
         return f"""你是一位极其严苛的文学编辑与翻译评论家。
 你的任务是对提供的【文学润色稿】进行深度审计，并依据【风格基准】进行打分。
 
@@ -237,8 +260,9 @@ Schema 要求：
                             answers = backend.primary.evaluate(state, questions, timeout=backend.timeout)
                             backend_path = "jev"
                         except Exception as e_jev:
-                            backend_diagnostics["jev"] = _classify_backend_error(e_jev)
-                            if type(e_jev).__name__ == "TypeSafeAuthenticationError":
+                            diag = _classify_backend_error(e_jev)
+                            backend_diagnostics["jev"] = diag
+                            if diag["category"] in ("auth", "dependency"):
                                 backend._jev_auth_dead = True
                     if not answers and backend.allow_openai_fallback:
                         try:

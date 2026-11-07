@@ -16,7 +16,7 @@
 
 用法：
   python3 scripts/pun_audit.py [--project-root .] [--profile input/book_profile.json]
-      [--merged output/translated_full.md] [--waivers input/pun_waivers.json]
+      [--merged output/<中文书名>.md] [--waivers input/pun_waivers.json]
       [--md output/pun_audit.md] [--json output/pun_audit.json] [--no-fail]
 豁免文件 input/pun_waivers.json 格式：{"waived": ["tale/tail", "game"], "note": "理由"}
 """
@@ -33,7 +33,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from src.book_lint import _scan_lines, _def_key  # noqa: E402
+from src.book_lint import _scan_lines, _def_key, resolve_book_output_path  # noqa: E402
 
 
 def _read_json(path, default=None):
@@ -255,7 +255,8 @@ def main(argv=None) -> int:
 
     root = Path(args.project_root)
     profile_path = Path(args.profile) if args.profile else root / "input" / "book_profile.json"
-    merged_path = Path(args.merged) if args.merged else root / "output" / "translated_full.md"
+    merged_path = (Path(args.merged) if args.merged
+                   else resolve_book_output_path(root, root / "output"))
     waivers_path = Path(args.waivers) if args.waivers else root / "input" / "pun_waivers.json"
     md_path = Path(args.md) if args.md else root / "output" / "pun_audit.md"
     json_path = Path(args.json_out) if args.json_out else root / "output" / "pun_audit.json"

@@ -86,11 +86,25 @@ def build_state(
             if entity_source_name_in_text(source_name, source_text):
                 relevant_variants[source_name] = list(variants) if variants else []
 
+    try:
+        from src.judgment_layer import sanitize_style_guide_for_scoring
+        scoring_style = sanitize_style_guide_for_scoring(style_guide_stats)
+    except Exception:
+        _advisory = {
+            "narrative_arc", "setup_payoff", "voice_notes", "judgment_notes",
+            "judgment", "generation", "deep_read", "schema_version",
+        }
+        scoring_style = {k: v for k, v in (style_guide_stats or {}).items()
+                         if k not in _advisory}
+
     return {
         "source_text": source_text,
         "raw_translation": raw_translation,
         "literary_translation": literary_translation,
-        "style_guide": style_guide_stats,
+        # Judgment-layer notes are advisory prompt context, never scoring
+        # targets.  Strip them at the single state-construction boundary so
+        # critic/Jev experiments cannot accidentally grade against them.
+        "style_guide": scoring_style,
         "entity_registry": relevant_entities,
         "entity_variants": relevant_variants,
     }
