@@ -89,13 +89,14 @@ import tempfile
 import unicodedata
 import datetime as _dt
 import logging  # P4-1: 引入 logging 框架
+from bisect import bisect_right
 from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 import sqlite3
 import psutil
 import threading
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Callable
@@ -1020,7 +1021,9 @@ for _sub in ("src.utils", "src.config", "src.agents", "src.core", "src.consisten
              # Round 131: prefer the real modules in repo mode.  A pre-created
              # fake module otherwise hides private helpers (e.g. pun_audit's
              # _split_anchors) from later imports in the same interpreter.
-             "src.judgment_layer", "src.story_graph", "src.style_profiler"):
+             "src.judgment_layer", "src.story_graph", "src.story_graph_query",
+             "src.setup_payoff_audit",
+             "src.style_profiler"):
     _ensure_real_or_fake(_sub)
 # Round 103 P2: src.judges.* shim 不覆盖真实模块, 仅补 attr.
 # R104 P1 修复: 旧条件 `_existing.__path__` 仅对父 package 有效, 子模块
@@ -1194,6 +1197,20 @@ _SRC_SUBMODULES = {
         "save_story_graph", "load_story_graph", "build_and_save_story_graph",
         "story_graph_context_for_chapter",
     ],
+    "src.story_graph_query": [
+        "QUERY_VERSION", "DEFAULT_TOP_K", "DEFAULT_MAX_HOPS",
+        "StoryGraphQueryIndex", "query_story_graph",
+        "default_story_graph_query_generate", "evaluate_story_graph_query",
+        "format_query_result",
+    ],
+    "src.setup_payoff_audit": [
+        "AUDIT_VERSION", "DEFAULT_TOP_N", "DEFAULT_SELECTION_BATCH",
+        "DEFAULT_L2_BATCH", "DEFAULT_AUDIT_PATH", "is_unpaired_setup",
+        "build_setup_payoff_audit", "summarize_setup_payoff_audit",
+        "build_setup_selection_prompt", "select_setup_payoff_candidates",
+        "verify_setup_payoff_selections", "promote_setup_payoff_pairs",
+        "default_setup_payoff_audit_generate", "format_setup_payoff_audit_summary",
+    ],
     "src.style_profiler": [
         "DEFAULT_PROFILE_PATH", "PROFILE_VERSION", "NEUTRAL_REGISTER",
         "NEUTRAL_PERSONA", "VALID_FOOTNOTE_POLICIES", "VALID_SOURCES",
@@ -1313,6 +1330,7 @@ def build_section_13() -> str:
         ("main.py", [
             "_INSTANCE_LOCK_FD", "_MUTATING_COMMANDS", "_SIGINT_WARNED",
             "acquire_instance_lock", "_install_sigint_guard",
+            "_command_needs_lock",
         ]),
         ("splitters.py", [
             "_AUDIT_CHAPTER_FLOOR", "_AUDIT_COVERAGE_THRESHOLD", "_AUDIT_MAX_MISSING_SPANS", "_AUDIT_TOC_SCAN_LINES",
@@ -1369,7 +1387,8 @@ def build_section_13() -> str:
     # by load_module); runtime cross-module imports are satisfied by the shim
     # below.  Keeping whole modules avoids another hand-maintained symbol list.
     out += section_comment("13.6", "Round 131 全书判断层 / 故事图 / 深读剖面")
-    for rel in ("judgment_layer.py", "story_graph.py", "style_profiler.py"):
+    for rel in ("judgment_layer.py", "story_graph.py", "story_graph_query.py",
+                "setup_payoff_audit.py", "style_profiler.py"):
         body = load_module(rel).strip("\n")
         if not body:
             raise SystemExit(f"❌ Section 13.6 空模块: {rel}")

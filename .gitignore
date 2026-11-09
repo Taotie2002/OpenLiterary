@@ -63,6 +63,7 @@ Thumbs.db
 
 # 翻译工作文件/临时文件（不上传到 GitHub，仅保留在本地）
 docs/*.md
+docs/ROUND142_PHASE_B_EVAL*.json
 input/README.md
 input/chaos/
 input/golden/

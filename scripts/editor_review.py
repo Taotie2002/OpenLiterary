@@ -77,7 +77,7 @@ def _model_label(task_name: str = "editor_review") -> str:
 
 def build_review_prompt(chapter_id, source_text, translated_text, max_chars=60000,
                         judgment_context: str = "", global_mode: bool = False,
-                        truncate: bool = True) -> str:
+                        truncate: bool = True, retrieval_context: str = "") -> str:
     src = source_text or "（原文缺失，仅审读译文）"
     tgt = translated_text or ""
     if truncate and max_chars > 0:
@@ -87,6 +87,7 @@ def build_review_prompt(chapter_id, source_text, translated_text, max_chars=6000
             tgt = tgt[:max_chars] + "\n……（译文超长截断）"
     focus = "全书弧线/伏笔闭环" if global_mode else "本章成书质量"
     judgment_block = (judgment_context.rstrip() + "\n\n") if judgment_context else ""
+    retrieval_block = (retrieval_context.rstrip() + "\n\n") if retrieval_context else ""
     return f"""你是资深中文文学编辑，负责译著付印前的成书级审读。只报告问题，不改写全文、不润色。
 
 请审读第 {chapter_id} 章（英译中译稿），本轮焦点：{focus}。检查以下六类缺陷：
@@ -97,7 +98,7 @@ def build_review_prompt(chapter_id, source_text, translated_text, max_chars=6000
 5. note_heavy 注释喧宾夺主：注释密度过高、频繁打断叙事节奏；
 6. arc 弧线违背：人物语气/关系演变、伏笔与回收、主题意象的阶段性变化与全书判断层冲突。
 
-{judgment_block}【原文】
+{judgment_block}{retrieval_block}【原文】
 {src}
 
 【译文】
@@ -188,9 +189,45 @@ def _source_window(source_text: str, target_start: int, target_end: int,
     return src[start:end], start, end
 
 
+def build_retrieval_context(query_text: str, index, current_chapter: str,
+                            top_k: int = 3, max_chars: int = 1800,
+                            max_hops: int = 2) -> str:
+    """Render bounded cross-chapter scene evidence; never raises."""
+    if index is None:
+        return ""
+    try:
+        result = index.query(query=str(query_text or "")[:3200], top_k=max(6, top_k * 3),
+                             max_hops=max_hops, use_dpp=True,
+                             use_note_similarity=True)
+    except Exception:
+        return ""
+    rows = [r for r in (result.get("results") or [])
+            if str(r.get("chapter") or "") != str(current_chapter or "")]
+    lines = ["【跨章检索证据（advisory；只用于核对弧线/伏笔，不是硬约束）】"]
+    used = len(lines[0])
+    picked = 0
+    for row in rows:
+        anchor = row.get("anchor") or {}
+        quote = " ".join(str(anchor.get("quote") or "").split())[:260]
+        if not quote:
+            continue
+        line = "- %s %s score=%.3f quote: %s" % (
+            row.get("chapter"), row.get("scene_id"), float(row.get("score") or 0.0), quote)
+        if used + len(line) + 1 > max(80, int(max_chars)):
+            continue
+        lines.append(line)
+        used += len(line) + 1
+        picked += 1
+        if picked >= max(1, int(top_k)):
+            break
+    return "\n".join(lines) if picked else ""
+
+
 def review_chapter(chapter_id: str, source_text: str, translated_text: str,
                    generate, max_chars: int = 60000, overlap_chars: int = 2000,
-                   judgment_context: str = "", global_mode: bool = False) -> dict:
+                   judgment_context: str = "", global_mode: bool = False,
+                   retrieval_index=None, retrieval_top_k: int = 3,
+                   retrieval_max_chars: int = 1800) -> dict:
     """Review a whole chapter via paragraph-aware windows; never silently truncate."""
     if not translated_text:
         return {"chapter": chapter_id, "error": "no_final_texts", "issues": []}
@@ -199,6 +236,7 @@ def review_chapter(chapter_id: str, source_text: str, translated_text: str,
     from src.utils.llm_adapter import robust_json_loads
     all_issues = []
     section_meta = []
+    retrieval_meta = []
     errors = []
     for win in windows:
         src_seg, src_start, src_end = _source_window(
@@ -206,10 +244,24 @@ def review_chapter(chapter_id: str, source_text: str, translated_text: str,
             len(translated_text), max(400, int(overlap_chars or 0)),
         )
         section_id = f"{chapter_id}:s{int(win['index']):03d}"
+        retrieval_context = ""
+        if global_mode and retrieval_index is not None:
+            try:
+                query_text = (str(src_seg or "")[:2200] + "\n" + str(win["text"] or "")[:1200]).strip()
+                retrieval_context = build_retrieval_context(
+                    query_text, retrieval_index, chapter_id,
+                    top_k=retrieval_top_k, max_chars=retrieval_max_chars)
+                retrieval_meta.append({"section_id": section_id,
+                                       "chars": len(retrieval_context),
+                                       "injected": bool(retrieval_context)})
+            except Exception as exc:  # noqa: BLE001 - retrieval is fail-open
+                retrieval_meta.append({"section_id": section_id, "chars": 0,
+                                       "injected": False,
+                                       "error": f"{type(exc).__name__}: {exc}"})
         prompt = build_review_prompt(
             chapter_id, src_seg, win["text"], max_chars=0,
             judgment_context=judgment_context, global_mode=global_mode,
-            truncate=False,
+            truncate=False, retrieval_context=retrieval_context,
         )
         section_meta.append({
             "section_id": section_id,
@@ -269,6 +321,7 @@ def review_chapter(chapter_id: str, source_text: str, translated_text: str,
         "max_chars": max_chars,
         "overlap_chars": overlap_chars,
         "global_mode": bool(global_mode),
+        "retrieval": retrieval_meta,
     }
 
 
@@ -421,11 +474,22 @@ def main(argv=None, generate=None) -> int:
                     help="分段审读窗口重叠字符数（默认 2000）")
     ap.add_argument("--global", dest="global_mode", action="store_true",
                     help="全书弧线/伏笔审读；加载 book_profile.json 并使用 editor_review_global 角色")
+    ap.add_argument("--retrieval", action="store_true",
+                    help="仅 --global：注入 top-k 跨章故事图证据；默认关闭，需 A/B 后再启用")
+    ap.add_argument("--retrieval-top-k", type=int, default=3,
+                    help="--retrieval 每个窗口注入的场景数（默认 3）")
+    ap.add_argument("--retrieval-max-chars", type=int, default=1800,
+                    help="--retrieval 每个窗口的注入字符上限（默认 1800）")
+    ap.add_argument("--graph-path", default=None,
+                    help="--retrieval 使用的故事图路径（默认 config.story_graph.path）")
     ap.add_argument("--review-dirty", action="store_true",
                     help="额外生成 review_dirty.json（仅机械校验过的结构 P0，不直接改状态）")
     ap.add_argument("--review-dirty-path", default="output/review_dirty.json")
     ap.add_argument("--fail-on-p0", action="store_true", help="存在 P0 时退出码 1")
     args = ap.parse_args(argv)
+    if args.retrieval and not args.global_mode:
+        print("❌ [editor_review] --retrieval 只能与 --global 一起使用", file=sys.stderr)
+        return 2
 
     root = Path(args.project_root)
     task_name = "editor_review_global" if args.global_mode else "editor_review"
@@ -443,6 +507,25 @@ def main(argv=None, generate=None) -> int:
                 print("⚠️ [editor_review] --global 未找到可注入的判断层注记（继续普通全局审读）")
         except Exception as exc:  # noqa: BLE001
             print(f"⚠️ [editor_review] 判断层加载失败，继续普通审读（{type(exc).__name__}: {exc}）")
+
+    retrieval_index = None
+    if args.retrieval:
+        try:
+            from src.config import get_config
+            from src.story_graph import load_story_graph
+            from src.story_graph_query import StoryGraphQueryIndex
+            cfg = get_config()
+            rel = str((cfg.get("story_graph", {}) or {}).get("path")
+                      or "input/story_graph.json")
+            graph_path = Path(args.graph_path) if args.graph_path else root / rel
+            graph = load_story_graph(graph_path)
+            if not graph:
+                raise ValueError(f"graph not readable: {graph_path}")
+            retrieval_index = StoryGraphQueryIndex(graph, input_dir=root / "input")
+            print(f"🔎 [editor_review] cross-chapter retrieval on ({graph_path})")
+        except Exception as exc:  # noqa: BLE001 - retrieval is fail-open
+            print(f"⚠️ [editor_review] 跨章检索初始化失败，继续无检索审读 "
+                  f"({type(exc).__name__}: {exc})")
 
     # 优先审读交付文本（merge + notes-normalize 后的切片）；缺失时回退 finals 拼接
     merged_map = {}
@@ -475,6 +558,9 @@ def main(argv=None, generate=None) -> int:
             ch, src, tgt, gen, max_chars=args.max_chars,
             overlap_chars=args.overlap_chars,
             judgment_context=judgment_context, global_mode=args.global_mode,
+            retrieval_index=retrieval_index,
+            retrieval_top_k=args.retrieval_top_k,
+            retrieval_max_chars=args.retrieval_max_chars,
         ))
         status = results[-1].get("error") or f"{len(results[-1].get('issues') or [])} issues"
         print(f"📖 [editor_review] {ch}: {status}")
@@ -490,6 +576,9 @@ def main(argv=None, generate=None) -> int:
         "generated_at": generated_at,
         "model": model_label,
         "global_mode": bool(args.global_mode),
+        "retrieval_enabled": bool(retrieval_index is not None),
+        "retrieval_top_k": args.retrieval_top_k if args.retrieval else 0,
+        "retrieval_max_chars": args.retrieval_max_chars if args.retrieval else 0,
         "judgment_context_chars": len(judgment_context),
         "summary": {
             "chapters": len(results),

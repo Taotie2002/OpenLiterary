@@ -11,9 +11,15 @@ Inspired by NVIDIA Auto Ontology's useful separation, not its stack:
 
 Artifact: ``input/story_graph.json``.  The graph can be rebuilt without an LLM
 from the decision DB and the current ``book_profile.json``.
+
+Round 142 (schema v5) adds deterministic scene nodes and entity -> scene
+incidence (``mentions_in``).  Chapter-level ``appears_in`` edges remain the
+backward-compatible rollup; scene incidence is additive and never replaces an
+existing edge or changes an existing coverage value.
 """
 from __future__ import annotations
 
+from bisect import bisect_right
 import hashlib
 import json
 import re
@@ -30,8 +36,14 @@ from src.judgment_layer import (
     sha256_text,
 )
 
-GRAPH_VERSION = 4
+GRAPH_VERSION = 5
 DEFAULT_GRAPH_PATH = "input/story_graph.json"
+_DEFAULT_SCENE_CHARS = 2200
+
+_PARAGRAPH_SEP_RE = re.compile(r"\r?\n[ \t]*\r?\n")
+_SCENE_HEADING_RE = re.compile(r"^#{1,6}(?:\s|$)")
+_SCENE_HR_RE = re.compile(r"^(?:[*\-_]\s*){3,}$")
+_SCENE_EQ_RE = re.compile(r"^(?:=\s*){3,}$")
 
 
 def _story_graph_config() -> Dict[str, Any]:
@@ -171,6 +183,109 @@ def _first_quote(text: str, start: int, end: int, radius: int = 40) -> str:
     return text[a:b].replace("\n", " ").strip()[:220]
 
 
+def _paragraph_spans(text: str) -> List[Tuple[int, int, str]]:
+    """Return non-empty paragraph spans in the original text.
+
+    Offsets must refer to the chapter file itself, not to a reconstructed
+    ``"\n\n".join(paragraphs)`` string: the latter drifts whenever the source
+    uses blank-line runs, indentation, or other whitespace that is normalized
+    during reconstruction.  Scene incidence quotes are validated by offsets,
+    so keep the original coordinates.
+    """
+    spans: List[Tuple[int, int, str]] = []
+    start = 0
+    pos = 0
+    n = len(text)
+    while pos < n:
+        match = _PARAGRAPH_SEP_RE.search(text, pos)
+        end = match.start() if match else n
+        chunk = text[start:end]
+        if chunk.strip():
+            lead = len(chunk) - len(chunk.lstrip())
+            trail = len(chunk) - len(chunk.rstrip())
+            spans.append((start + lead, end - trail,
+                          chunk[lead:len(chunk) - trail]))
+        if match is None:
+            break
+        start = match.end()
+        pos = start
+    return spans
+
+
+def _is_scene_boundary(paragraph: str) -> bool:
+    """Headings and visual separators start a new scene."""
+    stripped = paragraph.strip()
+    if not stripped:
+        return False
+    first_line = stripped.splitlines()[0].strip()
+    return bool(_SCENE_HEADING_RE.match(first_line)
+                or _SCENE_HR_RE.match(first_line)
+                or _SCENE_EQ_RE.match(first_line))
+
+
+def _scene_policy_label(scene_chars: int) -> str:
+    return ("paragraph_grouping:v1;target_chars=%d;"
+            "boundaries=heading,hr,equals;never_split_paragraph" % int(scene_chars))
+
+
+def _chapter_scenes(text: str, chapter_id: str,
+                    scene_chars: int = _DEFAULT_SCENE_CHARS) -> List[Dict[str, Any]]:
+    """Split one chapter into deterministic, offset-preserving scenes.
+
+    Policy: blank-line paragraph boundaries; a heading / ``***`` / ``---`` /
+    ``= = =`` starts a new scene; otherwise paragraphs are packed up to the
+    target size.  A single oversized paragraph is kept intact because splitting
+    it would break the quote/offset contract this layer exists to provide.
+    """
+    try:
+        target = int(scene_chars)
+    except (TypeError, ValueError):
+        target = _DEFAULT_SCENE_CHARS
+    if target <= 0:
+        target = _DEFAULT_SCENE_CHARS
+    policy = _scene_policy_label(target)
+    raw: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+
+    def flush() -> None:
+        nonlocal current
+        if current is not None:
+            raw.append(current)
+            current = None
+
+    for start, end, paragraph in _paragraph_spans(text):
+        boundary = _is_scene_boundary(paragraph)
+        if boundary:
+            flush()
+        if current is None:
+            current = {"start": start, "end": end, "paragraphs": 1}
+            continue
+        if end - current["start"] > target:
+            flush()
+            current = {"start": start, "end": end, "paragraphs": 1}
+            continue
+        current["end"] = end
+        current["paragraphs"] += 1
+    flush()
+
+    scenes: List[Dict[str, Any]] = []
+    for index, scene in enumerate(raw, 1):
+        start = int(scene["start"])
+        end = int(scene["end"])
+        scenes.append({
+            "id": _node_id("scene", f"{chapter_id}:{index:04d}"),
+            "chapter": chapter_id,
+            "index": index,
+            "start": start,
+            "end": end,
+            "chars": end - start,
+            "hash": sha256_text(text[start:end]),
+            "scene_policy": policy,
+            "paragraphs": int(scene.get("paragraphs") or 0),
+        })
+    return scenes
+
+
 def _node_id(prefix: str, value: Any) -> str:
     return f"{prefix}:{value}"
 
@@ -281,6 +396,7 @@ def build_story_graph(
     cooccur_window: int = 600,
     max_cooccur_edges: int = 600,
     entity_coverage_min: float = 0.5,
+    scene_chars: int = _DEFAULT_SCENE_CHARS,
 ) -> Dict[str, Any]:
     root = Path(project_root)
     dbp = Path(db_path) if db_path else root / "db" / "decision_db.sqlite"
@@ -289,6 +405,14 @@ def build_story_graph(
     rows = _registry_rows(dbp)
     nodes: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
+    try:
+        scene_target = int(scene_chars)
+    except (TypeError, ValueError):
+        scene_target = _DEFAULT_SCENE_CHARS
+    if scene_target <= 0:
+        scene_target = _DEFAULT_SCENE_CHARS
+    scene_policy = _scene_policy_label(scene_target)
+    scene_records_by_chapter: Dict[str, List[Dict[str, Any]]] = {}
 
     for cid, text in texts.items():
         nodes.append({
@@ -298,6 +422,27 @@ def build_story_graph(
             "attributes": {"chars": len(text), "hash": sha256_text(text)},
             "provenance": [{"artifact": "input", "path": f"input/{cid}.md"}],
         })
+        scenes = _chapter_scenes(text, cid, scene_target)
+        scene_records_by_chapter[cid] = scenes
+        for scene in scenes:
+            nodes.append({
+                "id": scene["id"],
+                "type": "scene",
+                "label": f"{cid} scene {int(scene['index']):04d}",
+                "attributes": {
+                    "chapter": cid,
+                    "index": int(scene["index"]),
+                    "start": int(scene["start"]),
+                    "end": int(scene["end"]),
+                    "chars": int(scene["chars"]),
+                    "hash": scene["hash"],
+                    "scene_policy": scene["scene_policy"],
+                    "paragraphs": int(scene["paragraphs"]),
+                },
+                "provenance": [{"artifact": "input", "path": f"input/{cid}.md",
+                                "start": int(scene["start"]),
+                                "end": int(scene["end"])}],
+            })
 
     alias_map: Dict[str, List[str]] = {}
     entity_by_id: Dict[str, Dict[str, Any]] = {}
@@ -457,6 +602,62 @@ def build_story_graph(
                 "certification": entity_certification.get(eid, "pending"),
                 "entity_certification": entity_certification.get(eid, "pending"),
             })
+
+    # Scene incidence is additive to the chapter-level rollup above.  One edge
+    # per (entity, scene), with the first occurrence as its provenance anchor.
+    scene_starts_by_chapter = {
+        cid: [int(scene["start"]) for scene in scenes]
+        for cid, scenes in scene_records_by_chapter.items()
+    }
+    scene_incidence: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    unassigned_scene_occurrences = 0
+    for eid, occs in occurrences.items():
+        for occ in occs:
+            cid = str(occ.get("chapter") or "")
+            scenes = scene_records_by_chapter.get(cid) or []
+            starts = scene_starts_by_chapter.get(cid) or []
+            if not scenes:
+                unassigned_scene_occurrences += 1
+                continue
+            pos = bisect_right(starts, int(occ["start"])) - 1
+            if pos < 0 or int(occ["start"]) >= int(scenes[pos]["end"]):
+                unassigned_scene_occurrences += 1
+                continue
+            scene = scenes[pos]
+            key = (eid, str(scene["id"]))
+            rec = scene_incidence.get(key)
+            if rec is None:
+                rec = {"count": 0, "first": dict(occ), "scene": scene}
+                scene_incidence[key] = rec
+            rec["count"] += 1
+            first = rec["first"]
+            if (int(occ["start"]), int(occ["end"]), str(occ["surface"])) < (
+                    int(first["start"]), int(first["end"]), str(first["surface"])):
+                rec["first"] = dict(occ)
+    for (eid, _scene_id), rec in sorted(scene_incidence.items()):
+        scene = rec["scene"]
+        cid = str(scene["chapter"])
+        first = rec["first"]
+        src = texts.get(cid, "")
+        certification = entity_certification.get(eid, "pending")
+        edges.append({
+            "id": f"edge:mentions_in:{eid}:{cid}:{int(scene['index']):04d}",
+            "type": "mentions_in",
+            "source": _node_id("entity", eid),
+            "target": scene["id"],
+            "count": int(rec["count"]),
+            "provenance": [{
+                "chapter": cid,
+                "scene": scene["id"],
+                "start": int(first["start"]),
+                "end": int(first["end"]),
+                "offset": int(first["start"]),
+                "quote": _first_quote(src, int(first["start"]), int(first["end"])),
+                "surface": first["surface"],
+            }],
+            "certification": certification,
+            "entity_certification": certification,
+        })
 
     pair_counts: Dict[Tuple[str, str], Dict[str, Any]] = {}
     for cid, co in chapter_occurrences.items():
@@ -622,6 +823,39 @@ def build_story_graph(
         appeared_certified / len(certified_entity_ids)
         if certified_entity_ids else 0.0
     )
+    all_scene_ids = {
+        str(scene["id"])
+        for scenes in scene_records_by_chapter.values()
+        for scene in scenes
+    }
+    scenes_with_entities_ids = {key[1] for key in scene_incidence}
+    scenes_with_certified_ids = {
+        key[1] for key in scene_incidence
+        if entity_certification.get(key[0], "pending") == "auto_verified"
+    }
+    scenes_total = len(all_scene_ids)
+    scenes_with_entities = len(scenes_with_entities_ids)
+    scene_coverage = (scenes_with_entities / scenes_total) if scenes_total else 0.0
+    scenes_without_certified_entities = sorted(
+        all_scene_ids - scenes_with_certified_ids
+    )
+    entities_with_scene_incidence = {key[0] for key in scene_incidence}
+    entity_scene_coverage = (
+        len(entities_with_scene_incidence) / total_entities
+        if total_entities else 0.0
+    )
+    certified_entity_scene_coverage = (
+        len(entities_with_scene_incidence & certified_entity_ids)
+        / len(certified_entity_ids)
+        if certified_entity_ids else 0.0
+    )
+    scene_coverage_by_chapter: Dict[str, float] = {}
+    for cid, scenes in sorted(scene_records_by_chapter.items()):
+        per_chapter_ids = {str(scene["id"]) for scene in scenes}
+        covered = len(per_chapter_ids & scenes_with_entities_ids)
+        scene_coverage_by_chapter[cid] = (
+            round(covered / len(per_chapter_ids), 4) if per_chapter_ids else 0.0
+        )
     chapters_with_entities = sorted({
         str(e["target"]).split(":", 1)[-1]
         for e in edges if e["type"] == "appears_in"
@@ -749,6 +983,8 @@ def build_story_graph(
         "cooccur_window": cooccur_window,
         "max_cooccur_edges": max_cooccur_edges,
         "entity_coverage_min": entity_coverage_min,
+        "scene_chars": scene_target,
+        "scene_policy": scene_policy,
     }
     fingerprint = sha256_text(json.dumps(
         {"graph_version": GRAPH_VERSION, "inputs": fingerprint_inputs,
@@ -775,6 +1011,16 @@ def build_story_graph(
             "certified_entity_coverage_of_trusted": round(
                 certified_entity_coverage_of_trusted, 4
             ),
+            "scenes_total": scenes_total,
+            "scenes_with_entities": scenes_with_entities,
+            "scene_coverage": round(scene_coverage, 4),
+            "scenes_with_certified_entities": len(scenes_with_certified_ids),
+            "scenes_without_certified_entities": scenes_without_certified_entities,
+            "entity_scene_coverage": round(entity_scene_coverage, 4),
+            "certified_entity_scene_coverage": round(
+                certified_entity_scene_coverage, 4
+            ),
+            "scene_coverage_by_chapter": scene_coverage_by_chapter,
             "answerable_threshold_basis": "certified_entity_coverage_of_trusted",
             "uncovered_entities": uncovered_entities,
             "uncovered_entity_ids": uncovered_entity_ids,
@@ -819,6 +1065,18 @@ def build_story_graph(
             "alias_tokens": len(alias_map),
             "entity_nodes": total_entities,
             "chapter_nodes": len(texts),
+            "scene_count": scenes_total,
+            "scene_chars": scene_target,
+            "scene_policy": scene_policy,
+            "scenes_per_chapter": {
+                cid: len(scenes)
+                for cid, scenes in sorted(scene_records_by_chapter.items())
+            },
+            "mentions_in_edges": len(scene_incidence),
+            "scene_mentions_total": sum(
+                int(rec["count"]) for rec in scene_incidence.values()
+            ),
+            "unassigned_scene_occurrences": unassigned_scene_occurrences,
             "cooccurrence_pairs_kept": min(len(ranked_pairs), max(0, int(max_cooccur_edges))),
             "unresolved_alias_count": len(unresolved_aliases),
             "unresolved_aliases": unresolved_aliases,
@@ -858,7 +1116,8 @@ def build_and_save_story_graph(project_root: Path = Path("."),
                                **kwargs: Any) -> Dict[str, Any]:
     root = Path(project_root)
     cfg = _story_graph_config() if use_config else {}
-    for key in ("cooccur_window", "max_cooccur_edges", "entity_coverage_min"):
+    for key in ("cooccur_window", "max_cooccur_edges", "entity_coverage_min",
+                "scene_chars"):
         if key in cfg and key not in kwargs:
             kwargs[key] = cfg[key]
     graph = build_story_graph(root, profile=profile, **kwargs)

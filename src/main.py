@@ -187,6 +187,17 @@ _INSTANCE_LOCK_FD: Optional[int] = None
 _MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile", "story-graph",
                       "consolidate", "finalize", "notes-normalize", "requeue"}
 
+
+def _command_needs_lock(command: str, args: object) -> bool:
+    """Return True for commands that can write DB/profile/graph artifacts."""
+    if command in _MUTATING_COMMANDS:
+        return True
+    if command == "consistency" and getattr(args, "apply", False):
+        return True
+    if command == "setup-payoff-audit" and getattr(args, "apply", False):
+        return True
+    return False
+
 # Round 141: Ctrl+C 防误触。第一次只警告并继续，第二次才真正中止。
 _SIGINT_WARNED = False
 
@@ -271,8 +282,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="SagaTrans — AI 文学语义编译系统")
     parser.add_argument("command", nargs="?", default="pipeline",
-                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "story-graph", "drift-audit", "notes-normalize", "requeue"],
-                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, story-graph, drift-audit, notes-normalize, requeue")
+                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "story-graph", "story-graph-query", "setup-payoff-audit", "drift-audit", "notes-normalize", "requeue"],
+                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, story-graph, story-graph-query, setup-payoff-audit, drift-audit, notes-normalize, requeue")
     parser.add_argument("--chapter", default="ch01", help="章节 ID (默认: ch01)")
     parser.add_argument("--chapters", default=None,
                         help="style-profile 命令：抽样章节，逗号分隔（默认均匀抽 5 章）")
@@ -283,9 +294,37 @@ def main():
     parser.add_argument("--deep-overlap-chars", type=int, default=2000,
                         help="style-profile --deep：相邻分段重叠字符数（默认 2000）")
     parser.add_argument("--graph-path", default=None,
-                        help="story-graph 命令：输出路径（默认读取 config.story_graph.path）")
+                        help="story-graph / story-graph-query 命令：图路径（默认读取 config.story_graph.path）")
     parser.add_argument("--require-answerable", action="store_true",
                         help="story-graph 命令：实体覆盖率不可答时返回 2")
+    parser.add_argument("--query", "--question", "--claim", dest="query", default=None,
+                        help="story-graph-query 命令：问题或叙事主张")
+    parser.add_argument("--note-id", default=None,
+                        help="story-graph-query 命令：已验证注记 ID；其 evidence 作为场景种子")
+    parser.add_argument("--top-k", type=int, default=10,
+                        help="story-graph-query 命令：返回场景数（默认 10）")
+    parser.add_argument("--max-hops", type=int, choices=[1, 2], default=2,
+                        help="story-graph-query 命令：最大 incidence 跳数（默认 2）")
+    parser.add_argument("--llm-judge", action="store_true",
+                        help="story-graph-query 命令：对候选做一次本地 LLM 必要证据复核（失败 fail-open）")
+    parser.add_argument("--no-dpp", action="store_true",
+                        help="story-graph-query 命令：关闭 DPP 多样性重排")
+    parser.add_argument("--no-note-similarity", action="store_true",
+                        help="story-graph-query 命令：关闭问题→已验证注记的相似度种子（严格别名模式）")
+    parser.add_argument("--eval-cases", default=None,
+                        help="story-graph-query 命令：运行 gold-span 评测 JSON")
+    parser.add_argument("--profile-path", default=None,
+                        help="setup-payoff-audit 命令：book_profile.json 路径（默认 input/book_profile.json）")
+    parser.add_argument("--top-n", type=int, default=5,
+                        help="setup-payoff-audit 命令：每个 setup 保留的候选数（默认 5）")
+    parser.add_argument("--audit-batch-size", type=int, default=8,
+                        help="setup-payoff-audit 命令：LLM 选候选的批大小（默认 8，上限 10）")
+    parser.add_argument("--audit-in", default=None,
+                        help="setup-payoff-audit 命令：复用已有候选审计 JSON（不重复调用模型）")
+    parser.add_argument("--llm", action="store_true",
+                        help="setup-payoff-audit 命令：调用本地模型从候选 ID 中选择 payoff（失败 fail-open）")
+    parser.add_argument("--l2", action="store_true",
+                        help="setup-payoff-audit 命令：对 L1 通过的配对做低成本 L2 复核")
     parser.add_argument("--fix-from-review", action="store_true",
                         help="pipeline 命令：读取 review_dirty.json，二次校验锚句后定向重跑结构 P0 chunk")
     parser.add_argument("--review-dirty-path", default="output/review_dirty.json",
@@ -325,7 +364,7 @@ def main():
 
     # Round 130: 单实例守卫（审计①）——写共享状态的命令必须独占锁；
     # 只读命令（gate/lint/drift-audit 等）不拦截，便于运行中诊断。
-    if args.command in _MUTATING_COMMANDS or (args.command == "consistency" and args.apply):
+    if _command_needs_lock(args.command, args):
         if not acquire_instance_lock():
             sys.exit(1)
 
@@ -403,12 +442,220 @@ def main():
                   f"entity_coverage={_cov.get('entity_coverage', 0):.1%} "
                   f"chapters={_cov.get('chapters_with_entities', 0)}/{_cov.get('chapters_total', 0)} "
                   f"answerable={_cov.get('answerable')}")
+            print(f"   scenes={_cov.get('scenes_with_entities', 0)}/{_cov.get('scenes_total', 0)} "
+                  f"scene_coverage={_cov.get('scene_coverage', 0):.1%} "
+                  f"mentions_in={(_graph.get('diagnostics') or {}).get('mentions_in_edges', 0)}")
             if _cov.get("uncovered_entities"):
                 print(f"   uncovered_entities={len(_cov.get('uncovered_entities') or [])}")
             if _cov.get("uncovered_chapters"):
                 print(f"   uncovered_chapters={','.join(_cov.get('uncovered_chapters') or [])}")
             if args.require_answerable and not _cov.get("answerable"):
                 sys.exit(2)
+        elif args.command == "story-graph-query":
+            from src.story_graph import load_story_graph
+            from src.story_graph_query import (
+                StoryGraphQueryIndex,
+                default_story_graph_query_generate,
+                evaluate_story_graph_query,
+                format_query_result,
+            )
+            from src.judgment_layer import atomic_write_json
+            _root = Path.cwd()
+            _rel = str((_config.get("story_graph", {}) or {}).get("path")
+                       or "input/story_graph.json")
+            _path = Path(args.graph_path) if args.graph_path else _root / _rel
+            _graph = load_story_graph(_path)
+            if not _graph:
+                print(f"❌ story-graph-query: 无法读取图 artifact: {_path}",
+                      file=sys.stderr)
+                sys.exit(1)
+            _in_dir = Path(args.input_dir) if args.input_dir else _root / "input"
+            _index = StoryGraphQueryIndex(_graph, input_dir=_in_dir)
+            _gen = default_story_graph_query_generate if args.llm_judge else None
+            if args.eval_cases:
+                _cases_path = Path(args.eval_cases)
+                try:
+                    _payload = json.loads(_cases_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    print(f"❌ story-graph-query eval: 读取失败 {_cases_path}: {exc}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                _cases = _payload.get("cases") if isinstance(_payload, dict) else _payload
+                _eval = evaluate_story_graph_query(
+                    _index, _cases or [], top_k=args.top_k,
+                    max_hops=args.max_hops, use_dpp=not args.no_dpp,
+                    use_note_similarity=not args.no_note_similarity,
+                    llm_generate=_gen,
+                )
+                _m = _eval.get("metrics") or {}
+                print(f"🧪 story-graph-query eval: cases={_m.get('cases', 0)} "
+                      f"R@5={_m.get('R@5', 0):.1%} R@10={_m.get('R@10', 0):.1%} "
+                      f"AE@5={_m.get('AE@5', 0):.1%} AE@10={_m.get('AE@10', 0):.1%} "
+                      f"anchor_precision@1={_m.get('anchor_precision@1', 0):.1%}")
+                if _m.get("note_evidence_cases"):
+                    print(f"   note_evidence: n={_m.get('note_evidence_cases')} "
+                          f"R@5={_m.get('note_evidence_R@5', 0):.1%} "
+                          f"R@10={_m.get('note_evidence_R@10', 0):.1%} "
+                          f"anchor_precision@1={_m.get('note_evidence_anchor_precision@1', 0):.1%}")
+                if _m.get("alias_only_cases"):
+                    print(f"   alias_only: n={_m.get('alias_only_cases')} "
+                          f"R@5={_m.get('alias_only_R@5', 0):.1%} "
+                          f"R@10={_m.get('alias_only_R@10', 0):.1%} "
+                          f"anchor_precision@1={_m.get('alias_only_anchor_precision@1', 0):.1%}")
+                if _m.get("note_similarity_cases"):
+                    print(f"   note_similarity: n={_m.get('note_similarity_cases')} "
+                          f"R@5={_m.get('note_similarity_R@5', 0):.1%} "
+                          f"R@10={_m.get('note_similarity_R@10', 0):.1%} "
+                          f"anchor_precision@1={_m.get('note_similarity_anchor_precision@1', 0):.1%}")
+                if args.json_out:
+                    atomic_write_json(Path(args.json_out), _eval)
+                    print(f"   json_out: {args.json_out}")
+                sys.exit(0)
+            if not args.query and not args.note_id:
+                print("❌ story-graph-query: 需要 --query/--question/--claim 或 --note-id",
+                      file=sys.stderr)
+                sys.exit(2)
+            _result = _index.query(
+                query=args.query or "", note_id=args.note_id,
+                top_k=args.top_k, max_hops=args.max_hops,
+                use_dpp=not args.no_dpp,
+                use_note_similarity=not args.no_note_similarity,
+                llm_generate=_gen,
+            )
+            print(format_query_result(_result, max_items=max(1, min(10, args.top_k))))
+            if args.json_out:
+                atomic_write_json(Path(args.json_out), _result)
+                print(f"   json_out: {args.json_out}")
+        elif args.command == "setup-payoff-audit":
+            import shutil
+
+            from src.judgment_layer import atomic_write_json
+            from src.setup_payoff_audit import (
+                DEFAULT_AUDIT_PATH,
+                build_setup_payoff_audit,
+                default_setup_payoff_audit_generate,
+                format_setup_payoff_audit_summary,
+                promote_setup_payoff_pairs,
+                select_setup_payoff_candidates,
+                verify_setup_payoff_selections,
+            )
+            from src.story_graph import (
+                build_story_graph,
+                load_story_graph,
+                save_story_graph,
+            )
+            from src.story_graph_query import StoryGraphQueryIndex
+            from src.style_profiler import load_profile, save_profile
+
+            _root = Path.cwd()
+            _profile_path = (Path(args.profile_path) if args.profile_path
+                             else _root / "input" / "book_profile.json")
+            _profile = load_profile(_profile_path)
+            if not _profile:
+                print(f"❌ setup-payoff-audit: 无法读取剖面 {_profile_path}",
+                      file=sys.stderr)
+                sys.exit(1)
+            _rel = str((_config.get("story_graph", {}) or {}).get("path")
+                       or "input/story_graph.json")
+            _graph_path = Path(args.graph_path) if args.graph_path else _root / _rel
+            _graph = load_story_graph(_graph_path)
+            if not _graph:
+                print(f"❌ setup-payoff-audit: 无法读取图 artifact {_graph_path}",
+                      file=sys.stderr)
+                sys.exit(1)
+            _input_dir = Path(args.input_dir) if args.input_dir else _root / "input"
+            _index = StoryGraphQueryIndex(_graph, input_dir=_input_dir)
+            if args.audit_in:
+                try:
+                    _audit = json.loads(Path(args.audit_in).read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    print(f"❌ setup-payoff-audit: 无法读取 --audit-in {args.audit_in}: {exc}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                if not isinstance(_audit, dict) or not isinstance(_audit.get("cases"), list):
+                    print("❌ setup-payoff-audit: --audit-in 不是有效审计制品",
+                          file=sys.stderr)
+                    sys.exit(1)
+                print(f"♻️ setup-payoff-audit: 复用审计制品 {args.audit_in}")
+            else:
+                _audit = build_setup_payoff_audit(
+                    _profile, _index, top_n=args.top_n, max_hops=args.max_hops)
+                if args.llm:
+                    _audit = select_setup_payoff_candidates(
+                        _audit, _index.chapter_texts,
+                        default_setup_payoff_audit_generate,
+                        batch_size=args.audit_batch_size)
+                if args.l2:
+                    if not args.llm:
+                        print("⚠️ setup-payoff-audit: --l2 需要 --llm 选出的候选；本次 L2 将无事可做")
+                    _audit = verify_setup_payoff_selections(
+                        _audit, _index.chapter_texts, llm_generate=None,
+                        batch_size=10)
+            print(format_setup_payoff_audit_summary(_audit))
+            if args.apply:
+                if not args.audit_in and not (args.llm and args.l2):
+                    print("❌ setup-payoff-audit --apply 需要同时指定 --llm 与 --l2，"
+                          "或使用已完成 L2 的 --audit-in",
+                          file=sys.stderr)
+                    sys.exit(2)
+                if args.audit_in and int((_audit.get("summary") or {}).get(
+                        "promotion_eligible") or 0) <= 0:
+                    print("❌ setup-payoff-audit: --audit-in 没有 promotion_eligible 配对；"
+                          "请先跑 --llm --l2",
+                          file=sys.stderr)
+                    sys.exit(2)
+                _promoted = promote_setup_payoff_pairs(_profile, _audit)
+                # Compare against a fresh graph built from the current DB/profile,
+                # not a possibly stale on-disk artifact.
+                _baseline_graph = build_story_graph(
+                    _root, profile=_profile, input_dir=_input_dir)
+                _new_graph = build_story_graph(
+                    _root, profile=_promoted["profile"], input_dir=_input_dir)
+                _old_cov = _baseline_graph.get("coverage") or {}
+                _new_cov = _new_graph.get("coverage") or {}
+                _old_cert = float(_old_cov.get("certified_entity_coverage_of_trusted") or 0.0)
+                _new_cert = float(_new_cov.get("certified_entity_coverage_of_trusted") or 0.0)
+
+                def _unresolved(payload):
+                    for gap in (payload.get("knowledge_gaps") or []):
+                        if str(gap.get("code") or "") == "unresolved_aliases":
+                            return int(gap.get("count") or 0)
+                    return 0
+
+                _old_alias = _unresolved(_baseline_graph)
+                _new_alias = _unresolved(_new_graph)
+                if _new_cert + 1e-9 < _old_cert or _new_alias > _old_alias:
+                    print("❌ setup-payoff-audit apply: 图谱不变量失败；未写 profile/graph "
+                          f"(cert {_old_cert:.4f}->{_new_cert:.4f}, "
+                          f"unresolved_alias {_old_alias}->{_new_alias})",
+                          file=sys.stderr)
+                    sys.exit(1)
+                _backup = _profile_path.with_name(
+                    _profile_path.stem + ".pre_setup_payoff_audit.json")
+                if not _backup.exists():
+                    shutil.copy2(_profile_path, _backup)
+                save_profile(_promoted["profile"], _profile_path)
+                save_story_graph(_new_graph, path=_graph_path, project_root=_root)
+                _audit["apply"] = {
+                    "activated": _promoted["activated"],
+                    "already_resolved": _promoted["already_resolved"],
+                    "terminal": _promoted["terminal"],
+                    "skipped_cap": _promoted["skipped_cap"],
+                    "existing_active": _promoted["existing_active"],
+                    "available_slots": _promoted["available_slots"],
+                    "certified_entity_coverage_of_trusted": {
+                        "before": _old_cert, "after": _new_cert},
+                    "unresolved_aliases": {"before": _old_alias, "after": _new_alias},
+                    "profile_backup": str(_backup),
+                }
+                print(f"✅ setup-payoff-audit apply: activated={len(_promoted['activated'])} "
+                      f"terminal={len(_promoted['terminal'])} "
+                      f"cert={_old_cert:.4f}->{_new_cert:.4f} "
+                      f"unresolved_alias={_old_alias}->{_new_alias}")
+            _out_path = (Path(args.json_out) if args.json_out
+                         else _root / DEFAULT_AUDIT_PATH)
+            atomic_write_json(_out_path, _audit)
+            print(f"   json_out: {_out_path}")
         elif args.command == "drift-audit":
             from src.drift_audit import (
                 audit_chapter,

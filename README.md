@@ -28,6 +28,8 @@ SagaTrans 把长篇文学翻译实现为一条可检查、可回滚的编译流�
 | 动态风格剖面 | 从当前作品原文生成，不硬编码任何书先验；支持 `style-profile --deep` 全书分段深读 |
 | 全书判断层 | v2 剖面保存 voice / arc / setup-payoff 注记，经 L1 原文匹配与 L2 交叉复核后作为 advisory 制品 |
 | 故事知识图谱 | `story-graph` 从实体注册表与章节原文确定性构建出现/共现边，叠加已验证的叙事边，并输出显式 `knowledge_gaps` |
+| 故事图查询 | `story-graph-query` 以别名、已验证注记或问题相似度种子检索场景，最多两跳，输出可审计 trace；只读、不注入翻译回路 |
+| 伏笔回收审计 | `setup-payoff-audit` 只为更后章节候选场景分配 ID，代码组装双章 evidence 并经 L1/L2 验证后才受控提升；默认只读 |
 | 成书级终审 | `editor_review.py` 支持逐章与 `--global` 弧线审读；结构 P0 可经机械锚句校验后写入 `review_dirty` |
 | 可回滚治理 | 章末合并式回溯、chunk/章级预算、PF 复活、旧稿 merit 保护、哈希绑定的 review-fix sidecar |
 | 交付工具链 | 成书清洗、一致性校正、双关核销、文学指标、交付 gate 与 EPUB3 导出 |
@@ -167,7 +169,11 @@ python3 scripts/build_epub.py --out output/book.epub
 | `golden --judgment-ab --chapter chXX` | 只比较判断层注记 off/on，不乘入模型×effort 矩阵 |
 | `style-profile --deep` | 全书分段深读、L1/L2 验证并生成 v2 剖面 |
 | `story-graph --require-answerable` | 重建故事图；实体索引不可答时退出码 2 |
+| `story-graph-query --query "..."` | 只读查询场景与锚句；自动匹配已验证注记，输出 seeds / hops / DPP / 图指纹 trace |
+| `story-graph-query --eval-cases cases.json` | 在 gold span 评测集上输出 R@5、R@10、AE 与 anchor precision |
+| `setup-payoff-audit` | 只读审计未配对 setup，输出更后章节候选；加 `--llm --l2 --apply` 才受控提升 |
 | `editor_review.py --global --review-dirty` | 成书级全书审读并生成机械校验过的结构修复清单 |
+| `editor_review.py --global --retrieval` | 可选注入有界跨章场景证据；默认关闭，单章 A/B 未显示稳定收益 |
 | `pipeline --fix-from-review` | 读取 `review_dirty.json`，定向重跑结构 P0 chunk |
 | `consistency` / `lint` / `gate` | 一致性、成书格式与交付门禁 |
 | `drift-audit --jev` | 翻译漂移与 Jev 窗口一致性诊断 |
@@ -180,6 +186,43 @@ python3 scripts/build_epub.py --out output/book.epub
 - **成书级**：`editor_review.py` 检查悬空承诺、重复注释、翻译腔、声音断裂、注释过密和弧线违背。
 - **结构修复**：只有机械锚定且唯一落块的 P0 才进入 `review_dirty`；sidecar 绑定原 final 哈希，旧反馈不会污染后续重跑。
 - **交付级**：状态机完成度、产物完整性、QA、book lint、EPUB→MD 审计、韵文、双关和最终 gate。
+
+### 故事图查询（Phase B）
+
+```bash
+python3 -m src.main story-graph-query --query "杰西卡如何成为圣母？" --top-k 10
+python3 -m src.main story-graph-query --note-id note:arc-ch05-p4-001 --llm-judge
+python3 -m src.main story-graph-query --eval-cases path/to/cases.json --top-k 10
+```
+
+查询层只读取 `input/story_graph.json` 与章源文件，不写图、不改认证、不参与翻译注入。只有 `status=active` 且通过 L1/L2 的注记会进入检索；问题没有显式注记时，会与这些已验证 arc / setup-payoff 注记做相似度匹配。LLM 复核是可选增强，失败时 fail-open。Dune 26 例代理评测（gold 取自已验证注记 evidence）在 Phase C1 后为：note-evidence 模式 R@5/R@10/anchor precision@1 均 100%；自动问题模式 R@5/R@10 100%、anchor precision@1 92.3%；严格别名模式仍仅 R@5 5.8% / R@10 9.6%，说明主要瓶颈是 Decision DB 未消歧别名，而不是叙事注记数量。该指标是代理集结果，不代表人工场景标注基准。
+
+### 伏笔回收审计（Phase C）
+
+```bash
+# 默认只读：确定性生成候选并写入 output/setup_payoff_candidates.json
+python3 -m src.main setup-payoff-audit
+
+# 完整受控流程：模型只选 candidate ID，L1 校验原文，L2 小批复核，最后 --apply
+python3 -m src.main setup-payoff-audit --llm --l2 --apply
+
+# 复用已完成的 L2 审计制品，避免再次调用选择模型
+python3 -m src.main setup-payoff-audit --audit-in /tmp/setup_audit_c1.json --apply
+```
+
+候选只来自 setup 之后的章节；模型不得返回引文或新 ID，双章 evidence 由代码组装。L1 对切分后的章源文件做精确→归一化→滑窗匹配，L2 按 ≤10 条小批复核；只有两级都通过的配对才会提升为 active。`--apply` 前会比较新构建的故事图基线，若 certified coverage 下降或 unresolved alias 增加则拒绝写入；写前保留 `book_profile.pre_setup_payoff_audit.json`。已激活和 `terminal_unpaired` 注记是终态，重复审计与复用旧制品不会重复计数或改写。
+
+真实 Dune 工作区 C1 结果：49 条未配对 setup 中，42 条可行动、7 条 ch07 标记为终态；模型选中 13 条，L1 命中 13/13、L2 确认 13/13 并全部受控提升。未配对缺口从 49 降至 29，active setup-payoff 注记从 9 增至 22；44 条 setup/payoff evidence 复核 44/44 命中。certified trusted coverage 保持 0.8987，`unresolved_aliases` 保持 371。收益集中在叙事检索与全书终审上下文；实体消歧仍是独立瓶颈。
+
+### 终审检索 A/B（Phase D，默认关闭）
+
+```bash
+python3 scripts/editor_review.py --chapters ch03 --global \
+  --retrieval --retrieval-top-k 3 --retrieval-max-chars 1800 \
+  --json output/editor_review.json --md output/editor_review.md
+```
+
+`--retrieval` 只允许与 `--global` 同用，每段最多注入 3 个跨章场景和锚句，字符数有上限，初始化或查询失败均 fail-open。Dune `ch03` 单章单轮 A/B：off 为 25 个问题（P0=8 / P1=11 / P2=6），on 为 30 个（P0=9 / P1=15 / P2=6）；两臂机械锚点均 100%（25/25、30/30），section error 均为 0。on-arm 每段实际注入 426 / 432 字符，但检索 top-3 分数仅约 0.19–0.21，证据与本章问题关联较弱；问题集合只有 4 条精确重合，差异主要符合温度 0.2 下的采样波动，且 on-arm 遇到一次 300 秒超时重试。由此不能把新增 5 个问题归因于检索收益。**结论：保持 `--retrieval` 默认关闭，Phase E 运行时注入继续关闭；只有多章多轮、人工 gold 问题集证明稳定收益后再重新评估。**审计制品见 `output/editor_review_phase_d_ab.json`。
 
 长篇运行还有三条硬规则：
 
@@ -203,9 +246,11 @@ python3 scripts/sync_book_lint_mirror.py --check
 | `output/chXX/chXX_chunk*_final.json` | 最终 chunk 稿 |
 | `output/<中文书名>.md` | 合并、清洗后的成书文本 |
 | `output/style_profile_audit.*` | 深读注记验证、丢弃与状态明细 |
+| `output/setup_payoff_candidates.json` | Phase C0/C1 候选、L1/L2 判定与受控提升审计 |
 | `input/book_profile.json` | 书级风格/叙事剖面（运行产物，不入库） |
-| `input/story_graph.json` | 全书实体/故事图（运行产物，不入库） |
+| `input/story_graph.json` | 全书实体/故事图（schema v5：章级 `appears_in` + 场景级 `mentions_in`；运行产物，不入库） |
 | `output/editor_review*.json` | 成书审读结果与锚点校验信息 |
+| `output/editor_review_phase_d_ab.json` | Phase D 单章检索 on/off 审计与默认关闭结论 |
 | `output/review_dirty.json` | 可定向修复的结构 P0 清单 |
 | `output/book.epub` | EPUB3 成品 |
 
@@ -236,6 +281,8 @@ python3 -m pytest -q tests/test_round119_mirror_parity.py
 │   ├── pipeline.py          # chunk 状态机与质量闭环
 │   ├── judgment_layer.py    # 注记 schema、L1/L2、切片注入
 │   ├── story_graph.py       # 实体/叙事知识图谱
+│   ├── story_graph_query.py # 只读故事图检索与评测
+│   ├── setup_payoff_audit.py # 伏笔候选审计与受控提升
 │   ├── style_profiler.py    # 抽样与全书深读剖面
 │   ├── core/                # scheduler / decision engine
 │   ├── agents/              # 直译 / 润色 / critic / rewriter

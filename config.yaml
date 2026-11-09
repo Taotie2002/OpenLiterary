@@ -179,6 +179,18 @@ task_routing:
     params_override:
       temperature: 0.2
       max_tokens: 60000
+  story_graph_query:           # Round 142 Phase B：只读图谱检索的可选必要证据复核
+    model: secondary
+    effort: "none"
+    params_override:
+      temperature: 0.0
+      max_tokens: 12000
+  setup_payoff_audit:          # Round 142 Phase C0：只从候选场景中选择回收证据
+    model: secondary
+    effort: low                # 候选选择是归并判断，不需要深读级推理
+    params_override:
+      temperature: 0.0
+      max_tokens: 20000
   golden_test:                 # 黄金测试集（与上面 5 类一致，独立列出便于单独调）
     reference_extraction: primary
     reference_confirmation: primary
@@ -414,6 +426,7 @@ story_graph:
   cooccur_window: 600          # 同章实体共现的字符窗口（确定性 L0 边）
   max_cooccur_edges: 600       # 共现边上限，防止图膨胀；按出现次数排序后截断
   entity_coverage_min: 0.5     # 可信实体（high 且 pending_review=0）自身出现覆盖率低于此值时关闭图上下文；全量 registry 覆盖率仅诊断
+  scene_chars: 2200            # Round 142 场景目标长度：按空行段落装箱，标题/***/---/= = = 强制分段；超长段落整段保留
 
 review_fix:
   # --fix-from-review 只接受落在 final 文本中的 P0 锚句；每个 chunk 的治理预算复用
