@@ -16,6 +16,7 @@ env/
 # 工具内部状态
 .sisyphus/
 .opencode/
+.workbuddy/
 
 # 密钥/环境变量（绝不上传）
 .env
@@ -76,7 +77,9 @@ plan.md
 
 # 运行时产物（书级/单次运行，不入库）
 db/chunk_tags.json
-input/book_profile.json
+# 判断层/图谱运行产物（可按源文与 DB 重建）
+input/book_profile*.json
+input/story_graph.json
 input/_conversion_audit.md
 input/entity_variants.yaml
 input/verse_manifest.json

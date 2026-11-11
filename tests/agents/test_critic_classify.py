@@ -21,11 +21,8 @@ from typesafe_sdk import (
     TypeSafeBadRequestError, TypeSafeAPIResponseValidationError,
     TypeSafeAPIError,
 )
-import httpx
-
-
 def _headers():
-    return httpx.Headers({})
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +36,7 @@ class TestClassifyWithRealExceptions:
         exc = TypeSafeAuthenticationError(401, {"error": "invalid api key"}, _headers(), "invalid api key")
         out = _classify_backend_error(exc)
         assert out["category"] == "auth"
-        assert "check TYPESAFE_API_KEY" in out["action"]
+        assert "check MOARK_API_KEY" in out["action"]
         assert "invalid api key" in out["msg"]
 
     def test_rate_limit_error_maps_to_rate_limit(self):
@@ -63,11 +60,11 @@ class TestClassifyWithRealExceptions:
         assert out["category"] == "network"
         assert "DNS" in out["action"] or "firewall" in out["action"]
 
-    def test_bad_request_error_maps_to_bad_request(self):
+    def test_bad_request_error_maps_to_request_schema(self):
         from typesafe_sdk import TypeSafeBadRequestError
         exc = TypeSafeBadRequestError(400, {"error": "invalid question schema"}, _headers(), "invalid question schema")
         out = _classify_backend_error(exc)
-        assert out["category"] == "bad_request"
+        assert out["category"] == "request_schema"
         assert "schema" in out["action"].lower()
 
     def test_response_validation_error_maps_to_schema_mismatch(self):
@@ -150,7 +147,7 @@ class TestClassifyReturnStructure:
     def test_category_is_one_of_known_values(self):
         valid = {
             "auth", "rate_limit", "timeout", "network",
-            "bad_request", "schema_mismatch", "api_error", "unknown",
+            "request_schema", "schema_mismatch", "api_error", "unknown",
         }
         out = _classify_backend_error(ValueError("test"))
         assert out["category"] in valid

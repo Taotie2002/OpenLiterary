@@ -48,9 +48,23 @@ def _classify_backend_error(exc: Exception) -> Dict[str, Any]:
     分类目标：让用户在 critic_report 中看到 Jev 失败的根因（auth/network/schema/...），
     而不是只能看到一个通用回退路径。
     """
+    # Round 145: model-access 403 and 400 request-schema must be distinguished
+    # from auth failures.  Reuse the same classifier as the backend so the
+    # circuit breaker and the report cannot disagree.
+    try:
+        from src.judges.typesafe_backend import classify_backend_error as _shared_classify
+        _shared = _shared_classify(exc, sdk_available=_TYPESAFE_EXC_AVAILABLE)
+        if _shared.get("category") in ("model_access", "request_schema"):
+            return _shared
+    except Exception:
+        pass
     if _TYPESAFE_EXC_AVAILABLE:
         if isinstance(exc, TypeSafeAuthenticationError):
-            return {"category": "auth", "msg": str(exc), "action": "check TYPESAFE_API_KEY"}
+            return {
+                "category": "auth",
+                "msg": str(exc),
+                "action": "check MOARK_API_KEY (legacy TYPESAFE_API_KEY)",
+            }
         if isinstance(exc, TypeSafeRateLimitError):
             return {"category": "rate_limit", "msg": str(exc), "action": "wait or upgrade quota"}
         if isinstance(exc, TypeSafeAPITimeoutError):
@@ -69,14 +83,17 @@ def _classify_backend_error(exc: Exception) -> Dict[str, Any]:
     # 只用消息文本匹配（不含 repr/类名）：类名如 TypeSafeAuthenticationError
     # 会让 "authentication" 关键字在 SDK 不可用的退化路径上误命中（Round 53 测试锁定）。
     combined = str(exc).lower()
-    if "typesafe_sdk" in combined and any(
+    missing_module = isinstance(exc, ModuleNotFoundError) or any(
         k in combined for k in ("no module named", "modulenotfound", "not installed")
-    ):
+    )
+    if missing_module:
+        module_name = getattr(exc, "name", None)
+        target = f" {module_name}" if module_name else ""
         return {
             "category": "dependency",
             "retryable": False,
             "msg": str(exc)[:200],
-            "action": "安装 typesafe_sdk，或关闭 typesafe 并显式启用 OpenAICompat 降级",
+            "action": f"安装缺失依赖{target}（见 requirements-core.txt），或关闭 typesafe 并显式启用 OpenAICompat 降级",
         }
     if any(k in combined for k in ("429", "rate limit", "rate_limit", "quota", "too many requests")):
         return {"category": "rate_limit", "retryable": True, "msg": str(exc)[:200], "action": "wait or upgrade quota"}
@@ -255,19 +272,39 @@ Schema 要求：
             try:
                 if isinstance(backend, FallbackBackend):
                     # 探测：哪个 backend 能用（A6 修复：异常不再静默吞，分类记录）
-                    if backend.primary.api_key and not getattr(backend, "_jev_auth_dead", False):
+                    primary_ok = (
+                        backend.primary_available()
+                        if hasattr(backend, "primary_available")
+                        else bool(backend.primary.api_key
+                                  and not getattr(backend, "_jev_auth_dead", False))
+                    )
+                    if primary_ok:
                         try:
                             answers = backend.primary.evaluate(state, questions, timeout=backend.timeout)
-                            backend_path = "jev"
+                            backend_path = getattr(
+                                backend.primary, "backend_kind", "jev"
+                            )
+                            # Round 145: flat success audit fields (no nested
+                            # dict values) so pipeline's error-diagnostics
+                            # summary ignores them.
+                            backend_diagnostics.update(
+                                getattr(backend.primary, "last_diagnostics", {}) or {}
+                            )
                         except Exception as e_jev:
                             diag = _classify_backend_error(e_jev)
                             backend_diagnostics["jev"] = diag
                             if diag["category"] in ("auth", "dependency"):
                                 backend._jev_auth_dead = True
+                            elif diag["category"] == "model_access":
+                                backend._jev_model_dead = True
                     if not answers and backend.allow_openai_fallback:
                         try:
                             answers = backend.fallback.evaluate(state, questions, timeout=backend.timeout)
                             backend_path = "openai_compat"
+                            backend_diagnostics.update({
+                                "provider": "openai_compat",
+                                "model": getattr(backend.fallback, "model_name", None),
+                            })
                         except (ConnectionError, OSError) as e_conn:
                             backend_diagnostics["openai_compat"] = {
                                 "category": "network",
@@ -277,7 +314,12 @@ Schema 要求：
                             raise ConnectionError("OpenAICompat 网络层失败") from e_conn
                 else:
                     answers = backend.evaluate(state, questions, timeout=backend.timeout)
-                    backend_path = type(backend).__name__
+                    backend_path = getattr(
+                        backend, "backend_kind", type(backend).__name__
+                    )
+                    backend_diagnostics.update(
+                        getattr(backend, "last_diagnostics", {}) or {}
+                    )
             except (ConnectionError, OSError) as e_conn_outer:
                 # 兜底走 Mock 时记录 connection 级诊断
                 backend_diagnostics_outer = {
@@ -290,6 +332,10 @@ Schema 要求：
                 if backend.allow_mock and backend._mock is not None:
                     answers = backend._mock.evaluate(state, questions)
                     backend_path = "mock_heuristic"
+                    backend_diagnostics.update({
+                        "provider": "mock_heuristic",
+                        "model": None,
+                    })
 
             # 兜底：OpenAICompat 返回 0 个答案（说明 _config.llm_backend="mock" 走 mock backend，
             #       mock 输出无法解析成 typesafe schema），降级到 MockBackend 启发式
@@ -297,6 +343,10 @@ Schema 要求：
                 if isinstance(backend, FallbackBackend) and backend.allow_mock and backend._mock is not None:
                     answers = backend._mock.evaluate(state, questions)
                     backend_path = "mock_heuristic"
+                    backend_diagnostics.update({
+                        "provider": "mock_heuristic",
+                        "model": None,
+                    })
                 else:
                     raise RuntimeError("所有 backend 都未产出答案")
 

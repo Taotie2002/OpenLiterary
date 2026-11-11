@@ -55,6 +55,23 @@ def test_postprocess_identity_on_clean_text():
     assert postprocess_chunk_text(t, "ch01", 0) == t
 
 
+def test_postprocess_strips_leading_unnumbered_h1_block():
+    src_text = "\n".join([
+        "# 第一部",
+        "# 沙丘",
+        "",
+        "第一部",
+        "",
+        "沙丘",
+        "",
+        "正文从引文之后开始。",
+    ])
+    out = postprocess_chunk_text(src_text, "ch01", 0)
+    assert "# 第一部" not in out
+    assert "# 沙丘" not in out
+    assert "正文从引文之后开始。" in out
+
+
 def test_sup_run_to_int():
     assert sup_run_to_int("¹") == 1
     assert sup_run_to_int("¹²") == 12

@@ -21,7 +21,15 @@ from src.utils.llm_adapter import (
     get_role_model_name,
     robust_json_loads,
 )
-from src.core.decision_engine import DecisionEngine, DecisionLevel
+from src.core.decision_engine import (
+    DecisionEngine,
+    DecisionLevel,
+    alias_attested_in_text,
+    classify_entity_source_name,
+    decision_alias_belongs_to_owner,
+    decision_alias_conflicts_with_owner,
+    load_decision_alias_targets,
+)
 
 
 def _levenshtein_distance(s1: str, s2: str) -> int:
@@ -111,11 +119,19 @@ class ReferenceAgent:
 【实体识别要求】
 对于识别出的人物/地点实体，必须提供以下字段：
 - canonical_name: 主名（中文译名，统一规范）
-- source_names: 原文中出现的所有指称形式（本名、昵称、"the captain"这类称谓、代词轨迹），JSON数组
+- source_names: 本片段中能**唯一指向该实体**的专名（本名、姓氏+名字、头衔+名字），JSON数组。
+  禁止把 the Duke / my Lord / Father / the Emperor / the man / 代词轨迹 放进 source_names；
+  这些泛称、关系词、描述性指称一律放进 context_names。
+- context_names: 本片段中指向该实体的泛称/称谓/关系词/描述性指称，JSON数组（可一对多，不作硬约束）
 - pronoun_gender: 代词性别
 - entity_type: 实体类型
 - confidence: 把握程度
 - translation_strategy: 翻译策略（literal=直译, transliteration=音译, free=自由意译）；首次登记后固定，后续必须沿用同一策略
+
+【别名归属硬约束】
+- 同一个 source_name 只能属于一个 canonical。若某指称可能指多人，或指代对象不确定，放入 context_names。
+- 不要在一个角色的 source_names 里登记其他角色的名字或别称。
+- 不要把 "Duke Leto" 登记给 Paul/Baron，"the Emperor" 登记给 Baron；这类跨人物错配会直接污染全书实体库。
 
 【输出格式】
 必须输出纯 JSON 格式，不要包含任何 Markdown 代码块标记（如 ```json）。
@@ -133,7 +149,8 @@ Schema 如下：
   "entities": [
     {{
       "canonical_name": "主名（中文译名，统一规范）",
-      "source_names": ["原文中的指称形式1", "指称形式2"],
+      "source_names": ["可唯一识别该实体的专名1", "专名2"],
+      "context_names": ["the Duke", "my Lord", "代词轨迹等泛称/关系指称"],
       "pronoun_gender": "he/she/it/unknown",
       "entity_type": "person/place/organization/other",
       "confidence": "high/medium/low",
@@ -191,7 +208,8 @@ Schema 如下：
 【复核规则】
 1. 逐条核验 allusion_target 是否被原文支撑；无依据、张冠李戴或明显误判 → 删除。
 2. 补漏：初筛漏掉且确有出处的典故/隐喻/历史名词 → 追加（宁精勿滥）。
-3. 实体：合并重复指称；canonical_name 统一为规范中文译名；source_names 必须都是原文实际出现的形式。
+3. 实体：合并重复指称；canonical_name 统一为规范中文译名；source_names 只保留可唯一识别该实体的专名，
+   泛称/关系词/描述性指称移入 context_names。source_name 跨 canonical 冲突时，宁可放入 context_names，绝不硬配。
 4. 策略只能是 RETAIN_AND_ANNOTATE / CULTURAL_EQUIVALENT / LITERAL_TRANSLATION 三选一。
 5. 若初筛正确，原样保留其条目（可修正字段格式）；不要为凑数新增无依据条目。
 
@@ -287,141 +305,293 @@ Schema 如下：
 
         # 4. 登记实体到 entity_registry (增量构建全书实体知识库)
         if entities:
-            self._register_entities(chunk_id, entities)
+            self._register_entities(chunk_id, entities, text_chunk)
 
-    def _register_entities(self, chunk_id: str, entities: List[Dict]):
-        """将识别到的实体增量登记到 entity_registry 表"""
+    def _register_entities(self, chunk_id: str, entities: List[Dict],
+                           source_text: str = None):
+        """将识别到的实体增量登记到 entity_registry 表。
+
+        Round 144 别名完整性：
+          - source_names 只存可执行专名；泛称/关系/描述进入 context_names；
+          - 同一专名被第二个 canonical 声明时，立即从所有 owner 的硬别名中移除，
+            并写入 quarantined_names（fail-open：宁可少约束，也不制造错约束）。
+        """
         if not entities:
             return
-        
+
         cursor = self.db.conn.cursor()
-        
+
+        # 一次性载入 registry，避免每个 alias 全表扫描。
+        try:
+            cursor.execute(
+                "SELECT id, canonical_name, source_names, context_names, quarantined_names, "
+                "variant_names, confidence, pending_review, entity_type "
+                "FROM entity_registry"
+            )
+        except Exception:
+            # 兼容极端旧库：补齐列后重试。
+            from src.core.decision_engine import ensure_entity_alias_columns
+            ensure_entity_alias_columns(self.db.conn)
+            cursor.execute(
+                "SELECT id, canonical_name, source_names, context_names, quarantined_names, "
+                "variant_names, confidence, pending_review, entity_type "
+                "FROM entity_registry"
+            )
+
+        def _load_list(raw):
+            return robust_json_loads(raw, expected_type=list) if raw else []
+
+        def _norm(sn):
+            return re.sub(r"\s+", " ", (sn or "")).strip().lower()
+
+        def _dedupe(items):
+            out, seen = [], set()
+            for item in items or []:
+                if not isinstance(item, str):
+                    continue
+                s = item.strip()
+                key = _norm(s)
+                if not s or key in seen:
+                    continue
+                seen.add(key)
+                out.append(s)
+            return out
+
+        registry: Dict[str, Dict[str, Any]] = {}
+        owners: Dict[str, set] = {}
+        for rid, canon, src_json, ctx_json, qt_json, var_json, conf, pending, etype in cursor.fetchall():
+            row = {
+                "id": rid,
+                "source": _dedupe(_load_list(src_json)),
+                "context": _dedupe(_load_list(ctx_json)),
+                "quarantine": _dedupe(_load_list(qt_json)),
+                "variants": _dedupe(_load_list(var_json)),
+                "confidence": conf or "low",
+                "pending_review": pending or 0,
+                "entity_type": etype or "",
+            }
+            registry[canon] = row
+            for sn in row["source"]:
+                owners.setdefault(_norm(sn), set()).add(canon)
+        decision_targets = load_decision_alias_targets(self.db.conn)
+
+        def _persist(canon: str) -> None:
+            row = registry[canon]
+            cursor.execute(
+                "UPDATE entity_registry SET source_names=?, context_names=?, "
+                "quarantined_names=?, variant_names=?, confidence=?, pending_review=?, "
+                "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (json.dumps(_dedupe(row["source"]), ensure_ascii=False),
+                 json.dumps(_dedupe(row["context"]), ensure_ascii=False),
+                 json.dumps(_dedupe(row["quarantine"]), ensure_ascii=False),
+                 json.dumps(_dedupe(row["variants"]), ensure_ascii=False),
+                 row["confidence"], row["pending_review"], row["id"]),
+            )
+
+        # Round 18/121 保留既有结构性停用词护栏。
+        _STOPWORDS = {
+            "a", "an", "the", "and", "or", "but", "in", "on", "at",
+            "to", "for", "of", "by", "with", "from", "as", "is", "was",
+            "he", "she", "it", "they", "we", "you", "i", "me", "him",
+            "her", "his", "my", "your", "its", "our", "their", "them",
+            "us", "this", "that", "these", "those", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would",
+            "can", "could", "shall", "should", "may", "might", "not",
+            "who", "whom", "whose", "which", "what", "where", "when", "why", "how",
+        }
+        _CONF_ORDER = {"high": 3, "medium": 2, "low": 1}
+
         for ent in entities:
-            canonical = ent.get("canonical_name")
-            source_names = ent.get("source_names", [])
+            canonical = (ent.get("canonical_name") or "").strip()
             pronoun_gender = ent.get("pronoun_gender", "unknown")
             entity_type = ent.get("entity_type", "other")
             confidence = ent.get("confidence", "low")
             translation_strategy = ent.get("translation_strategy", "free")
-            
-            if not canonical or not source_names:
+
+            if not canonical:
                 continue
-            
-            # 确保 source_names 是列表
-            if isinstance(source_names, str):
-                source_names = [source_names]
-            
-            # 过滤代词/停用词；Round 18 审计修复：移除 `len(sn) >= 4` 长度阈值
-            # 原因：
-            #   1. 长度阈值导致所有 <4 字符的英文原名（如 3 字符人名 "Joe"/"Kim"/"Ana"）
-            #      永远无法进入 entity_registry.source_names
-            #   2. Section 11.5 的 english_residue 检测依赖 source_names 列表，
-            #      短英文原名的残留检测因此"天生失效"（Round 18 问题 1）
-            #   3. 短名字的"子串误匹配"风险由调用方处理：
-            #      - _detect_issues 已用 `\b` 词边界匹配（L4191-4193）
-            #      - format_prompt_context 已用 `(sn in src or sn.lower() in src_lower)`
-            #      停用词表本身已能排除代词/冠词/介词的误判
-            _STOPWORDS = {
-                "a", "an", "the", "and", "or", "but", "in", "on", "at",
-                "to", "for", "of", "by", "with", "from", "as", "is", "was",
-                "he", "she", "it", "they", "we", "you", "i", "me", "him",
-                "her", "his", "my", "your", "its", "our", "their", "them",
-                "us", "this", "that", "these", "those", "be", "been", "being",
-                "have", "has", "had", "do", "does", "did", "will", "would",
-                "can", "could", "shall", "should", "may", "might", "not",
-                # Round 121: 疑问词/连词泄漏护栏（ch06 "who"→帽匠等 6 实体污染，
-                # 造成"在场却漏译"不可满足核查 → 实体硬失败循环）
-                "who", "whom", "whose", "which", "what", "where", "when", "why", "how",
-            }
-            source_names = [sn for sn in source_names if sn.lower() not in _STOPWORDS]
-            if not source_names:
+
+            raw_sources = ent.get("source_names", []) or []
+            raw_contexts = ent.get("context_names", []) or []
+            if isinstance(raw_sources, str):
+                raw_sources = [raw_sources]
+            if isinstance(raw_contexts, str):
+                raw_contexts = [raw_contexts]
+
+            aliases = _dedupe(list(raw_sources) + list(raw_contexts))
+            aliases = [s for s in aliases if s.lower() not in _STOPWORDS]
+            if not aliases:
                 continue
-            
-            source_names_json = json.dumps(source_names, ensure_ascii=False)
-            
-            # 查找是否已存在同一 canonical_name
-            cursor.execute('SELECT id, source_names, pending_review FROM entity_registry WHERE canonical_name = ?', (canonical,))
-            row = cursor.fetchone()
-            
-            if row:
-                # 已存在：合并 source_names
-                existing_id, existing_names_json, pending_review = row
-                # P2-1: 统一走 robust_json_loads
-                existing_names = robust_json_loads(existing_names_json, expected_type=list) if existing_names_json else []
-                
-                # 合并新旧 source_names（去重）
-                merged_names = list(set(existing_names + source_names))
-                merged_names_json = json.dumps(merged_names, ensure_ascii=False)
-                
-                # 合并置信度：取较高者
-                confidence_order = {"high": 3, "medium": 2, "low": 1}
-                new_conf_level = confidence_order.get(confidence, 1)
-                cursor.execute('SELECT confidence FROM entity_registry WHERE id = ?', (existing_id,))
-                current_row = cursor.fetchone()
-                if current_row:
-                    current_conf = confidence_order.get(current_row[0], 1)
-                    final_conf = confidence if new_conf_level > current_conf else current_row[0]
-                else:
-                    final_conf = confidence
-                
-                cursor.execute('''
-                    UPDATE entity_registry 
-                    SET source_names = ?, confidence = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                ''', (merged_names_json, final_conf, existing_id))
-                print(f"  📝 实体已存在，合并指称: {canonical} <- {source_names}")
-            else:
-                # 检查是否有语义相近的已有实体（简单字符串包含/编辑距离初筛）
-                cursor.execute('SELECT id, canonical_name, source_names, variant_names FROM entity_registry')
-                similar_found = False
-                for existing_row in cursor.fetchall():
-                    eid, ecanon, enames_json, evariants_json = existing_row
-                    # P2-1: 统一走 robust_json_loads
-                    enames = robust_json_loads(enames_json, expected_type=list) if enames_json else []
-                    evariants = robust_json_loads(evariants_json, expected_type=list) if evariants_json else []
-                    
-                    # 双向子串包含 + 编辑距离(≤2) 初筛
-                    # 注：source_names 已在 _register_entities 入口过滤停用词
+
+            proper_candidates = [s for s in aliases if classify_entity_source_name(s) == "proper"]
+            context_candidates = [s for s in aliases if classify_entity_source_name(s) != "proper"]
+
+            existing = registry.get(canonical)
+            existing_qt = {_norm(x) for x in (existing or {}).get("quarantine", [])}
+
+            accepted: List[str] = []
+            quarantined: List[str] = []
+            for sn in proper_candidates:
+                key = _norm(sn)
+                if source_text and not alias_attested_in_text(sn, source_text):
+                    quarantined.append(sn)
+                    print(f"  ⚠️ 无原文出处的专名隔离: {sn!r} 不登记给 {canonical}")
+                    continue
+                known_canonicals = list(registry)
+                if canonical not in registry:
+                    known_canonicals.append(canonical)
+                known_types = {c: r["entity_type"] for c, r in registry.items()}
+                known_types[canonical] = entity_type
+                decision_owned = decision_alias_belongs_to_owner(
+                    sn, canonical, decision_targets, known_canonicals,
+                    entity_types=known_types)
+                decision_foreign = (not decision_owned
+                                    and decision_alias_conflicts_with_owner(
+                                        sn, canonical, decision_targets,
+                                        known_canonicals,
+                                        entity_types=known_types))
+                if key in existing_qt and not decision_owned:
+                    quarantined.append(sn)
+                    continue
+                # 任何 owner 已隔离过该专名 → 不可再被硬声明。
+                if (not decision_owned and any(
+                        key in {_norm(x) for x in row["quarantine"]}
+                        for row in registry.values())):
+                    quarantined.append(sn)
+                    continue
+                other_owners = set(owners.get(key, set())) - {canonical}
+                if other_owners:
+                    if decision_owned:
+                        # decision_db 已裁决归属：只从身份无关的 owner 移除，
+                        # 同一身份簇（同人重复 canonical）保留。
+                        kept_owners = {canonical}
+                        for owner in sorted(other_owners):
+                            if decision_alias_belongs_to_owner(
+                                    sn, owner, decision_targets,
+                                    known_canonicals, entity_types=known_types):
+                                kept_owners.add(owner)
+                                continue
+                            orow = registry.get(owner)
+                            if not orow:
+                                continue
+                            orow["source"] = [
+                                x for x in orow["source"] if _norm(x) != key
+                            ]
+                            orow["quarantine"] = _dedupe(orow["quarantine"] + [sn])
+                            _persist(owner)
+                            print(f"  ⚖️ decision_db 归属裁决: {sn!r} 保留给 {canonical}，"
+                                  f"从 {owner} 隔离")
+                        if existing is not None:
+                            existing["quarantine"] = [
+                                x for x in existing["quarantine"]
+                                if _norm(x) != key
+                            ]
+                        owners[key] = kept_owners
+                        accepted.append(sn)
+                        continue
+                    # fail-open：冲突专名从所有 owner 移除，任何 canonical 都不再执行。
+                    for owner in sorted(other_owners):
+                        orow = registry.get(owner)
+                        if not orow:
+                            continue
+                        before = len(orow["source"])
+                        orow["source"] = [x for x in orow["source"] if _norm(x) != key]
+                        orow["quarantine"] = _dedupe(orow["quarantine"] + [sn])
+                        if len(orow["source"]) != before:
+                            _persist(owner)
+                        print(f"  ⚠️ 专名冲突隔离: {sn!r} 同时指向 {owner} 与 {canonical}；两边均不硬执行")
+                    owners[key] = set()
+                    quarantined.append(sn)
+                    continue
+                # Round 144: 即使当前只有一个 owner，只要 decision_db 把
+                # 这个专名唯一翻译到另一个身份无关的 canonical，也隔离。
+                # 这能挡住“只错挂一次、没有第二 owner 触发冲突”的污染。
+                if decision_foreign:
+                    quarantined.append(sn)
+                    print(f"  ⚠️ decision_db 归属冲突隔离: {sn!r} 不登记给 {canonical}")
+                    continue
+                if decision_owned and existing is not None:
+                    existing["quarantine"] = [
+                        x for x in existing["quarantine"] if _norm(x) != key
+                    ]
+                accepted.append(sn)
+                owners.setdefault(key, set()).add(canonical)
+
+            if existing is not None:
+                existing["source"] = _dedupe(existing["source"] + accepted)
+                existing["context"] = _dedupe(existing["context"] + context_candidates)
+                existing["quarantine"] = _dedupe(existing["quarantine"] + quarantined)
+                cur_conf = _CONF_ORDER.get(existing["confidence"], 1)
+                new_conf = _CONF_ORDER.get(confidence, 1)
+                if new_conf > cur_conf:
+                    existing["confidence"] = confidence
+                _persist(canonical)
+                print(f"  📝 实体已存在，合并专名: {canonical} <- {accepted or '[]'}")
+                continue
+
+            # 新 canonical：保留既有“近似名 → pending_review”行为。
+            similar_found = False
+            if proper_candidates:
+                for ecanon, erow in list(registry.items()):
+                    enames = erow["source"]
                     substr_match = any(
                         sn in existing_name or existing_name in sn
-                        for existing_name in enames
-                        for sn in source_names
+                        for existing_name in enames for sn in proper_candidates
                     )
                     fuzzy_match = any(
                         _levenshtein_distance(sn, existing_name) <= 2
-                        for existing_name in enames
-                        for sn in source_names
+                        for existing_name in enames for sn in proper_candidates
                     )
-                    if substr_match or fuzzy_match:
-                        # Round 121: 新中文名已是该实体的登记异体 → 已知别名，
-                        # 仅并入 source_names，不再标记待核查（防归一后反复重标）
-                        if canonical in evariants:
-                            merged_names = list(set(enames + source_names))
-                            cursor.execute('''
-                                UPDATE entity_registry
-                                SET source_names = ?, updated_at = CURRENT_TIMESTAMP
-                                WHERE id = ?
-                            ''', (json.dumps(merged_names, ensure_ascii=False), eid))
-                            similar_found = True
-                            print(f"  📝 已知异体合并: {canonical} <- {source_names} (并入 {ecanon})")
-                            break
-                        # 发现潜在同一实体的不同译名
-                        # 不自动合并，标记待核查
-                        cursor.execute('''
-                            UPDATE entity_registry 
-                            SET pending_review = 1, review_reason = ?
-                            WHERE id = ?
-                        ''', (f"称谓差异大: 新实体 {canonical} 与现有 {ecanon} 可能指向同一对象", eid))
+                    if not (substr_match or fuzzy_match):
+                        continue
+                    if canonical in erow["variants"]:
+                        erow["source"] = _dedupe(erow["source"] + accepted)
+                        erow["context"] = _dedupe(erow["context"] + context_candidates)
+                        erow["quarantine"] = _dedupe(erow["quarantine"] + quarantined)
+                        for sn in accepted:
+                            owners.setdefault(_norm(sn), set()).discard(canonical)
+                            owners.setdefault(_norm(sn), set()).add(ecanon)
+                        _persist(ecanon)
                         similar_found = True
-                        print(f"  ⚠️ 发现潜在同一实体不同译名: {canonical} vs {ecanon}，标记待核查")
+                        print(f"  📝 已知异体合并: {canonical} <- {accepted} (并入 {ecanon})")
                         break
-                
-                if not similar_found:
-                    # 新建条目
-                    cursor.execute('''
-                        INSERT INTO entity_registry (canonical_name, source_names, pronoun_gender, entity_type, first_seen_chunk, confidence, pending_review, translation_strategy)
-                        VALUES (?, ?, ?, ?, ?, ?, 0, ?)
-                    ''', (canonical, source_names_json, pronoun_gender, entity_type, chunk_id, confidence, translation_strategy))
-                    print(f"  ✅ 新实体登记: {canonical} ({entity_type}, {confidence})")
-        
+                    erow["pending_review"] = 1
+                    cursor.execute(
+                        "UPDATE entity_registry SET pending_review=1, review_reason=?, "
+                        "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (f"称谓差异大: 新实体 {canonical} 与现有 {ecanon} 可能指向同一对象",
+                         erow["id"]),
+                    )
+                    similar_found = True
+                    print(f"  ⚠️ 发现潜在同一实体不同译名: {canonical} vs {ecanon}，标记待核查")
+                    break
+
+            if not similar_found:
+                pending = 0 if accepted else 1
+                cursor.execute(
+                    "INSERT INTO entity_registry "
+                    "(canonical_name, source_names, context_names, quarantined_names, "
+                    "pronoun_gender, entity_type, first_seen_chunk, confidence, "
+                    "pending_review, translation_strategy) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (canonical,
+                     json.dumps(_dedupe(accepted), ensure_ascii=False),
+                     json.dumps(_dedupe(context_candidates), ensure_ascii=False),
+                     json.dumps(_dedupe(quarantined), ensure_ascii=False),
+                     pronoun_gender, entity_type, chunk_id, confidence, pending,
+                     translation_strategy),
+                )
+                registry[canonical] = {
+                    "id": cursor.lastrowid,
+                    "source": _dedupe(accepted),
+                    "context": _dedupe(context_candidates),
+                    "quarantine": _dedupe(quarantined),
+                    "variants": [],
+                    "confidence": confidence,
+                    "pending_review": pending,
+                    "entity_type": entity_type,
+                }
+                print(f"  ✅ 新实体登记: {canonical} ({entity_type}, {confidence}, "
+                      f"专名={len(accepted)}, 上下文={len(context_candidates)})")
+
         self.db.conn.commit()

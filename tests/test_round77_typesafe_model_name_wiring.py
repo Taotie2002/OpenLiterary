@@ -179,7 +179,7 @@ class TestLoadTypesafeConfigBehavior:
         )
 
     def test_no_model_field_uses_default(self):
-        """场景 4: 都没配时, 使用硬编码默认 `jev-latest`."""
+        """场景 4: 都没配时, 使用 Round 145 默认 `d3-flash`."""
         _mod = _load_module_isolated()
         _load_typesafe_config = _mod._load_typesafe_config
 
@@ -188,8 +188,8 @@ class TestLoadTypesafeConfigBehavior:
             MockConfig.return_value.get_section.return_value = fake_section
             cfg = _load_typesafe_config()
 
-        assert cfg["primary_model"] == "jev-latest", (
-            "未配置 model 字段时应保持向后兼容默认 jev-latest"
+        assert cfg["primary_model"] == "d3-flash", (
+            "未配置 model 字段时应使用 MoArk d3-flash 默认值"
         )
 
     def test_fallback_role_still_works(self):
@@ -238,7 +238,7 @@ class TestLoadTypesafeConfigBehavior:
             cfg = _load_typesafe_config()
 
         # 应使用 defaults
-        assert cfg["primary_model"] == "jev-latest"
+        assert cfg["primary_model"] == "d3-flash"
         assert cfg["fallback_role"] == "primary"
         assert cfg["enabled"] is True
         assert cfg["timeout"] == 30.0

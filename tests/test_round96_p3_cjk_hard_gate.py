@@ -149,10 +149,12 @@ class TestEvaluateChunkPassesLitText:
         sig = inspect.signature(evaluate_chunk)
         assert "literary_translation" in sig.parameters
 
-    def test_evaluate_chunk_english_lit_rejects(self):
+    def test_evaluate_chunk_english_lit_rejects(self, monkeypatch):
         """evaluate_chunk 输入英文 lit → REJECT (无需 LLM 调用)."""
         from src.judges.judge import evaluate_chunk
-        # 使用 Mock backend (无需真实 LLM)
+        from src.judges.typesafe_backend import MockBackend
+        # 显式使用 Mock backend；生产配置 allow_mock=false 时不能依赖隐式降级。
+        monkeypatch.setattr("src.judges.judge.get_backend", lambda: MockBackend())
         result = evaluate_chunk(
             source_text="Hello world.",
             raw_translation="你好世界",

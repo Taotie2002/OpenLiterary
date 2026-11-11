@@ -78,6 +78,24 @@ def test_orphan_relocate_without_term():
     assert "[^zz]" not in new
 
 
+def test_orphan_relocation_reaches_duplicate_fixed_point():
+    para = ("**克里姆克尔纤维/克里姆克尔绳**：用厄卡兹胡富藤的藤条编成的“爪纤维”。"
+            "用克里姆克尔纤维打成的结，在结线被拉紧时，会像爪子一样越收越紧，直到预先设定的极限。"
+            "（更详细的研究，见霍尔扬斯·冯布鲁克的《厄卡兹的绞杀藤》。）[^ch07_c155_5]")
+    definition = ("[^ch07_c155_5]: 胡富藤是克里姆克尔纤维的原料；厄卡兹是这种藤蔓的原产地。"
+                  "《厄卡兹的绞杀藤》是霍尔扬斯·冯布鲁克所著的研究。")
+    body = ("正文讲述沙漠中的行旅与部落生活，篇幅足够长以避免被误判成注释段落本身。\n\n"
+            + para + "\n\n---\n\n" + definition + "\n")
+    assert _chapter_note_dupes(body) == []
+
+    new, ch, _ = normalize_chapter_notes(body, 1)
+    assert ch["dangling_refs_removed"] == 1
+    assert ch["md_relocated"] == 1
+    assert ch["merged_dups"] == 1
+    assert _chapter_note_dupes(new) == []
+    assert normalize_chapter_notes(new, 1)[0] == new
+
+
 def test_title_block_moved_to_chapter_end():
     body = (
         "第一段正文，足够长以构成叙事。\n\n"

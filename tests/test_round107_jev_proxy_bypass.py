@@ -119,8 +119,10 @@ class TestJevProxyNormalization:
         from src.judges.typesafe_backend import JevBackend
 
         with patch.dict("os.environ", {}, clear=True):
-            backend = JevBackend(api_key=None)
-            with pytest.raises(RuntimeError, match="TYPESAFE_API_KEY"):
+            # Round 145: explicit empty string disables config/env fallback;
+            # None now means "resolve from config / MOARK_API_KEY".
+            backend = JevBackend(api_key="")
+            with pytest.raises(RuntimeError, match="MOARK_API_KEY"):
                 backend._ensure_client()
 
     def test_monolith_and_scattered_match(self):

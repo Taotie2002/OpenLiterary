@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Round 116: Jev 配对仲裁 CLI（bench 工具，不接线主流水线）。
+"""System One（MoArk d3）配对仲裁 CLI（历史文件名 jev_pairwise，bench 工具）。
 
 对同一 source/raw 的两个候选润色稿（A/B）跑同一组 typesafe primitives，
 输出每维胜负、分歧清单与总体建议（JSON 可选落盘）。
@@ -25,7 +25,7 @@ def _read(path: str) -> str:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Jev pairwise arbitration bench")
+    ap = argparse.ArgumentParser(description="System One pairwise arbitration bench")
     ap.add_argument("--source", required=True, help="原文文件")
     ap.add_argument("--raw", required=True, help="直译底稿文件")
     ap.add_argument("--a", required=True, help="候选 A 文件（如 DeepSeek 润色稿）")
@@ -34,7 +34,7 @@ def main(argv=None) -> int:
     ap.add_argument("--min-confidence", type=float, default=0.5)
     ap.add_argument("--out", default=None, help="结果 JSON 落盘路径（可选）")
     ap.add_argument("--require-jev", action="store_true",
-                    help="Jev 不可达时直接失败（禁止静默降级到 openai fallback）")
+                    help="System One 主后端不可达时直接失败（禁止静默降级）")
     args = ap.parse_args(argv)
 
     # 注意导入顺序：必须先导入真实 src.judges.* 子模块，再导入 translator_agent。
@@ -57,8 +57,8 @@ def main(argv=None) -> int:
                     jev_error = f"{type(e).__name__}: {e}"
                     print(f"⚠️ [jev_pairwise] Jev 不可达: {jev_error}", file=sys.stderr)
             else:
-                jev_error = "no TYPESAFE_API_KEY"
-                print("⚠️ [jev_pairwise] 未配置 TYPESAFE_API_KEY, Jev 不可用", file=sys.stderr)
+                jev_error = "no MOARK_API_KEY"
+                print("⚠️ [jev_pairwise] 未配置 MOARK_API_KEY（旧 TYPESAFE_API_KEY 仅兼容）", file=sys.stderr)
             if args.require_jev:
                 raise SystemExit(f"❌ --require-jev: Jev 不可用（{jev_error}）")
             if backend.allow_openai_fallback:

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -29,7 +30,13 @@ from src.utils.entity_stopwords import (  # noqa: E402
     differing_char,
     is_likely_common_word,
 )
-from src.core.decision_engine import unify_entity_registry  # noqa: E402
+from src.core.decision_engine import (  # noqa: E402
+    entity_registry_alias_report,
+    is_cross_person_canonical_variant,
+    sanitize_entity_registry_aliases,
+    sanitize_entity_registry_variants,
+    unify_entity_registry,
+)
 
 
 # 确认的合法变体白名单（canonical, variant）。清理时只保留这些 + 种子变体，
@@ -43,6 +50,14 @@ CONFIRMED_VARIANTS = {
 
 # 裸警衔词：泛指警衔，盲替换会改坏正文（其他警官也可能用这些词），绝不作变体。
 BARE_RANK_WORDS = frozenset({"警监", "警司", "警督"})
+
+
+def _json_list(raw):
+    try:
+        value = json.loads(raw) if raw else []
+    except (ValueError, TypeError):
+        return []
+    return value if isinstance(value, list) else []
 
 
 def _keep_set() -> set:
@@ -74,10 +89,27 @@ def clean_common_word_variants(conn, dry_run: bool = True) -> list:
     """
     keep = _keep_set()
     cursor = conn.cursor()
-    cursor.execute("SELECT id, canonical_name, variant_names FROM entity_registry")
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+    etype_col = "entity_type" if "entity_type" in cols else "NULL"
+    cursor.execute(
+        f"SELECT id, canonical_name, variant_names, {etype_col}, source_names "
+        "FROM entity_registry"
+    )
     rows = cursor.fetchall()
+    canonical_names = [r[1] for r in rows if isinstance(r[1], str)]
+    canonical_norms = {
+        re.sub(r"\s+", " ", c).strip().lower()
+        for c in canonical_names if isinstance(c, str) and c.strip()
+    }
+    entity_types = {
+        r[1]: (r[3] or "") for r in rows if isinstance(r[1], str)
+    }
+    entity_sources = {
+        r[1]: _json_list(r[4]) for r in rows
+        if isinstance(r[1], str)
+    }
     changes = []
-    for rid, canonical, vns_json in rows:
+    for rid, canonical, vns_json, _etype, _src_json in rows:
         if not vns_json:
             continue
         try:
@@ -99,6 +131,19 @@ def clean_common_word_variants(conn, dry_run: bool = True) -> list:
             if v in BARE_RANK_WORDS:
                 removed.append(v)
                 continue
+            v_norm = re.sub(r"\s+", " ", v).strip().lower()
+            # 精确对应另一个 canonical 时，先用身份/类型判定。音译异写、
+            # 同人简称、纯头衔，以及地点/组织/语义别名一律保留；只有明确
+            # person↔person 且身份不相关的 canonical 才删除。
+            if v_norm in canonical_norms:
+                if is_cross_person_canonical_variant(
+                        canonical, v, canonical_names=canonical_names,
+                        entity_types=entity_types,
+                        entity_sources=entity_sources):
+                    removed.append(v)
+                else:
+                    kept.append(v)
+                continue
             if differing_char(canonical, v) is not None:
                 removed.append(v)
                 continue
@@ -119,6 +164,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="entity_registry 数据清理")
     ap.add_argument("--apply", action="store_true", help="实际写库（默认 dry-run）")
     ap.add_argument("--no-unify", action="store_true", help="跳过同人多规范名归一")
+    ap.add_argument("--no-alias-sanitize", action="store_true",
+                    help="跳过 source_names/context_names/quarantined_names 分层清理")
+    ap.add_argument("--no-variant-sanitize", action="store_true",
+                    help="跳过 variant_names 中的跨人物 canonical 清理")
     ap.add_argument("--db", default=str(_ROOT / "db" / "decision_db.sqlite"))
     args = ap.parse_args()
 
@@ -129,6 +178,22 @@ def main() -> int:
 
     conn = sqlite3.connect(args.db)
     try:
+        # 0. 别名分层清理（Round 144）：proper / context / quarantined
+        if not args.no_alias_sanitize:
+            print("\n⓪ 清理 source_names 跨人物污染…")
+            _before = entity_registry_alias_report(conn)
+            res = sanitize_entity_registry_aliases(conn, dry_run=dry_run)
+            print(f"   rows={res['rows']} changed={res['changed_rows']} "
+                  f"context_moved={res['context_moved']} "
+                  f"cross_owner_names={res['cross_owner_proper_names']} "
+                  f"quarantined_instances={res['quarantined_instances']} "
+                  f"decision_preferred={res.get('decision_preferred_aliases', 0)} "
+                  f"decision_single_owner={res.get('decision_single_owner_quarantined', 0)}")
+            for ex in res.get("examples", [])[:8]:
+                why = ex.get("reason", "")
+                print(f"   - {ex['source_name']!r} ← {ex['owners']} {why}")
+            print(f"   before active_proper_conflicts={_before['active_proper_conflicts']}")
+
         # 1. 清理普通词变体
         print("\n① 清理 variant_names 中的普通词…")
         changes = clean_common_word_variants(conn, dry_run=dry_run)
@@ -137,6 +202,15 @@ def main() -> int:
         for canonical, removed in changes:
             print(f"   - {canonical}: 移除 {removed}")
         print(f"   共 {len(changes)} 个实体受影响")
+
+        # 1.5 清理 variant_names 中的跨人物 canonical（独立污染源）
+        if not args.no_variant_sanitize:
+            print("\n①.5 清理 variant_names 跨人物 canonical…")
+            vres = sanitize_entity_registry_variants(conn, dry_run=dry_run)
+            print(f"   rows={vres['rows']} changed={vres['changed_rows']} "
+                  f"removed_instances={vres['removed_instances']}")
+            for ex in vres.get("examples", [])[:8]:
+                print(f"   - {ex['canonical']}: 移除 {ex['removed']}")
 
         # 2. 同人多规范名归一
         if not args.no_unify:
@@ -149,6 +223,21 @@ def main() -> int:
                 print(f"       winner: {info['winner']}")
                 print(f"       降级: {info['demoted']}")
             print(f"   共 {len(plan)} 个簇")
+
+        if not args.no_alias_sanitize:
+            _after = entity_registry_alias_report(conn)
+            print("\n③ 清理后别名校验：")
+            print(f"   rows={_after['rows']} kinds={_after['kind_counts']} "
+                  f"active_proper_conflicts={_after['active_proper_conflicts']} "
+                  f"all_proper_conflicts={_after['all_proper_conflicts']} "
+                  f"active_foreign_aliases={_after.get('active_foreign_aliases', 0)} "
+                  f"quarantined_names={_after['quarantined_names']}")
+            if (not dry_run and (
+                    _after["active_proper_conflicts"] > 0
+                    or _after.get("active_foreign_aliases", 0) > 0)):
+                print("\n❌ 清理后仍有行为可达的别名冲突；请先人工复核，"
+                      "不要把此状态当作完成。", file=sys.stderr)
+                return 2
     finally:
         conn.close()
 

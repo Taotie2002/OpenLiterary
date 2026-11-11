@@ -50,12 +50,12 @@ def _make_registry(rows):
 
 
 DUNE_ROWS = [
-    ("杰西卡夫人", ["Mother", "my mother", "his mother"], 0),
-    ("盖乌斯·海伦·莫希阿姆", ["the Reverend Mother", "Reverend Mother", "old woman"], 0),
+    ("保罗", ["Paul"], 0),
+    ("保罗·阿特雷德斯", ["Paul Atreides"], 0),
 ]
 
-DUNE_SRC = '“Did the Reverend Mother warn you?” Paul blurted.'
-DUNE_LIT = '“盖乌斯·海伦·莫希阿姆——那位老妇人——可曾警告过你？”保罗脱口而出。'
+DUNE_SRC = "Paul Atreides spoke."
+DUNE_LIT = "保罗·阿特雷德斯开口了。"
 
 
 def _pipeline(conn):
@@ -75,20 +75,20 @@ def _pipeline(conn):
 
 class TestAliasSwallowSuppression:
     def test_reverend_mother_no_jessica_missing(self):
-        """chunk071 场景: missing 假阳性被吞并抑制清除."""
+        """短专名被另一实体的更长专名吞并时，不报 missing 假阳性."""
         p = _pipeline(_make_registry(DUNE_ROWS))
         notes = p._check_entity_consistency("chXX_chunk000", DUNE_LIT, DUNE_SRC)
         missing = [n for n in notes if n.get("type") == "missing"]
-        assert missing == [], f"吞并伪命中不应再报 missing, 但 notes={notes}"
+        assert not any(n["entity"] == "保罗" for n in missing), f"吞并伪命中不应再报 missing, 但 notes={notes}"
 
     def test_standalone_mother_still_reported(self):
-        """真在场("Mother" 独立出现)时 missing 仍须报告 — 防过度抑制."""
+        """短专名独立出现时 missing 仍须报告 — 防过度抑制."""
         p = _pipeline(_make_registry(DUNE_ROWS))
         notes = p._check_entity_consistency(
-            "chXX_chunk000", "有人开口。", "Mother said: be careful, Paul.",
+            "chXX_chunk000", "有人开口。", "Paul said: be careful.",
         )
-        assert any(n.get("type") == "missing" and n["entity"] == "杰西卡夫人" for n in notes), (
-            f"独立出现的 Mother 应报 missing, 但 notes={notes}"
+        assert any(n.get("type") == "missing" and n["entity"] == "保罗" for n in notes), (
+            f"独立出现的 Paul 应报 missing, 但 notes={notes}"
         )
 
     def test_partial_occurrence_not_swallowed(self):
@@ -96,25 +96,25 @@ class TestAliasSwallowSuppression:
         p = _pipeline(_make_registry(DUNE_ROWS))
         notes = p._check_entity_consistency(
             "chXX_chunk000", "有人开口。",
-            "The Reverend Mother spoke. Mother smiled at Paul.",
+            "Paul Atreides spoke. Paul smiled.",
         )
-        assert any(n.get("type") == "missing" and n["entity"] == "杰西卡夫人" for n in notes), (
+        assert any(n.get("type") == "missing" and n["entity"] == "保罗" for n in notes), (
             f"存在未吞并出现时应报 missing, 但 notes={notes}"
         )
 
     def test_registry_excludes_swallowed_alias(self):
-        """rewriter registry 不得注入 "Mother"→杰西卡夫人 的伪映射."""
+        """rewriter registry 不得注入短专名的伪映射."""
         p = _pipeline(_make_registry(DUNE_ROWS))
         reg = p._build_entity_registry_for_rewriter(DUNE_SRC)
-        assert "Mother" not in reg, f"被吞并别名不应注入 registry: {reg}"
-        assert reg.get("the Reverend Mother") == "盖乌斯·海伦·莫希阿姆"
-        assert all(v != "杰西卡夫人" for v in reg.values()), f"杰西卡夫人 本章无真在场别名: {reg}"
+        assert "Paul" not in reg, f"被吞并别名不应注入 registry: {reg}"
+        assert reg.get("Paul Atreides") == "保罗·阿特雷德斯"
+        assert all(v != "保罗" for v in reg.values()), f"保罗 本章无真在场别名: {reg}"
 
     def test_variants_excludes_swallowed_alias(self):
         """critic variants 表同语义过滤."""
         p = _pipeline(_make_registry(DUNE_ROWS))
         variants = p._build_entity_variants_for_critic(DUNE_SRC)
-        assert "Mother" not in variants, f"被吞并别名不应进入 variants: {variants}"
+        assert "Paul" not in variants, f"被吞并别名不应进入 variants: {variants}"
 
     def test_same_canonical_coverer_does_not_suppress(self):
         """覆盖别名与候选别名同属一个 canonical 时不抑制（防误杀同人长名）."""
@@ -126,12 +126,12 @@ class TestAliasSwallowSuppression:
     def test_uncovered_registered_alias_keeps_candidate(self):
         """更长别名已注册但原文未出现（不构成覆盖）→ 短别名保留."""
         conn = _make_registry([
-            ("杰西卡夫人", ["Mother"], 0),
-            ("盖乌斯·海伦·莫希阿姆", ["Reverend Mother"], 0),
+            ("保罗", ["Paul"], 0),
+            ("保罗·阿特雷德斯", ["Paul Atreides"], 0),
         ])
         p = _pipeline(conn)
-        reg = p._build_entity_registry_for_rewriter("Mother smiled.")
-        assert reg.get("Mother") == "杰西卡夫人", f"未出现的长别名不应造成抑制: {reg}"
+        reg = p._build_entity_registry_for_rewriter("Paul smiled.")
+        assert reg.get("Paul") == "保罗", f"未出现的长别名不应造成抑制: {reg}"
 
 
 class TestSpansPrimitive:

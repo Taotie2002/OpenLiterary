@@ -28,7 +28,8 @@ FUNCS = [
     '_infer_title_zh', 'book_title_zh', 'resolve_book_output_path',
     '_note_norm', '_note_key', '_note_merge_key', '_note_anchor_stop',
     '_note_is_dup', '_note_terms', '_note_candidates',
-    '_group_title_units', '_split_h1_sections', 'normalize_chapter_notes',
+    '_group_title_units', '_split_h1_sections', '_normalize_chapter_notes_once',
+    'normalize_chapter_notes',
     'normalize_notes_document', 'notes_normalize_outputs', '_chapter_note_dupes',
 ]
 CONSTS = [

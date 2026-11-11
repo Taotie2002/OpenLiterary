@@ -1,16 +1,12 @@
 """
-typesafe.ai System One 后端 — Jev 优先，MiniMax/DeepSeek fallback
+System One 判断后端 — Round 145 起默认 MoArk d3-flash。
 
 设计：
-  - 优先用 typesafe_sdk.TypeSafeClient（调 Jev，typesafe-ai 原生）
-  - 不可达/失败时降级到现有 OpenAICompatibleAdapter（MiniMax/DeepSeek）
-  - 降级路径同样按 Choice/Score/Noul 三种 schema 提问
+  - 优先用 typesafe_sdk.TypeSafeClient 调 MoArk ``/v1/systemone``
+  - ``JevBackend`` / ``backend_kind="jev"`` 仅保留历史兼容与已校准阈值档
+  - 单请求按 ``max_questions_per_batch``（d3 默认 64）稳定分批
+  - 失败时按配置降级到 OpenAICompat / Mock；生产配置默认关闭这两条掩蔽路径
   - 返回值结构与 typesafe_sdk.SystemOneResponse 对齐
-
-为什么需要 fallback：
-  - typesafe_sdk 已安装（0.7.1），但 api.typesafe.ai 当前 DNS 失败
-  - 用户指示："如果执行中发现LLM调用超时，那就是本时段的token配额用完了，请每隔5个小时重试"
-  - 因此必须支持优雅降级，让 typesafe-spec 重构即使无 Jev 也可用
 """
 from __future__ import annotations
 
@@ -20,6 +16,7 @@ import os
 import time
 import requests
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 from src.judges.typesafe_spec import (
     NoulAnswer,
@@ -29,6 +26,194 @@ from src.judges.typesafe_spec import (
 )
 
 logger = __import__("logging").getLogger("sagatrans.judges")
+
+# Round 145: MoArk d3 decision backend defaults.  The legacy class/env names
+# ("JevBackend", TYPESAFE_*) are kept for compatibility, but the actual
+# provider/model are MoArk d3-flash.  ``backend_kind`` intentionally stays
+# "jev" so verdict.py keeps the calibrated-probability threshold profile until
+# a separate A/B proves d3 is interchangeable.
+DEFAULT_API_BASE = "https://api.moark.com"
+DEFAULT_MODEL = "d3-flash"
+DEFAULT_MAX_QUESTIONS_PER_BATCH = 64
+
+
+def _config_text(value: Any) -> str:
+    """Return a usable config string, treating unresolved ``${ENV}`` as empty."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or (text.startswith("${") and text.endswith("}")):
+        return ""
+    return text
+
+
+def normalize_api_root(value: Any) -> str:
+    """Normalize the API root without duplicating the SDK's ``/v1/systemone``."""
+    root = _config_text(value).rstrip("/")
+    if not root:
+        return ""
+    lowered = root.lower()
+    for suffix in ("/v1/systemone", "/v1"):
+        if lowered.endswith(suffix):
+            root = root[: -len(suffix)].rstrip("/")
+            lowered = root.lower()
+    return root
+
+
+def _api_base_host(value: str) -> str:
+    try:
+        return urlparse(value or "").netloc
+    except Exception:
+        return ""
+
+
+def _typesafe_sdk_module():
+    try:
+        import typesafe_sdk as _sdk
+        return _sdk
+    except ImportError:
+        return None
+
+
+def classify_backend_error(
+    exc: Exception,
+    *,
+    sdk_available: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Classify a decision-backend failure for diagnostics/circuit breaking.
+
+    Categories used by Round 145:
+      auth          — 401/403 explicitly about an invalid API key/token
+      model_access  — 403 explicitly about permission to use a model
+      request_schema— 400 (question count, instructions type, etc.)
+      rate_limit / timeout / network / dependency / parse / server / unknown
+
+    The distinction matters: a model-access 403 must NOT set the process-wide
+    auth circuit breaker, otherwise a single wrong model name silently disables
+    the primary backend for the rest of the run.
+    """
+    text = str(exc).lower()
+    sdk = _typesafe_sdk_module() if sdk_available is not False else None
+
+    # Status-code-specific rules must run before SDK class mapping: MoArk may
+    # surface a model-permission 403 as TypeSafeAuthenticationError.
+    has_403 = bool(("403" in text) or ("forbidden" in text))
+    has_401 = bool(("401" in text) or ("unauthorized" in text))
+    has_400 = bool(("400" in text) or ("bad request" in text))
+    model_words = any(k in text for k in ("model", "模型"))
+    permission_words = any(k in text for k in (
+        "无权访问", "无权使用", "无权限", "没有权限", "访问被拒",
+        "not allowed", "no access", "access denied", "permission",
+        "not authorized", "forbidden",
+    ))
+    key_words = any(k in text for k in (
+        "api key", "api_key", "invalid token", "invalid api",
+        "令牌无效", "密钥无效", "鉴权失败", "认证失败", "authentication",
+    ))
+    model_name_error = any(k in text for k in (
+        "模型名称", "模型不存在", "model name", "model not found",
+        "unknown model", "invalid model",
+    ))
+
+    if has_403 and model_words and permission_words and not key_words:
+        return {
+            "category": "model_access",
+            "retryable": False,
+            "msg": str(exc)[:200],
+            "action": "检查该 API key 是否有权访问当前模型（403 model_access）",
+        }
+    if model_name_error and (has_400 or has_403):
+        # MoArk returns 400 "模型名称有误" for a typo'd model.  Treat it as a
+        # model-access/config error, not a question-schema error.
+        return {
+            "category": "model_access",
+            "retryable": False,
+            "msg": str(exc)[:200],
+            "action": "检查 config typesafe.model_name 是否为 d3-flash / d3-turbo",
+        }
+    if has_401 or (has_403 and key_words):
+        return {
+            "category": "auth",
+            "retryable": False,
+            "msg": str(exc)[:200],
+            "action": "check MOARK_API_KEY / legacy TYPESAFE_API_KEY",
+        }
+    if has_400:
+        return {
+            "category": "request_schema",
+            "retryable": False,
+            "msg": str(exc)[:200],
+            "action": "检查 max_questions_per_batch / instructions schema / 模型问题上限",
+        }
+
+    if sdk is not None:
+        if isinstance(exc, getattr(sdk, "TypeSafeAuthenticationError", ())):
+            return {
+                "category": "auth", "retryable": False,
+                "msg": str(exc)[:200], "action": "check MOARK_API_KEY / legacy TYPESAFE_API_KEY",
+            }
+        if isinstance(exc, getattr(sdk, "TypeSafeRateLimitError", ())):
+            return {
+                "category": "rate_limit", "retryable": True,
+                "msg": str(exc)[:200], "action": "wait or upgrade quota",
+            }
+        if isinstance(exc, getattr(sdk, "TypeSafeAPITimeoutError", ())):
+            return {
+                "category": "timeout", "retryable": True,
+                "msg": str(exc)[:200], "action": "increase timeout or retry",
+            }
+        if isinstance(exc, getattr(sdk, "TypeSafeAPIConnectionError", ())):
+            return {
+                "category": "network", "retryable": True,
+                "msg": str(exc)[:200], "action": "check DNS/firewall/cert/proxy",
+            }
+        if isinstance(exc, getattr(sdk, "TypeSafeBadRequestError", ())):
+            return {
+                "category": "request_schema", "retryable": False,
+                "msg": str(exc)[:200], "action": "检查 max_questions_per_batch / instructions schema",
+            }
+        if isinstance(exc, getattr(sdk, "TypeSafeAPIResponseValidationError", ())):
+            return {
+                "category": "schema_mismatch", "retryable": False,
+                "msg": str(exc)[:200], "action": "update verdict parser",
+            }
+        if isinstance(exc, getattr(sdk, "TypeSafeAPIError", ())):
+            return {
+                "category": "api_error", "retryable": True,
+                "msg": str(exc)[:200], "action": "check MoArk status page",
+            }
+
+    missing_module = isinstance(exc, ModuleNotFoundError) or any(
+        k in text for k in ("no module named", "modulenotfound", "not installed")
+    )
+    if missing_module:
+        module_name = getattr(exc, "name", None)
+        target = f" `{module_name}`" if module_name else ""
+        return {
+            "category": "dependency", "retryable": False,
+            "msg": str(exc)[:200],
+            "action": f"安装缺失依赖{target}（见 requirements-core.txt），或显式启用 OpenAICompat 降级",
+        }
+    if any(k in text for k in ("429", "rate limit", "rate_limit", "quota", "too many requests")):
+        return {"category": "rate_limit", "retryable": True, "msg": str(exc)[:200],
+                "action": "wait or upgrade quota"}
+    if any(k in text for k in ("timeout", "timed out", "connection reset", "connection aborted")):
+        return {"category": "timeout", "retryable": True, "msg": str(exc)[:200],
+                "action": "increase timeout or retry"}
+    if any(k in text for k in ("json", "decode", "parse", "invalid response", "malformed")):
+        return {"category": "parse", "retryable": False, "msg": str(exc)[:200],
+                "action": "check response format"}
+    if any(k in text for k in ("500", "502", "503", "504", "internal server", "bad gateway", "service unavailable")):
+        return {"category": "server", "retryable": True, "msg": str(exc)[:200],
+                "action": "check MoArk status page"}
+    if any(k in text for k in ("connection", "dns", "network", "unreachable", "ssl", "certificate", "proxy")):
+        return {"category": "network", "retryable": True, "msg": str(exc)[:200],
+                "action": "check DNS/firewall/cert/proxy"}
+    return {
+        "category": "unknown", "retryable": True,
+        "msg": f"{type(exc).__name__}: {exc}"[:200],
+        "action": "inspect stack trace",
+    }
 
 
 def _typesafe_sdk_available() -> bool:
@@ -40,23 +225,8 @@ def _typesafe_sdk_available() -> bool:
 
 
 def _is_auth_failure(exc: Exception) -> bool:
-    """识别 Jev 的鉴权/权限类失败，供进程内熔断使用。"""
-    name = type(exc).__name__.lower()
-    text = str(exc).lower()
-    if "authentication" in name or "auth" in name or "permission" in name:
-        return True
-    phrases = (
-        "unauthorized", "forbidden", "invalid api", "api key",
-        "authentication", "authorization", "无权访问", "无权限", "鉴权",
-        "认证失败",
-    )
-    if any(p in text for p in phrases):
-        return True
-    return bool(("401" in text or "403" in text) and any(
-        p in text for p in (
-            "http", "status", "client error", "客户端错误", "url", "token", "model"
-        )
-    ))
+    """Only true auth failures should trip the process-wide circuit breaker."""
+    return classify_backend_error(exc).get("category") == "auth"
 
 
 def _confidence_from_probs(probs: Dict[Any, float]) -> float:
@@ -75,6 +245,27 @@ def _confidence_from_probs(probs: Dict[Any, float]) -> float:
         return float(max(probs.values()))
     except (TypeError, ValueError):
         return 0.0
+
+
+def batch_questions(
+    questions: Dict[str, Any],
+    max_per_batch: int = DEFAULT_MAX_QUESTIONS_PER_BATCH,
+) -> list:
+    """Split questions into stable, insertion-order-preserving batches.
+
+    d3 currently accepts at most 64 questions per system_one request.  The
+    caller's dict order is meaningful: base primitives are inserted before
+    per-entity questions, so keeping order also keeps the base questions in
+    the first batch.
+    """
+    try:
+        limit = max(1, int(max_per_batch))
+    except (TypeError, ValueError):
+        limit = DEFAULT_MAX_QUESTIONS_PER_BATCH
+    items = list(questions.items())
+    if not items:
+        return []
+    return [dict(items[i:i + limit]) for i in range(0, len(items), limit)]
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -110,30 +301,74 @@ class SystemOneBackend:
 # ────────────────────────────────────────────────────────────────────────
 
 class JevBackend(SystemOneBackend):
-    """typesafe.ai Jev 1.13 后端（首选）"""
+    """MoArk d3 System One 后端（保留 JevBackend 类名以兼容旧调用方）。
 
-    backend_kind = "jev"
+    Round 145: Jev 配额已停用，实际 provider/model 改为 MoArk
+    ``d3-flash``。``backend_kind`` 仍为 ``"jev"`` —— 这不是伪装迁移完成，
+    而是让 verdict 继续使用 Jev 的已校准阈值档，直到 d3-flash / d3-turbo
+    的 A/B 证明概率语义可互换。真实 provider/model/endpoint 会写入
+    ``last_diagnostics`` 和 critic report 的 ``_backend_diagnostics``。
+    """
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "jev-latest"):
-        self.api_key = api_key or os.environ.get("TYPESAFE_API_KEY")
-        self.model = model
+    backend_kind = "jev"  # calibrated-probability compatibility label
+    provider = "moark"
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        api_base: Optional[str] = None,
+        max_questions_per_batch: Optional[int] = None,
+    ):
+        cfg = _load_typesafe_config()
+
+        # Priority: explicit > config (resolved ${MOARK_API_KEY}) > MOARK env >
+        # legacy TYPESAFE_API_KEY.  Config/MOARK must win over the legacy env
+        # name: on this machine TYPESAFE_API_KEY still holds the expired Jev
+        # key, while MOARK_API_KEY is the working d3 credential.
+        if api_key is None:
+            api_key = (
+                _config_text(cfg.get("api_key"))
+                or _config_text(os.environ.get("MOARK_API_KEY"))
+                or _config_text(os.environ.get("TYPESAFE_API_KEY"))
+            )
+        self.api_key = _config_text(api_key)
+
+        if model is None:
+            model = _config_text(cfg.get("primary_model")) or DEFAULT_MODEL
+        self.model = str(model or DEFAULT_MODEL)
+
+        if api_base is None:
+            api_base = (
+                _config_text(cfg.get("api_base"))
+                or _config_text(os.environ.get("TYPESAFE_BASE_URL"))
+                or DEFAULT_API_BASE
+            )
+        self.api_base = normalize_api_root(api_base) or DEFAULT_API_BASE
+
+        if max_questions_per_batch is None:
+            max_questions_per_batch = cfg.get("max_questions_per_batch")
+        try:
+            self.max_questions_per_batch = max(1, int(max_questions_per_batch))
+        except (TypeError, ValueError):
+            self.max_questions_per_batch = DEFAULT_MAX_QUESTIONS_PER_BATCH
+
         self._client = None
+        self.last_diagnostics: Dict[str, Any] = {}
 
     def _ensure_client(self):
         if self._client is None:
             from typesafe_sdk import TypeSafeClient
             if not self.api_key:
                 raise RuntimeError(
-                    "JevBackend 需要 TYPESAFE_API_KEY 环境变量或显式传入"
+                    "System One 后端需要 MOARK_API_KEY（兼容 TYPESAFE_API_KEY）环境变量、"
+                    "config typesafe.api_key，或显式传入"
                 )
-            # Round 107 修正: 恢复默认行为 (trust_env=True), 让 httpx2 读代理环境变量.
-            # 背景: 用户区域被 Typesafe 451 封锁, 靠 SOCKS 代理路由到允许区域.
-            # curl 内置 SOCKS 支持所以能通; httpx2 需要 socksio 包 + socks5:// 方案.
-            # 前置条件: pip install socksio.
-            # Round 107 P2: httpx2 只支持 socks5/socks5h 方案, 不支持 socks.
-            # 若环境变量用 socks://, 归一化为 socks5:// (curl 两者等价).
-            import os
-            import httpx2
+            # Round 107: keep proxy support.  httpx2 only accepts
+            # socks5/socks5h, so normalize the common socks:// spelling.
+            # Import lazily only when a proxy is configured: the SDK already
+            # depends on httpx2, but direct no-proxy calls must not fail on a
+            # partially installed/optional environment.
             proxy_url = None
             for var in ("ALL_PROXY", "HTTPS_PROXY", "https_proxy", "all_proxy"):
                 val = os.environ.get(var, "")
@@ -142,19 +377,46 @@ class JevBackend(SystemOneBackend):
                     break
             if proxy_url and proxy_url.startswith("socks://"):
                 proxy_url = proxy_url.replace("socks://", "socks5://", 1)
+            kwargs: Dict[str, Any] = {
+                "api_key": self.api_key,
+                "base_url": self.api_base,
+            }
             if proxy_url:
-                http_client = httpx2.Client(proxy=proxy_url)
-                self._client = TypeSafeClient(api_key=self.api_key, http_client=http_client)
-            else:
-                self._client = TypeSafeClient(api_key=self.api_key)
+                import httpx2
+                kwargs["http_client"] = httpx2.Client(proxy=proxy_url)
+            self._client = TypeSafeClient(**kwargs)
         return self._client
+
+    @staticmethod
+    def _convert_answer(ans: Any) -> Answer:
+        from typesafe_sdk import (
+            NoulAnswer as _NoulA,
+            ChoiceAnswer as _ChoiceA,
+            ScoreAnswer as _ScoreA,
+        )
+        if isinstance(ans, _NoulA):
+            # Noul carries no confidence field; noul itself encodes uncertainty.
+            return NoulAnswer(noul=ans.noul)
+        if isinstance(ans, _ChoiceA):
+            return ChoiceAnswer(
+                choice=ans.choice,
+                probabilities=dict(ans.probabilities),
+                confidence=ans.confidence,
+            )
+        if isinstance(ans, _ScoreA):
+            return ScoreAnswer(
+                score=ans.score,
+                probabilities={int(k): float(v) for k, v in ans.probabilities.items()},
+                confidence=ans.confidence,
+            )
+        raise TypeError(f"未知 typesafe answer 类型: {type(ans).__name__}")
 
     def evaluate(self, state, questions, *, model=None, timeout=30.0):
         if not _typesafe_sdk_available():
             raise ModuleNotFoundError("No module named 'typesafe_sdk'")
         client = self._ensure_client()
-        # typesafe_sdk 期望 Choice/Score/Noul 对象；我们 dict 入参则需要构造
         from typesafe_sdk import Choice, Score, Noul
+
         q_objects: Dict[str, Any] = {}
         for qid, q in questions.items():
             t = q.get("type")
@@ -176,36 +438,59 @@ class JevBackend(SystemOneBackend):
             else:
                 raise ValueError(f"未知 primitive type: {t}")
 
-        resp = client.system_one(
-            state=state,
-            questions=q_objects,
-            model=model or self.model,
-            timeout=timeout,
-        )
+        used_model = model or self.model
+        batches = batch_questions(q_objects, self.max_questions_per_batch)
+        merged: Dict[str, Answer] = {}
+        batch_counts = []
+        input_tokens = 0
+        output_tokens = 0
 
-        # 转换为统一 Answer 格式
-        out: Dict[str, Answer] = {}
-        for qid, ans in resp.answers.items():
-            from typesafe_sdk import NoulAnswer as _NoulA, ChoiceAnswer as _ChoiceA, ScoreAnswer as _ScoreA
-            if isinstance(ans, _NoulA):
-                # SDK NoulAnswer 没有 confidence 字段（实测验证）
-                # SDK schema 文档（api.md）也明确："Choice and Score answers also carry a confidence"
-                # Noul 答案的"模型不确定度"由 noul 值本身隐含（noul=0.5 即不确定），
-                # 不再尝试访问 ans.confidence（AttributeError 的根因）。
-                out[qid] = NoulAnswer(noul=ans.noul)
-            elif isinstance(ans, _ChoiceA):
-                out[qid] = ChoiceAnswer(
-                    choice=ans.choice,
-                    probabilities=dict(ans.probabilities),
-                    confidence=ans.confidence,
+        for batch in batches:
+            resp = client.system_one(
+                state=state,
+                questions=batch,
+                model=used_model,
+                timeout=timeout,
+            )
+            batch_counts.append(len(batch))
+            answers_obj = getattr(resp, "answers", None) or {}
+            missing = [qid for qid in batch if qid not in answers_obj]
+            if missing:
+                raise RuntimeError(
+                    "system_one 返回缺少 qid: " + ", ".join(str(q) for q in missing[:8])
                 )
-            elif isinstance(ans, _ScoreA):
-                out[qid] = ScoreAnswer(
-                    score=ans.score,
-                    probabilities={int(k): float(v) for k, v in ans.probabilities.items()},
-                    confidence=ans.confidence,
-                )
-        return out
+            for qid, ans in answers_obj.items():
+                if qid not in batch:
+                    raise RuntimeError(f"system_one 返回了未请求的 qid: {qid}")
+                if qid in merged:
+                    raise ValueError(f"重复 qid: {qid}")
+                merged[qid] = self._convert_answer(ans)
+            usage = getattr(resp, "usage", None)
+            try:
+                input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
+                output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+
+        missing_all = [qid for qid in q_objects if qid not in merged]
+        if missing_all:
+            raise RuntimeError(
+                "system_one 合并后缺少 qid: " + ", ".join(str(q) for q in missing_all[:8])
+            )
+
+        self.last_diagnostics = {
+            "provider": self.provider,
+            "model": used_model,
+            "base_url_host": _api_base_host(self.api_base),
+            "question_count": len(q_objects),
+            "batch_count": len(batches),
+            "batch_question_counts": batch_counts,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+        # Preserve the caller's original question order for deterministic
+        # aggregation downstream.
+        return {qid: merged[qid] for qid in q_objects}
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -593,10 +878,10 @@ class MockBackend(SystemOneBackend):
 # ────────────────────────────────────────────────────────────────────────
 
 class FallbackBackend(SystemOneBackend):
-    """三级 fallback 链：Jev → OpenAICompat → Mock（启发式）
+    """三级 fallback 链：MoArk d3 → OpenAICompat → Mock（启发式）
 
     适用场景：
-      - 有 TYPESAFE_API_KEY + 网络可达：Jev 原生
+      - 有 MOARK_API_KEY + 网络可达：MoArk d3 原生
       - 无 typesafe API 但有 OpenAI 兼容 LLM：MiniMax / DeepSeek
       - 完全离线或网络中断：Mock 启发式（仅用于架构验证，不保证精度）
     """
@@ -604,14 +889,20 @@ class FallbackBackend(SystemOneBackend):
     def __init__(
         self,
         *,
-        primary_model: str = "jev-latest",
+        primary_model: str = DEFAULT_MODEL,
+        api_base: Optional[str] = None,
+        max_questions_per_batch: Optional[int] = None,
         fallback_role: str = "primary",
         allow_mock: bool = True,
         allow_openai_fallback: bool = False,
         enabled: bool = True,
         timeout: float = 30.0,
     ):
-        self.primary = JevBackend(model=primary_model)
+        self.primary = JevBackend(
+            model=primary_model,
+            api_base=api_base,
+            max_questions_per_batch=max_questions_per_batch,
+        )
         # self.fallback 保留为 OpenAICompatBackend 实例（向后兼容 verify_typesafe_refactor.py
         # test_05 静态探测），但默认不参与自动链（Jev → Mock）。
         # OpenAICompat 在 LLM-as-judge 模式下不返回校准概率，与 Jev 语义不等价，
@@ -627,9 +918,20 @@ class FallbackBackend(SystemOneBackend):
         self._mock = MockBackend() if allow_mock else None
         # Round 118 P1-1: 记录本次实际命中的后端（供 verdict confidence_source 分档）
         self.last_backend: str = "unknown"
-        # Round 121: 401 鉴权失败缓存 —— key 修复须重启进程，本轮内不再反复试探 Jev
+        self.last_diagnostics: Dict[str, Any] = {}
+        # Round 121/145: auth and model-access failures are process-lifetime
+        # circuit breakers (a restart is required after fixing key/model access).
         self._jev_auth_dead = False
+        self._jev_model_dead = False
         self._jev_disabled_reason = ""
+
+    def primary_available(self) -> bool:
+        """True when the primary backend should still be attempted."""
+        return bool(
+            self.primary.api_key
+            and not self._jev_auth_dead
+            and not self._jev_model_dead
+        )
 
     def evaluate(self, state, questions, *, model=None, timeout=None):
         # 有效 timeout：调用方传入优先，否则用 self.timeout（来自 config.yaml typesafe.timeout）
@@ -642,28 +944,45 @@ class FallbackBackend(SystemOneBackend):
                 return self._mock.evaluate(state, questions, model=model, timeout=eff_timeout)
             raise RuntimeError("typesafe 已禁用 (enabled=false)，且 Mock 未启用")
 
-        # 1. 尝试 Jev（typesafe.ai 原生）；401 后本轮不再试探（见下方 except）
-        if self.primary.api_key and not self._jev_auth_dead:
+        # 1. 尝试 MoArk d3（保留 last_backend="jev" 校准标签）
+        if self.primary_available():
             try:
                 answers = self.primary.evaluate(state, questions, model=model, timeout=eff_timeout)
                 self.last_backend = "jev"
+                self.last_diagnostics = dict(
+                    getattr(self.primary, "last_diagnostics", {}) or {}
+                )
                 return answers
             except Exception as e:
                 missing_sdk = isinstance(e, (ImportError, ModuleNotFoundError)) or (
                     "typesafe_sdk" in str(e)
                 )
-                auth_failed = _is_auth_failure(e)
-                if missing_sdk or auth_failed:
-                    # Jev 鉴权/依赖失败：修复须重启进程；本进程内不再试探 Jev
+                diag = classify_backend_error(e)
+                self.last_diagnostics = {
+                    "provider": getattr(self.primary, "provider", "moark"),
+                    "model": getattr(self.primary, "model", None),
+                    "error": diag,
+                }
+                dependency_failure = missing_sdk or diag["category"] == "dependency"
+                if dependency_failure or diag["category"] == "auth":
+                    # Auth/dependency failure: restart required after fixing.
                     if not self._jev_auth_dead:
-                        reason = "typesafe_sdk 缺失" if missing_sdk else "Jev 鉴权失败"
-                        logger.warning(f"{reason}（{e}）；本进程内不再尝试 Jev，改走降级链")
+                        reason = ("System One 判断后端依赖缺失" if dependency_failure
+                                  else "MoArk 鉴权失败")
+                        logger.warning(f"{reason}（{e}）；本进程内不再尝试主后端，改走降级链")
                     self._jev_auth_dead = True
-                    self._jev_disabled_reason = (
-                        "typesafe_sdk 未安装" if missing_sdk else "Jev 鉴权失败"
-                    )
+                    self._jev_disabled_reason = (reason if dependency_failure
+                                                 else "MoArk 鉴权失败")
+                elif diag["category"] == "model_access":
+                    if not self._jev_model_dead:
+                        logger.warning(
+                            "MoArk 无权访问模型 %s（%s）；本进程内不再尝试主后端",
+                            getattr(self.primary, "model", "?"), e,
+                        )
+                    self._jev_model_dead = True
+                    self._jev_disabled_reason = "MoArk 模型访问被拒 (model_access)"
                 else:
-                    logger.info(f"Jev 不可用: {type(e).__name__}: {e}")
+                    logger.info(f"MoArk 不可用: {type(e).__name__}: {e}")
                 if not self.allow_openai_fallback:
                     # 默认跳过 OpenAICompat（设计原则：Jev → Mock，不模拟 Jev）
                     # 详见 audit A3；OpenAICompat 不返回校准概率，与 Jev 语义不等价。
@@ -673,19 +992,27 @@ class FallbackBackend(SystemOneBackend):
                     try:
                         answers = self.fallback.evaluate(state, questions, model=model, timeout=eff_timeout)
                         self.last_backend = "openai_compat"
+                        self.last_diagnostics = {
+                            "provider": "openai_compat",
+                            "model": getattr(self.fallback, "model_name", None),
+                        }
                         return answers
                     except Exception as e2:
                         logger.info(f"OpenAICompat 不可用，降级到 Mock: {e2}")
         else:
-            if self._jev_auth_dead:
+            if self._jev_auth_dead or self._jev_model_dead:
                 logger.debug("Jev 跳过：%s", self._jev_disabled_reason or "鉴权/依赖不可用")
             else:
-                logger.debug("Jev 跳过：无 TYPESAFE_API_KEY")
+                logger.debug("Jev 跳过：无 MOARK_API_KEY / TYPESAFE_API_KEY")
             if self.allow_openai_fallback:
                 # 无 Jev key 时仍可走 OpenAICompat（显式开启）
                 try:
                     answers = self.fallback.evaluate(state, questions, model=model, timeout=eff_timeout)
                     self.last_backend = "openai_compat"
+                    self.last_diagnostics = {
+                        "provider": "openai_compat",
+                        "model": getattr(self.fallback, "model_name", None),
+                    }
                     return answers
                 except Exception as e:
                     logger.info(f"OpenAICompat 不可用，降级到 Mock: {e}")
@@ -693,6 +1020,7 @@ class FallbackBackend(SystemOneBackend):
         # 3. 降级到 Mock（启发式离线）
         if self._mock is not None:
             self.last_backend = "mock_heuristic"
+            self.last_diagnostics = {"provider": "mock_heuristic", "model": None}
             return self._mock.evaluate(state, questions, model=model, timeout=eff_timeout)
         raise RuntimeError("所有 backend 都不可用，且 Mock 未启用")
 
@@ -715,7 +1043,10 @@ def _load_typesafe_config() -> Dict[str, Any]:
       `primary_model` 作为 legacy fallback (若用户旧版 yaml 还在用).
     """
     defaults: Dict[str, Any] = {
-        "primary_model": "jev-latest",  # 内部 key, 由 FallbackBackend.__init__ 消费
+        "primary_model": DEFAULT_MODEL,  # 内部 key, 由 FallbackBackend.__init__ 消费
+        "api_base": DEFAULT_API_BASE,
+        "api_key": "",
+        "max_questions_per_batch": DEFAULT_MAX_QUESTIONS_PER_BATCH,
         "fallback_role": "primary",
         "allow_mock": True,
         "allow_openai_fallback": False,  # 默认关闭，详见 audit A3
@@ -736,6 +1067,18 @@ def _load_typesafe_config() -> Dict[str, Any]:
                 defaults["timeout"] = float(section["timeout"])
             except (TypeError, ValueError):
                 pass
+        api_base = section.get("api_base")
+        if _config_text(api_base):
+            defaults["api_base"] = normalize_api_root(api_base)
+        api_key = section.get("api_key")
+        if _config_text(api_key):
+            defaults["api_key"] = str(api_key).strip()
+        try:
+            defaults["max_questions_per_batch"] = max(
+                1, int(section.get("max_questions_per_batch", DEFAULT_MAX_QUESTIONS_PER_BATCH))
+            )
+        except (TypeError, ValueError):
+            pass
         # Round 77: config.yaml 用 `model_name` 字段 (与全局 llm_backend/llm_openai_api 节命名一致),
         # 旧代码读 `primary_model` 导致配置静默失效. 现在优先 `model_name`,
         # 兼容旧 yaml 用 `primary_model`.
@@ -757,6 +1100,8 @@ def get_backend() -> SystemOneBackend:
         cfg = _load_typesafe_config()
         _DEFAULT_BACKEND = FallbackBackend(
             primary_model=cfg["primary_model"],
+            api_base=cfg.get("api_base"),
+            max_questions_per_batch=cfg.get("max_questions_per_batch"),
             fallback_role=cfg["fallback_role"],
             allow_mock=cfg["allow_mock"],
             allow_openai_fallback=cfg["allow_openai_fallback"],

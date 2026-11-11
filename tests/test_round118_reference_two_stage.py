@@ -130,8 +130,9 @@ class TestConfirmStage:
                 recorded.append(kw)
 
         agent.db = _StubDB()
-        monkeypatch.setattr(agent, "_register_entities", lambda cid, ents: recorded.append(
-            {"entities": ents}))
+        monkeypatch.setattr(agent, "_register_entities",
+                            lambda cid, ents, source_text=None: recorded.append(
+                                {"entities": ents}))
         agent.process_chunk("ch01_chunk005", "原文 morganatic")
         ref_sources = [r["source"] for r in recorded if "source" in r]
         assert ref_sources == ["morganatic"]  # wild-cat 已被确认阶段剔除

@@ -3,7 +3,7 @@
 覆盖事故链：
   1. typesafe_sdk 缺失时 Jev 主路径应在进程内熔断，不每 chunk 重复探测；
   2. OpenAICompat 兜底的客户端与 model_name 必须来自同一 critic_scoring 路由；
-  3. 中文 403「无权访问模型」必须归类为 auth，而不是 unknown。
+  3. 中文 403「无权访问模型」必须归类为 model_access，而不是 auth/unknown。
 """
 from __future__ import annotations
 
@@ -87,13 +87,13 @@ class TestOpenAICompatTaskBinding:
 
 
 class TestBackendErrorClassification:
-    def test_chinese_403_model_permission_is_auth(self):
+    def test_chinese_403_model_permission_is_model_access(self):
         exc = RuntimeError(
             'API 客户端错误 403: {"error":{"message":'
             '"该令牌无权访问模型 MiniMax-M3.1-Flash"}}'
         )
         out = _classify_backend_error(exc)
-        assert out["category"] == "auth"
+        assert out["category"] == "model_access"
         assert out["retryable"] is False
 
     def test_missing_typesafe_sdk_is_dependency(self):
@@ -105,8 +105,11 @@ class TestBackendErrorClassification:
         assert not _is_auth_failure(
             RuntimeError("API 客户端错误 400: max_tokens_exceeded")
         )
-        assert _is_auth_failure(
+        assert not _is_auth_failure(
             RuntimeError("API 客户端错误 403: 该令牌无权访问模型 MiniMax-M3.1-Flash")
+        )
+        assert _is_auth_failure(
+            RuntimeError("API 客户端错误 401: invalid api key")
         )
 
 

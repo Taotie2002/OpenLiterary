@@ -41,10 +41,11 @@ class TestSecondaryRole:
         assert role.get("api_base", "").startswith("http")
 
     def test_api_key_env_wired(self, fresh_config, monkeypatch):
-        """角色 api_key 的 ${ENV} 占位符须与 shell/.env 注入联动。
+        """角色 api_key 的 ${ENV} 占位符须与 .env / shell 联动。
 
         不锁定"角色↔具体环境变量名"的绑定：读取 config.yaml 声明的占位符，
         逐一声明注入再断言解析结果（Round 127 起绑定可随用户重排）。
+        Round 146 起 .env 优先，shell 仅在 .env 缺项时 fallback。
         """
         import yaml as _yaml
         from pathlib import Path as _Path
@@ -62,7 +63,10 @@ class TestSecondaryRole:
             sentinel = f"test-{role_key}-key"
             monkeypatch.setenv(env_name, sentinel)
             cfg.reload()
-            assert cfg.get_role_config(role_key).get("api_key") == sentinel, role_key
+            resolved = cfg.get_role_config(role_key).get("api_key")
+            expected = cfg.dotenv_values.get(env_name) or sentinel
+            # Compare booleans so a mismatch never prints a real API key.
+            assert (resolved == expected) is True, role_key
             checked += 1
         assert checked >= 3, "models 段各角色的 api_key 都应是 ${ENV} 占位符"
 

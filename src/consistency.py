@@ -39,16 +39,64 @@ def _load_glossary(db_path: str) -> dict:
             seed_entity_variants(db)
         except Exception:
             pass
-        cursor = db.execute(
-            "SELECT canonical_name, source_names, entity_type, confidence, variant_names "
-            "FROM entity_registry WHERE confidence = 'high' AND pending_review = 0"
-        )
-        for row in cursor:
-            entities[row[0]] = {
-                "source_names": robust_json_loads(row[1], expected_type=list) if row[1] else [],
-                "type": row[2],
-                "confidence": row[3],
-                "variant_names": robust_json_loads(row[4], expected_type=list) if row[4] else [],
+        # Round 144: 一致性校正也必须在查询层过滤旧污染。否则旧库中
+        # “男爵.variant_names 含保罗/雷托”或“Paul.source_names 含 Duke Leto”
+        # 会被重新当成合法别名，进入残留检测/修正。
+        try:
+            from src.core.decision_engine import (
+                filter_entity_variant_names,
+                is_proper_entity_alias,
+            )
+        except Exception:
+            filter_entity_variant_names = None
+            is_proper_entity_alias = None
+
+        def _norm_alias(name):
+            return re.sub(r"\s+", " ", str(name or "").strip()).casefold()
+
+        cols = {r[1] for r in db.execute("PRAGMA table_info(entity_registry)")}
+        qt_col = "quarantined_names" if "quarantined_names" in cols else "NULL"
+        rows = db.execute(
+            "SELECT canonical_name, source_names, entity_type, confidence, variant_names, "
+            f"pending_review, {qt_col} FROM entity_registry"
+        ).fetchall()
+        canonical_names = [r[0] for r in rows if isinstance(r[0], str) and r[0]]
+        entity_types = {r[0]: (r[2] or "") for r in rows if isinstance(r[0], str) and r[0]}
+        entity_sources = {
+            r[0]: (robust_json_loads(r[1], expected_type=list) if r[1] else [])
+            for r in rows if isinstance(r[0], str) and r[0]
+        }
+        global_qt = set()
+        for row in rows:
+            qts = robust_json_loads(row[6], expected_type=list) if row[6] else []
+            global_qt.update(_norm_alias(x) for x in qts if isinstance(x, str))
+
+        for canonical, src_json, etype, conf, var_json, pending, qt_json in rows:
+            if conf != "high" or pending != 0:
+                continue
+            srcs = robust_json_loads(src_json, expected_type=list) if src_json else []
+            variants = robust_json_loads(var_json, expected_type=list) if var_json else []
+            row_qt = {_norm_alias(x) for x in (
+                robust_json_loads(qt_json, expected_type=list) if qt_json else []
+            ) if isinstance(x, str)}
+            if is_proper_entity_alias is not None:
+                srcs = [
+                    s for s in srcs
+                    if is_proper_entity_alias(s) and _norm_alias(s) not in row_qt
+                ]
+            if filter_entity_variant_names is not None:
+                variants = filter_entity_variant_names(
+                    canonical, variants,
+                    canonical_names=canonical_names,
+                    quarantined_names=global_qt,
+                    entity_types=entity_types,
+                    entity_sources=entity_sources,
+                )
+            entities[canonical] = {
+                "source_names": srcs,
+                "type": etype,
+                "confidence": conf,
+                "variant_names": variants,
             }
     except Exception as e:
         print(f"  ⚠️ 读取 entity_registry 失败: {e}", file=sys.stderr)

@@ -3,3 +3,11 @@ pyyaml>=6.0
 requests>=2.31.0
 psutil>=5.9.0
 json-repair>=0.24.0
+
+# System One / MoArk d3 判断后端（生产必需；PyPI 包，Requires-Python>=3.10）
+# typesafe-sdk 是 TypeSafe System One 协议的官方 SDK；MoArk d3 仍通过该
+# SDK 调用 /v1/systemone。httpx2 同时是 SDK 的传递依赖和本项目直连代理
+# 客户端所用的 HTTP 库，故显式声明，避免只靠 conda 环境里的偶然安装。
+# 安装：python -m pip install -r requirements-core.txt（3.10/3.13 均可）。
+typesafe-sdk==0.7.1
+httpx2>=2.0.0,<3

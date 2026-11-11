@@ -19,7 +19,10 @@ from src.config import config as _config
 from src.core.scheduler import TaskScheduler, TaskState
 from src.core.decision_engine import (
     DecisionEngine,
+    classify_entity_source_name,
+    canonical_names_related,
     get_sibling_canonicals_by_source,
+    is_proper_entity_alias,
     query_reviewable_entities,
 )
 from src.utils.llm_adapter import (
@@ -1607,16 +1610,16 @@ class TranslationPipeline:
                 if conflicts:
                     cross = sum(1 for c in conflicts if c["conflict_type"] == "cross_entity")
                     variant = sum(1 for c in conflicts if c["conflict_type"] == "variant_for_same_person")
-                    resolved = sum(1 for c in conflicts if c["conflict_type"] == "resolved_same_person")
+                    quarantined = sum(1 for c in conflicts if c["conflict_type"] == "quarantined_proper")
                     lines = []
                     lines.append(f"# entity_registry 冲突检测 - {self.chapter_id}\n\n")
                     lines.append(f"- 总冲突数: {len(conflicts)} "
-                                 f"(跨人物: {cross}, 同人变体: {variant}, 已自动归一: {resolved})\n\n")
-                    if resolved:
-                        lines.append("## ✅ 已自动归一（Round 134 同人归一生效，无需人工处理）\n\n")
-                        for c in [x for x in conflicts if x["conflict_type"] == "resolved_same_person"]:
+                                 f"(跨人物活跃: {cross}, 同人变体: {variant}, 已隔离: {quarantined})\n\n")
+                    if quarantined:
+                        lines.append("## 🛡️ 已隔离专名（跨人物冲突，已从所有硬别名移除；fail-open）\n\n")
+                        for c in [x for x in conflicts if x["conflict_type"] == "quarantined_proper"]:
                             lines.append("- **\"" + c["source_name"] + "\"** ← " + str(c["canonicals"])
-                                         + "  →  簇: `" + str(c.get("resolved_by", "")) + "`\n")
+                                         + "  →  已写入 quarantined_names\n")
                         lines.append("")
                     lines.append("## 跨人物冲突（明确错误，需人工修复）\n\n")
                     for c in [x for x in conflicts if x["conflict_type"] == "cross_entity"]:
@@ -1624,12 +1627,12 @@ class TranslationPipeline:
                     lines.append("\n## 同人变体（可接受但建议整合）\n\n")
                     for c in [x for x in conflicts if x["conflict_type"] == "variant_for_same_person"]:
                         lines.append("- **\"" + c["source_name"] + "\"** ← " + str(c["canonicals"]) + "\n")
-                    lines.append("\n注：Round 134 起，同人别名会由 unify_entity_registry 自动归一\n")
-                    lines.append("（winner + 白名单 variant_names 写库），")
-                    lines.append("残留人工项只需处理「跨人物冲突」。\n")
+                    lines.append("\n注：Round 144 起，source_names 只保留可执行专名；\n")
+                    lines.append("称谓/关系/描述进入 context_names（advisory），跨人物专名冲突进入 quarantined_names。\n")
                     conflict_path = self.output_dir / "entity_registry_conflicts.md"
                     conflict_path.write_text("".join(lines), encoding="utf-8")
-                    print(f"⚠️ [Entity Registry] 发现 {cross} 个跨人物冲突 + {variant} 个同人变体（详见 entity_registry_conflicts.md）")
+                    print(f"⚠️ [Entity Registry] 跨人物活跃冲突 {cross} 个 + 同人变体 {variant} 个 "
+                          f"+ 已隔离专名 {quarantined} 个（详见 entity_registry_conflicts.md）")
                 else:
                     print(f"✅ [Entity Registry] 无冲突")
             except Exception as e:
@@ -1979,13 +1982,13 @@ class TranslationPipeline:
                 lines.append("| Category | 次数 | 含义 / 建议动作 |\n")
                 lines.append("|---|---:|---|\n")
                 diag_desc = {
-                    "auth": "🔑 认证失败 — 检查 TYPESAFE_API_KEY",
+                    "auth": "🔑 认证失败 — 检查 MOARK_API_KEY（旧 TYPESAFE_API_KEY 仅兼容）",
                     "rate_limit": "🚦 速率限制 — 等待或升级配额",
                     "timeout": "⏱️ 超时 — 增加 timeout 或重试",
                     "network": "🌐 网络故障 — 检查 DNS / 防火墙 / 证书",
                     "bad_request": "📝 请求格式错误 — 检查 question schema",
                     "schema_mismatch": "🔧 响应解析失败 — 更新 verdict parser",
-                    "api_error": "⚠️ 服务端错误 — 检查 typesafe status page",
+                    "api_error": "⚠️ 服务端错误 — 检查 MoArk 服务状态",
                     "unknown": "❓ 未分类",
                 }
                 for cat, n in sorted(diag_counter.items(), key=lambda kv: -kv[1]):
@@ -1995,7 +1998,7 @@ class TranslationPipeline:
                     lines.append(f"| {cat} | {n} | {desc} |\n")
                 # 健康度判断
                 if diag_counter.get("auth", 0) > 0:
-                    lines.append("\n- 🔴 **认证失败次数 > 0**：检查 .env 中的 TYPESAFE_API_KEY 是否有效\n")
+                    lines.append("\n- 🔴 **认证失败次数 > 0**：检查 .env 中的 MOARK_API_KEY 是否有效（旧 TYPESAFE_API_KEY 仅兼容）\n")
                 elif diag_counter.get("network", 0) > total_diag * 0.5:
                     lines.append("\n- 🔴 **网络失败占比 > 50%**：检查 DNS / 防火墙 / 证书（参考 Round 18 Jev 利用率）\n")
                 elif diag_counter.get("rate_limit", 0) > 0:
@@ -2426,82 +2429,65 @@ class TranslationPipeline:
             )
 
     def _entity_registry_conflict_audit(self) -> List[Dict]:
-        """Round 15: 检测 entity_registry 中 source_name 冲突
+        """Round 15/144: 检测 entity_registry 的硬专名冲突。
 
-        冲突定义：同一英文 source_name 被登记到 ≥2 个 canonical 时
-        影响：consistency.py 无法确定替换目标，导致 Round 7/9 行为不可预期
-        解决：本方法只生成诊断报告（entity_registry_conflicts.md），运维手动修复
+        Round 144 语义：
+          - 只把 proper 专名视为硬冲突候选；
+          - 多个 owner 的 canonical 身份相关 → variant_for_same_person（可归一）；
+          - 已写入 quarantined_names、且不在任何 source_names 中 → quarantined_proper
+            （已隔离，fail-open，不再算活跃冲突）；
+          - 其余跨人物 proper 冲突 → cross_entity（需处理）。
 
-        Returns:
-            [{source_name: str, canonicals: [str, ...], conflict_type: str}, ...]
+        context_names 中的 the Duke/my Lord/描述性指称允许一对多，不参与冲突判定。
         """
         if not self.decision_engine:
             return []
-        # Round 15: 查全部实体（含 pending_review=1）—— 冲突可能就藏在待核查里
         try:
-            cursor = self.decision_engine.conn.execute(
-                "SELECT canonical_name, source_names FROM entity_registry"
-            )
-            entities = [(row[0], row[1], "[]") for row in cursor.fetchall()]
+            conn = self.decision_engine.conn
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+            qt_col = "quarantined_names" if "quarantined_names" in cols else "NULL"
+            rows = conn.execute(
+                f"SELECT canonical_name, source_names, {qt_col} FROM entity_registry"
+            ).fetchall()
         except Exception:
             return []
 
-        # 反向索引：source_name → [canonical, ...]
         from collections import defaultdict
-        src_to_canonicals = defaultdict(list)
-        for row in entities:
-            canonical = row[0]
-            sn_json = row[1]
-            sn_list = robust_json_loads(sn_json, expected_type=list) if sn_json else []
-            for sn in sn_list:
-                if sn:
-                    src_to_canonicals[sn].append(canonical)
+        hard_owners = defaultdict(set)
+        quarantine_owners = defaultdict(set)
+        for canonical, src_json, qt_json in rows:
+            srcs = robust_json_loads(src_json, expected_type=list) if src_json else []
+            qts = robust_json_loads(qt_json, expected_type=list) if qt_json else []
+            for sn in srcs:
+                if isinstance(sn, str) and is_proper_entity_alias(sn):
+                    hard_owners[sn].add(canonical)
+            for sn in qts:
+                if isinstance(sn, str) and is_proper_entity_alias(sn):
+                    quarantine_owners[sn].add(canonical)
 
-        # 找冲突：source_name → ≥2 canonicals
         conflicts = []
-        for src_name, canonicals in src_to_canonicals.items():
-            if len(canonicals) < 2:
+        for src_name in sorted(set(hard_owners) | set(quarantine_owners)):
+            hard = hard_owners.get(src_name, set())
+            qt = quarantine_owners.get(src_name, set())
+            owners = hard | qt
+            if len(owners) < 2:
                 continue
-            # 区分冲突类型
-            # 同名变体（如 "Mr. Lomax" 同时给 洛马克斯先生 + 乔治·洛马克斯先生）：可能是 acceptable（同一人不同译名）
-            # 跨人物冲突（如 "Joe" 同时给 安东尼·凯德 + 绅士乔）：明确错误
-            conflict_type = "cross_entity"  # 默认
-            canon_set = set(canonicals)
-            # 简单启发式：如果所有 canonical 都包含相同的人名姓氏，可能是变体
-            # 否则视为跨人物冲突
-            unique_first_chars = set()
-            for c in canonicals:
-                # 取中文译名前 2 字作为"姓氏"
-                if len(c) >= 2:
-                    unique_first_chars.add(c[:2])
-            if len(unique_first_chars) == 1:
+            owner_list = sorted(owners)
+            if not hard:
+                conflict_type = "quarantined_proper"
+            elif all(canonical_names_related(a, b)
+                      for i, a in enumerate(owner_list) for b in owner_list[i + 1:]):
                 conflict_type = "variant_for_same_person"
             else:
                 conflict_type = "cross_entity"
 
             conflicts.append({
                 "source_name": src_name,
-                "canonicals": canonicals,
+                "canonicals": owner_list,
                 "conflict_type": conflict_type,
+                "hard_owners": sorted(hard),
+                "quarantined_owners": sorted(qt),
             })
-
-        # Round 134: 已被同人归一（unify_entity_registry）覆盖的冲突 → resolved。
-        # 语义：同一 source_name 落到同一簇的多个 canonical 上 = 已收编为白名单,
-        # 不再是"跨人物错误"（残留的人工编辑提示也不再需要）。
-        try:
-            from src.core.decision_engine import unify_entity_registry
-            plan = unify_entity_registry(self.decision_engine.conn, dry_run=True)
-            cluster_of = {}
-            for key, info in plan.items():
-                for canon in [info["winner"]] + list(info.get("demoted", [])):
-                    cluster_of[canon] = key
-            for c in conflicts:
-                keys = {cluster_of.get(x) for x in c["canonicals"]}
-                if keys and None not in keys and len(keys) == 1:
-                    c["conflict_type"] = "resolved_same_person"
-                    c["resolved_by"] = keys.pop()
-        except Exception:
-            pass
 
         return conflicts
 
@@ -2567,6 +2553,7 @@ class TranslationPipeline:
                 valid_sns = [
                     sn for sn in source_names
                     if sn and self._is_valid_entity_source_name(sn)
+                    and is_proper_entity_alias(sn)
                 ]
                 effective_sns, _swallowed = self._partition_swallowed_source_names(
                     source_text, canonical, valid_sns,
@@ -4279,7 +4266,10 @@ class TranslationPipeline:
             # 避免全库实体每次 AUDITING 都被遍历、variant 误发现累积、
             # quality_retries 无限增长。修前 ch32 quality_retries=112+ 死循环。
             # ch06: 过滤非实体 source_name（sir/his eyelids 等），避免误判"实体出场"
-            valid_source_names = [sn for sn in source_names if self._is_valid_entity_source_name(sn)]
+            valid_source_names = [
+                sn for sn in source_names
+                if self._is_valid_entity_source_name(sn) and is_proper_entity_alias(sn)
+            ]
             # Round 133b: 别名吞并抑制 — 剔除被其它实体更长别名吞并的伪命中
             # （chunk071 "Mother"⊂"Reverend Mother" 根因, 详见 _partition_swallowed_source_names）
             effective_source_names, _swallowed = self._partition_swallowed_source_names(
@@ -4427,7 +4417,10 @@ class TranslationPipeline:
             # Round 112: 身份映射 canonical（如 " Cloak Room"→"Cloak Room"）同步剔除。
             if not self._is_enforceable_canonical(canonical, source_names):
                 continue
-            valid_sns = [sn for sn in source_names if self._is_valid_entity_source_name(sn)]
+            valid_sns = [
+                sn for sn in source_names
+                if self._is_valid_entity_source_name(sn) and is_proper_entity_alias(sn)
+            ]
             # Round 133b: 别名吞并抑制 — swallowed 别名不注入/不当在场证据
             # （chunk071 "Mother"→杰西卡夫人 污染 prompt 根因）
             effective_sns, swallowed_sns = self._partition_swallowed_source_names(
@@ -4478,7 +4471,10 @@ class TranslationPipeline:
             # Round 112: 身份映射 canonical 同步剔除（无翻译信息）
             if not self._is_enforceable_canonical(canonical, source_names):
                 continue
-            valid_sns = [sn for sn in source_names if self._is_valid_entity_source_name(sn)]
+            valid_sns = [
+                sn for sn in source_names
+                if self._is_valid_entity_source_name(sn) and is_proper_entity_alias(sn)
+            ]
             # Round 133b: 别名吞并抑制（与 _build_entity_registry_for_rewriter 同语义）
             effective_sns, swallowed_sns = self._partition_swallowed_source_names(
                 source_text, canonical, valid_sns,
@@ -5189,7 +5185,7 @@ class TranslationPipeline:
                 elif early_stop_enabled and quality_retries == 0:
                     # early_stop 仅在首轮裁决生效：避免 rework 一两次就放弃可恢复的 chunk
                     # 第二轮起若仍不达标，正常走 fallback 完成 max_quality_retries 轮 rework
-                    # 详见 config.yaml pipeline.early_stop.apply_only_first_round
+                    # 该行为由状态机固定为“仅首轮”，不再暴露配置开关。
                     scores = critic_report.get("scores", {})
                     very_low_count = sum(
                         1 for v in scores.values()
@@ -5421,6 +5417,7 @@ def run_final_gate(
     ⑤ T1 转换审计报告结论为 "✅ 通过"
     ⑥ L1 韵文对齐（verse_lint，门禁内联自动运行）
     ⑦ L2 双关核销（pun_audit，门禁内联自动运行；Round 130 起无需手动补跑）
+    ⑧ 裁决校准占比（最终稿必须主要由 confidence_source=jev 的校准后端产出）
     任一为红 → ok=False（translate_book.sh 以非零退出中止 / ⛔）。
     """
     root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
@@ -5435,6 +5432,7 @@ def run_final_gate(
     stats: dict = {"tasks": 0, "states": {}, "chapters": 0, "qa_fallbacks": 0}
     by_state: dict = {}
     expected: dict = {}
+    task_ids: list = []
 
     # ① 状态机 + ② 产物
     rows = []
@@ -5449,6 +5447,7 @@ def run_final_gate(
     for ch, _cid, st in rows:
         by_state[st] = by_state.get(st, 0) + 1
         expected[ch] = expected.get(ch, 0) + 1
+        task_ids.append((ch, _cid))
     stats["states"] = by_state
     stats["chapters"] = len(expected)
 
@@ -5472,11 +5471,16 @@ def run_final_gate(
     if not qa_file.exists():
         failures.append(f"③ QA_REPORT 不存在: {qa_file}")
     else:
-        falls = [ln[3:].strip() for ln in qa_file.read_text(encoding="utf-8").split("\n")
-                 if ln.startswith("## ")]
-        stats["qa_fallbacks"] = len(falls)
-        if falls:
-            failures.append(f"③ QA_REPORT 记录 {len(falls)} 个 fallback 章节: {falls[:5]}")
+        try:
+            qa_text = qa_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            failures.append(f"③ QA_REPORT 读取失败: {exc}")
+        else:
+            falls = [ln[3:].strip() for ln in qa_text.split("\n")
+                     if ln.startswith("## ")]
+            stats["qa_fallbacks"] = len(falls)
+            if falls:
+                failures.append(f"③ QA_REPORT 记录 {len(falls)} 个 fallback 章节: {falls[:5]}")
 
     # ④ T5 lint
     try:
@@ -5494,12 +5498,16 @@ def run_final_gate(
     if not audit_file.exists():
         failures.append(f"⑤ 转换审计报告不存在: {audit_file}")
     else:
-        audit_text = audit_file.read_text(encoding="utf-8")
-        cov = re.search(r'全书覆盖率:\s*([\d.]+)%', audit_text)
-        if cov:
-            stats["audit_coverage"] = float(cov.group(1))
-        if "✅ 通过" not in audit_text:
-            failures.append(f"⑤ 转换审计未通过（详见 {audit_file}）")
+        try:
+            audit_text = audit_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            failures.append(f"⑤ 转换审计报告读取失败: {exc}")
+        else:
+            cov = re.search(r'全书覆盖率:\s*([\d.]+)%', audit_text)
+            if cov:
+                stats["audit_coverage"] = float(cov.group(1))
+            if "✅ 通过" not in audit_text:
+                failures.append(f"⑤ 转换审计未通过（详见 {audit_file}）")
 
     # ⑥ L1 韵文对齐（verse_lint；manifest 无韵文块或功能关闭时跳过）
     try:
@@ -5581,14 +5589,99 @@ def run_final_gate(
             if not _pun_json.exists():
                 failures.append("⑦ pun_audit 未运行（缺 output/pun_audit.json；自动补跑不可用，请手动跑 scripts/pun_audit.py）")
             else:
-                _pun_report = json.loads(_pun_json.read_text(encoding="utf-8"))
-                _pun_sum = _pun_report.get("summary") or {}
-                stats["pun"] = _pun_sum
-                _pun_miss = int(_pun_sum.get("uncovered_nonwaived", 0) or 0)
-                if _pun_miss:
-                    failures.append(f"⑦ pun_watchlist 未核销 {_pun_miss} 项（详见 output/pun_audit.md）")
+                try:
+                    _pun_report = json.loads(_pun_json.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as _pun_read_exc:
+                    failures.append(f"⑦ pun_audit.json 读取/解析失败: {_pun_read_exc}")
+                else:
+                    _pun_sum = _pun_report.get("summary") or {}
+                    stats["pun"] = _pun_sum
+                    _pun_miss = int(_pun_sum.get("uncovered_nonwaived", 0) or 0)
+                    if _pun_miss:
+                        failures.append(f"⑦ pun_watchlist 未核销 {_pun_miss} 项（详见 output/pun_audit.md）")
     except Exception as _p_exc:
         failures.append(f"⑦ pun 审计执行异常: {_p_exc}")
+
+    # ⑧ 校准裁决占比：最终稿必须能证明主要来自校准概率后端（_backend_path=jev）。
+    # Jev 是 Round 145 后保留的兼容标签，实际提供者为 MoArk d3-flash；legacy /
+    # openai_compat / mock_heuristic 均为未校准路径。零人工审核下，不能只看
+    # 成本报告里的“可看但不阻断”统计。
+    gate_cfg = _config.get("pipeline.final_gate", {}) or {}
+    try:
+        _min_cal = float(gate_cfg.get("min_calibrated_ratio", 0.95))
+    except (TypeError, ValueError):
+        _min_cal = 0.95
+    _min_cal = max(0.0, min(1.0, _min_cal))
+    _enforce_cal = bool(gate_cfg.get("enforce_calibrated_ratio", True))
+    _cal_sources_raw = gate_cfg.get("calibrated_backends") or ["jev"]
+    if isinstance(_cal_sources_raw, str):
+        _cal_sources_raw = [_cal_sources_raw]
+    _cal_sources = {str(x) for x in _cal_sources_raw}
+    _backend_counts: dict = {}
+    _chapter_cal: dict = {}
+    _missing_reports = []
+    _bad_reports = []
+    _calibrated_n = 0
+    _multi_batch_calibrated = 0
+    for _ch, _cid in task_ids:
+        _report_path = out_root / _ch / f"{_cid}_critic_report.json"
+        _chapter_cal.setdefault(_ch, {"total": 0, "calibrated": 0})
+        _chapter_cal[_ch]["total"] += 1
+        if not _report_path.exists():
+            _missing_reports.append(str(_report_path))
+            continue
+        try:
+            _report = json.loads(_report_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            _bad_reports.append(str(_report_path))
+            continue
+        _bp = str((_report or {}).get("_backend_path") or "unknown")
+        _backend_counts[_bp] = _backend_counts.get(_bp, 0) + 1
+        if _bp in _cal_sources:
+            _calibrated_n += 1
+            _chapter_cal[_ch]["calibrated"] += 1
+            _diag = (_report or {}).get("_backend_diagnostics") or {}
+            try:
+                if int(_diag.get("batch_count") or 0) > 1:
+                    _multi_batch_calibrated += 1
+            except (TypeError, ValueError):
+                pass
+
+    stats["backend_paths"] = _backend_counts
+    stats["multi_batch_calibrated"] = _multi_batch_calibrated
+    stats["calibrated_ratio"] = (
+        _calibrated_n / len(task_ids) if task_ids else None)
+    stats["calibrated_by_chapter"] = {
+        ch: (v["calibrated"] / v["total"] if v["total"] else 0.0)
+        for ch, v in sorted(_chapter_cal.items())
+    }
+    if _min_cal > 0 and task_ids:
+        if _missing_reports:
+            failures.append(
+                f"⑧ 校准审计缺少 critic_report {len(_missing_reports)} 个: {_missing_reports[:5]}")
+        if _bad_reports:
+            failures.append(
+                f"⑧ critic_report 读取/解析失败 {len(_bad_reports)} 个: {_bad_reports[:5]}")
+        _ratio = float(stats["calibrated_ratio"] or 0.0)
+        if _ratio < _min_cal:
+            _msg = (f"⑧ 校准裁决占比 {_ratio:.1%} < {_min_cal:.1%} "
+                    f"(backend={_backend_counts})")
+            if _enforce_cal:
+                failures.append(_msg)
+            else:
+                warnings.append(_msg + "（config 显式豁免 enforce_calibrated_ratio=false）")
+        _bad_chapters = [
+            (ch, ratio) for ch, ratio in stats["calibrated_by_chapter"].items()
+            if ratio < _min_cal
+        ]
+        if _bad_chapters and _enforce_cal:
+            failures.append(
+                "⑧ 章节校准占比不足: " + ", ".join(
+                    f"{ch}={ratio:.1%}" for ch, ratio in _bad_chapters[:5]))
+        if _multi_batch_calibrated:
+            warnings.append(
+                f"⑧ 多批 System One 裁决 {_multi_batch_calibrated} 个：跨批概率尺度尚未做整批/拆批 A/B，"
+                "当前按同一校准来源处理")
 
     if stats["tasks"] == 0 and db_file.exists():
         failures.append("① workflow.db 无任务行（未 init？）")
@@ -5611,6 +5704,9 @@ def run_final_gate(
     if _ps:
         print(f"  ⑦ 双关核销: covered={_ps.get('covered', 0)}/{_ps.get('total', 0)}, "
               f"waived={_ps.get('waived', 0)}, uncovered={_ps.get('uncovered_nonwaived', 0)}")
+    if stats.get("calibrated_ratio") is not None:
+        print(f"  ⑧ 校准裁决: {stats['calibrated_ratio']:.1%} "
+              f"(min={_min_cal:.0%}, backends={stats.get('backend_paths')})")
     for f in failures:
         print(f"  ❌ {f}")
     if result["ok"]:

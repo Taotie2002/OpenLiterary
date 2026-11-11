@@ -23,6 +23,12 @@ psutil>=5.9.0
 # 防御性 JSON 解析（处理 LLM 输出格式违规）
 json-repair>=0.24.0
 
+# System One / MoArk d3 判断后端（生产必需；PyPI 包，Requires-Python>=3.10）
+# typesafe-sdk 自带 httpx2 传递依赖；本项目也直接 import httpx2 做代理客户端，
+# 因此显式列出。3.10/3.13 均使用同一版本约束。
+typesafe-sdk==0.7.1
+httpx2>=2.0.0,<3
+
 # ===========================
 # EPUB 预处理工具
 # ===========================

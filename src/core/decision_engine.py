@@ -9,6 +9,7 @@ import sqlite3
 import re
 import json
 import threading
+from functools import lru_cache
 from enum import IntEnum
 from pathlib import Path
 from typing import List, Optional, Tuple, Callable, Dict, Any
@@ -76,7 +77,7 @@ class DecisionEngine:
             CREATE TABLE IF NOT EXISTS entity_registry (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 canonical_name TEXT NOT NULL,          -- 主名（中文译名）
-                source_names TEXT NOT NULL,            -- JSON数组：原文出现的所有指称形式
+                source_names TEXT NOT NULL,            -- JSON数组：可唯一识别实体的硬专名（Round 144）
                 pronoun_gender TEXT,                   -- he/she/it/unknown
                 entity_type TEXT,                      -- person/place/organization/other
                 first_seen_chunk TEXT,                 -- 首次出现的 chunk_id
@@ -101,6 +102,18 @@ class DecisionEngine:
             self.conn.execute("SELECT translation_strategy FROM entity_registry LIMIT 1")
         except Exception:
             self.conn.execute("ALTER TABLE entity_registry ADD COLUMN translation_strategy TEXT DEFAULT 'free'")
+
+        # Round 144: 实体别名分层。source_names 只保留可执行专名；
+        # context_names 保存称谓/关系/描述性指称（advisory，不做硬约束/合并证据）；
+        # quarantined_names 保存跨人物冲突专名（fail-open：任何 canonical 都不执行）。
+        for _col, _ddl in (
+            ("context_names", "TEXT"),
+            ("quarantined_names", "TEXT"),
+        ):
+            try:
+                self.conn.execute(f"SELECT {_col} FROM entity_registry LIMIT 1")
+            except Exception:
+                self.conn.execute(f"ALTER TABLE entity_registry ADD COLUMN {_col} {_ddl}")
 
         # 决策锁定列（Round 121）：防跨章译文翻转 → 回溯乒乓。
         # locked=1 的决策拒绝覆盖性更新且不触发 backtrack；旧库幂等迁移
@@ -438,6 +451,29 @@ class DecisionEngine:
 
 
 # P3-1: entity_registry 公共查询 helpers（双变体——confidence 过滤语义不等价）
+def _variant_filter_context(conn):
+    """Round 144: 查询层过滤 variant_names 所需的 canonical/quarantine 快照。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+    qt_col = "quarantined_names" if "quarantined_names" in cols else "NULL"
+    etype_col = "entity_type" if "entity_type" in cols else "NULL"
+    rows = conn.execute(
+        f"SELECT canonical_name, {qt_col}, {etype_col}, source_names "
+        "FROM entity_registry"
+    ).fetchall()
+    canonical_names = [r[0] for r in rows if isinstance(r[0], str)]
+    entity_types = {r[0]: (r[2] or "") for r in rows if isinstance(r[0], str)}
+    entity_sources = {}
+    global_qt = set()
+    for _canon, qt_json, _etype, _src_json in rows:
+        if isinstance(_canon, str):
+            entity_sources[_canon] = (
+                robust_json_loads(_src_json, expected_type=list) if _src_json else []
+            )
+        qts = robust_json_loads(qt_json, expected_type=list) if qt_json else []
+        global_qt.update(_alias_norm(x) for x in qts if isinstance(x, str))
+    return canonical_names, global_qt, entity_types, entity_sources
+
+
 def query_high_confidence_entities(conn) -> List[Tuple[str, str, str, str]]:
     """返回高置信度且无待核查的实体 (canonical_name, source_names_json, variant_names_json, translation_strategy)。
 
@@ -445,11 +481,29 @@ def query_high_confidence_entities(conn) -> List[Tuple[str, str, str, str]]:
     等价 SQL：`WHERE confidence = 'high' AND pending_review = 0`
     """
     cursor = conn.cursor()
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+    qt_col = "quarantined_names" if "quarantined_names" in cols else "NULL"
     cursor.execute(
-        'SELECT canonical_name, source_names, variant_names, translation_strategy FROM entity_registry '
-        'WHERE confidence = "high" AND pending_review = 0'
+        f'SELECT canonical_name, source_names, variant_names, translation_strategy, {qt_col} '
+        'FROM entity_registry WHERE confidence = "high" AND pending_review = 0'
     )
-    return cursor.fetchall()
+    canonical_names, global_qt, entity_types, entity_sources = _variant_filter_context(conn)
+    out = []
+    for canonical, src_json, var_json, strategy, qt_json in cursor.fetchall():
+        srcs = robust_json_loads(src_json, expected_type=list) if src_json else []
+        vars_ = robust_json_loads(var_json, expected_type=list) if var_json else []
+        qts = robust_json_loads(qt_json, expected_type=list) if qt_json else []
+        qt_norms = {_alias_norm(x) for x in qts if isinstance(x, str)}
+        hard = [sn for sn in srcs if is_proper_entity_alias(sn)
+                and _alias_norm(sn) not in qt_norms]
+        safe_vars = filter_entity_variant_names(
+            canonical, vars_, canonical_names=canonical_names,
+            quarantined_names=global_qt, entity_types=entity_types,
+            entity_sources=entity_sources,
+        )
+        out.append((canonical, json.dumps(hard, ensure_ascii=False),
+                    json.dumps(safe_vars, ensure_ascii=False), strategy))
+    return out
 
 
 def query_reviewable_entities(conn) -> List[Tuple[str, str]]:
@@ -460,11 +514,29 @@ def query_reviewable_entities(conn) -> List[Tuple[str, str]]:
     等价 SQL：`WHERE pending_review = 0`
     """
     cursor = conn.cursor()
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+    qt_col = "quarantined_names" if "quarantined_names" in cols else "NULL"
     cursor.execute(
-        'SELECT canonical_name, source_names, variant_names FROM entity_registry '
-        'WHERE pending_review = 0'
+        f'SELECT canonical_name, source_names, variant_names, {qt_col} '
+        'FROM entity_registry WHERE pending_review = 0'
     )
-    return cursor.fetchall()
+    canonical_names, global_qt, entity_types, entity_sources = _variant_filter_context(conn)
+    out = []
+    for canonical, src_json, var_json, qt_json in cursor.fetchall():
+        srcs = robust_json_loads(src_json, expected_type=list) if src_json else []
+        vars_ = robust_json_loads(var_json, expected_type=list) if var_json else []
+        qts = robust_json_loads(qt_json, expected_type=list) if qt_json else []
+        qt_norms = {_alias_norm(x) for x in qts if isinstance(x, str)}
+        hard = [sn for sn in srcs if is_proper_entity_alias(sn)
+                and _alias_norm(sn) not in qt_norms]
+        safe_vars = filter_entity_variant_names(
+            canonical, vars_, canonical_names=canonical_names,
+            quarantined_names=global_qt, entity_types=entity_types,
+            entity_sources=entity_sources,
+        )
+        out.append((canonical, json.dumps(hard, ensure_ascii=False),
+                    json.dumps(safe_vars, ensure_ascii=False)))
+    return out
 
 
 def get_sibling_canonicals_by_source(conn) -> Dict[str, Set[str]]:
@@ -968,6 +1040,7 @@ _EN_ROLE_WORDS = frozenset({
     "duke", "duchess", "lord", "lady", "baron", "baroness", "sir", "dame",
     "king", "queen", "prince", "princess", "emperor", "empress", "archduke",
     "count", "countess", "earl", "viscount", "marquis", "marquess",
+    "padishah", "sire", "milord", "milady", "m'lord", "m'lady", "m’lord", "m’lady",
     "mother", "father", "sister", "brother", "priest", "priestess",
     "reverend", "reverence", "bishop", "archbishop", "pope", "cardinal",
     "pastor", "deacon", "nun", "monk", "abbot", "abbess", "holiness",
@@ -980,6 +1053,18 @@ _EN_ROLE_WORDS = frozenset({
     "czar", "sultan", "sheik", "emir", "pasha", "nabob", "mayor",
     "governor", "president", "minister", "chancellor", "ambassador",
     "consul", "senator", "steward", "warden", "champion", "knight",
+    "judge", "justice", "truthsayer",
+})
+
+# Round 144: 普通/描述性词汇。即使首字母大写，也不应当作硬专名证据。
+_EN_NON_NAME_COMMON_WORDS = frozenset({
+    "person", "people", "man", "woman", "boy", "girl", "child", "children",
+    "fool", "hand", "hands", "ear", "ears", "eye", "eyes", "face", "head",
+    "voice", "body", "heart", "mind", "beast", "creature", "thing", "dog",
+    "friend", "stranger", "servant", "guard", "soldier", "warrior", "royal",
+    "imperial", "young", "old", "great", "little", "fat", "dead", "poor",
+    "good", "evil", "cub", "youth", "elder", "fellow", "gentleman", "lady",
+    "change",
 })
 
 # 英文关系词（"X's father" / "my mother" 之类不作为专名证据）
@@ -1100,6 +1185,197 @@ def _en_normalize_token(tok):
     return t
 
 
+def _en_role_base(tok):
+    """Round 144: 将英文头衔的复数/所有格形态归一到角色词根。
+
+    emperors → emperor，dukes → duke，countesses → countess。仅当候选词根
+    确实在 _EN_ROLE_WORDS 中才转换，避免误伤普通复数名词。
+    """
+    t = _en_normalize_token(tok)
+    if not t or t in _EN_ROLE_WORDS:
+        return t
+    if t.endswith("ies"):
+        cand = t[:-3] + "y"
+        if cand in _EN_ROLE_WORDS:
+            return cand
+    for suffix in ("es", "s"):
+        if t.endswith(suffix):
+            cand = t[:-len(suffix)]
+            if cand in _EN_ROLE_WORDS:
+                return cand
+    return t
+
+
+def classify_entity_source_name(source_name) -> str:
+    """Round 144: 把英文指称分为可执行专名 / 上下文指称。
+
+    Returns one of:
+      - proper:      可唯一识别的专名或“头衔+专名”（Paul Atreides / Duke Leto）
+      - title:       纯头衔/敬语（the Emperor / my Lord / Emperors）
+      - relation:    关系指称（my father / his son / Grandfather）
+      - description: 描述性短语（fifteen years / the man / Emperor's ears）
+      - pronoun:     代词轨迹
+      - invalid:     空串
+
+    只有 proper 可进入硬核查与同人合并证据；其余进入 context_names，
+    允许一对多，绝不据此判 missing，也绝不作 merge bridge。
+    """
+    s = (source_name or "").strip()
+    if not s:
+        return "invalid"
+    if re.search(r"[\u4e00-\u9fff\u3400-\u4dbf]", s):
+        return "proper"
+    raw_tokens = _en_tokens(s)
+    if not raw_tokens:
+        return "description"
+    norm_tokens = [_en_normalize_token(t) for t in raw_tokens]
+    core = [t for t in norm_tokens if t and t not in _EN_DETERMINERS]
+    if not core:
+        return "description"
+    if all(t in _EN_RELATION_WORDS for t in core):
+        return "relation"
+    if source_name_is_relational(s):
+        return "relation"
+    role_core = [_en_role_base(t) for t in core]
+    if all(t in _EN_ROLE_WORDS or t in _EN_GENERIC_MODIFIERS or t in _EN_RELATION_WORDS
+           for t in role_core):
+        return "relation" if any(t in _EN_RELATION_WORDS for t in role_core) else "title"
+    proper = source_name_proper_tokens(s)
+    if not proper:
+        return "description"
+    # Round 144: “a/an + 单个专名”通常是类别/家族指称（an Atreides），
+    # 不是可唯一执行的人名。带头衔的 the Duke Leto 不在此列。
+    # 注：不把通用规则扩展到 "the + 专名" —— the Nationalists /
+    # the Newcomer 是合法实体指称，扩展会误伤组织名和既有核查。
+    if raw_tokens and raw_tokens[0].lower() in ("a", "an"):
+        role_like = any(
+            _en_role_base(t) in _EN_ROLE_WORDS or t in _EN_GENERIC_MODIFIERS
+            or t in _EN_RELATION_WORDS
+            for t in core
+        )
+        if not role_like and len(proper) == 1:
+            return "description"
+    if all(t in _EN_NON_NAME_COMMON_WORDS for t in proper):
+        return "description"
+    # 描述性短语常含小写普通名词（old Harkonnen beast / the fat hand）。
+    # 真正的专名 token 必须首字母大写；小写 content token 说明是描述，而非姓名。
+    for raw_tok, norm_tok in zip(raw_tokens, norm_tokens):
+        if not norm_tok or norm_tok in _EN_DETERMINERS:
+            continue
+        base = _en_role_base(norm_tok)
+        if base in _EN_ROLE_WORDS or norm_tok in _EN_GENERIC_MODIFIERS \
+                or norm_tok in _EN_RELATION_WORDS:
+            continue
+        if not raw_tok[0].isupper():
+            return "description"
+    return "proper"
+
+
+def is_proper_entity_alias(source_name) -> bool:
+    """Round 144: 是否可进入硬实体核查/同人合并证据。"""
+    return classify_entity_source_name(source_name) == "proper"
+
+
+def alias_attested_in_text(alias, source_text) -> bool:
+    """Round 144: alias 是否真的在本 chunk 原文中出现（L1 式机械校验）。
+
+    模型偶尔会把推断出来的称呼写成 source_name；这类“无出处专名”一旦
+    进入 registry 就会变成硬约束。这里只做保守的原文核对：空白/弯引号
+    归一、ASCII 词边界、中文子串。宁可丢弃一个合法别名，也不接受幻觉。
+    """
+    if not isinstance(alias, str) or not isinstance(source_text, str):
+        return False
+    a = re.sub(r"\s+", " ", alias).strip().replace("’", "'").casefold()
+    t = re.sub(r"\s+", " ", source_text).strip().replace("’", "'").casefold()
+    if not a or not t:
+        return False
+    if not a[0].isascii() or not a[-1].isascii():
+        return a in t
+    pattern = r"(?<![A-Za-z0-9])" + re.escape(a) + r"(?![A-Za-z0-9])"
+    return re.search(pattern, t) is not None
+
+
+@lru_cache(maxsize=4096)
+def canonical_identity_tokens(name) -> frozenset:
+    """Round 144: 去掉中文头衔/泛指修饰后的身份 token。
+
+    雷托公爵 → {雷托}；弗拉基米尔·哈克南男爵 → {弗拉基米尔, 哈克南}；
+    皇帝/皇帝陛下/老侯爵 → ∅（纯头衔不提供身份证据）。
+    """
+    base = _r134_strip_parens(name or "")
+    parts = [p for p in re.split(r"[" + re.escape(_NAME_SEP_CHARS) + r"\s]+", base) if p]
+    out = set()
+    for part in parts:
+        p = part.strip()
+        if not p:
+            continue
+        changed = True
+        while changed:
+            changed = False
+            for mod in _ZH_GENERIC_MODIFIERS:
+                if p.startswith(mod) and len(p) > len(mod):
+                    p = p[len(mod):]
+                    changed = True
+                    break
+        changed = True
+        while changed:
+            changed = False
+            for role in sorted(_ZH_ROLE_WORDS, key=len, reverse=True):
+                if p.startswith(role) and len(p) > len(role):
+                    p = p[len(role):]
+                    changed = True
+                    break
+                if p.endswith(role) and len(p) > len(role):
+                    p = p[:-len(role)]
+                    changed = True
+                    break
+        if len(p) >= 2 and p not in _ZH_ROLE_WORDS and p not in _ZH_GENERIC_MODIFIERS:
+            out.add(p)
+    return frozenset(out)
+
+
+def canonical_names_related(a: str, b: str) -> bool:
+    """Round 144: 两个 canonical 是否可能指向同一实体（保守版）。
+
+    只认“去掉头衔后的身份 token 交集”，例如 雷托 vs 雷托公爵、
+    哈克南男爵 vs 弗拉基米尔·哈克南男爵、佐恩侯爵 vs 佐恩·巴列。
+    Paul vs Baron、Paul vs Leto、Emperor vs Baron 必须为 False。
+    纯头衔/关系词（皇帝/侯爵/老侯爵）不提供交集证据，避免把不同人物
+    仅凭 shared title 合并。
+    """
+    ta = canonical_identity_tokens(a)
+    tb = canonical_identity_tokens(b)
+    if ta and tb and (ta & tb):
+        return True
+    return False
+
+
+def canonical_variant_forms_related(a: str, b: str) -> bool:
+    """Round 144: 两个 canonical 是否可视为同一人物的合法异写。
+
+    这个判定比 ``canonical_names_related`` 宽松，只用于清理/过滤
+    ``variant_names``，**不用于身份合并**。原因：音译异体（伊鲁兰 / 伊如兰、
+    阿拉基斯 / 阿拉肯、卡拉丹 / 卡拉丹城堡）不应被当成跨人物污染删除；
+    而保罗·厄崔迪 / 雷托 / 沙达姆四世这类跨人物 canonical 则必须删除。
+
+    保守阈值：中文名长度 >=3 时，字符 Dice 相似度 >=0.45 视为合法异写；
+    纯头衔/关系名和完全不同的人名不会通过。
+    """
+    if canonical_names_related(a, b):
+        return True
+    na = _r134_strip_parens(a or "").strip()
+    nb = _r134_strip_parens(b or "").strip()
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    if na in nb or nb in na:
+        return min(len(na), len(nb)) >= 2
+    if len(na) >= 3 and len(nb) >= 3:
+        return name_char_similarity(na, nb) >= 0.45
+    return False
+
+
 def source_name_is_relational(source_name):
     """Round 134: source_name 是否为「X's father / my mother」式关系指称。
 
@@ -1130,7 +1406,8 @@ def source_name_proper_tokens(source_name):
         if not raw or not raw[0].isupper():
             continue  # 专名证据只认大写词
         tl = _en_normalize_token(raw)
-        if not tl or tl in _EN_DETERMINERS or tl in _EN_ROLE_WORDS \
+        role = _en_role_base(tl)
+        if not tl or tl in _EN_DETERMINERS or role in _EN_ROLE_WORDS \
                 or tl in _EN_GENERIC_MODIFIERS or tl in _EN_RELATION_WORDS:
             continue
         out.add(tl)
@@ -1157,7 +1434,7 @@ def source_name_generic_keys(source_name):
     """
     if not source_name or source_name_is_relational(source_name):
         return set()
-    toks = [_en_normalize_token(t) for t in _en_tokens(source_name)]
+    toks = [_en_role_base(t) for t in _en_tokens(source_name)]
     toks = [t for t in toks if t and t not in _EN_DETERMINERS and t not in _EN_RELATION_WORDS]
     if not toks:
         return set()
@@ -1461,6 +1738,606 @@ def _r134_registry_rows(conn) -> List[tuple]:
     return rows
 
 
+def ensure_entity_alias_columns(conn) -> None:
+    """Round 144: 幂等补齐 context_names / quarantined_names 两列。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+    for col in ("context_names", "quarantined_names"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE entity_registry ADD COLUMN {col} TEXT")
+    conn.commit()
+
+
+def _alias_norm(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "")).strip().lower()
+
+
+def _dedupe_keep_order(items) -> List[str]:
+    out, seen = [], set()
+    for item in items or []:
+        if not isinstance(item, str):
+            continue
+        s = item.strip()
+        if not s:
+            continue
+        key = _alias_norm(s)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+
+_PERSON_ENTITY_TYPES = frozenset({"person", "people", "人物", "character", "角色"})
+
+
+def _entity_type_is_person_like(entity_type) -> bool:
+    """Round 144: 只在明确的 person 类型上做跨人物 variant 删除。"""
+    return (entity_type or "").strip().lower() in _PERSON_ENTITY_TYPES
+
+
+def _canonical_name_index(canonical_names) -> Dict[str, List[str]]:
+    index: Dict[str, List[str]] = {}
+    for name in canonical_names or ():
+        if isinstance(name, str) and name.strip():
+            index.setdefault(_alias_norm(name.strip()), []).append(name.strip())
+    return index
+
+
+def is_cross_person_canonical_variant(canonical: str, variant: str,
+                                      canonical_names=(), entity_types=None,
+                                      entity_sources=None) -> bool:
+    """Round 144: variant 是否是明确的“另一个人物 canonical”污染。
+
+    只删除同时满足以下条件的条目：
+      - variant 精确等于另一个 canonical；
+      - 两边都明确是 person-like 类型；
+      - 两边都有身份 token，且没有身份 token 交集 / 合法异写相似度；
+      - 另一个 canonical 至少有一个 proper source_name（纯头衔/描述/关系行
+        不应作为跨人物删除对象，例如 Judge of the Change / Princess Royal）；
+      - 不是纯头衔/关系词。
+
+    对地点、组织、物种、语义别名、旧库缺 entity_type、以及 ``岳医生``
+    这类因头衔压缩后身份 token 为空的名称，一律 fail-open 保留。
+
+    这个判定只用于 ``variant_names`` 清理，不参与 canonical 身份合并。
+    """
+    c_norm = _alias_norm(canonical)
+    v_norm = _alias_norm(variant)
+    if not c_norm or not v_norm or c_norm == v_norm:
+        return False
+    foreign = [n for n in _canonical_name_index(canonical_names).get(v_norm, [])
+               if _alias_norm(n) != c_norm]
+    if not foreign:
+        return False
+    if canonical_is_title_only(canonical) or any(canonical_is_title_only(n) for n in foreign):
+        return False
+    if any(canonical_variant_forms_related(canonical, n) for n in foreign):
+        return False
+    owner_tokens = canonical_identity_tokens(canonical)
+    if not owner_tokens:
+        return False
+    type_map = entity_types or {}
+    owner_type = type_map.get(canonical, "")
+    if not _entity_type_is_person_like(owner_type):
+        return False
+    for name in foreign:
+        if entity_sources is not None:
+            sources = entity_sources.get(name, ())
+            if not any(is_proper_entity_alias(sn) for sn in sources
+                       if isinstance(sn, str) and sn):
+                return False
+        if not canonical_identity_tokens(name):
+            return False
+        if not _entity_type_is_person_like(type_map.get(name, "")):
+            return False
+    return True
+
+
+def filter_entity_variant_names(canonical: str, variants, canonical_names=(),
+                                quarantined_names=(), entity_types=None,
+                                entity_sources=None) -> List[str]:
+    """Round 144: 只保留可解释为同一人物异写的 variant_names。
+
+    背景：旧 unify 会把同一簇成员的 canonical 直接并入 winner.variant_names；
+    一旦簇被污染，男爵行就会出现保罗/雷托/皇帝等“合法异写”。这里只做
+    保守过滤：variant 若精确等于另一个 canonical，必须能通过
+    ``canonical_variant_forms_related`` 才保留；否则视为跨人物污染。
+
+    该函数不写库，可用于查询层兜底；DB 清理脚本另有持久化版本。
+    """
+    c_norm = _alias_norm(canonical)
+    qt_norms = {_alias_norm(x) for x in quarantined_names or () if isinstance(x, str)}
+    canonical_by_norm = _canonical_name_index(canonical_names)
+
+    out, seen = [], set()
+    for raw in variants or ():
+        if not isinstance(raw, str):
+            continue
+        v = raw.strip()
+        if not v:
+            continue
+        vn = _alias_norm(v)
+        if vn in seen or vn == c_norm or vn in qt_norms:
+            continue
+        foreign = [n for n in canonical_by_norm.get(vn, [])
+                   if _alias_norm(n) != c_norm]
+        if foreign and is_cross_person_canonical_variant(
+                canonical, v, canonical_names=canonical_names,
+                entity_types=entity_types, entity_sources=entity_sources):
+            continue
+        seen.add(vn)
+        out.append(v)
+    return out
+
+
+def _load_decision_alias_targets(conn) -> Dict[str, set]:
+    """Round 144: 读取 decision_db 的 source_key → 译文，供 alias 归属裁决。
+
+    decision DB 是译名权威；只有当一个 alias 的译文能唯一落到某个身份簇时
+    才用它保留正确 owner，否则仍走全量 quarantine（fail-open）。
+    """
+    out: Dict[str, set] = {}
+    try:
+        rows = conn.execute(
+            "SELECT source_key, translation FROM decision_db"
+        ).fetchall()
+    except Exception:
+        return out
+    for source, translation in rows:
+        sn = _alias_norm(source) if isinstance(source, str) else ""
+        tn = _alias_norm(translation) if isinstance(translation, str) else ""
+        if sn and tn:
+            out.setdefault(sn, set()).add(translation)
+    return out
+
+
+def load_decision_alias_targets(conn) -> Dict[str, set]:
+    """Public wrapper for decision_db alias -> translation snapshots."""
+    return _load_decision_alias_targets(conn)
+
+
+def decision_alias_target_canonicals(alias, decision_targets: Dict[str, set],
+                                     canonical_names) -> List[str]:
+    """Return registered canonicals whose decision_db translation matches alias."""
+    norm = _alias_norm(alias)
+    if not norm or not decision_targets:
+        return []
+    out: List[str] = []
+    seen = set()
+    for translation in decision_targets.get(norm, ()):
+        for canon in canonical_names or ():
+            if not isinstance(canon, str) or not canon.strip():
+                continue
+            if canon in seen:
+                continue
+            # 归属裁决只用精确同名或身份 token 交集。不能用宽松的
+            # canonical_variant_forms_related（查利斯/伊布利斯、科尔巴/科尼韦尔
+            # 都会被字符相似度误配），否则会把合法单 owner 别名误隔离。
+            if (_alias_norm(translation) == _alias_norm(canon)
+                    or canonical_names_related(translation, canon)):
+                seen.add(canon)
+                out.append(canon)
+    return out
+
+
+def decision_alias_conflicts_with_owner(alias, owner_canonical: str,
+                                        decision_targets: Dict[str, set],
+                                        canonical_names,
+                                        entity_types=None) -> bool:
+    """Round 144: decision_db says this alias belongs to a different person.
+
+    Only fires when both the owner and the decision target have real identity
+    tokens and are explicitly person-like.  Title-only canonicals (皇帝/公爵),
+    short role+surname forms (岳医生), places and organizations stay
+    conservative; a shared title or a same-entity semantic alias (沙胡鲁德 /
+    沙虫) must never become a hard cross-person signal.
+    """
+    if entity_types is None:
+        return False
+    if not owner_canonical or not canonical_identity_tokens(owner_canonical):
+        return False
+    owner_type = entity_types.get(owner_canonical, "")
+    if not _entity_type_is_person_like(owner_type):
+        return False
+    targets = decision_alias_target_canonicals(
+        alias, decision_targets, canonical_names)
+    if not targets:
+        return False
+    targets = [
+        t for t in targets if _entity_type_is_person_like(entity_types.get(t, ""))
+    ]
+    if not targets:
+        return False
+    checked = False
+    for target in targets:
+        if not canonical_identity_tokens(target):
+            continue
+        checked = True
+        if canonical_names_related(owner_canonical, target):
+            return False
+        if canonical_variant_forms_related(owner_canonical, target):
+            return False
+    return checked
+
+
+def decision_alias_belongs_to_owner(alias, owner_canonical: str,
+                                    decision_targets: Dict[str, set],
+                                    canonical_names,
+                                    entity_types=None) -> bool:
+    """Round 144: decision_db maps alias to this owner's identity cluster."""
+    if not owner_canonical or not canonical_identity_tokens(owner_canonical):
+        return False
+    targets = decision_alias_target_canonicals(
+        alias, decision_targets, canonical_names)
+    if not targets:
+        return False
+    if entity_types is not None:
+        owner_type = entity_types.get(owner_canonical, "")
+        targets = [
+            t for t in targets
+            if (not owner_type or not entity_types.get(t)
+                or entity_types.get(t) == owner_type)
+        ]
+    return any(
+        canonical_identity_tokens(t)
+        and (canonical_names_related(owner_canonical, t)
+             or canonical_variant_forms_related(owner_canonical, t))
+        for t in targets
+    )
+
+
+def _preferred_alias_root(alias_norm: str, owners, decision_targets: Dict[str, set],
+                          by_canon: Dict[str, Dict[str, Any]], find) -> Optional[str]:
+    """Round 144: 用 decision_db 的唯一译文为一个冲突 alias 选身份簇。"""
+    if not alias_norm or not owners:
+        return None
+    targets = set(decision_targets.get(alias_norm, ()))
+    # Duke Paul 这类简称可用 decision_db 中更长的同名 key 补足；只在没有
+    # 精确 key 且 alias 足够长时启用，避免把 the/child 等短词泛化。
+    if not targets and len(alias_norm) >= 4:
+        for source_norm, translations in decision_targets.items():
+            if source_norm.startswith(alias_norm + " "):
+                targets.update(translations)
+    roots = set()
+    for translation in targets:
+        for canon in by_canon:
+            if (_alias_norm(translation) == _alias_norm(canon)
+                    or canonical_names_related(translation, canon)):
+                roots.add(find(canon))
+    roots &= {find(o) for o in owners}
+    if len(roots) == 1:
+        return roots.pop()
+    return None
+
+
+def sanitize_entity_registry_aliases(conn, dry_run: bool = True) -> Dict[str, Any]:
+    """Round 144: 把旧库指称拆成 hard/context/quarantine 三层。
+
+    规则：
+      1. 非 proper 指称 → context_names（允许一对多，不作硬核查/合并证据）；
+      2. proper 指称被多个“身份不相关”的 canonical 共同声明 → quarantined_names，
+         从所有 owner 的 source_names 移除（fail-open，任何一方都不执行）；
+      3. 多个 owner 的 canonical 身份 token 相交（同一人不同规范名）→ 保留，
+         交给 unify_entity_registry 合并。
+      4. 单 owner 的 proper 指称若被 decision_db 唯一翻译到另一个身份无关的
+         canonical → 也从该 owner 隔离（防止“只错挂一次”逃过多 owner 检测）。
+
+    返回统计 + changes；dry-run 不写库。
+    """
+    if not dry_run:
+        ensure_entity_alias_columns(conn)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+    ctx_col = "context_names" if "context_names" in cols else "NULL"
+    qt_col = "quarantined_names" if "quarantined_names" in cols else "NULL"
+    rows = conn.execute(
+        f"SELECT id, canonical_name, source_names, {ctx_col}, {qt_col}, entity_type "
+        "FROM entity_registry"
+    ).fetchall()
+    by_canon: Dict[str, Dict[str, Any]] = {}
+    for rid, canon, src_json, ctx_json, qt_json, etype in rows:
+        srcs = robust_json_loads(src_json, expected_type=list) if src_json else []
+        ctxs = robust_json_loads(ctx_json, expected_type=list) if ctx_json else []
+        qts = robust_json_loads(qt_json, expected_type=list) if qt_json else []
+        by_canon[canon] = {
+            "id": rid,
+            "old_src": _dedupe_keep_order(srcs),
+            "old_ctx": _dedupe_keep_order(ctxs),
+            "old_qt": _dedupe_keep_order(qts),
+            "entity_type": (etype or "").strip(),
+        }
+
+    # 身份相关簇（只用于判断多个 owner 是否可能同一人，不直接合并）。
+    parent = {c: c for c in by_canon}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    canon_list = list(by_canon)
+    for i, a in enumerate(canon_list):
+        ta = by_canon[a]["entity_type"]
+        for b in canon_list[i + 1:]:
+            tb = by_canon[b]["entity_type"]
+            if ta and tb and ta != tb:
+                continue
+            if canonical_names_related(a, b):
+                union(a, b)
+
+    proper_forms: Dict[str, Dict[str, List[str]]] = {c: {} for c in by_canon}
+    context_by_canon: Dict[str, List[str]] = {c: list(r["old_ctx"]) for c, r in by_canon.items()}
+    quarantine_by_canon: Dict[str, List[str]] = {c: list(r["old_qt"]) for c, r in by_canon.items()}
+    context_moved = 0
+    for canon, row in by_canon.items():
+        for sn in row["old_src"] + row["old_ctx"]:
+            if is_proper_entity_alias(sn):
+                proper_forms[canon].setdefault(_alias_norm(sn), []).append(sn)
+            else:
+                context_by_canon[canon].append(sn)
+                if sn in row["old_src"]:
+                    context_moved += 1
+
+    proper_owners: Dict[str, set] = {}
+    for canon, forms in proper_forms.items():
+        for norm in forms:
+            proper_owners.setdefault(norm, set()).add(canon)
+    entity_type_by_canon = {c: r["entity_type"] for c, r in by_canon.items()}
+
+    # decision_db 是译名权威：能唯一落到某个身份簇的 alias 不因另一个
+    # 污染 owner 而整体失效（例如 Paul Atreides 不应因男爵误登记而连保罗
+    # 一起隔离）。没有唯一 owner 时仍全量 quarantine。
+    decision_targets = _load_decision_alias_targets(conn)
+    keep_by_canon: Dict[str, List[str]] = {c: [] for c in by_canon}
+    quarantined_instances = 0
+    cross_owner_names = 0
+    decision_preferred_aliases = 0
+    decision_single_owner_quarantined = 0
+    examples: List[Dict[str, Any]] = []
+    for norm, owners in proper_owners.items():
+        if len(owners) <= 1:
+            for canon in owners:
+                if decision_alias_conflicts_with_owner(
+                        norm, canon, decision_targets, canon_list,
+                        entity_types=entity_type_by_canon):
+                    forms = proper_forms[canon][norm]
+                    quarantine_by_canon[canon].extend(forms)
+                    quarantined_instances += len(forms)
+                    decision_single_owner_quarantined += len(forms)
+                    if len(examples) < 20:
+                        examples.append({
+                            "source_name": norm,
+                            "owners": [canon],
+                            "reason": "decision_db_foreign_owner_single_owner",
+                        })
+                    continue
+                keep_by_canon[canon].extend(proper_forms[canon][norm])
+            continue
+        roots = {find(o) for o in owners}
+        if len(roots) == 1:
+            for canon in owners:
+                keep_by_canon[canon].extend(proper_forms[canon][norm])
+            continue
+        cross_owner_names += 1
+        preferred_root = _preferred_alias_root(
+            norm, owners, decision_targets, by_canon, find,
+        )
+        if preferred_root is not None:
+            decision_preferred_aliases += 1
+            for canon in owners:
+                forms = proper_forms[canon][norm]
+                if find(canon) == preferred_root:
+                    keep_by_canon[canon].extend(forms)
+                else:
+                    quarantine_by_canon[canon].extend(forms)
+                    quarantined_instances += len(forms)
+            if len(examples) < 20:
+                examples.append({
+                    "source_name": norm,
+                    "owners": sorted(owners),
+                    "selected": preferred_root,
+                    "reason": "decision_db_unique_owner",
+                })
+            continue
+        for canon in owners:
+            forms = proper_forms[canon][norm]
+            quarantine_by_canon[canon].extend(forms)
+            quarantined_instances += len(forms)
+        if len(examples) < 20:
+            examples.append({"source_name": norm, "owners": sorted(owners)})
+
+    # 已隔离的别名不可被本轮重新启用（隔离是 sticky 的，需人工明确解封）。
+    changes = []
+    for canon, row in by_canon.items():
+        qt_norms = {_alias_norm(x) for x in quarantine_by_canon[canon]}
+        new_src = [sn for sn in _dedupe_keep_order(keep_by_canon[canon])
+                   if _alias_norm(sn) not in qt_norms]
+        new_ctx = _dedupe_keep_order(context_by_canon[canon])
+        new_qt = _dedupe_keep_order(quarantine_by_canon[canon])
+        if new_src != row["old_src"] or new_ctx != row["old_ctx"] or new_qt != row["old_qt"]:
+            changes.append({
+                "canonical": canon,
+                "source_names": new_src,
+                "context_names": new_ctx,
+                "quarantined_names": new_qt,
+            })
+            if not dry_run:
+                conn.execute(
+                    "UPDATE entity_registry SET source_names=?, context_names=?, "
+                    "quarantined_names=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (json.dumps(new_src, ensure_ascii=False),
+                     json.dumps(new_ctx, ensure_ascii=False),
+                     json.dumps(new_qt, ensure_ascii=False), row["id"]),
+                )
+    if not dry_run:
+        conn.commit()
+    return {
+        "rows": len(by_canon),
+        "changed_rows": len(changes),
+        "context_moved": context_moved,
+        "quarantined_instances": quarantined_instances,
+        "cross_owner_proper_names": cross_owner_names,
+        "decision_preferred_aliases": decision_preferred_aliases,
+        "decision_single_owner_quarantined": decision_single_owner_quarantined,
+        "examples": examples,
+        "changes": changes,
+    }
+
+
+def entity_registry_alias_report(conn) -> Dict[str, Any]:
+    """Round 144: 只读审计当前 registry 的别名分层情况。
+
+    ``active_proper_conflicts`` 只统计 pending_review=0 的 owner：pending 行
+    不会被 query_reviewable_entities 执行，若把它们算作“活跃冲突”，归一后
+    的报告会制造假警报。``all_proper_conflicts`` 保留全量诊断口径。
+    ``active_foreign_aliases`` 进一步用 decision_db 检查单 owner 错挂。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+    ctx_col = "context_names" if "context_names" in cols else "NULL"
+    qt_col = "quarantined_names" if "quarantined_names" in cols else "NULL"
+    rows = conn.execute(
+        f"SELECT canonical_name, source_names, {ctx_col}, {qt_col}, pending_review "
+        "FROM entity_registry"
+    ).fetchall()
+    kind_counts: Dict[str, int] = {}
+    active_owners: Dict[str, set] = {}
+    all_owners: Dict[str, set] = {}
+    quarantined_names = set()
+    active_rows = 0
+    for canon, src_json, ctx_json, qt_json, pending in rows:
+        if not pending:
+            active_rows += 1
+        srcs = robust_json_loads(src_json, expected_type=list) if src_json else []
+        ctxs = robust_json_loads(ctx_json, expected_type=list) if ctx_json else []
+        qts = robust_json_loads(qt_json, expected_type=list) if qt_json else []
+        quarantined_names.update(_alias_norm(x) for x in qts if isinstance(x, str))
+        for sn in list(srcs) + list(ctxs):
+            kind = classify_entity_source_name(sn)
+            kind_counts[kind] = kind_counts.get(kind, 0) + 1
+            if kind == "proper":
+                norm = _alias_norm(sn)
+                all_owners.setdefault(norm, set()).add(canon)
+                if not pending:
+                    active_owners.setdefault(norm, set()).add(canon)
+    active_conflicts = {
+        name: sorted(owners) for name, owners in active_owners.items()
+        if len(owners) > 1 and name not in quarantined_names
+    }
+    all_conflicts = {
+        name: sorted(owners) for name, owners in all_owners.items()
+        if len(owners) > 1 and name not in quarantined_names
+    }
+    canonical_names = [r[0] for r in rows if isinstance(r[0], str) and r[0]]
+    entity_types = {
+        c: (t or "") for c, t in conn.execute(
+            "SELECT canonical_name, entity_type FROM entity_registry"
+        ).fetchall() if isinstance(c, str) and c
+    }
+    decision_targets = _load_decision_alias_targets(conn)
+    foreign_aliases = []
+    seen_foreign = set()
+    for canon, src_json, _ctx_json, qt_json, pending in rows:
+        if pending:
+            continue
+        srcs = robust_json_loads(src_json, expected_type=list) if src_json else []
+        qts = robust_json_loads(qt_json, expected_type=list) if qt_json else []
+        qt_norms = {_alias_norm(x) for x in qts if isinstance(x, str)}
+        for sn in srcs:
+            if classify_entity_source_name(sn) != "proper":
+                continue
+            norm = _alias_norm(sn)
+            key = (canon, norm)
+            if key in seen_foreign or norm in qt_norms:
+                continue
+            if decision_alias_conflicts_with_owner(
+                    norm, canon, decision_targets, canonical_names,
+                    entity_types=entity_types):
+                seen_foreign.add(key)
+                foreign_aliases.append({"source_name": norm, "canonical": canon})
+    return {
+        "rows": len(rows),
+        "active_rows": active_rows,
+        "pending_rows": len(rows) - active_rows,
+        "kind_counts": kind_counts,
+        "active_proper_conflicts": len(active_conflicts),
+        "all_proper_conflicts": len(all_conflicts),
+        "active_foreign_aliases": len(foreign_aliases),
+        "foreign_alias_examples": foreign_aliases[:20],
+        "conflict_examples": [
+            {"source_name": k, "owners": v}
+            for k, v in list(sorted(active_conflicts.items()))[:20]
+        ],
+        "quarantined_names": len(quarantined_names),
+    }
+
+
+def sanitize_entity_registry_variants(conn, dry_run: bool = True) -> Dict[str, Any]:
+    """Round 144: 清理 variant_names 中的跨人物 canonical 污染。
+
+    这是独立于 source_names 的第二污染源：旧 unify 曾把同一错误簇的
+    canonical 全部写入 winner.variant_names，导致男爵行出现保罗/雷托/皇帝
+    等异体。这里只删除“精确等于另一个 canonical 且无法解释为同人异写”的
+    variant；音译异体（伊鲁兰/伊如兰、阿拉基斯/阿拉肯）保留。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+    qt_col = "quarantined_names" if "quarantined_names" in cols else "NULL"
+    etype_col = "entity_type" if "entity_type" in cols else "NULL"
+    rows = conn.execute(
+        f"SELECT id, canonical_name, variant_names, {qt_col}, {etype_col}, source_names "
+        "FROM entity_registry"
+    ).fetchall()
+    canonical_names = [r[1] for r in rows if isinstance(r[1], str)]
+    entity_types = {r[1]: (r[4] or "") for r in rows if isinstance(r[1], str)}
+    entity_sources = {
+        r[1]: (robust_json_loads(r[5], expected_type=list) if r[5] else [])
+        for r in rows if isinstance(r[1], str)
+    }
+    global_qt = set()
+    for _rid, _canon, _vns, qt_json, _etype, _src_json in rows:
+        qts = robust_json_loads(qt_json, expected_type=list) if qt_json else []
+        global_qt.update(_alias_norm(x) for x in qts if isinstance(x, str))
+
+    changes = []
+    removed_instances = 0
+    examples = []
+    for rid, canonical, vns_json, _qt_json, _etype, _src_json in rows:
+        vns = robust_json_loads(vns_json, expected_type=list) if vns_json else []
+        old = _dedupe_keep_order(vns)
+        kept = filter_entity_variant_names(
+            canonical, old, canonical_names=canonical_names,
+            quarantined_names=global_qt, entity_types=entity_types,
+            entity_sources=entity_sources,
+        )
+        if kept == old:
+            continue
+        kept_norms = {_alias_norm(x) for x in kept}
+        removed = [x for x in old if _alias_norm(x) not in kept_norms]
+        removed_instances += len(removed)
+        changes.append({"canonical": canonical, "removed": removed, "kept": kept})
+        if len(examples) < 20:
+            examples.append({"canonical": canonical, "removed": removed})
+        if not dry_run:
+            conn.execute(
+                "UPDATE entity_registry SET variant_names=?, "
+                "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (json.dumps(kept, ensure_ascii=False), rid),
+            )
+    if not dry_run:
+        conn.commit()
+    return {
+        "rows": len(rows),
+        "changed_rows": len(changes),
+        "removed_instances": removed_instances,
+        "examples": examples,
+        "changes": changes,
+    }
+
+
 def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
     """Round 134: 同人多规范名归一（通用版，取代 Round 105 原型）。
 
@@ -1478,7 +2355,9 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
          头衔键重合 → 并入该簇；带修饰词的键（the old Duke）不参与 → 老公爵独立。
     实体类型冲突（person vs place 等）不合并。
 
-    winner 规则：confidence → 含「·」→ 去括注长度 → 更早 created_at → 字典序。
+    winner 规则：非纯头衔 → confidence → 专名证据数 → 含「·」→ 去括注长度
+    → 更早 created_at → 字典序。confidence 优先于别名数量，避免污染 hub 靠
+    别名多而获胜。
 
     合并动作：
       - winner 收编全部成员的 source_names（合并去重）；
@@ -1572,7 +2451,13 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
             a, b = order[i], order[j]
             if find(a) == find(b) or _type_conflict(a, b):
                 continue
-            if (meta[a]["proper_src"] & meta[b]["proper_src"]) or _drift_equivalent(a, b):
+            # Round 144: 共享一个 source_name 不再足以证明同人。必须先过
+            # canonical 身份 token 交集（去掉头衔后的名字部分），防止
+            # Duke Leto / an Atreides / Emperors 这类错配别名把 Paul、Leto、
+            # Emperor、Baron 串成一个单链连通分量。
+            related = canonical_names_related(a, b)
+            if related and ((meta[a]["proper_src"] & meta[b]["proper_src"])
+                            or _drift_equivalent(a, b)):
                 union(a, b)
 
     # E3：纯头衔行桥接（带修饰词的头衔键不参与 → 老公爵独立）
@@ -1612,8 +2497,12 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
 
         def _key(c):
             m = meta[c]
+            # Round 144: confidence 必须排在 aliases 数量之前；否则一个被
+            # 污染出来的“高别名数 hub”会比干净 canonical 更容易当 winner。
             return (
+                1 if m["title_only"] else 0,
                 _CONF_ORDER.get(m["confidence"], 3),
+                -len(m["proper_src"]),
                 0 if "·" in c else 1,
                 -_base_len(c),
                 m["created"],
@@ -1642,8 +2531,18 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
             if cls["policy"] == "replace" and cls["target"] != d:
                 replace_pairs.append([d, cls["target"]])
 
-        merged_srcs = list(dict.fromkeys(meta[winner]["srcs"] + [s for d in demoted for s in meta[d]["srcs"]]))
-        merged_variants = list(dict.fromkeys([v for v in meta[winner]["variants"] if v] + whitelist))
+        merged_srcs = list(dict.fromkeys(
+            meta[winner]["srcs"] + [s for d in demoted for s in meta[d]["srcs"]]
+        ))
+        raw_variants = list(dict.fromkeys(
+            [v for v in meta[winner]["variants"] if v] + whitelist
+        ))
+        # Round 144: 不把跨人物 canonical 重新写回 winner.variant_names。
+        merged_variants = filter_entity_variant_names(
+            winner, raw_variants, canonical_names=order,
+            entity_types={c: meta[c]["etype"] for c in order},
+            entity_sources={c: meta[c]["srcs"] for c in order},
+        )
 
         entry = {
             "winner": winner,

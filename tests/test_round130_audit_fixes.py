@@ -84,6 +84,26 @@ class TestInstanceLockGuard:
         content = lockp.read_text(encoding="utf-8")
         assert f"pid={os.getpid()}" in content
 
+    def test_default_lock_path_is_project_root(self, tmp_path, monkeypatch):
+        from src.main import _default_lock_path
+        monkeypatch.chdir(tmp_path)
+        assert _default_lock_path() == REPO / "db" / ".sagatrans.lock"
+
+    def test_lock_creation_failure_is_fail_closed(self, tmp_path, capsys):
+        from src.main import acquire_instance_lock
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("x", encoding="utf-8")
+        assert acquire_instance_lock(lock_path=blocker / "child.lock") is False
+        assert "⛔ [Lock] 无法创建锁文件" in capsys.readouterr().err
+
+    def test_lock_creation_failure_allows_explicit_bypass(self, tmp_path, monkeypatch, capsys):
+        from src.main import acquire_instance_lock
+        monkeypatch.setenv("SAGATRANS_ALLOW_CONCURRENT", "1")
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("x", encoding="utf-8")
+        assert acquire_instance_lock(lock_path=blocker / "child.lock") is True
+        assert "放行" in capsys.readouterr().err
+
     def test_contended_lock_rejected(self, tmp_path, capsys):
         from src.main import acquire_instance_lock
         lockp = tmp_path / "db" / ".sagatrans.lock"
@@ -135,6 +155,7 @@ class TestInstanceLockGuard:
         try:
             env = dict(os.environ)
             env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", "")
+            env["SAGATRANS_LOCK_PATH"] = str(lockp)
             proc = subprocess.run(
                 [sys.executable, "-m", "src.translator_agent", "init", "--chapter", "ch01"],
                 cwd=str(tmp_path), env=env, capture_output=True, text=True, timeout=120)
@@ -162,6 +183,8 @@ def _build_gate_project(root: Path, with_pun_watchlist: bool = True) -> None:
     (outch / "ch01_chunk000_final.json").write_text(json.dumps(
         {"text": "他说了一句双关语：猫头鹰与夜莺。", "metadata": {}},
         ensure_ascii=False), encoding="utf-8")
+    (outch / "ch01_chunk000_critic_report.json").write_text(
+        json.dumps({"_backend_path": "jev"}, ensure_ascii=False), encoding="utf-8")
     (root / "output" / "QA_REPORT.md").write_text("# QA\n\n全部通过\n", encoding="utf-8")
     (root / "input" / "_conversion_audit.md").write_text(
         "全书覆盖率: 100.0%\n\n✅ 通过\n", encoding="utf-8")
@@ -212,6 +235,14 @@ class TestGateInlinePunAudit:
         assert not any("⑦" in f for f in res["failures"]), res["failures"]
         assert res["ok"] is True, res["failures"]
         assert not (tmp_path / "output" / "pun_audit.json").exists()
+
+    def test_gate_bad_pun_json_is_a_failure_not_a_traceback(self, tmp_path):
+        from src.pipeline import run_final_gate
+        _build_gate_project(tmp_path, with_pun_watchlist=True)
+        (tmp_path / "output" / "pun_audit.json").write_text("{bad json", encoding="utf-8")
+        res = run_final_gate(project_root=tmp_path)
+        assert res["ok"] is False
+        assert any("⑦ pun_audit.json 读取/解析失败" in f for f in res["failures"]), res["failures"]
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -296,6 +327,7 @@ class TestMonolithSplitterPackaging:
         outdir = tmp_path / "out"
         env = dict(os.environ)
         env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", "")
+        env["SAGATRANS_LOCK_PATH"] = str(tmp_path / "sagatrans.lock")
         proc = subprocess.run(
             [sys.executable, "-m", "src.translator_agent", "split",
              "--input", str(book), "--input-dir", str(outdir)],

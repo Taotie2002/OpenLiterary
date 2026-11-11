@@ -155,12 +155,11 @@ if _config is None:
             "secondary": {"model_name": "Qwen3.8-Flash-Next-SS", "thinking": False},
         }
         openai_api = {"api_base": "http://127.0.0.1:1234/v1", "api_key": "lm-studio",
-                      "max_retries": 3, "retry_delay": 2.0, "request_timeout": 300,
-                      "max_concurrent_requests": 4}
+                      "max_retries": 3, "retry_delay": 2.0, "request_timeout": 300}
         pipeline = {"batch_size": 50, "max_retries": 3, "max_quality_retries": 6, "judge_safety_net_avg_min": 5.5,
                     "poll_interval": 0.5, "entity_hard_fail": True,
                     "version_merit": {"enabled": True, "tolerance": 0.0},
-                    "early_stop": {"enabled": True, "max_low_dims": 3, "low_score_threshold": 3.0, "apply_only_first_round": True}}
+                    "early_stop": {"enabled": True, "max_low_dims": 3, "low_score_threshold": 3.0}}
         chunker = {"soft_limit": 1000, "hard_limit": 2500}
         decision_engine = {"terminology_triggers_backtrack": True,
                            "reference_triggers_backtrack": True,
@@ -180,8 +179,7 @@ if _config is None:
         review_fix = {"structural_p0_bypass_merit": True}
         critic_thresholds = {"fluency": 7.0, "readability": 7.0, "style_compliance": 6.5,
                             "voice_consistency": 7.0, "semantic_preservation": 7.0,
-                            "literal_residue": 7.0,
-                            "average_score_min": 7.0}
+                            "literal_residue": 7.0}
 
         def get(self, key, default=None):
             """Minimal dotted-key access used by pipeline/judgment code."""
@@ -1644,7 +1642,7 @@ class DecisionEngine:
             CREATE TABLE IF NOT EXISTS entity_registry (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 canonical_name TEXT NOT NULL,          -- 主名（中文译名）
-                source_names TEXT NOT NULL,            -- JSON数组：原文出现的所有指称形式
+                source_names TEXT NOT NULL,            -- JSON数组：可唯一识别实体的硬专名（Round 144）
                 pronoun_gender TEXT,                   -- he/she/it/unknown
                 entity_type TEXT,                      -- person/place/organization/other
                 first_seen_chunk TEXT,                 -- 首次出现的 chunk_id
@@ -1669,6 +1667,18 @@ class DecisionEngine:
             self.conn.execute("SELECT translation_strategy FROM entity_registry LIMIT 1")
         except Exception:
             self.conn.execute("ALTER TABLE entity_registry ADD COLUMN translation_strategy TEXT DEFAULT 'free'")
+
+        # Round 144: 实体别名分层。source_names 只保留可执行专名；
+        # context_names 保存称谓/关系/描述性指称（advisory，不做硬约束/合并证据）；
+        # quarantined_names 保存跨人物冲突专名（fail-open：任何 canonical 都不执行）。
+        for _col, _ddl in (
+            ("context_names", "TEXT"),
+            ("quarantined_names", "TEXT"),
+        ):
+            try:
+                self.conn.execute(f"SELECT {_col} FROM entity_registry LIMIT 1")
+            except Exception:
+                self.conn.execute(f"ALTER TABLE entity_registry ADD COLUMN {_col} {_ddl}")
 
         # 决策锁定列（Round 121）：防跨章译文翻转 → 回溯乒乓。
         # locked=1 的决策拒绝覆盖性更新且不触发 backtrack；旧库幂等迁移
@@ -2013,11 +2023,29 @@ def query_high_confidence_entities(conn) -> List[Tuple[str, str, str, str]]:
     等价 SQL：`WHERE confidence = 'high' AND pending_review = 0`
     """
     cursor = conn.cursor()
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+    qt_col = "quarantined_names" if "quarantined_names" in cols else "NULL"
     cursor.execute(
-        'SELECT canonical_name, source_names, variant_names, translation_strategy FROM entity_registry '
-        'WHERE confidence = "high" AND pending_review = 0'
+        f'SELECT canonical_name, source_names, variant_names, translation_strategy, {qt_col} '
+        'FROM entity_registry WHERE confidence = "high" AND pending_review = 0'
     )
-    return cursor.fetchall()
+    canonical_names, global_qt, entity_types, entity_sources = _variant_filter_context(conn)
+    out = []
+    for canonical, src_json, var_json, strategy, qt_json in cursor.fetchall():
+        srcs = robust_json_loads(src_json, expected_type=list) if src_json else []
+        vars_ = robust_json_loads(var_json, expected_type=list) if var_json else []
+        qts = robust_json_loads(qt_json, expected_type=list) if qt_json else []
+        qt_norms = {_alias_norm(x) for x in qts if isinstance(x, str)}
+        hard = [sn for sn in srcs if is_proper_entity_alias(sn)
+                and _alias_norm(sn) not in qt_norms]
+        safe_vars = filter_entity_variant_names(
+            canonical, vars_, canonical_names=canonical_names,
+            quarantined_names=global_qt, entity_types=entity_types,
+            entity_sources=entity_sources,
+        )
+        out.append((canonical, json.dumps(hard, ensure_ascii=False),
+                    json.dumps(safe_vars, ensure_ascii=False), strategy))
+    return out
 
 
 def query_reviewable_entities(conn) -> List[Tuple[str, str]]:
@@ -2028,11 +2056,29 @@ def query_reviewable_entities(conn) -> List[Tuple[str, str]]:
     等价 SQL：`WHERE pending_review = 0`
     """
     cursor = conn.cursor()
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+    qt_col = "quarantined_names" if "quarantined_names" in cols else "NULL"
     cursor.execute(
-        'SELECT canonical_name, source_names, variant_names FROM entity_registry '
-        'WHERE pending_review = 0'
+        f'SELECT canonical_name, source_names, variant_names, {qt_col} '
+        'FROM entity_registry WHERE pending_review = 0'
     )
-    return cursor.fetchall()
+    canonical_names, global_qt, entity_types, entity_sources = _variant_filter_context(conn)
+    out = []
+    for canonical, src_json, var_json, qt_json in cursor.fetchall():
+        srcs = robust_json_loads(src_json, expected_type=list) if src_json else []
+        vars_ = robust_json_loads(var_json, expected_type=list) if var_json else []
+        qts = robust_json_loads(qt_json, expected_type=list) if qt_json else []
+        qt_norms = {_alias_norm(x) for x in qts if isinstance(x, str)}
+        hard = [sn for sn in srcs if is_proper_entity_alias(sn)
+                and _alias_norm(sn) not in qt_norms]
+        safe_vars = filter_entity_variant_names(
+            canonical, vars_, canonical_names=canonical_names,
+            quarantined_names=global_qt, entity_types=entity_types,
+            entity_sources=entity_sources,
+        )
+        out.append((canonical, json.dumps(hard, ensure_ascii=False),
+                    json.dumps(safe_vars, ensure_ascii=False)))
+    return out
 
 
 def get_sibling_canonicals_by_source(conn) -> Dict[str, Set[str]]:
@@ -2351,11 +2397,19 @@ class ReferenceAgent:
 【实体识别要求】
 对于识别出的人物/地点实体，必须提供以下字段：
 - canonical_name: 主名（中文译名，统一规范）
-- source_names: 原文中出现的所有指称形式（本名、昵称、"the captain"这类称谓、代词轨迹），JSON数组
+- source_names: 本片段中能**唯一指向该实体**的专名（本名、姓氏+名字、头衔+名字），JSON数组。
+  禁止把 the Duke / my Lord / Father / the Emperor / the man / 代词轨迹 放进 source_names；
+  这些泛称、关系词、描述性指称一律放进 context_names。
+- context_names: 本片段中指向该实体的泛称/称谓/关系词/描述性指称，JSON数组（可一对多，不作硬约束）
 - pronoun_gender: 代词性别
 - entity_type: 实体类型
 - confidence: 把握程度
 - translation_strategy: 翻译策略（literal=直译, transliteration=音译, free=自由意译）；首次登记后固定，后续必须沿用同一策略
+
+【别名归属硬约束】
+- 同一个 source_name 只能属于一个 canonical。若某指称可能指多人，或指代对象不确定，放入 context_names。
+- 不要在一个角色的 source_names 里登记其他角色的名字或别称。
+- 不要把 "Duke Leto" 登记给 Paul/Baron，"the Emperor" 登记给 Baron；这类跨人物错配会直接污染全书实体库。
 
 【输出格式】
 必须输出纯 JSON 格式，不要包含任何 Markdown 代码块标记（如 ```json）。
@@ -2373,7 +2427,8 @@ Schema 如下：
   "entities": [
     {{
       "canonical_name": "主名（中文译名，统一规范）",
-      "source_names": ["原文中的指称形式1", "指称形式2"],
+      "source_names": ["可唯一识别该实体的专名1", "专名2"],
+      "context_names": ["the Duke", "my Lord", "代词轨迹等泛称/关系指称"],
       "pronoun_gender": "he/she/it/unknown",
       "entity_type": "person/place/organization/other",
       "confidence": "high/medium/low",
@@ -2431,7 +2486,8 @@ Schema 如下：
 【复核规则】
 1. 逐条核验 allusion_target 是否被原文支撑；无依据、张冠李戴或明显误判 → 删除。
 2. 补漏：初筛漏掉且确有出处的典故/隐喻/历史名词 → 追加（宁精勿滥）。
-3. 实体：合并重复指称；canonical_name 统一为规范中文译名；source_names 必须都是原文实际出现的形式。
+3. 实体：合并重复指称；canonical_name 统一为规范中文译名；source_names 只保留可唯一识别该实体的专名，
+   泛称/关系词/描述性指称移入 context_names。source_name 跨 canonical 冲突时，宁可放入 context_names，绝不硬配。
 4. 策略只能是 RETAIN_AND_ANNOTATE / CULTURAL_EQUIVALENT / LITERAL_TRANSLATION 三选一。
 5. 若初筛正确，原样保留其条目（可修正字段格式）；不要为凑数新增无依据条目。
 
@@ -2527,143 +2583,295 @@ Schema 如下：
 
         # 4. 登记实体到 entity_registry (增量构建全书实体知识库)
         if entities:
-            self._register_entities(chunk_id, entities)
+            self._register_entities(chunk_id, entities, text_chunk)
 
-    def _register_entities(self, chunk_id: str, entities: List[Dict]):
-        """将识别到的实体增量登记到 entity_registry 表"""
+    def _register_entities(self, chunk_id: str, entities: List[Dict],
+                           source_text: str = None):
+        """将识别到的实体增量登记到 entity_registry 表。
+
+        Round 144 别名完整性：
+          - source_names 只存可执行专名；泛称/关系/描述进入 context_names；
+          - 同一专名被第二个 canonical 声明时，立即从所有 owner 的硬别名中移除，
+            并写入 quarantined_names（fail-open：宁可少约束，也不制造错约束）。
+        """
         if not entities:
             return
-        
+
         cursor = self.db.conn.cursor()
-        
+
+        # 一次性载入 registry，避免每个 alias 全表扫描。
+        try:
+            cursor.execute(
+                "SELECT id, canonical_name, source_names, context_names, quarantined_names, "
+                "variant_names, confidence, pending_review, entity_type "
+                "FROM entity_registry"
+            )
+        except Exception:
+            # 兼容极端旧库：补齐列后重试。
+            from src.core.decision_engine import ensure_entity_alias_columns
+            ensure_entity_alias_columns(self.db.conn)
+            cursor.execute(
+                "SELECT id, canonical_name, source_names, context_names, quarantined_names, "
+                "variant_names, confidence, pending_review, entity_type "
+                "FROM entity_registry"
+            )
+
+        def _load_list(raw):
+            return robust_json_loads(raw, expected_type=list) if raw else []
+
+        def _norm(sn):
+            return re.sub(r"\s+", " ", (sn or "")).strip().lower()
+
+        def _dedupe(items):
+            out, seen = [], set()
+            for item in items or []:
+                if not isinstance(item, str):
+                    continue
+                s = item.strip()
+                key = _norm(s)
+                if not s or key in seen:
+                    continue
+                seen.add(key)
+                out.append(s)
+            return out
+
+        registry: Dict[str, Dict[str, Any]] = {}
+        owners: Dict[str, set] = {}
+        for rid, canon, src_json, ctx_json, qt_json, var_json, conf, pending, etype in cursor.fetchall():
+            row = {
+                "id": rid,
+                "source": _dedupe(_load_list(src_json)),
+                "context": _dedupe(_load_list(ctx_json)),
+                "quarantine": _dedupe(_load_list(qt_json)),
+                "variants": _dedupe(_load_list(var_json)),
+                "confidence": conf or "low",
+                "pending_review": pending or 0,
+                "entity_type": etype or "",
+            }
+            registry[canon] = row
+            for sn in row["source"]:
+                owners.setdefault(_norm(sn), set()).add(canon)
+        decision_targets = load_decision_alias_targets(self.db.conn)
+
+        def _persist(canon: str) -> None:
+            row = registry[canon]
+            cursor.execute(
+                "UPDATE entity_registry SET source_names=?, context_names=?, "
+                "quarantined_names=?, variant_names=?, confidence=?, pending_review=?, "
+                "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (json.dumps(_dedupe(row["source"]), ensure_ascii=False),
+                 json.dumps(_dedupe(row["context"]), ensure_ascii=False),
+                 json.dumps(_dedupe(row["quarantine"]), ensure_ascii=False),
+                 json.dumps(_dedupe(row["variants"]), ensure_ascii=False),
+                 row["confidence"], row["pending_review"], row["id"]),
+            )
+
+        # Round 18/121 保留既有结构性停用词护栏。
+        _STOPWORDS = {
+            "a", "an", "the", "and", "or", "but", "in", "on", "at",
+            "to", "for", "of", "by", "with", "from", "as", "is", "was",
+            "he", "she", "it", "they", "we", "you", "i", "me", "him",
+            "her", "his", "my", "your", "its", "our", "their", "them",
+            "us", "this", "that", "these", "those", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would",
+            "can", "could", "shall", "should", "may", "might", "not",
+            "who", "whom", "whose", "which", "what", "where", "when", "why", "how",
+        }
+        _CONF_ORDER = {"high": 3, "medium": 2, "low": 1}
+
         for ent in entities:
-            canonical = ent.get("canonical_name")
-            source_names = ent.get("source_names", [])
+            canonical = (ent.get("canonical_name") or "").strip()
             pronoun_gender = ent.get("pronoun_gender", "unknown")
             entity_type = ent.get("entity_type", "other")
             confidence = ent.get("confidence", "low")
             translation_strategy = ent.get("translation_strategy", "free")
-            
-            if not canonical or not source_names:
+
+            if not canonical:
                 continue
-            
-            # 确保 source_names 是列表
-            if isinstance(source_names, str):
-                source_names = [source_names]
-            
-            # 过滤代词/停用词；Round 18 审计修复：移除 `len(sn) >= 4` 长度阈值
-            # 原因：
-            #   1. 长度阈值导致所有 <4 字符的英文原名（如 3 字符人名 "Joe"/"Kim"/"Ana"）
-            #      永远无法进入 entity_registry.source_names
-            #   2. Section 11.5 的 english_residue 检测依赖 source_names 列表，
-            #      短英文原名的残留检测因此"天生失效"（Round 18 问题 1）
-            #   3. 短名字的"子串误匹配"风险由调用方处理：
-            #      - _detect_issues 已用 `\b` 词边界匹配（L4191-4193）
-            #      - format_prompt_context 已用 `(sn in src or sn.lower() in src_lower)`
-            #      停用词表本身已能排除代词/冠词/介词的误判
-            _STOPWORDS = {
-                "a", "an", "the", "and", "or", "but", "in", "on", "at",
-                "to", "for", "of", "by", "with", "from", "as", "is", "was",
-                "he", "she", "it", "they", "we", "you", "i", "me", "him",
-                "her", "his", "my", "your", "its", "our", "their", "them",
-                "us", "this", "that", "these", "those", "be", "been", "being",
-                "have", "has", "had", "do", "does", "did", "will", "would",
-                "can", "could", "shall", "should", "may", "might", "not",
-                # Round 121: 疑问词/连词泄漏护栏（ch06 "who"→帽匠等 6 实体污染，
-                # 造成"在场却漏译"不可满足核查 → 实体硬失败循环）
-                "who", "whom", "whose", "which", "what", "where", "when", "why", "how",
-            }
-            source_names = [sn for sn in source_names if sn.lower() not in _STOPWORDS]
-            if not source_names:
+
+            raw_sources = ent.get("source_names", []) or []
+            raw_contexts = ent.get("context_names", []) or []
+            if isinstance(raw_sources, str):
+                raw_sources = [raw_sources]
+            if isinstance(raw_contexts, str):
+                raw_contexts = [raw_contexts]
+
+            aliases = _dedupe(list(raw_sources) + list(raw_contexts))
+            aliases = [s for s in aliases if s.lower() not in _STOPWORDS]
+            if not aliases:
                 continue
-            
-            source_names_json = json.dumps(source_names, ensure_ascii=False)
-            
-            # 查找是否已存在同一 canonical_name
-            cursor.execute('SELECT id, source_names, pending_review FROM entity_registry WHERE canonical_name = ?', (canonical,))
-            row = cursor.fetchone()
-            
-            if row:
-                # 已存在：合并 source_names
-                existing_id, existing_names_json, pending_review = row
-                # P2-1: 统一走 robust_json_loads
-                existing_names = robust_json_loads(existing_names_json, expected_type=list) if existing_names_json else []
-                
-                # 合并新旧 source_names（去重）
-                merged_names = list(set(existing_names + source_names))
-                merged_names_json = json.dumps(merged_names, ensure_ascii=False)
-                
-                # 合并置信度：取较高者
-                confidence_order = {"high": 3, "medium": 2, "low": 1}
-                new_conf_level = confidence_order.get(confidence, 1)
-                cursor.execute('SELECT confidence FROM entity_registry WHERE id = ?', (existing_id,))
-                current_row = cursor.fetchone()
-                if current_row:
-                    current_conf = confidence_order.get(current_row[0], 1)
-                    final_conf = confidence if new_conf_level > current_conf else current_row[0]
-                else:
-                    final_conf = confidence
-                
-                cursor.execute('''
-                    UPDATE entity_registry 
-                    SET source_names = ?, confidence = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ?
-                ''', (merged_names_json, final_conf, existing_id))
-                print(f"  📝 实体已存在，合并指称: {canonical} <- {source_names}")
-            else:
-                # 检查是否有语义相近的已有实体（简单字符串包含/编辑距离初筛）
-                cursor.execute('SELECT id, canonical_name, source_names, variant_names FROM entity_registry')
-                similar_found = False
-                for existing_row in cursor.fetchall():
-                    eid, ecanon, enames_json, evariants_json = existing_row
-                    # P2-1: 统一走 robust_json_loads
-                    enames = robust_json_loads(enames_json, expected_type=list) if enames_json else []
-                    evariants = robust_json_loads(evariants_json, expected_type=list) if evariants_json else []
-                    
-                    # 双向子串包含 + 编辑距离(≤2) 初筛
-                    # 注：source_names 已在 _register_entities 入口过滤停用词
+
+            proper_candidates = [s for s in aliases if classify_entity_source_name(s) == "proper"]
+            context_candidates = [s for s in aliases if classify_entity_source_name(s) != "proper"]
+
+            existing = registry.get(canonical)
+            existing_qt = {_norm(x) for x in (existing or {}).get("quarantine", [])}
+
+            accepted: List[str] = []
+            quarantined: List[str] = []
+            for sn in proper_candidates:
+                key = _norm(sn)
+                if source_text and not alias_attested_in_text(sn, source_text):
+                    quarantined.append(sn)
+                    print(f"  ⚠️ 无原文出处的专名隔离: {sn!r} 不登记给 {canonical}")
+                    continue
+                known_canonicals = list(registry)
+                if canonical not in registry:
+                    known_canonicals.append(canonical)
+                known_types = {c: r["entity_type"] for c, r in registry.items()}
+                known_types[canonical] = entity_type
+                decision_owned = decision_alias_belongs_to_owner(
+                    sn, canonical, decision_targets, known_canonicals,
+                    entity_types=known_types)
+                decision_foreign = (not decision_owned
+                                    and decision_alias_conflicts_with_owner(
+                                        sn, canonical, decision_targets,
+                                        known_canonicals,
+                                        entity_types=known_types))
+                if key in existing_qt and not decision_owned:
+                    quarantined.append(sn)
+                    continue
+                # 任何 owner 已隔离过该专名 → 不可再被硬声明。
+                if (not decision_owned and any(
+                        key in {_norm(x) for x in row["quarantine"]}
+                        for row in registry.values())):
+                    quarantined.append(sn)
+                    continue
+                other_owners = set(owners.get(key, set())) - {canonical}
+                if other_owners:
+                    if decision_owned:
+                        # decision_db 已裁决归属：只从身份无关的 owner 移除，
+                        # 同一身份簇（同人重复 canonical）保留。
+                        kept_owners = {canonical}
+                        for owner in sorted(other_owners):
+                            if decision_alias_belongs_to_owner(
+                                    sn, owner, decision_targets,
+                                    known_canonicals, entity_types=known_types):
+                                kept_owners.add(owner)
+                                continue
+                            orow = registry.get(owner)
+                            if not orow:
+                                continue
+                            orow["source"] = [
+                                x for x in orow["source"] if _norm(x) != key
+                            ]
+                            orow["quarantine"] = _dedupe(orow["quarantine"] + [sn])
+                            _persist(owner)
+                            print(f"  ⚖️ decision_db 归属裁决: {sn!r} 保留给 {canonical}，"
+                                  f"从 {owner} 隔离")
+                        if existing is not None:
+                            existing["quarantine"] = [
+                                x for x in existing["quarantine"]
+                                if _norm(x) != key
+                            ]
+                        owners[key] = kept_owners
+                        accepted.append(sn)
+                        continue
+                    # fail-open：冲突专名从所有 owner 移除，任何 canonical 都不再执行。
+                    for owner in sorted(other_owners):
+                        orow = registry.get(owner)
+                        if not orow:
+                            continue
+                        before = len(orow["source"])
+                        orow["source"] = [x for x in orow["source"] if _norm(x) != key]
+                        orow["quarantine"] = _dedupe(orow["quarantine"] + [sn])
+                        if len(orow["source"]) != before:
+                            _persist(owner)
+                        print(f"  ⚠️ 专名冲突隔离: {sn!r} 同时指向 {owner} 与 {canonical}；两边均不硬执行")
+                    owners[key] = set()
+                    quarantined.append(sn)
+                    continue
+                # Round 144: 即使当前只有一个 owner，只要 decision_db 把
+                # 这个专名唯一翻译到另一个身份无关的 canonical，也隔离。
+                # 这能挡住“只错挂一次、没有第二 owner 触发冲突”的污染。
+                if decision_foreign:
+                    quarantined.append(sn)
+                    print(f"  ⚠️ decision_db 归属冲突隔离: {sn!r} 不登记给 {canonical}")
+                    continue
+                if decision_owned and existing is not None:
+                    existing["quarantine"] = [
+                        x for x in existing["quarantine"] if _norm(x) != key
+                    ]
+                accepted.append(sn)
+                owners.setdefault(key, set()).add(canonical)
+
+            if existing is not None:
+                existing["source"] = _dedupe(existing["source"] + accepted)
+                existing["context"] = _dedupe(existing["context"] + context_candidates)
+                existing["quarantine"] = _dedupe(existing["quarantine"] + quarantined)
+                cur_conf = _CONF_ORDER.get(existing["confidence"], 1)
+                new_conf = _CONF_ORDER.get(confidence, 1)
+                if new_conf > cur_conf:
+                    existing["confidence"] = confidence
+                _persist(canonical)
+                print(f"  📝 实体已存在，合并专名: {canonical} <- {accepted or '[]'}")
+                continue
+
+            # 新 canonical：保留既有“近似名 → pending_review”行为。
+            similar_found = False
+            if proper_candidates:
+                for ecanon, erow in list(registry.items()):
+                    enames = erow["source"]
                     substr_match = any(
                         sn in existing_name or existing_name in sn
-                        for existing_name in enames
-                        for sn in source_names
+                        for existing_name in enames for sn in proper_candidates
                     )
                     fuzzy_match = any(
                         _levenshtein_distance(sn, existing_name) <= 2
-                        for existing_name in enames
-                        for sn in source_names
+                        for existing_name in enames for sn in proper_candidates
                     )
-                    if substr_match or fuzzy_match:
-                        # Round 121: 新中文名已是该实体的登记异体 → 已知别名，
-                        # 仅并入 source_names，不再标记待核查（防归一后反复重标）
-                        if canonical in evariants:
-                            merged_names = list(set(enames + source_names))
-                            cursor.execute('''
-                                UPDATE entity_registry
-                                SET source_names = ?, updated_at = CURRENT_TIMESTAMP
-                                WHERE id = ?
-                            ''', (json.dumps(merged_names, ensure_ascii=False), eid))
-                            similar_found = True
-                            print(f"  📝 已知异体合并: {canonical} <- {source_names} (并入 {ecanon})")
-                            break
-                        # 发现潜在同一实体的不同译名
-                        # 不自动合并，标记待核查
-                        cursor.execute('''
-                            UPDATE entity_registry 
-                            SET pending_review = 1, review_reason = ?
-                            WHERE id = ?
-                        ''', (f"称谓差异大: 新实体 {canonical} 与现有 {ecanon} 可能指向同一对象", eid))
+                    if not (substr_match or fuzzy_match):
+                        continue
+                    if canonical in erow["variants"]:
+                        erow["source"] = _dedupe(erow["source"] + accepted)
+                        erow["context"] = _dedupe(erow["context"] + context_candidates)
+                        erow["quarantine"] = _dedupe(erow["quarantine"] + quarantined)
+                        for sn in accepted:
+                            owners.setdefault(_norm(sn), set()).discard(canonical)
+                            owners.setdefault(_norm(sn), set()).add(ecanon)
+                        _persist(ecanon)
                         similar_found = True
-                        print(f"  ⚠️ 发现潜在同一实体不同译名: {canonical} vs {ecanon}，标记待核查")
+                        print(f"  📝 已知异体合并: {canonical} <- {accepted} (并入 {ecanon})")
                         break
-                
-                if not similar_found:
-                    # 新建条目
-                    cursor.execute('''
-                        INSERT INTO entity_registry (canonical_name, source_names, pronoun_gender, entity_type, first_seen_chunk, confidence, pending_review, translation_strategy)
-                        VALUES (?, ?, ?, ?, ?, ?, 0, ?)
-                    ''', (canonical, source_names_json, pronoun_gender, entity_type, chunk_id, confidence, translation_strategy))
-                    print(f"  ✅ 新实体登记: {canonical} ({entity_type}, {confidence})")
-        
+                    erow["pending_review"] = 1
+                    cursor.execute(
+                        "UPDATE entity_registry SET pending_review=1, review_reason=?, "
+                        "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (f"称谓差异大: 新实体 {canonical} 与现有 {ecanon} 可能指向同一对象",
+                         erow["id"]),
+                    )
+                    similar_found = True
+                    print(f"  ⚠️ 发现潜在同一实体不同译名: {canonical} vs {ecanon}，标记待核查")
+                    break
+
+            if not similar_found:
+                pending = 0 if accepted else 1
+                cursor.execute(
+                    "INSERT INTO entity_registry "
+                    "(canonical_name, source_names, context_names, quarantined_names, "
+                    "pronoun_gender, entity_type, first_seen_chunk, confidence, "
+                    "pending_review, translation_strategy) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (canonical,
+                     json.dumps(_dedupe(accepted), ensure_ascii=False),
+                     json.dumps(_dedupe(context_candidates), ensure_ascii=False),
+                     json.dumps(_dedupe(quarantined), ensure_ascii=False),
+                     pronoun_gender, entity_type, chunk_id, confidence, pending,
+                     translation_strategy),
+                )
+                registry[canonical] = {
+                    "id": cursor.lastrowid,
+                    "source": _dedupe(accepted),
+                    "context": _dedupe(context_candidates),
+                    "quarantine": _dedupe(quarantined),
+                    "variants": [],
+                    "confidence": confidence,
+                    "pending_review": pending,
+                    "entity_type": entity_type,
+                }
+                print(f"  ✅ 新实体登记: {canonical} ({entity_type}, {confidence}, "
+                      f"专名={len(accepted)}, 上下文={len(context_candidates)})")
+
         self.db.conn.commit()
 
 
@@ -3612,19 +3820,39 @@ Schema 要求：
             try:
                 if isinstance(backend, FallbackBackend):
                     # 探测：哪个 backend 能用（A6 修复：异常不再静默吞，分类记录）
-                    if backend.primary.api_key and not getattr(backend, "_jev_auth_dead", False):
+                    primary_ok = (
+                        backend.primary_available()
+                        if hasattr(backend, "primary_available")
+                        else bool(backend.primary.api_key
+                                  and not getattr(backend, "_jev_auth_dead", False))
+                    )
+                    if primary_ok:
                         try:
                             answers = backend.primary.evaluate(state, questions, timeout=backend.timeout)
-                            backend_path = "jev"
+                            backend_path = getattr(
+                                backend.primary, "backend_kind", "jev"
+                            )
+                            # Round 145: flat success audit fields (no nested
+                            # dict values) so pipeline's error-diagnostics
+                            # summary ignores them.
+                            backend_diagnostics.update(
+                                getattr(backend.primary, "last_diagnostics", {}) or {}
+                            )
                         except Exception as e_jev:
                             diag = _classify_backend_error(e_jev)
                             backend_diagnostics["jev"] = diag
                             if diag["category"] in ("auth", "dependency"):
                                 backend._jev_auth_dead = True
+                            elif diag["category"] == "model_access":
+                                backend._jev_model_dead = True
                     if not answers and backend.allow_openai_fallback:
                         try:
                             answers = backend.fallback.evaluate(state, questions, timeout=backend.timeout)
                             backend_path = "openai_compat"
+                            backend_diagnostics.update({
+                                "provider": "openai_compat",
+                                "model": getattr(backend.fallback, "model_name", None),
+                            })
                         except (ConnectionError, OSError) as e_conn:
                             backend_diagnostics["openai_compat"] = {
                                 "category": "network",
@@ -3634,7 +3862,12 @@ Schema 要求：
                             raise ConnectionError("OpenAICompat 网络层失败") from e_conn
                 else:
                     answers = backend.evaluate(state, questions, timeout=backend.timeout)
-                    backend_path = type(backend).__name__
+                    backend_path = getattr(
+                        backend, "backend_kind", type(backend).__name__
+                    )
+                    backend_diagnostics.update(
+                        getattr(backend, "last_diagnostics", {}) or {}
+                    )
             except (ConnectionError, OSError) as e_conn_outer:
                 # 兜底走 Mock 时记录 connection 级诊断
                 backend_diagnostics_outer = {
@@ -3647,6 +3880,10 @@ Schema 要求：
                 if backend.allow_mock and backend._mock is not None:
                     answers = backend._mock.evaluate(state, questions)
                     backend_path = "mock_heuristic"
+                    backend_diagnostics.update({
+                        "provider": "mock_heuristic",
+                        "model": None,
+                    })
 
             # 兜底：OpenAICompat 返回 0 个答案（说明 _config.llm_backend="mock" 走 mock backend，
             #       mock 输出无法解析成 typesafe schema），降级到 MockBackend 启发式
@@ -3654,6 +3891,10 @@ Schema 要求：
                 if isinstance(backend, FallbackBackend) and backend.allow_mock and backend._mock is not None:
                     answers = backend._mock.evaluate(state, questions)
                     backend_path = "mock_heuristic"
+                    backend_diagnostics.update({
+                        "provider": "mock_heuristic",
+                        "model": None,
+                    })
                 else:
                     raise RuntimeError("所有 backend 都未产出答案")
 
@@ -5639,16 +5880,16 @@ class TranslationPipeline:
                 if conflicts:
                     cross = sum(1 for c in conflicts if c["conflict_type"] == "cross_entity")
                     variant = sum(1 for c in conflicts if c["conflict_type"] == "variant_for_same_person")
-                    resolved = sum(1 for c in conflicts if c["conflict_type"] == "resolved_same_person")
+                    quarantined = sum(1 for c in conflicts if c["conflict_type"] == "quarantined_proper")
                     lines = []
                     lines.append(f"# entity_registry 冲突检测 - {self.chapter_id}\n\n")
                     lines.append(f"- 总冲突数: {len(conflicts)} "
-                                 f"(跨人物: {cross}, 同人变体: {variant}, 已自动归一: {resolved})\n\n")
-                    if resolved:
-                        lines.append("## ✅ 已自动归一（Round 134 同人归一生效，无需人工处理）\n\n")
-                        for c in [x for x in conflicts if x["conflict_type"] == "resolved_same_person"]:
+                                 f"(跨人物活跃: {cross}, 同人变体: {variant}, 已隔离: {quarantined})\n\n")
+                    if quarantined:
+                        lines.append("## 🛡️ 已隔离专名（跨人物冲突，已从所有硬别名移除；fail-open）\n\n")
+                        for c in [x for x in conflicts if x["conflict_type"] == "quarantined_proper"]:
                             lines.append("- **\"" + c["source_name"] + "\"** ← " + str(c["canonicals"])
-                                         + "  →  簇: `" + str(c.get("resolved_by", "")) + "`\n")
+                                         + "  →  已写入 quarantined_names\n")
                         lines.append("")
                     lines.append("## 跨人物冲突（明确错误，需人工修复）\n\n")
                     for c in [x for x in conflicts if x["conflict_type"] == "cross_entity"]:
@@ -5656,12 +5897,12 @@ class TranslationPipeline:
                     lines.append("\n## 同人变体（可接受但建议整合）\n\n")
                     for c in [x for x in conflicts if x["conflict_type"] == "variant_for_same_person"]:
                         lines.append("- **\"" + c["source_name"] + "\"** ← " + str(c["canonicals"]) + "\n")
-                    lines.append("\n注：Round 134 起，同人别名会由 unify_entity_registry 自动归一\n")
-                    lines.append("（winner + 白名单 variant_names 写库），")
-                    lines.append("残留人工项只需处理「跨人物冲突」。\n")
+                    lines.append("\n注：Round 144 起，source_names 只保留可执行专名；\n")
+                    lines.append("称谓/关系/描述进入 context_names（advisory），跨人物专名冲突进入 quarantined_names。\n")
                     conflict_path = self.output_dir / "entity_registry_conflicts.md"
                     conflict_path.write_text("".join(lines), encoding="utf-8")
-                    print(f"⚠️ [Entity Registry] 发现 {cross} 个跨人物冲突 + {variant} 个同人变体（详见 entity_registry_conflicts.md）")
+                    print(f"⚠️ [Entity Registry] 跨人物活跃冲突 {cross} 个 + 同人变体 {variant} 个 "
+                          f"+ 已隔离专名 {quarantined} 个（详见 entity_registry_conflicts.md）")
                 else:
                     print(f"✅ [Entity Registry] 无冲突")
             except Exception as e:
@@ -6011,13 +6252,13 @@ class TranslationPipeline:
                 lines.append("| Category | 次数 | 含义 / 建议动作 |\n")
                 lines.append("|---|---:|---|\n")
                 diag_desc = {
-                    "auth": "🔑 认证失败 — 检查 TYPESAFE_API_KEY",
+                    "auth": "🔑 认证失败 — 检查 MOARK_API_KEY（旧 TYPESAFE_API_KEY 仅兼容）",
                     "rate_limit": "🚦 速率限制 — 等待或升级配额",
                     "timeout": "⏱️ 超时 — 增加 timeout 或重试",
                     "network": "🌐 网络故障 — 检查 DNS / 防火墙 / 证书",
                     "bad_request": "📝 请求格式错误 — 检查 question schema",
                     "schema_mismatch": "🔧 响应解析失败 — 更新 verdict parser",
-                    "api_error": "⚠️ 服务端错误 — 检查 typesafe status page",
+                    "api_error": "⚠️ 服务端错误 — 检查 MoArk 服务状态",
                     "unknown": "❓ 未分类",
                 }
                 for cat, n in sorted(diag_counter.items(), key=lambda kv: -kv[1]):
@@ -6027,7 +6268,7 @@ class TranslationPipeline:
                     lines.append(f"| {cat} | {n} | {desc} |\n")
                 # 健康度判断
                 if diag_counter.get("auth", 0) > 0:
-                    lines.append("\n- 🔴 **认证失败次数 > 0**：检查 .env 中的 TYPESAFE_API_KEY 是否有效\n")
+                    lines.append("\n- 🔴 **认证失败次数 > 0**：检查 .env 中的 MOARK_API_KEY 是否有效（旧 TYPESAFE_API_KEY 仅兼容）\n")
                 elif diag_counter.get("network", 0) > total_diag * 0.5:
                     lines.append("\n- 🔴 **网络失败占比 > 50%**：检查 DNS / 防火墙 / 证书（参考 Round 18 Jev 利用率）\n")
                 elif diag_counter.get("rate_limit", 0) > 0:
@@ -6458,82 +6699,65 @@ class TranslationPipeline:
             )
 
     def _entity_registry_conflict_audit(self) -> List[Dict]:
-        """Round 15: 检测 entity_registry 中 source_name 冲突
+        """Round 15/144: 检测 entity_registry 的硬专名冲突。
 
-        冲突定义：同一英文 source_name 被登记到 ≥2 个 canonical 时
-        影响：consistency.py 无法确定替换目标，导致 Round 7/9 行为不可预期
-        解决：本方法只生成诊断报告（entity_registry_conflicts.md），运维手动修复
+        Round 144 语义：
+          - 只把 proper 专名视为硬冲突候选；
+          - 多个 owner 的 canonical 身份相关 → variant_for_same_person（可归一）；
+          - 已写入 quarantined_names、且不在任何 source_names 中 → quarantined_proper
+            （已隔离，fail-open，不再算活跃冲突）；
+          - 其余跨人物 proper 冲突 → cross_entity（需处理）。
 
-        Returns:
-            [{source_name: str, canonicals: [str, ...], conflict_type: str}, ...]
+        context_names 中的 the Duke/my Lord/描述性指称允许一对多，不参与冲突判定。
         """
         if not self.decision_engine:
             return []
-        # Round 15: 查全部实体（含 pending_review=1）—— 冲突可能就藏在待核查里
         try:
-            cursor = self.decision_engine.conn.execute(
-                "SELECT canonical_name, source_names FROM entity_registry"
-            )
-            entities = [(row[0], row[1], "[]") for row in cursor.fetchall()]
+            conn = self.decision_engine.conn
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+            qt_col = "quarantined_names" if "quarantined_names" in cols else "NULL"
+            rows = conn.execute(
+                f"SELECT canonical_name, source_names, {qt_col} FROM entity_registry"
+            ).fetchall()
         except Exception:
             return []
 
-        # 反向索引：source_name → [canonical, ...]
         from collections import defaultdict
-        src_to_canonicals = defaultdict(list)
-        for row in entities:
-            canonical = row[0]
-            sn_json = row[1]
-            sn_list = robust_json_loads(sn_json, expected_type=list) if sn_json else []
-            for sn in sn_list:
-                if sn:
-                    src_to_canonicals[sn].append(canonical)
+        hard_owners = defaultdict(set)
+        quarantine_owners = defaultdict(set)
+        for canonical, src_json, qt_json in rows:
+            srcs = robust_json_loads(src_json, expected_type=list) if src_json else []
+            qts = robust_json_loads(qt_json, expected_type=list) if qt_json else []
+            for sn in srcs:
+                if isinstance(sn, str) and is_proper_entity_alias(sn):
+                    hard_owners[sn].add(canonical)
+            for sn in qts:
+                if isinstance(sn, str) and is_proper_entity_alias(sn):
+                    quarantine_owners[sn].add(canonical)
 
-        # 找冲突：source_name → ≥2 canonicals
         conflicts = []
-        for src_name, canonicals in src_to_canonicals.items():
-            if len(canonicals) < 2:
+        for src_name in sorted(set(hard_owners) | set(quarantine_owners)):
+            hard = hard_owners.get(src_name, set())
+            qt = quarantine_owners.get(src_name, set())
+            owners = hard | qt
+            if len(owners) < 2:
                 continue
-            # 区分冲突类型
-            # 同名变体（如 "Mr. Lomax" 同时给 洛马克斯先生 + 乔治·洛马克斯先生）：可能是 acceptable（同一人不同译名）
-            # 跨人物冲突（如 "Joe" 同时给 安东尼·凯德 + 绅士乔）：明确错误
-            conflict_type = "cross_entity"  # 默认
-            canon_set = set(canonicals)
-            # 简单启发式：如果所有 canonical 都包含相同的人名姓氏，可能是变体
-            # 否则视为跨人物冲突
-            unique_first_chars = set()
-            for c in canonicals:
-                # 取中文译名前 2 字作为"姓氏"
-                if len(c) >= 2:
-                    unique_first_chars.add(c[:2])
-            if len(unique_first_chars) == 1:
+            owner_list = sorted(owners)
+            if not hard:
+                conflict_type = "quarantined_proper"
+            elif all(canonical_names_related(a, b)
+                      for i, a in enumerate(owner_list) for b in owner_list[i + 1:]):
                 conflict_type = "variant_for_same_person"
             else:
                 conflict_type = "cross_entity"
 
             conflicts.append({
                 "source_name": src_name,
-                "canonicals": canonicals,
+                "canonicals": owner_list,
                 "conflict_type": conflict_type,
+                "hard_owners": sorted(hard),
+                "quarantined_owners": sorted(qt),
             })
-
-        # Round 134: 已被同人归一（unify_entity_registry）覆盖的冲突 → resolved。
-        # 语义：同一 source_name 落到同一簇的多个 canonical 上 = 已收编为白名单,
-        # 不再是"跨人物错误"（残留的人工编辑提示也不再需要）。
-        try:
-            from src.core.decision_engine import unify_entity_registry
-            plan = unify_entity_registry(self.decision_engine.conn, dry_run=True)
-            cluster_of = {}
-            for key, info in plan.items():
-                for canon in [info["winner"]] + list(info.get("demoted", [])):
-                    cluster_of[canon] = key
-            for c in conflicts:
-                keys = {cluster_of.get(x) for x in c["canonicals"]}
-                if keys and None not in keys and len(keys) == 1:
-                    c["conflict_type"] = "resolved_same_person"
-                    c["resolved_by"] = keys.pop()
-        except Exception:
-            pass
 
         return conflicts
 
@@ -6599,6 +6823,7 @@ class TranslationPipeline:
                 valid_sns = [
                     sn for sn in source_names
                     if sn and self._is_valid_entity_source_name(sn)
+                    and is_proper_entity_alias(sn)
                 ]
                 effective_sns, _swallowed = self._partition_swallowed_source_names(
                     source_text, canonical, valid_sns,
@@ -8311,7 +8536,10 @@ class TranslationPipeline:
             # 避免全库实体每次 AUDITING 都被遍历、variant 误发现累积、
             # quality_retries 无限增长。修前 ch32 quality_retries=112+ 死循环。
             # ch06: 过滤非实体 source_name（sir/his eyelids 等），避免误判"实体出场"
-            valid_source_names = [sn for sn in source_names if self._is_valid_entity_source_name(sn)]
+            valid_source_names = [
+                sn for sn in source_names
+                if self._is_valid_entity_source_name(sn) and is_proper_entity_alias(sn)
+            ]
             # Round 133b: 别名吞并抑制 — 剔除被其它实体更长别名吞并的伪命中
             # （chunk071 "Mother"⊂"Reverend Mother" 根因, 详见 _partition_swallowed_source_names）
             effective_source_names, _swallowed = self._partition_swallowed_source_names(
@@ -8459,7 +8687,10 @@ class TranslationPipeline:
             # Round 112: 身份映射 canonical（如 " Cloak Room"→"Cloak Room"）同步剔除。
             if not self._is_enforceable_canonical(canonical, source_names):
                 continue
-            valid_sns = [sn for sn in source_names if self._is_valid_entity_source_name(sn)]
+            valid_sns = [
+                sn for sn in source_names
+                if self._is_valid_entity_source_name(sn) and is_proper_entity_alias(sn)
+            ]
             # Round 133b: 别名吞并抑制 — swallowed 别名不注入/不当在场证据
             # （chunk071 "Mother"→杰西卡夫人 污染 prompt 根因）
             effective_sns, swallowed_sns = self._partition_swallowed_source_names(
@@ -8510,7 +8741,10 @@ class TranslationPipeline:
             # Round 112: 身份映射 canonical 同步剔除（无翻译信息）
             if not self._is_enforceable_canonical(canonical, source_names):
                 continue
-            valid_sns = [sn for sn in source_names if self._is_valid_entity_source_name(sn)]
+            valid_sns = [
+                sn for sn in source_names
+                if self._is_valid_entity_source_name(sn) and is_proper_entity_alias(sn)
+            ]
             # Round 133b: 别名吞并抑制（与 _build_entity_registry_for_rewriter 同语义）
             effective_sns, swallowed_sns = self._partition_swallowed_source_names(
                 source_text, canonical, valid_sns,
@@ -9221,7 +9455,7 @@ class TranslationPipeline:
                 elif early_stop_enabled and quality_retries == 0:
                     # early_stop 仅在首轮裁决生效：避免 rework 一两次就放弃可恢复的 chunk
                     # 第二轮起若仍不达标，正常走 fallback 完成 max_quality_retries 轮 rework
-                    # 详见 config.yaml pipeline.early_stop.apply_only_first_round
+                    # 该行为由状态机固定为“仅首轮”，不再暴露配置开关。
                     scores = critic_report.get("scores", {})
                     very_low_count = sum(
                         1 for v in scores.values()
@@ -11500,16 +11734,64 @@ def _load_glossary(db_path: str) -> dict:
             seed_entity_variants(db)
         except Exception:
             pass
-        cursor = db.execute(
-            "SELECT canonical_name, source_names, entity_type, confidence, variant_names "
-            "FROM entity_registry WHERE confidence = 'high' AND pending_review = 0"
-        )
-        for row in cursor:
-            entities[row[0]] = {
-                "source_names": robust_json_loads(row[1], expected_type=list) if row[1] else [],
-                "type": row[2],
-                "confidence": row[3],
-                "variant_names": robust_json_loads(row[4], expected_type=list) if row[4] else [],
+        # Round 144: 一致性校正也必须在查询层过滤旧污染。否则旧库中
+        # “男爵.variant_names 含保罗/雷托”或“Paul.source_names 含 Duke Leto”
+        # 会被重新当成合法别名，进入残留检测/修正。
+        try:
+            from src.core.decision_engine import (
+                filter_entity_variant_names,
+                is_proper_entity_alias,
+            )
+        except Exception:
+            filter_entity_variant_names = None
+            is_proper_entity_alias = None
+
+        def _norm_alias(name):
+            return re.sub(r"\s+", " ", str(name or "").strip()).casefold()
+
+        cols = {r[1] for r in db.execute("PRAGMA table_info(entity_registry)")}
+        qt_col = "quarantined_names" if "quarantined_names" in cols else "NULL"
+        rows = db.execute(
+            "SELECT canonical_name, source_names, entity_type, confidence, variant_names, "
+            f"pending_review, {qt_col} FROM entity_registry"
+        ).fetchall()
+        canonical_names = [r[0] for r in rows if isinstance(r[0], str) and r[0]]
+        entity_types = {r[0]: (r[2] or "") for r in rows if isinstance(r[0], str) and r[0]}
+        entity_sources = {
+            r[0]: (robust_json_loads(r[1], expected_type=list) if r[1] else [])
+            for r in rows if isinstance(r[0], str) and r[0]
+        }
+        global_qt = set()
+        for row in rows:
+            qts = robust_json_loads(row[6], expected_type=list) if row[6] else []
+            global_qt.update(_norm_alias(x) for x in qts if isinstance(x, str))
+
+        for canonical, src_json, etype, conf, var_json, pending, qt_json in rows:
+            if conf != "high" or pending != 0:
+                continue
+            srcs = robust_json_loads(src_json, expected_type=list) if src_json else []
+            variants = robust_json_loads(var_json, expected_type=list) if var_json else []
+            row_qt = {_norm_alias(x) for x in (
+                robust_json_loads(qt_json, expected_type=list) if qt_json else []
+            ) if isinstance(x, str)}
+            if is_proper_entity_alias is not None:
+                srcs = [
+                    s for s in srcs
+                    if is_proper_entity_alias(s) and _norm_alias(s) not in row_qt
+                ]
+            if filter_entity_variant_names is not None:
+                variants = filter_entity_variant_names(
+                    canonical, variants,
+                    canonical_names=canonical_names,
+                    quarantined_names=global_qt,
+                    entity_types=entity_types,
+                    entity_sources=entity_sources,
+                )
+            entities[canonical] = {
+                "source_names": srcs,
+                "type": etype,
+                "confidence": conf,
+                "variant_names": variants,
             }
     except Exception as e:
         print(f"  ⚠️ 读取 entity_registry 失败: {e}", file=sys.stderr)
@@ -12368,7 +12650,9 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
          头衔键重合 → 并入该簇；带修饰词的键（the old Duke）不参与 → 老公爵独立。
     实体类型冲突（person vs place 等）不合并。
 
-    winner 规则：confidence → 含「·」→ 去括注长度 → 更早 created_at → 字典序。
+    winner 规则：非纯头衔 → confidence → 专名证据数 → 含「·」→ 去括注长度
+    → 更早 created_at → 字典序。confidence 优先于别名数量，避免污染 hub 靠
+    别名多而获胜。
 
     合并动作：
       - winner 收编全部成员的 source_names（合并去重）；
@@ -12462,7 +12746,13 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
             a, b = order[i], order[j]
             if find(a) == find(b) or _type_conflict(a, b):
                 continue
-            if (meta[a]["proper_src"] & meta[b]["proper_src"]) or _drift_equivalent(a, b):
+            # Round 144: 共享一个 source_name 不再足以证明同人。必须先过
+            # canonical 身份 token 交集（去掉头衔后的名字部分），防止
+            # Duke Leto / an Atreides / Emperors 这类错配别名把 Paul、Leto、
+            # Emperor、Baron 串成一个单链连通分量。
+            related = canonical_names_related(a, b)
+            if related and ((meta[a]["proper_src"] & meta[b]["proper_src"])
+                            or _drift_equivalent(a, b)):
                 union(a, b)
 
     # E3：纯头衔行桥接（带修饰词的头衔键不参与 → 老公爵独立）
@@ -12502,8 +12792,12 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
 
         def _key(c):
             m = meta[c]
+            # Round 144: confidence 必须排在 aliases 数量之前；否则一个被
+            # 污染出来的“高别名数 hub”会比干净 canonical 更容易当 winner。
             return (
+                1 if m["title_only"] else 0,
                 _CONF_ORDER.get(m["confidence"], 3),
+                -len(m["proper_src"]),
                 0 if "·" in c else 1,
                 -_base_len(c),
                 m["created"],
@@ -12532,8 +12826,18 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
             if cls["policy"] == "replace" and cls["target"] != d:
                 replace_pairs.append([d, cls["target"]])
 
-        merged_srcs = list(dict.fromkeys(meta[winner]["srcs"] + [s for d in demoted for s in meta[d]["srcs"]]))
-        merged_variants = list(dict.fromkeys([v for v in meta[winner]["variants"] if v] + whitelist))
+        merged_srcs = list(dict.fromkeys(
+            meta[winner]["srcs"] + [s for d in demoted for s in meta[d]["srcs"]]
+        ))
+        raw_variants = list(dict.fromkeys(
+            [v for v in meta[winner]["variants"] if v] + whitelist
+        ))
+        # Round 144: 不把跨人物 canonical 重新写回 winner.variant_names。
+        merged_variants = filter_entity_variant_names(
+            winner, raw_variants, canonical_names=order,
+            entity_types={c: meta[c]["etype"] for c in order},
+            entity_sources={c: meta[c]["srcs"] for c in order},
+        )
 
         entry = {
             "winner": winner,
@@ -12584,10 +12888,467 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
     return plan
 
 
+def classify_entity_source_name(source_name) -> str:
+    """Round 144: 把英文指称分为可执行专名 / 上下文指称。
+
+    Returns one of:
+      - proper:      可唯一识别的专名或“头衔+专名”（Paul Atreides / Duke Leto）
+      - title:       纯头衔/敬语（the Emperor / my Lord / Emperors）
+      - relation:    关系指称（my father / his son / Grandfather）
+      - description: 描述性短语（fifteen years / the man / Emperor's ears）
+      - pronoun:     代词轨迹
+      - invalid:     空串
+
+    只有 proper 可进入硬核查与同人合并证据；其余进入 context_names，
+    允许一对多，绝不据此判 missing，也绝不作 merge bridge。
+    """
+    s = (source_name or "").strip()
+    if not s:
+        return "invalid"
+    if re.search(r"[\u4e00-\u9fff\u3400-\u4dbf]", s):
+        return "proper"
+    raw_tokens = _en_tokens(s)
+    if not raw_tokens:
+        return "description"
+    norm_tokens = [_en_normalize_token(t) for t in raw_tokens]
+    core = [t for t in norm_tokens if t and t not in _EN_DETERMINERS]
+    if not core:
+        return "description"
+    if all(t in _EN_RELATION_WORDS for t in core):
+        return "relation"
+    if source_name_is_relational(s):
+        return "relation"
+    role_core = [_en_role_base(t) for t in core]
+    if all(t in _EN_ROLE_WORDS or t in _EN_GENERIC_MODIFIERS or t in _EN_RELATION_WORDS
+           for t in role_core):
+        return "relation" if any(t in _EN_RELATION_WORDS for t in role_core) else "title"
+    proper = source_name_proper_tokens(s)
+    if not proper:
+        return "description"
+    # Round 144: “a/an + 单个专名”通常是类别/家族指称（an Atreides），
+    # 不是可唯一执行的人名。带头衔的 the Duke Leto 不在此列。
+    # 注：不把通用规则扩展到 "the + 专名" —— the Nationalists /
+    # the Newcomer 是合法实体指称，扩展会误伤组织名和既有核查。
+    if raw_tokens and raw_tokens[0].lower() in ("a", "an"):
+        role_like = any(
+            _en_role_base(t) in _EN_ROLE_WORDS or t in _EN_GENERIC_MODIFIERS
+            or t in _EN_RELATION_WORDS
+            for t in core
+        )
+        if not role_like and len(proper) == 1:
+            return "description"
+    if all(t in _EN_NON_NAME_COMMON_WORDS for t in proper):
+        return "description"
+    # 描述性短语常含小写普通名词（old Harkonnen beast / the fat hand）。
+    # 真正的专名 token 必须首字母大写；小写 content token 说明是描述，而非姓名。
+    for raw_tok, norm_tok in zip(raw_tokens, norm_tokens):
+        if not norm_tok or norm_tok in _EN_DETERMINERS:
+            continue
+        base = _en_role_base(norm_tok)
+        if base in _EN_ROLE_WORDS or norm_tok in _EN_GENERIC_MODIFIERS \
+                or norm_tok in _EN_RELATION_WORDS:
+            continue
+        if not raw_tok[0].isupper():
+            return "description"
+    return "proper"
+
+
+def is_proper_entity_alias(source_name) -> bool:
+    """Round 144: 是否可进入硬实体核查/同人合并证据。"""
+    return classify_entity_source_name(source_name) == "proper"
+
+
+def alias_attested_in_text(alias, source_text) -> bool:
+    """Round 144: alias 是否真的在本 chunk 原文中出现（L1 式机械校验）。
+
+    模型偶尔会把推断出来的称呼写成 source_name；这类“无出处专名”一旦
+    进入 registry 就会变成硬约束。这里只做保守的原文核对：空白/弯引号
+    归一、ASCII 词边界、中文子串。宁可丢弃一个合法别名，也不接受幻觉。
+    """
+    if not isinstance(alias, str) or not isinstance(source_text, str):
+        return False
+    a = re.sub(r"\s+", " ", alias).strip().replace("’", "'").casefold()
+    t = re.sub(r"\s+", " ", source_text).strip().replace("’", "'").casefold()
+    if not a or not t:
+        return False
+    if not a[0].isascii() or not a[-1].isascii():
+        return a in t
+    pattern = r"(?<![A-Za-z0-9])" + re.escape(a) + r"(?![A-Za-z0-9])"
+    return re.search(pattern, t) is not None
+
+
+def load_decision_alias_targets(conn) -> Dict[str, set]:
+    """Public wrapper for decision_db alias -> translation snapshots."""
+    return _load_decision_alias_targets(conn)
+
+
+def _load_decision_alias_targets(conn) -> Dict[str, set]:
+    """Round 144: 读取 decision_db 的 source_key → 译文，供 alias 归属裁决。
+
+    decision DB 是译名权威；只有当一个 alias 的译文能唯一落到某个身份簇时
+    才用它保留正确 owner，否则仍走全量 quarantine（fail-open）。
+    """
+    out: Dict[str, set] = {}
+    try:
+        rows = conn.execute(
+            "SELECT source_key, translation FROM decision_db"
+        ).fetchall()
+    except Exception:
+        return out
+    for source, translation in rows:
+        sn = _alias_norm(source) if isinstance(source, str) else ""
+        tn = _alias_norm(translation) if isinstance(translation, str) else ""
+        if sn and tn:
+            out.setdefault(sn, set()).add(translation)
+    return out
+
+
+def decision_alias_target_canonicals(alias, decision_targets: Dict[str, set],
+                                     canonical_names) -> List[str]:
+    """Return registered canonicals whose decision_db translation matches alias."""
+    norm = _alias_norm(alias)
+    if not norm or not decision_targets:
+        return []
+    out: List[str] = []
+    seen = set()
+    for translation in decision_targets.get(norm, ()):
+        for canon in canonical_names or ():
+            if not isinstance(canon, str) or not canon.strip():
+                continue
+            if canon in seen:
+                continue
+            # 归属裁决只用精确同名或身份 token 交集。不能用宽松的
+            # canonical_variant_forms_related（查利斯/伊布利斯、科尔巴/科尼韦尔
+            # 都会被字符相似度误配），否则会把合法单 owner 别名误隔离。
+            if (_alias_norm(translation) == _alias_norm(canon)
+                    or canonical_names_related(translation, canon)):
+                seen.add(canon)
+                out.append(canon)
+    return out
+
+
+def decision_alias_conflicts_with_owner(alias, owner_canonical: str,
+                                        decision_targets: Dict[str, set],
+                                        canonical_names,
+                                        entity_types=None) -> bool:
+    """Round 144: decision_db says this alias belongs to a different person.
+
+    Only fires when both the owner and the decision target have real identity
+    tokens and are explicitly person-like.  Title-only canonicals (皇帝/公爵),
+    short role+surname forms (岳医生), places and organizations stay
+    conservative; a shared title or a same-entity semantic alias (沙胡鲁德 /
+    沙虫) must never become a hard cross-person signal.
+    """
+    if entity_types is None:
+        return False
+    if not owner_canonical or not canonical_identity_tokens(owner_canonical):
+        return False
+    owner_type = entity_types.get(owner_canonical, "")
+    if not _entity_type_is_person_like(owner_type):
+        return False
+    targets = decision_alias_target_canonicals(
+        alias, decision_targets, canonical_names)
+    if not targets:
+        return False
+    targets = [
+        t for t in targets if _entity_type_is_person_like(entity_types.get(t, ""))
+    ]
+    if not targets:
+        return False
+    checked = False
+    for target in targets:
+        if not canonical_identity_tokens(target):
+            continue
+        checked = True
+        if canonical_names_related(owner_canonical, target):
+            return False
+        if canonical_variant_forms_related(owner_canonical, target):
+            return False
+    return checked
+
+
+def decision_alias_belongs_to_owner(alias, owner_canonical: str,
+                                    decision_targets: Dict[str, set],
+                                    canonical_names,
+                                    entity_types=None) -> bool:
+    """Round 144: decision_db maps alias to this owner's identity cluster."""
+    if not owner_canonical or not canonical_identity_tokens(owner_canonical):
+        return False
+    targets = decision_alias_target_canonicals(
+        alias, decision_targets, canonical_names)
+    if not targets:
+        return False
+    if entity_types is not None:
+        owner_type = entity_types.get(owner_canonical, "")
+        targets = [
+            t for t in targets
+            if (not owner_type or not entity_types.get(t)
+                or entity_types.get(t) == owner_type)
+        ]
+    return any(
+        canonical_identity_tokens(t)
+        and (canonical_names_related(owner_canonical, t)
+             or canonical_variant_forms_related(owner_canonical, t))
+        for t in targets
+    )
+
+
+def canonical_identity_tokens(name) -> frozenset:
+    """Round 144: 去掉中文头衔/泛指修饰后的身份 token。
+
+    雷托公爵 → {雷托}；弗拉基米尔·哈克南男爵 → {弗拉基米尔, 哈克南}；
+    皇帝/皇帝陛下/老侯爵 → ∅（纯头衔不提供身份证据）。
+    """
+    base = _r134_strip_parens(name or "")
+    parts = [p for p in re.split(r"[" + re.escape(_NAME_SEP_CHARS) + r"\s]+", base) if p]
+    out = set()
+    for part in parts:
+        p = part.strip()
+        if not p:
+            continue
+        changed = True
+        while changed:
+            changed = False
+            for mod in _ZH_GENERIC_MODIFIERS:
+                if p.startswith(mod) and len(p) > len(mod):
+                    p = p[len(mod):]
+                    changed = True
+                    break
+        changed = True
+        while changed:
+            changed = False
+            for role in sorted(_ZH_ROLE_WORDS, key=len, reverse=True):
+                if p.startswith(role) and len(p) > len(role):
+                    p = p[len(role):]
+                    changed = True
+                    break
+                if p.endswith(role) and len(p) > len(role):
+                    p = p[:-len(role)]
+                    changed = True
+                    break
+        if len(p) >= 2 and p not in _ZH_ROLE_WORDS and p not in _ZH_GENERIC_MODIFIERS:
+            out.add(p)
+    return frozenset(out)
+
+
+def canonical_names_related(a: str, b: str) -> bool:
+    """Round 144: 两个 canonical 是否可能指向同一实体（保守版）。
+
+    只认“去掉头衔后的身份 token 交集”，例如 雷托 vs 雷托公爵、
+    哈克南男爵 vs 弗拉基米尔·哈克南男爵、佐恩侯爵 vs 佐恩·巴列。
+    Paul vs Baron、Paul vs Leto、Emperor vs Baron 必须为 False。
+    纯头衔/关系词（皇帝/侯爵/老侯爵）不提供交集证据，避免把不同人物
+    仅凭 shared title 合并。
+    """
+    ta = canonical_identity_tokens(a)
+    tb = canonical_identity_tokens(b)
+    if ta and tb and (ta & tb):
+        return True
+    return False
+
+
+def canonical_variant_forms_related(a: str, b: str) -> bool:
+    """Round 144: 两个 canonical 是否可视为同一人物的合法异写。
+
+    这个判定比 ``canonical_names_related`` 宽松，只用于清理/过滤
+    ``variant_names``，**不用于身份合并**。原因：音译异体（伊鲁兰 / 伊如兰、
+    阿拉基斯 / 阿拉肯、卡拉丹 / 卡拉丹城堡）不应被当成跨人物污染删除；
+    而保罗·厄崔迪 / 雷托 / 沙达姆四世这类跨人物 canonical 则必须删除。
+
+    保守阈值：中文名长度 >=3 时，字符 Dice 相似度 >=0.45 视为合法异写；
+    纯头衔/关系名和完全不同的人名不会通过。
+    """
+    if canonical_names_related(a, b):
+        return True
+    na = _r134_strip_parens(a or "").strip()
+    nb = _r134_strip_parens(b or "").strip()
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    if na in nb or nb in na:
+        return min(len(na), len(nb)) >= 2
+    if len(na) >= 3 and len(nb) >= 3:
+        return name_char_similarity(na, nb) >= 0.45
+    return False
+
+
+def is_cross_person_canonical_variant(canonical: str, variant: str,
+                                      canonical_names=(), entity_types=None,
+                                      entity_sources=None) -> bool:
+    """Round 144: variant 是否是明确的“另一个人物 canonical”污染。
+
+    只删除同时满足以下条件的条目：
+      - variant 精确等于另一个 canonical；
+      - 两边都明确是 person-like 类型；
+      - 两边都有身份 token，且没有身份 token 交集 / 合法异写相似度；
+      - 另一个 canonical 至少有一个 proper source_name（纯头衔/描述/关系行
+        不应作为跨人物删除对象，例如 Judge of the Change / Princess Royal）；
+      - 不是纯头衔/关系词。
+
+    对地点、组织、物种、语义别名、旧库缺 entity_type、以及 ``岳医生``
+    这类因头衔压缩后身份 token 为空的名称，一律 fail-open 保留。
+
+    这个判定只用于 ``variant_names`` 清理，不参与 canonical 身份合并。
+    """
+    c_norm = _alias_norm(canonical)
+    v_norm = _alias_norm(variant)
+    if not c_norm or not v_norm or c_norm == v_norm:
+        return False
+    foreign = [n for n in _canonical_name_index(canonical_names).get(v_norm, [])
+               if _alias_norm(n) != c_norm]
+    if not foreign:
+        return False
+    if canonical_is_title_only(canonical) or any(canonical_is_title_only(n) for n in foreign):
+        return False
+    if any(canonical_variant_forms_related(canonical, n) for n in foreign):
+        return False
+    owner_tokens = canonical_identity_tokens(canonical)
+    if not owner_tokens:
+        return False
+    type_map = entity_types or {}
+    owner_type = type_map.get(canonical, "")
+    if not _entity_type_is_person_like(owner_type):
+        return False
+    for name in foreign:
+        if entity_sources is not None:
+            sources = entity_sources.get(name, ())
+            if not any(is_proper_entity_alias(sn) for sn in sources
+                       if isinstance(sn, str) and sn):
+                return False
+        if not canonical_identity_tokens(name):
+            return False
+        if not _entity_type_is_person_like(type_map.get(name, "")):
+            return False
+    return True
+
+
+def filter_entity_variant_names(canonical: str, variants, canonical_names=(),
+                                quarantined_names=(), entity_types=None,
+                                entity_sources=None) -> List[str]:
+    """Round 144: 只保留可解释为同一人物异写的 variant_names。
+
+    背景：旧 unify 会把同一簇成员的 canonical 直接并入 winner.variant_names；
+    一旦簇被污染，男爵行就会出现保罗/雷托/皇帝等“合法异写”。这里只做
+    保守过滤：variant 若精确等于另一个 canonical，必须能通过
+    ``canonical_variant_forms_related`` 才保留；否则视为跨人物污染。
+
+    该函数不写库，可用于查询层兜底；DB 清理脚本另有持久化版本。
+    """
+    c_norm = _alias_norm(canonical)
+    qt_norms = {_alias_norm(x) for x in quarantined_names or () if isinstance(x, str)}
+    canonical_by_norm = _canonical_name_index(canonical_names)
+
+    out, seen = [], set()
+    for raw in variants or ():
+        if not isinstance(raw, str):
+            continue
+        v = raw.strip()
+        if not v:
+            continue
+        vn = _alias_norm(v)
+        if vn in seen or vn == c_norm or vn in qt_norms:
+            continue
+        foreign = [n for n in canonical_by_norm.get(vn, [])
+                   if _alias_norm(n) != c_norm]
+        if foreign and is_cross_person_canonical_variant(
+                canonical, v, canonical_names=canonical_names,
+                entity_types=entity_types, entity_sources=entity_sources):
+            continue
+        seen.add(vn)
+        out.append(v)
+    return out
+
+
+def _variant_filter_context(conn):
+    """Round 144: 查询层过滤 variant_names 所需的 canonical/quarantine 快照。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+    qt_col = "quarantined_names" if "quarantined_names" in cols else "NULL"
+    etype_col = "entity_type" if "entity_type" in cols else "NULL"
+    rows = conn.execute(
+        f"SELECT canonical_name, {qt_col}, {etype_col}, source_names "
+        "FROM entity_registry"
+    ).fetchall()
+    canonical_names = [r[0] for r in rows if isinstance(r[0], str)]
+    entity_types = {r[0]: (r[2] or "") for r in rows if isinstance(r[0], str)}
+    entity_sources = {}
+    global_qt = set()
+    for _canon, qt_json, _etype, _src_json in rows:
+        if isinstance(_canon, str):
+            entity_sources[_canon] = (
+                robust_json_loads(_src_json, expected_type=list) if _src_json else []
+            )
+        qts = robust_json_loads(qt_json, expected_type=list) if qt_json else []
+        global_qt.update(_alias_norm(x) for x in qts if isinstance(x, str))
+    return canonical_names, global_qt, entity_types, entity_sources
+
+
+def _alias_norm(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "")).strip().lower()
+
+
+def ensure_entity_alias_columns(conn) -> None:
+    """Round 144: 幂等补齐 context_names / quarantined_names 两列。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+    for col in ("context_names", "quarantined_names"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE entity_registry ADD COLUMN {col} TEXT")
+    conn.commit()
+
+
+_PERSON_ENTITY_TYPES = frozenset({"person", "people", "人物", "character", "角色"})
+
+
+def _entity_type_is_person_like(entity_type) -> bool:
+    """Round 144: 只在明确的 person 类型上做跨人物 variant 删除。"""
+    return (entity_type or "").strip().lower() in _PERSON_ENTITY_TYPES
+
+
+def _canonical_name_index(canonical_names) -> Dict[str, List[str]]:
+    index: Dict[str, List[str]] = {}
+    for name in canonical_names or ():
+        if isinstance(name, str) and name.strip():
+            index.setdefault(_alias_norm(name.strip()), []).append(name.strip())
+    return index
+
+
+def _en_role_base(tok):
+    """Round 144: 将英文头衔的复数/所有格形态归一到角色词根。
+
+    emperors → emperor，dukes → duke，countesses → countess。仅当候选词根
+    确实在 _EN_ROLE_WORDS 中才转换，避免误伤普通复数名词。
+    """
+    t = _en_normalize_token(tok)
+    if not t or t in _EN_ROLE_WORDS:
+        return t
+    if t.endswith("ies"):
+        cand = t[:-3] + "y"
+        if cand in _EN_ROLE_WORDS:
+            return cand
+    for suffix in ("es", "s"):
+        if t.endswith(suffix):
+            cand = t[:-len(suffix)]
+            if cand in _EN_ROLE_WORDS:
+                return cand
+    return t
+
+
+_EN_NON_NAME_COMMON_WORDS = frozenset({
+    "person", "people", "man", "woman", "boy", "girl", "child", "children",
+    "fool", "hand", "hands", "ear", "ears", "eye", "eyes", "face", "head",
+    "voice", "body", "heart", "mind", "beast", "creature", "thing", "dog",
+    "friend", "stranger", "servant", "guard", "soldier", "warrior", "royal",
+    "imperial", "young", "old", "great", "little", "fat", "dead", "poor",
+    "good", "evil", "cub", "youth", "elder", "fellow", "gentleman", "lady",
+    "change",
+})
+
+
 _EN_ROLE_WORDS = frozenset({
     "duke", "duchess", "lord", "lady", "baron", "baroness", "sir", "dame",
     "king", "queen", "prince", "princess", "emperor", "empress", "archduke",
     "count", "countess", "earl", "viscount", "marquis", "marquess",
+    "padishah", "sire", "milord", "milady", "m'lord", "m'lady", "m’lord", "m’lady",
     "mother", "father", "sister", "brother", "priest", "priestess",
     "reverend", "reverence", "bishop", "archbishop", "pope", "cardinal",
     "pastor", "deacon", "nun", "monk", "abbot", "abbess", "holiness",
@@ -12600,6 +13361,7 @@ _EN_ROLE_WORDS = frozenset({
     "czar", "sultan", "sheik", "emir", "pasha", "nabob", "mayor",
     "governor", "president", "minister", "chancellor", "ambassador",
     "consul", "senator", "steward", "warden", "champion", "knight",
+    "judge", "justice", "truthsayer",
 })
 
 
@@ -12810,7 +13572,8 @@ def source_name_proper_tokens(source_name):
         if not raw or not raw[0].isupper():
             continue  # 专名证据只认大写词
         tl = _en_normalize_token(raw)
-        if not tl or tl in _EN_DETERMINERS or tl in _EN_ROLE_WORDS \
+        role = _en_role_base(tl)
+        if not tl or tl in _EN_DETERMINERS or role in _EN_ROLE_WORDS \
                 or tl in _EN_GENERIC_MODIFIERS or tl in _EN_RELATION_WORDS:
             continue
         out.add(tl)
@@ -12837,7 +13600,7 @@ def source_name_generic_keys(source_name):
     """
     if not source_name or source_name_is_relational(source_name):
         return set()
-    toks = [_en_normalize_token(t) for t in _en_tokens(source_name)]
+    toks = [_en_role_base(t) for t in _en_tokens(source_name)]
     toks = [t for t in toks if t and t not in _EN_DETERMINERS and t not in _EN_RELATION_WORDS]
     if not toks:
         return set()
@@ -13516,9 +14279,23 @@ def _classify_backend_error(exc: Exception) -> Dict[str, Any]:
     分类目标：让用户在 critic_report 中看到 Jev 失败的根因（auth/network/schema/...），
     而不是只能看到一个通用回退路径。
     """
+    # Round 145: model-access 403 and 400 request-schema must be distinguished
+    # from auth failures.  Reuse the same classifier as the backend so the
+    # circuit breaker and the report cannot disagree.
+    try:
+        from src.judges.typesafe_backend import classify_backend_error as _shared_classify
+        _shared = _shared_classify(exc, sdk_available=_TYPESAFE_EXC_AVAILABLE)
+        if _shared.get("category") in ("model_access", "request_schema"):
+            return _shared
+    except Exception:
+        pass
     if _TYPESAFE_EXC_AVAILABLE:
         if isinstance(exc, TypeSafeAuthenticationError):
-            return {"category": "auth", "msg": str(exc), "action": "check TYPESAFE_API_KEY"}
+            return {
+                "category": "auth",
+                "msg": str(exc),
+                "action": "check MOARK_API_KEY (legacy TYPESAFE_API_KEY)",
+            }
         if isinstance(exc, TypeSafeRateLimitError):
             return {"category": "rate_limit", "msg": str(exc), "action": "wait or upgrade quota"}
         if isinstance(exc, TypeSafeAPITimeoutError):
@@ -13537,14 +14314,17 @@ def _classify_backend_error(exc: Exception) -> Dict[str, Any]:
     # 只用消息文本匹配（不含 repr/类名）：类名如 TypeSafeAuthenticationError
     # 会让 "authentication" 关键字在 SDK 不可用的退化路径上误命中（Round 53 测试锁定）。
     combined = str(exc).lower()
-    if "typesafe_sdk" in combined and any(
+    missing_module = isinstance(exc, ModuleNotFoundError) or any(
         k in combined for k in ("no module named", "modulenotfound", "not installed")
-    ):
+    )
+    if missing_module:
+        module_name = getattr(exc, "name", None)
+        target = f" {module_name}" if module_name else ""
         return {
             "category": "dependency",
             "retryable": False,
             "msg": str(exc)[:200],
-            "action": "安装 typesafe_sdk，或关闭 typesafe 并显式启用 OpenAICompat 降级",
+            "action": f"安装缺失依赖{target}（见 requirements-core.txt），或关闭 typesafe 并显式启用 OpenAICompat 降级",
         }
     if any(k in combined for k in ("429", "rate limit", "rate_limit", "quota", "too many requests")):
         return {"category": "rate_limit", "retryable": True, "msg": str(exc)[:200], "action": "wait or upgrade quota"}
@@ -14042,6 +14822,7 @@ def run_final_gate(
     ⑤ T1 转换审计报告结论为 "✅ 通过"
     ⑥ L1 韵文对齐（verse_lint，门禁内联自动运行）
     ⑦ L2 双关核销（pun_audit，门禁内联自动运行；Round 130 起无需手动补跑）
+    ⑧ 裁决校准占比（最终稿必须主要由 confidence_source=jev 的校准后端产出）
     任一为红 → ok=False（translate_book.sh 以非零退出中止 / ⛔）。
     """
     root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
@@ -14056,6 +14837,7 @@ def run_final_gate(
     stats: dict = {"tasks": 0, "states": {}, "chapters": 0, "qa_fallbacks": 0}
     by_state: dict = {}
     expected: dict = {}
+    task_ids: list = []
 
     # ① 状态机 + ② 产物
     rows = []
@@ -14070,6 +14852,7 @@ def run_final_gate(
     for ch, _cid, st in rows:
         by_state[st] = by_state.get(st, 0) + 1
         expected[ch] = expected.get(ch, 0) + 1
+        task_ids.append((ch, _cid))
     stats["states"] = by_state
     stats["chapters"] = len(expected)
 
@@ -14093,11 +14876,16 @@ def run_final_gate(
     if not qa_file.exists():
         failures.append(f"③ QA_REPORT 不存在: {qa_file}")
     else:
-        falls = [ln[3:].strip() for ln in qa_file.read_text(encoding="utf-8").split("\n")
-                 if ln.startswith("## ")]
-        stats["qa_fallbacks"] = len(falls)
-        if falls:
-            failures.append(f"③ QA_REPORT 记录 {len(falls)} 个 fallback 章节: {falls[:5]}")
+        try:
+            qa_text = qa_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            failures.append(f"③ QA_REPORT 读取失败: {exc}")
+        else:
+            falls = [ln[3:].strip() for ln in qa_text.split("\n")
+                     if ln.startswith("## ")]
+            stats["qa_fallbacks"] = len(falls)
+            if falls:
+                failures.append(f"③ QA_REPORT 记录 {len(falls)} 个 fallback 章节: {falls[:5]}")
 
     # ④ T5 lint
     try:
@@ -14115,12 +14903,16 @@ def run_final_gate(
     if not audit_file.exists():
         failures.append(f"⑤ 转换审计报告不存在: {audit_file}")
     else:
-        audit_text = audit_file.read_text(encoding="utf-8")
-        cov = re.search(r'全书覆盖率:\s*([\d.]+)%', audit_text)
-        if cov:
-            stats["audit_coverage"] = float(cov.group(1))
-        if "✅ 通过" not in audit_text:
-            failures.append(f"⑤ 转换审计未通过（详见 {audit_file}）")
+        try:
+            audit_text = audit_file.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            failures.append(f"⑤ 转换审计报告读取失败: {exc}")
+        else:
+            cov = re.search(r'全书覆盖率:\s*([\d.]+)%', audit_text)
+            if cov:
+                stats["audit_coverage"] = float(cov.group(1))
+            if "✅ 通过" not in audit_text:
+                failures.append(f"⑤ 转换审计未通过（详见 {audit_file}）")
 
     # ⑥ L1 韵文对齐（verse_lint；manifest 无韵文块或功能关闭时跳过）
     try:
@@ -14202,14 +14994,99 @@ def run_final_gate(
             if not _pun_json.exists():
                 failures.append("⑦ pun_audit 未运行（缺 output/pun_audit.json；自动补跑不可用，请手动跑 scripts/pun_audit.py）")
             else:
-                _pun_report = json.loads(_pun_json.read_text(encoding="utf-8"))
-                _pun_sum = _pun_report.get("summary") or {}
-                stats["pun"] = _pun_sum
-                _pun_miss = int(_pun_sum.get("uncovered_nonwaived", 0) or 0)
-                if _pun_miss:
-                    failures.append(f"⑦ pun_watchlist 未核销 {_pun_miss} 项（详见 output/pun_audit.md）")
+                try:
+                    _pun_report = json.loads(_pun_json.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as _pun_read_exc:
+                    failures.append(f"⑦ pun_audit.json 读取/解析失败: {_pun_read_exc}")
+                else:
+                    _pun_sum = _pun_report.get("summary") or {}
+                    stats["pun"] = _pun_sum
+                    _pun_miss = int(_pun_sum.get("uncovered_nonwaived", 0) or 0)
+                    if _pun_miss:
+                        failures.append(f"⑦ pun_watchlist 未核销 {_pun_miss} 项（详见 output/pun_audit.md）")
     except Exception as _p_exc:
         failures.append(f"⑦ pun 审计执行异常: {_p_exc}")
+
+    # ⑧ 校准裁决占比：最终稿必须能证明主要来自校准概率后端（_backend_path=jev）。
+    # Jev 是 Round 145 后保留的兼容标签，实际提供者为 MoArk d3-flash；legacy /
+    # openai_compat / mock_heuristic 均为未校准路径。零人工审核下，不能只看
+    # 成本报告里的“可看但不阻断”统计。
+    gate_cfg = _config.get("pipeline.final_gate", {}) or {}
+    try:
+        _min_cal = float(gate_cfg.get("min_calibrated_ratio", 0.95))
+    except (TypeError, ValueError):
+        _min_cal = 0.95
+    _min_cal = max(0.0, min(1.0, _min_cal))
+    _enforce_cal = bool(gate_cfg.get("enforce_calibrated_ratio", True))
+    _cal_sources_raw = gate_cfg.get("calibrated_backends") or ["jev"]
+    if isinstance(_cal_sources_raw, str):
+        _cal_sources_raw = [_cal_sources_raw]
+    _cal_sources = {str(x) for x in _cal_sources_raw}
+    _backend_counts: dict = {}
+    _chapter_cal: dict = {}
+    _missing_reports = []
+    _bad_reports = []
+    _calibrated_n = 0
+    _multi_batch_calibrated = 0
+    for _ch, _cid in task_ids:
+        _report_path = out_root / _ch / f"{_cid}_critic_report.json"
+        _chapter_cal.setdefault(_ch, {"total": 0, "calibrated": 0})
+        _chapter_cal[_ch]["total"] += 1
+        if not _report_path.exists():
+            _missing_reports.append(str(_report_path))
+            continue
+        try:
+            _report = json.loads(_report_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            _bad_reports.append(str(_report_path))
+            continue
+        _bp = str((_report or {}).get("_backend_path") or "unknown")
+        _backend_counts[_bp] = _backend_counts.get(_bp, 0) + 1
+        if _bp in _cal_sources:
+            _calibrated_n += 1
+            _chapter_cal[_ch]["calibrated"] += 1
+            _diag = (_report or {}).get("_backend_diagnostics") or {}
+            try:
+                if int(_diag.get("batch_count") or 0) > 1:
+                    _multi_batch_calibrated += 1
+            except (TypeError, ValueError):
+                pass
+
+    stats["backend_paths"] = _backend_counts
+    stats["multi_batch_calibrated"] = _multi_batch_calibrated
+    stats["calibrated_ratio"] = (
+        _calibrated_n / len(task_ids) if task_ids else None)
+    stats["calibrated_by_chapter"] = {
+        ch: (v["calibrated"] / v["total"] if v["total"] else 0.0)
+        for ch, v in sorted(_chapter_cal.items())
+    }
+    if _min_cal > 0 and task_ids:
+        if _missing_reports:
+            failures.append(
+                f"⑧ 校准审计缺少 critic_report {len(_missing_reports)} 个: {_missing_reports[:5]}")
+        if _bad_reports:
+            failures.append(
+                f"⑧ critic_report 读取/解析失败 {len(_bad_reports)} 个: {_bad_reports[:5]}")
+        _ratio = float(stats["calibrated_ratio"] or 0.0)
+        if _ratio < _min_cal:
+            _msg = (f"⑧ 校准裁决占比 {_ratio:.1%} < {_min_cal:.1%} "
+                    f"(backend={_backend_counts})")
+            if _enforce_cal:
+                failures.append(_msg)
+            else:
+                warnings.append(_msg + "（config 显式豁免 enforce_calibrated_ratio=false）")
+        _bad_chapters = [
+            (ch, ratio) for ch, ratio in stats["calibrated_by_chapter"].items()
+            if ratio < _min_cal
+        ]
+        if _bad_chapters and _enforce_cal:
+            failures.append(
+                "⑧ 章节校准占比不足: " + ", ".join(
+                    f"{ch}={ratio:.1%}" for ch, ratio in _bad_chapters[:5]))
+        if _multi_batch_calibrated:
+            warnings.append(
+                f"⑧ 多批 System One 裁决 {_multi_batch_calibrated} 个：跨批概率尺度尚未做整批/拆批 A/B，"
+                "当前按同一校准来源处理")
 
     if stats["tasks"] == 0 and db_file.exists():
         failures.append("① workflow.db 无任务行（未 init？）")
@@ -14232,6 +15109,9 @@ def run_final_gate(
     if _ps:
         print(f"  ⑦ 双关核销: covered={_ps.get('covered', 0)}/{_ps.get('total', 0)}, "
               f"waived={_ps.get('waived', 0)}, uncovered={_ps.get('uncovered_nonwaived', 0)}")
+    if stats.get("calibrated_ratio") is not None:
+        print(f"  ⑧ 校准裁决: {stats['calibrated_ratio']:.1%} "
+              f"(min={_min_cal:.0%}, backends={stats.get('backend_paths')})")
     for f in failures:
         print(f"  ❌ {f}")
     if result["ok"]:
@@ -14249,6 +15129,11 @@ _MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile", "story-graph
 _SIGINT_WARNED = False
 
 
+def _default_lock_path() -> Path:
+    """Project-root lock path, independent of the caller's cwd."""
+    return Path(__file__).resolve().parent.parent / "db" / ".sagatrans.lock"
+
+
 def acquire_instance_lock(lock_path: Optional[Path] = None) -> bool:
     """非阻塞获取单实例锁。
 
@@ -14261,13 +15146,20 @@ def acquire_instance_lock(lock_path: Optional[Path] = None) -> bool:
         return True
     import fcntl
     import time as _time
-    path = Path(lock_path) if lock_path else Path.cwd() / "db" / ".sagatrans.lock"
+    override = os.environ.get("SAGATRANS_LOCK_PATH")
+    path = Path(lock_path or override) if (lock_path or override) else _default_lock_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
     except OSError as e:
-        print(f"⚠️ [Lock] 无法创建锁文件 {path}: {e}（继续执行）", file=sys.stderr)
-        return True
+        if os.environ.get("SAGATRANS_ALLOW_CONCURRENT") == "1":
+            print(f"⚠️ [Lock] 无法创建锁文件 {path}: {e}——"
+                  f"SAGATRANS_ALLOW_CONCURRENT=1 放行", file=sys.stderr)
+            return True
+        print(f"⛔ [Lock] 无法创建锁文件 {path}: {e}", file=sys.stderr)
+        print("   单实例保护不可用，拒绝执行；修复目录权限或设置 SAGATRANS_LOCK_PATH。",
+              file=sys.stderr)
+        return False
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -15959,10 +16851,12 @@ def lint_texts(items) -> dict:
     return {"ok": not failures, "failures": failures, "warnings": warnings}
 
 
-def normalize_chapter_notes(text: str, start_num: int = 1):
-    """章级注释统一：去重 → 孤儿改锚/章末归位 → 顺序重编号（幂等）。
+def _normalize_chapter_notes_once(text: str, start_num: int = 1):
+    """单轮章级注释统一：去重 → 孤儿改锚/章末归位 → 顺序重编号。
 
-    Returns: (new_text, changes: dict, next_num: int)
+    孤儿归位可能把 md 定义改写成译者注，从而形成新的重复组；调用方
+    不应假设单轮即可达到固定点。公开入口 normalize_chapter_notes()
+    负责有限轮稳定化。
     """
     blocks, units = _note_candidates(text)
     _group_title_units(units)
@@ -16297,6 +17191,29 @@ def normalize_chapter_notes(text: str, start_num: int = 1):
     return assembled, changes, start_num + len(order)
 
 
+def normalize_chapter_notes(text: str, start_num: int = 1):
+    """章级注释统一至固定点（最多 3 轮实际变更），保证重复执行幂等。
+
+    Returns: (new_text, changes: dict, next_num: int)
+    """
+    current = text
+    totals = None
+    next_num = start_num
+    for pass_idx in range(3):
+        new_text, changes, next_num = _normalize_chapter_notes_once(current, start_num)
+        if new_text == current:
+            if pass_idx == 0:
+                return new_text, changes, next_num
+            return new_text, totals or changes, next_num
+        if totals is None:
+            totals = {k: int(v) for k, v in changes.items()}
+        else:
+            for key, value in changes.items():
+                totals[key] = totals.get(key, 0) + int(value)
+        current = new_text
+    return current, totals or {}, next_num
+
+
 def normalize_final_style(text: str):
     """T5 规范化 pass（幂等）。Returns: (new_text, changes dict)。"""
     changes = {"headers_removed": 0, "sup_defs_converted": 0, "md_defs_kept": 0,
@@ -16436,12 +17353,24 @@ def notes_normalize_outputs(project_root=None, output_dir=None, apply: bool = Fa
 def postprocess_chunk_text(text: str, chapter_id: str, chunk_idx: int) -> str:
     """merge 前处理：剥离页眉/版本行残留 + chunk 内嵌章节标题行。"""
     out = []
+    leading_heading_block = True
     for line in text.split('\n'):
         s = line.strip()
         if _FRONTMATTER_LINE_RE.match(s):
             continue
         if _CHAPTER_HEAD_RE.match(s) or _PART_HEAD_RE.match(s):
             continue
+        # chunk 0 常带译者自行补的部/卷副标题（如 "# 沙丘"）。merge 层
+        # 已用 chapter_heading() 生成唯一规范 H1；正文开始前的自由 H1
+        # 一律剥离，避免成书出现第二个无编号章节标题。正文开始后的行
+        # 保持原样，不把合法正文误当作标题块。
+        if leading_heading_block:
+            if not s:
+                out.append(line)
+                continue
+            if s.startswith('# '):
+                continue
+            leading_heading_block = False
         out.append(line)
     return '\n'.join(out)
 
@@ -17732,7 +18661,7 @@ def _registry_rows(db_path: Path) -> List[Dict[str, Any]]:
             return []
         wanted = ["id", "canonical_name", "source_names", "variant_names", "entity_type",
                   "pronoun_gender", "confidence", "pending_review", "translation_strategy",
-                  "first_seen_chunk"]
+                  "first_seen_chunk", "quarantined_names"]
         select = ", ".join(c for c in wanted if c in cols)
         rows = con.execute(f"SELECT {select} FROM entity_registry ORDER BY id").fetchall()
         return [dict(r) for r in rows]
@@ -17742,13 +18671,40 @@ def _registry_rows(db_path: Path) -> List[Dict[str, Any]]:
         con.close()
 
 
-def _entity_aliases(row: Dict[str, Any]) -> List[str]:
+def _entity_aliases(row: Dict[str, Any], canonical_names=(),
+                    quarantined_names=(), entity_types=None,
+                    entity_sources=None) -> List[str]:
     names: List[str] = []
     canonical = str(row.get("canonical_name") or "").strip()
     if canonical:
         names.append(canonical)
-    for raw in (row.get("source_names"), row.get("variant_names")):
-        names.extend(_load_json_list(raw))
+    sources = _load_json_list(row.get("source_names"))
+    variants = _load_json_list(row.get("variant_names"))
+    qt_norms = {str(x).strip().casefold() for x in (quarantined_names or ())
+                if str(x).strip()}
+    # Round 144: source_names 只把 proper 指称画成 alias 节点；variant_names
+    # 先经跨人物过滤。旧库中的 Duke Leto / the Emperor / 保罗 等错误归属
+    # 不能再作为图谱事实扩散。
+    try:
+        from src.core.decision_engine import (
+            filter_entity_variant_names,
+            is_proper_entity_alias,
+        )
+        sources = [
+            s for s in sources
+            if is_proper_entity_alias(s) and str(s).strip().casefold() not in qt_norms
+        ]
+        variants = filter_entity_variant_names(
+            canonical, variants,
+            canonical_names=canonical_names,
+            quarantined_names=quarantined_names,
+            entity_types=entity_types,
+            entity_sources=entity_sources,
+        )
+    except Exception:
+        pass
+    names.extend(sources)
+    names.extend(variants)
     out: List[str] = []
     seen: set = set()
     for name in names:
@@ -18021,6 +18977,26 @@ def build_story_graph(
     indir = Path(input_dir) if input_dir else root / "input"
     texts = _chapter_texts(indir)
     rows = _registry_rows(dbp)
+    canonical_names = [
+        str(r.get("canonical_name") or "").strip() for r in rows
+        if str(r.get("canonical_name") or "").strip()
+    ]
+    entity_types = {
+        str(r.get("canonical_name") or "").strip(): str(r.get("entity_type") or "")
+        for r in rows if str(r.get("canonical_name") or "").strip()
+    }
+    entity_sources = {
+        str(r.get("canonical_name") or "").strip(): _load_json_list(r.get("source_names"))
+        for r in rows if str(r.get("canonical_name") or "").strip()
+    }
+    global_qt: List[str] = []
+    _qt_seen = set()
+    for r in rows:
+        for name in _load_json_list(r.get("quarantined_names")):
+            key = name.strip().casefold()
+            if key and key not in _qt_seen:
+                _qt_seen.add(key)
+                global_qt.append(name)
     nodes: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
     try:
@@ -18071,7 +19047,11 @@ def build_story_graph(
         canonical = str(row.get("canonical_name") or "").strip()
         if not canonical:
             continue
-        aliases = _entity_aliases(row)
+        aliases = _entity_aliases(
+            row, canonical_names=canonical_names,
+            quarantined_names=global_qt, entity_types=entity_types,
+            entity_sources=entity_sources,
+        )
         aliases_by_entity[eid] = aliases
         entity_by_id[eid] = row
         conf, conf_label = _entity_confidence(row)
@@ -22554,6 +23534,223 @@ from typing import Optional
 _DEFAULT_BACKEND: Optional["SystemOneBackend"] = None
 
 
+DEFAULT_API_BASE = "https://api.moark.com"
+
+
+DEFAULT_MODEL = "d3-flash"
+
+
+DEFAULT_MAX_QUESTIONS_PER_BATCH = 64
+
+
+def _config_text(value: Any) -> str:
+    """Return a usable config string, treating unresolved ``${ENV}`` as empty."""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text or (text.startswith("${") and text.endswith("}")):
+        return ""
+    return text
+
+
+def normalize_api_root(value: Any) -> str:
+    """Normalize the API root without duplicating the SDK's ``/v1/systemone``."""
+    root = _config_text(value).rstrip("/")
+    if not root:
+        return ""
+    lowered = root.lower()
+    for suffix in ("/v1/systemone", "/v1"):
+        if lowered.endswith(suffix):
+            root = root[: -len(suffix)].rstrip("/")
+            lowered = root.lower()
+    return root
+
+
+def _api_base_host(value: str) -> str:
+    try:
+        return urlparse(value or "").netloc
+    except Exception:
+        return ""
+
+
+def _typesafe_sdk_module():
+    try:
+        import typesafe_sdk as _sdk
+        return _sdk
+    except ImportError:
+        return None
+
+
+def classify_backend_error(
+    exc: Exception,
+    *,
+    sdk_available: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Classify a decision-backend failure for diagnostics/circuit breaking.
+
+    Categories used by Round 145:
+      auth          — 401/403 explicitly about an invalid API key/token
+      model_access  — 403 explicitly about permission to use a model
+      request_schema— 400 (question count, instructions type, etc.)
+      rate_limit / timeout / network / dependency / parse / server / unknown
+
+    The distinction matters: a model-access 403 must NOT set the process-wide
+    auth circuit breaker, otherwise a single wrong model name silently disables
+    the primary backend for the rest of the run.
+    """
+    text = str(exc).lower()
+    sdk = _typesafe_sdk_module() if sdk_available is not False else None
+
+    # Status-code-specific rules must run before SDK class mapping: MoArk may
+    # surface a model-permission 403 as TypeSafeAuthenticationError.
+    has_403 = bool(("403" in text) or ("forbidden" in text))
+    has_401 = bool(("401" in text) or ("unauthorized" in text))
+    has_400 = bool(("400" in text) or ("bad request" in text))
+    model_words = any(k in text for k in ("model", "模型"))
+    permission_words = any(k in text for k in (
+        "无权访问", "无权使用", "无权限", "没有权限", "访问被拒",
+        "not allowed", "no access", "access denied", "permission",
+        "not authorized", "forbidden",
+    ))
+    key_words = any(k in text for k in (
+        "api key", "api_key", "invalid token", "invalid api",
+        "令牌无效", "密钥无效", "鉴权失败", "认证失败", "authentication",
+    ))
+    model_name_error = any(k in text for k in (
+        "模型名称", "模型不存在", "model name", "model not found",
+        "unknown model", "invalid model",
+    ))
+
+    if has_403 and model_words and permission_words and not key_words:
+        return {
+            "category": "model_access",
+            "retryable": False,
+            "msg": str(exc)[:200],
+            "action": "检查该 API key 是否有权访问当前模型（403 model_access）",
+        }
+    if model_name_error and (has_400 or has_403):
+        # MoArk returns 400 "模型名称有误" for a typo'd model.  Treat it as a
+        # model-access/config error, not a question-schema error.
+        return {
+            "category": "model_access",
+            "retryable": False,
+            "msg": str(exc)[:200],
+            "action": "检查 config typesafe.model_name 是否为 d3-flash / d3-turbo",
+        }
+    if has_401 or (has_403 and key_words):
+        return {
+            "category": "auth",
+            "retryable": False,
+            "msg": str(exc)[:200],
+            "action": "check MOARK_API_KEY / legacy TYPESAFE_API_KEY",
+        }
+    if has_400:
+        return {
+            "category": "request_schema",
+            "retryable": False,
+            "msg": str(exc)[:200],
+            "action": "检查 max_questions_per_batch / instructions schema / 模型问题上限",
+        }
+
+    if sdk is not None:
+        if isinstance(exc, getattr(sdk, "TypeSafeAuthenticationError", ())):
+            return {
+                "category": "auth", "retryable": False,
+                "msg": str(exc)[:200], "action": "check MOARK_API_KEY / legacy TYPESAFE_API_KEY",
+            }
+        if isinstance(exc, getattr(sdk, "TypeSafeRateLimitError", ())):
+            return {
+                "category": "rate_limit", "retryable": True,
+                "msg": str(exc)[:200], "action": "wait or upgrade quota",
+            }
+        if isinstance(exc, getattr(sdk, "TypeSafeAPITimeoutError", ())):
+            return {
+                "category": "timeout", "retryable": True,
+                "msg": str(exc)[:200], "action": "increase timeout or retry",
+            }
+        if isinstance(exc, getattr(sdk, "TypeSafeAPIConnectionError", ())):
+            return {
+                "category": "network", "retryable": True,
+                "msg": str(exc)[:200], "action": "check DNS/firewall/cert/proxy",
+            }
+        if isinstance(exc, getattr(sdk, "TypeSafeBadRequestError", ())):
+            return {
+                "category": "request_schema", "retryable": False,
+                "msg": str(exc)[:200], "action": "检查 max_questions_per_batch / instructions schema",
+            }
+        if isinstance(exc, getattr(sdk, "TypeSafeAPIResponseValidationError", ())):
+            return {
+                "category": "schema_mismatch", "retryable": False,
+                "msg": str(exc)[:200], "action": "update verdict parser",
+            }
+        if isinstance(exc, getattr(sdk, "TypeSafeAPIError", ())):
+            return {
+                "category": "api_error", "retryable": True,
+                "msg": str(exc)[:200], "action": "check MoArk status page",
+            }
+
+    missing_module = isinstance(exc, ModuleNotFoundError) or any(
+        k in text for k in ("no module named", "modulenotfound", "not installed")
+    )
+    if missing_module:
+        module_name = getattr(exc, "name", None)
+        target = f" `{module_name}`" if module_name else ""
+        return {
+            "category": "dependency", "retryable": False,
+            "msg": str(exc)[:200],
+            "action": f"安装缺失依赖{target}（见 requirements-core.txt），或显式启用 OpenAICompat 降级",
+        }
+    if any(k in text for k in ("429", "rate limit", "rate_limit", "quota", "too many requests")):
+        return {"category": "rate_limit", "retryable": True, "msg": str(exc)[:200],
+                "action": "wait or upgrade quota"}
+    if any(k in text for k in ("timeout", "timed out", "connection reset", "connection aborted")):
+        return {"category": "timeout", "retryable": True, "msg": str(exc)[:200],
+                "action": "increase timeout or retry"}
+    if any(k in text for k in ("json", "decode", "parse", "invalid response", "malformed")):
+        return {"category": "parse", "retryable": False, "msg": str(exc)[:200],
+                "action": "check response format"}
+    if any(k in text for k in ("500", "502", "503", "504", "internal server", "bad gateway", "service unavailable")):
+        return {"category": "server", "retryable": True, "msg": str(exc)[:200],
+                "action": "check MoArk status page"}
+    if any(k in text for k in ("connection", "dns", "network", "unreachable", "ssl", "certificate", "proxy")):
+        return {"category": "network", "retryable": True, "msg": str(exc)[:200],
+                "action": "check DNS/firewall/cert/proxy"}
+    return {
+        "category": "unknown", "retryable": True,
+        "msg": f"{type(exc).__name__}: {exc}"[:200],
+        "action": "inspect stack trace",
+    }
+
+
+def _typesafe_sdk_available() -> bool:
+    """类型化后端依赖探测（不触发 import，避免每 chunk 重复失败）。"""
+    try:
+        return importlib.util.find_spec("typesafe_sdk") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def batch_questions(
+    questions: Dict[str, Any],
+    max_per_batch: int = DEFAULT_MAX_QUESTIONS_PER_BATCH,
+) -> list:
+    """Split questions into stable, insertion-order-preserving batches.
+
+    d3 currently accepts at most 64 questions per system_one request.  The
+    caller's dict order is meaningful: base primitives are inserted before
+    per-entity questions, so keeping order also keeps the base questions in
+    the first batch.
+    """
+    try:
+        limit = max(1, int(max_per_batch))
+    except (TypeError, ValueError):
+        limit = DEFAULT_MAX_QUESTIONS_PER_BATCH
+    items = list(questions.items())
+    if not items:
+        return []
+    return [dict(items[i:i + limit]) for i in range(0, len(items), limit)]
+
+
 class SystemOneBackend:
     """typesafe.ai System One 后端抽象（接口与 typesafe_sdk 对齐）"""
 
@@ -22580,30 +23777,74 @@ class SystemOneBackend:
 
 
 class JevBackend(SystemOneBackend):
-    """typesafe.ai Jev 1.13 后端（首选）"""
+    """MoArk d3 System One 后端（保留 JevBackend 类名以兼容旧调用方）。
 
-    backend_kind = "jev"
+    Round 145: Jev 配额已停用，实际 provider/model 改为 MoArk
+    ``d3-flash``。``backend_kind`` 仍为 ``"jev"`` —— 这不是伪装迁移完成，
+    而是让 verdict 继续使用 Jev 的已校准阈值档，直到 d3-flash / d3-turbo
+    的 A/B 证明概率语义可互换。真实 provider/model/endpoint 会写入
+    ``last_diagnostics`` 和 critic report 的 ``_backend_diagnostics``。
+    """
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "jev-latest"):
-        self.api_key = api_key or os.environ.get("TYPESAFE_API_KEY")
-        self.model = model
+    backend_kind = "jev"  # calibrated-probability compatibility label
+    provider = "moark"
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        api_base: Optional[str] = None,
+        max_questions_per_batch: Optional[int] = None,
+    ):
+        cfg = _load_typesafe_config()
+
+        # Priority: explicit > config (resolved ${MOARK_API_KEY}) > MOARK env >
+        # legacy TYPESAFE_API_KEY.  Config/MOARK must win over the legacy env
+        # name: on this machine TYPESAFE_API_KEY still holds the expired Jev
+        # key, while MOARK_API_KEY is the working d3 credential.
+        if api_key is None:
+            api_key = (
+                _config_text(cfg.get("api_key"))
+                or _config_text(os.environ.get("MOARK_API_KEY"))
+                or _config_text(os.environ.get("TYPESAFE_API_KEY"))
+            )
+        self.api_key = _config_text(api_key)
+
+        if model is None:
+            model = _config_text(cfg.get("primary_model")) or DEFAULT_MODEL
+        self.model = str(model or DEFAULT_MODEL)
+
+        if api_base is None:
+            api_base = (
+                _config_text(cfg.get("api_base"))
+                or _config_text(os.environ.get("TYPESAFE_BASE_URL"))
+                or DEFAULT_API_BASE
+            )
+        self.api_base = normalize_api_root(api_base) or DEFAULT_API_BASE
+
+        if max_questions_per_batch is None:
+            max_questions_per_batch = cfg.get("max_questions_per_batch")
+        try:
+            self.max_questions_per_batch = max(1, int(max_questions_per_batch))
+        except (TypeError, ValueError):
+            self.max_questions_per_batch = DEFAULT_MAX_QUESTIONS_PER_BATCH
+
         self._client = None
+        self.last_diagnostics: Dict[str, Any] = {}
 
     def _ensure_client(self):
         if self._client is None:
             from typesafe_sdk import TypeSafeClient
             if not self.api_key:
                 raise RuntimeError(
-                    "JevBackend 需要 TYPESAFE_API_KEY 环境变量或显式传入"
+                    "System One 后端需要 MOARK_API_KEY（兼容 TYPESAFE_API_KEY）环境变量、"
+                    "config typesafe.api_key，或显式传入"
                 )
-            # Round 107 修正: 恢复默认行为 (trust_env=True), 让 httpx2 读代理环境变量.
-            # 背景: 用户区域被 Typesafe 451 封锁, 靠 SOCKS 代理路由到允许区域.
-            # curl 内置 SOCKS 支持所以能通; httpx2 需要 socksio 包 + socks5:// 方案.
-            # 前置条件: pip install socksio.
-            # Round 107 P2: httpx2 只支持 socks5/socks5h 方案, 不支持 socks.
-            # 若环境变量用 socks://, 归一化为 socks5:// (curl 两者等价).
-            import os
-            import httpx2
+            # Round 107: keep proxy support.  httpx2 only accepts
+            # socks5/socks5h, so normalize the common socks:// spelling.
+            # Import lazily only when a proxy is configured: the SDK already
+            # depends on httpx2, but direct no-proxy calls must not fail on a
+            # partially installed/optional environment.
             proxy_url = None
             for var in ("ALL_PROXY", "HTTPS_PROXY", "https_proxy", "all_proxy"):
                 val = os.environ.get(var, "")
@@ -22612,19 +23853,46 @@ class JevBackend(SystemOneBackend):
                     break
             if proxy_url and proxy_url.startswith("socks://"):
                 proxy_url = proxy_url.replace("socks://", "socks5://", 1)
+            kwargs: Dict[str, Any] = {
+                "api_key": self.api_key,
+                "base_url": self.api_base,
+            }
             if proxy_url:
-                http_client = httpx2.Client(proxy=proxy_url)
-                self._client = TypeSafeClient(api_key=self.api_key, http_client=http_client)
-            else:
-                self._client = TypeSafeClient(api_key=self.api_key)
+                import httpx2
+                kwargs["http_client"] = httpx2.Client(proxy=proxy_url)
+            self._client = TypeSafeClient(**kwargs)
         return self._client
+
+    @staticmethod
+    def _convert_answer(ans: Any) -> Answer:
+        from typesafe_sdk import (
+            NoulAnswer as _NoulA,
+            ChoiceAnswer as _ChoiceA,
+            ScoreAnswer as _ScoreA,
+        )
+        if isinstance(ans, _NoulA):
+            # Noul carries no confidence field; noul itself encodes uncertainty.
+            return NoulAnswer(noul=ans.noul)
+        if isinstance(ans, _ChoiceA):
+            return ChoiceAnswer(
+                choice=ans.choice,
+                probabilities=dict(ans.probabilities),
+                confidence=ans.confidence,
+            )
+        if isinstance(ans, _ScoreA):
+            return ScoreAnswer(
+                score=ans.score,
+                probabilities={int(k): float(v) for k, v in ans.probabilities.items()},
+                confidence=ans.confidence,
+            )
+        raise TypeError(f"未知 typesafe answer 类型: {type(ans).__name__}")
 
     def evaluate(self, state, questions, *, model=None, timeout=30.0):
         if not _typesafe_sdk_available():
             raise ModuleNotFoundError("No module named 'typesafe_sdk'")
         client = self._ensure_client()
-        # typesafe_sdk 期望 Choice/Score/Noul 对象；我们 dict 入参则需要构造
         from typesafe_sdk import Choice, Score, Noul
+
         q_objects: Dict[str, Any] = {}
         for qid, q in questions.items():
             t = q.get("type")
@@ -22646,36 +23914,59 @@ class JevBackend(SystemOneBackend):
             else:
                 raise ValueError(f"未知 primitive type: {t}")
 
-        resp = client.system_one(
-            state=state,
-            questions=q_objects,
-            model=model or self.model,
-            timeout=timeout,
-        )
+        used_model = model or self.model
+        batches = batch_questions(q_objects, self.max_questions_per_batch)
+        merged: Dict[str, Answer] = {}
+        batch_counts = []
+        input_tokens = 0
+        output_tokens = 0
 
-        # 转换为统一 Answer 格式
-        out: Dict[str, Answer] = {}
-        for qid, ans in resp.answers.items():
-            from typesafe_sdk import NoulAnswer as _NoulA, ChoiceAnswer as _ChoiceA, ScoreAnswer as _ScoreA
-            if isinstance(ans, _NoulA):
-                # SDK NoulAnswer 没有 confidence 字段（实测验证）
-                # SDK schema 文档（api.md）也明确："Choice and Score answers also carry a confidence"
-                # Noul 答案的"模型不确定度"由 noul 值本身隐含（noul=0.5 即不确定），
-                # 不再尝试访问 ans.confidence（AttributeError 的根因）。
-                out[qid] = NoulAnswer(noul=ans.noul)
-            elif isinstance(ans, _ChoiceA):
-                out[qid] = ChoiceAnswer(
-                    choice=ans.choice,
-                    probabilities=dict(ans.probabilities),
-                    confidence=ans.confidence,
+        for batch in batches:
+            resp = client.system_one(
+                state=state,
+                questions=batch,
+                model=used_model,
+                timeout=timeout,
+            )
+            batch_counts.append(len(batch))
+            answers_obj = getattr(resp, "answers", None) or {}
+            missing = [qid for qid in batch if qid not in answers_obj]
+            if missing:
+                raise RuntimeError(
+                    "system_one 返回缺少 qid: " + ", ".join(str(q) for q in missing[:8])
                 )
-            elif isinstance(ans, _ScoreA):
-                out[qid] = ScoreAnswer(
-                    score=ans.score,
-                    probabilities={int(k): float(v) for k, v in ans.probabilities.items()},
-                    confidence=ans.confidence,
-                )
-        return out
+            for qid, ans in answers_obj.items():
+                if qid not in batch:
+                    raise RuntimeError(f"system_one 返回了未请求的 qid: {qid}")
+                if qid in merged:
+                    raise ValueError(f"重复 qid: {qid}")
+                merged[qid] = self._convert_answer(ans)
+            usage = getattr(resp, "usage", None)
+            try:
+                input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
+                output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
+            except (TypeError, ValueError):
+                pass
+
+        missing_all = [qid for qid in q_objects if qid not in merged]
+        if missing_all:
+            raise RuntimeError(
+                "system_one 合并后缺少 qid: " + ", ".join(str(q) for q in missing_all[:8])
+            )
+
+        self.last_diagnostics = {
+            "provider": self.provider,
+            "model": used_model,
+            "base_url_host": _api_base_host(self.api_base),
+            "question_count": len(q_objects),
+            "batch_count": len(batches),
+            "batch_question_counts": batch_counts,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+        }
+        # Preserve the caller's original question order for deterministic
+        # aggregation downstream.
+        return {qid: merged[qid] for qid in q_objects}
 
 
 
@@ -23054,10 +24345,10 @@ class MockBackend(SystemOneBackend):
 
 
 class FallbackBackend(SystemOneBackend):
-    """三级 fallback 链：Jev → OpenAICompat → Mock（启发式）
+    """三级 fallback 链：MoArk d3 → OpenAICompat → Mock（启发式）
 
     适用场景：
-      - 有 TYPESAFE_API_KEY + 网络可达：Jev 原生
+      - 有 MOARK_API_KEY + 网络可达：MoArk d3 原生
       - 无 typesafe API 但有 OpenAI 兼容 LLM：MiniMax / DeepSeek
       - 完全离线或网络中断：Mock 启发式（仅用于架构验证，不保证精度）
     """
@@ -23065,14 +24356,20 @@ class FallbackBackend(SystemOneBackend):
     def __init__(
         self,
         *,
-        primary_model: str = "jev-latest",
+        primary_model: str = DEFAULT_MODEL,
+        api_base: Optional[str] = None,
+        max_questions_per_batch: Optional[int] = None,
         fallback_role: str = "primary",
         allow_mock: bool = True,
         allow_openai_fallback: bool = False,
         enabled: bool = True,
         timeout: float = 30.0,
     ):
-        self.primary = JevBackend(model=primary_model)
+        self.primary = JevBackend(
+            model=primary_model,
+            api_base=api_base,
+            max_questions_per_batch=max_questions_per_batch,
+        )
         # self.fallback 保留为 OpenAICompatBackend 实例（向后兼容 verify_typesafe_refactor.py
         # test_05 静态探测），但默认不参与自动链（Jev → Mock）。
         # OpenAICompat 在 LLM-as-judge 模式下不返回校准概率，与 Jev 语义不等价，
@@ -23088,9 +24385,20 @@ class FallbackBackend(SystemOneBackend):
         self._mock = MockBackend() if allow_mock else None
         # Round 118 P1-1: 记录本次实际命中的后端（供 verdict confidence_source 分档）
         self.last_backend: str = "unknown"
-        # Round 121: 401 鉴权失败缓存 —— key 修复须重启进程，本轮内不再反复试探 Jev
+        self.last_diagnostics: Dict[str, Any] = {}
+        # Round 121/145: auth and model-access failures are process-lifetime
+        # circuit breakers (a restart is required after fixing key/model access).
         self._jev_auth_dead = False
+        self._jev_model_dead = False
         self._jev_disabled_reason = ""
+
+    def primary_available(self) -> bool:
+        """True when the primary backend should still be attempted."""
+        return bool(
+            self.primary.api_key
+            and not self._jev_auth_dead
+            and not self._jev_model_dead
+        )
 
     def evaluate(self, state, questions, *, model=None, timeout=None):
         # 有效 timeout：调用方传入优先，否则用 self.timeout（来自 config.yaml typesafe.timeout）
@@ -23103,28 +24411,45 @@ class FallbackBackend(SystemOneBackend):
                 return self._mock.evaluate(state, questions, model=model, timeout=eff_timeout)
             raise RuntimeError("typesafe 已禁用 (enabled=false)，且 Mock 未启用")
 
-        # 1. 尝试 Jev（typesafe.ai 原生）；401 后本轮不再试探（见下方 except）
-        if self.primary.api_key and not self._jev_auth_dead:
+        # 1. 尝试 MoArk d3（保留 last_backend="jev" 校准标签）
+        if self.primary_available():
             try:
                 answers = self.primary.evaluate(state, questions, model=model, timeout=eff_timeout)
                 self.last_backend = "jev"
+                self.last_diagnostics = dict(
+                    getattr(self.primary, "last_diagnostics", {}) or {}
+                )
                 return answers
             except Exception as e:
                 missing_sdk = isinstance(e, (ImportError, ModuleNotFoundError)) or (
                     "typesafe_sdk" in str(e)
                 )
-                auth_failed = _is_auth_failure(e)
-                if missing_sdk or auth_failed:
-                    # Jev 鉴权/依赖失败：修复须重启进程；本进程内不再试探 Jev
+                diag = classify_backend_error(e)
+                self.last_diagnostics = {
+                    "provider": getattr(self.primary, "provider", "moark"),
+                    "model": getattr(self.primary, "model", None),
+                    "error": diag,
+                }
+                dependency_failure = missing_sdk or diag["category"] == "dependency"
+                if dependency_failure or diag["category"] == "auth":
+                    # Auth/dependency failure: restart required after fixing.
                     if not self._jev_auth_dead:
-                        reason = "typesafe_sdk 缺失" if missing_sdk else "Jev 鉴权失败"
-                        logger.warning(f"{reason}（{e}）；本进程内不再尝试 Jev，改走降级链")
+                        reason = ("System One 判断后端依赖缺失" if dependency_failure
+                                  else "MoArk 鉴权失败")
+                        logger.warning(f"{reason}（{e}）；本进程内不再尝试主后端，改走降级链")
                     self._jev_auth_dead = True
-                    self._jev_disabled_reason = (
-                        "typesafe_sdk 未安装" if missing_sdk else "Jev 鉴权失败"
-                    )
+                    self._jev_disabled_reason = (reason if dependency_failure
+                                                 else "MoArk 鉴权失败")
+                elif diag["category"] == "model_access":
+                    if not self._jev_model_dead:
+                        logger.warning(
+                            "MoArk 无权访问模型 %s（%s）；本进程内不再尝试主后端",
+                            getattr(self.primary, "model", "?"), e,
+                        )
+                    self._jev_model_dead = True
+                    self._jev_disabled_reason = "MoArk 模型访问被拒 (model_access)"
                 else:
-                    logger.info(f"Jev 不可用: {type(e).__name__}: {e}")
+                    logger.info(f"MoArk 不可用: {type(e).__name__}: {e}")
                 if not self.allow_openai_fallback:
                     # 默认跳过 OpenAICompat（设计原则：Jev → Mock，不模拟 Jev）
                     # 详见 audit A3；OpenAICompat 不返回校准概率，与 Jev 语义不等价。
@@ -23134,19 +24459,27 @@ class FallbackBackend(SystemOneBackend):
                     try:
                         answers = self.fallback.evaluate(state, questions, model=model, timeout=eff_timeout)
                         self.last_backend = "openai_compat"
+                        self.last_diagnostics = {
+                            "provider": "openai_compat",
+                            "model": getattr(self.fallback, "model_name", None),
+                        }
                         return answers
                     except Exception as e2:
                         logger.info(f"OpenAICompat 不可用，降级到 Mock: {e2}")
         else:
-            if self._jev_auth_dead:
+            if self._jev_auth_dead or self._jev_model_dead:
                 logger.debug("Jev 跳过：%s", self._jev_disabled_reason or "鉴权/依赖不可用")
             else:
-                logger.debug("Jev 跳过：无 TYPESAFE_API_KEY")
+                logger.debug("Jev 跳过：无 MOARK_API_KEY / TYPESAFE_API_KEY")
             if self.allow_openai_fallback:
                 # 无 Jev key 时仍可走 OpenAICompat（显式开启）
                 try:
                     answers = self.fallback.evaluate(state, questions, model=model, timeout=eff_timeout)
                     self.last_backend = "openai_compat"
+                    self.last_diagnostics = {
+                        "provider": "openai_compat",
+                        "model": getattr(self.fallback, "model_name", None),
+                    }
                     return answers
                 except Exception as e:
                     logger.info(f"OpenAICompat 不可用，降级到 Mock: {e}")
@@ -23154,6 +24487,7 @@ class FallbackBackend(SystemOneBackend):
         # 3. 降级到 Mock（启发式离线）
         if self._mock is not None:
             self.last_backend = "mock_heuristic"
+            self.last_diagnostics = {"provider": "mock_heuristic", "model": None}
             return self._mock.evaluate(state, questions, model=model, timeout=eff_timeout)
         raise RuntimeError("所有 backend 都不可用，且 Mock 未启用")
 
@@ -23191,7 +24525,10 @@ def _load_typesafe_config() -> Dict[str, Any]:
       `primary_model` 作为 legacy fallback (若用户旧版 yaml 还在用).
     """
     defaults: Dict[str, Any] = {
-        "primary_model": "jev-latest",  # 内部 key, 由 FallbackBackend.__init__ 消费
+        "primary_model": DEFAULT_MODEL,  # 内部 key, 由 FallbackBackend.__init__ 消费
+        "api_base": DEFAULT_API_BASE,
+        "api_key": "",
+        "max_questions_per_batch": DEFAULT_MAX_QUESTIONS_PER_BATCH,
         "fallback_role": "primary",
         "allow_mock": True,
         "allow_openai_fallback": False,  # 默认关闭，详见 audit A3
@@ -23212,6 +24549,18 @@ def _load_typesafe_config() -> Dict[str, Any]:
                 defaults["timeout"] = float(section["timeout"])
             except (TypeError, ValueError):
                 pass
+        api_base = section.get("api_base")
+        if _config_text(api_base):
+            defaults["api_base"] = normalize_api_root(api_base)
+        api_key = section.get("api_key")
+        if _config_text(api_key):
+            defaults["api_key"] = str(api_key).strip()
+        try:
+            defaults["max_questions_per_batch"] = max(
+                1, int(section.get("max_questions_per_batch", DEFAULT_MAX_QUESTIONS_PER_BATCH))
+            )
+        except (TypeError, ValueError):
+            pass
         # Round 77: config.yaml 用 `model_name` 字段 (与全局 llm_backend/llm_openai_api 节命名一致),
         # 旧代码读 `primary_model` 导致配置静默失效. 现在优先 `model_name`,
         # 兼容旧 yaml 用 `primary_model`.
@@ -23233,6 +24582,8 @@ def get_backend() -> SystemOneBackend:
         cfg = _load_typesafe_config()
         _DEFAULT_BACKEND = FallbackBackend(
             primary_model=cfg["primary_model"],
+            api_base=cfg.get("api_base"),
+            max_questions_per_batch=cfg.get("max_questions_per_batch"),
             fallback_role=cfg["fallback_role"],
             allow_mock=cfg["allow_mock"],
             allow_openai_fallback=cfg["allow_openai_fallback"],
@@ -24162,7 +25513,9 @@ for _mod_name, _attrs in {
     # build_per_entity_questions / _sanitize_key 函数, 整合脚本中 MockBackend 等位置
     # 的 `from src.judges.primitives import PER_ENTITY_KEY_PREFIX` 触发 ImportError.
     "src.judges.primitives": ["VOICE_DRIFT", "REGISTER_MATCH", "ENTITY_CONSISTENCY", "LITERAL_RESIDUE", "SEMANTIC_LOSS", "STYLE_COMPLIANCE_SCORE", "ALL_PRIMITIVES", "build_question_set", "PER_ENTITY_KEY_PREFIX", "build_per_entity_questions", "_sanitize_key", "aggregate_per_entity_nouls", "entity_present_in_text", "apply_entity_presence_override"],
-    "src.judges.typesafe_backend": ["SystemOneBackend", "JevBackend", "OpenAICompatBackend", "MockBackend", "FallbackBackend", "get_backend", "_DEFAULT_BACKEND"],
+    "src.judges.typesafe_backend": ["SystemOneBackend", "JevBackend", "OpenAICompatBackend", "MockBackend", "FallbackBackend", "get_backend", "_DEFAULT_BACKEND",
+                                    "DEFAULT_API_BASE", "DEFAULT_MODEL", "DEFAULT_MAX_QUESTIONS_PER_BATCH",
+                                    "normalize_api_root", "batch_questions", "classify_backend_error"],
     "src.judges.verdict": ["synthesize_verdict", "DEFAULT_THRESHOLDS",
                            "flagged_entity_labels"],
     "src.judges.judge": ["build_state", "evaluate_chunk", "to_legacy_scores"],
@@ -24171,6 +25524,8 @@ for _mod_name, _attrs in {
                    "PER_ENTITY_KEY_PREFIX", "build_per_entity_questions", "_sanitize_key", "aggregate_per_entity_nouls",
                    "entity_present_in_text", "apply_entity_presence_override",
                    "SystemOneBackend", "JevBackend", "OpenAICompatBackend", "MockBackend", "FallbackBackend", "get_backend",
+                   "DEFAULT_API_BASE", "DEFAULT_MODEL", "DEFAULT_MAX_QUESTIONS_PER_BATCH",
+                   "normalize_api_root", "batch_questions", "classify_backend_error",
                    "synthesize_verdict", "DEFAULT_THRESHOLDS",
                    "build_state", "evaluate_chunk", "to_legacy_scores"],
 }.items():
@@ -24226,6 +25581,16 @@ _SRC_SUBMODULES = {
         "DecisionLevel", "DecisionEngine", "query_high_confidence_entities",
         "query_reviewable_entities", "get_sibling_canonicals_by_source",
         "detect_cross_person_conflicts", "seed_entity_variants", "SEED_ENTITY_VARIANTS",
+        "classify_entity_source_name", "is_proper_entity_alias",
+        "alias_attested_in_text",
+        "load_decision_alias_targets", "_load_decision_alias_targets",
+        "decision_alias_target_canonicals",
+        "decision_alias_conflicts_with_owner", "decision_alias_belongs_to_owner",
+        "canonical_identity_tokens", "canonical_names_related",
+        "canonical_variant_forms_related", "is_cross_person_canonical_variant",
+        "filter_entity_variant_names",
+        "_variant_filter_context", "_alias_norm", "ensure_entity_alias_columns",
+        "_entity_type_is_person_like", "_canonical_name_index",
         # Round 105 P2-2: 同人多规范名归一
         "unify_entity_registry", "_CONF_ORDER",
         # Round 134: 名称统一（pair 判定 / 映射生成 / 正文应用）
@@ -24244,7 +25609,8 @@ _SRC_SUBMODULES = {
                       # L2/L6: pun_audit / literary_metrics 复用的私有 helper
                       "_scan_lines", "_def_key",
                       # Round 121: 注释统一新面（editor_review / 测试复用）
-                      "_split_h1_sections", "normalize_chapter_notes",
+                      "_split_h1_sections", "_normalize_chapter_notes_once",
+                      "normalize_chapter_notes",
                       "normalize_notes_document", "notes_normalize_outputs",
                       "_chapter_note_dupes", "_note_is_dup", "_note_anchor_stop"],
     "src.consistency": ["run_consistency_check", "_load_glossary", "_load_decisions",

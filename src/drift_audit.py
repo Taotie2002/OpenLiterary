@@ -188,7 +188,7 @@ def jev_window_check(
         if primary_key is None:
             return {"available": False, "error": "backend 无 Jev 主链 (可能是单后端 mock)"}
         if not primary_key:
-            return {"available": False, "error": "no TYPESAFE_API_KEY"}
+            return {"available": False, "error": "no MOARK_API_KEY (legacy TYPESAFE_API_KEY)"}
     except Exception as e:
         return {"available": False, "error": f"backend init failed: {type(e).__name__}: {e}"}
 

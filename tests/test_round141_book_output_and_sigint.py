@@ -102,7 +102,7 @@ def test_translate_book_shell_has_sigint_guard_and_chinese_output_resolver():
     assert "PY_CHILD_ACTIVE" in text
     assert "Ctrl+C x2" in text
     assert "resolve_book_output_path" in text
-    assert "run_cmd python3 -m src.translator_agent pipeline" in text
+    assert 'run_cmd "$PYTHON" -m src.translator_agent pipeline' in text
     check = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
     assert check.returncode == 0, check.stderr
 

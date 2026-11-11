@@ -607,12 +607,24 @@ def lint_book(project_root=None, output_dir=None, merged_path=None) -> dict:
 def postprocess_chunk_text(text: str, chapter_id: str, chunk_idx: int) -> str:
     """merge 前处理：剥离页眉/版本行残留 + chunk 内嵌章节标题行。"""
     out = []
+    leading_heading_block = True
     for line in text.split('\n'):
         s = line.strip()
         if _FRONTMATTER_LINE_RE.match(s):
             continue
         if _CHAPTER_HEAD_RE.match(s) or _PART_HEAD_RE.match(s):
             continue
+        # chunk 0 常带译者自行补的部/卷副标题（如 "# 沙丘"）。merge 层
+        # 已用 chapter_heading() 生成唯一规范 H1；正文开始前的自由 H1
+        # 一律剥离，避免成书出现第二个无编号章节标题。正文开始后的行
+        # 保持原样，不把合法正文误当作标题块。
+        if leading_heading_block:
+            if not s:
+                out.append(line)
+                continue
+            if s.startswith('# '):
+                continue
+            leading_heading_block = False
         out.append(line)
     return '\n'.join(out)
 
@@ -898,10 +910,12 @@ def _split_h1_sections(text: str):
     return out
 
 
-def normalize_chapter_notes(text: str, start_num: int = 1):
-    """章级注释统一：去重 → 孤儿改锚/章末归位 → 顺序重编号（幂等）。
+def _normalize_chapter_notes_once(text: str, start_num: int = 1):
+    """单轮章级注释统一：去重 → 孤儿改锚/章末归位 → 顺序重编号。
 
-    Returns: (new_text, changes: dict, next_num: int)
+    孤儿归位可能把 md 定义改写成译者注，从而形成新的重复组；调用方
+    不应假设单轮即可达到固定点。公开入口 normalize_chapter_notes()
+    负责有限轮稳定化。
     """
     blocks, units = _note_candidates(text)
     _group_title_units(units)
@@ -1234,6 +1248,29 @@ def normalize_chapter_notes(text: str, start_num: int = 1):
     if _style_changes.get("orphans_relocated"):
         changes["md_relocated"] += _style_changes["orphans_relocated"]
     return assembled, changes, start_num + len(order)
+
+
+def normalize_chapter_notes(text: str, start_num: int = 1):
+    """章级注释统一至固定点（最多 3 轮实际变更），保证重复执行幂等。
+
+    Returns: (new_text, changes: dict, next_num: int)
+    """
+    current = text
+    totals = None
+    next_num = start_num
+    for pass_idx in range(3):
+        new_text, changes, next_num = _normalize_chapter_notes_once(current, start_num)
+        if new_text == current:
+            if pass_idx == 0:
+                return new_text, changes, next_num
+            return new_text, totals or changes, next_num
+        if totals is None:
+            totals = {k: int(v) for k, v in changes.items()}
+        else:
+            for key, value in changes.items():
+                totals[key] = totals.get(key, 0) + int(value)
+        current = new_text
+    return current, totals or {}, next_num
 
 
 def normalize_notes_document(text: str):

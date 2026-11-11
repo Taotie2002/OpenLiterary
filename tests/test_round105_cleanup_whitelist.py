@@ -34,6 +34,7 @@ def registry():
             canonical_name TEXT NOT NULL,
             source_names TEXT NOT NULL,
             variant_names TEXT,
+            entity_type TEXT,
             confidence TEXT DEFAULT 'high',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             pending_review INTEGER DEFAULT 0,
@@ -44,10 +45,12 @@ def registry():
     conn.close()
 
 
-def _insert(conn, canonical, variants):
+def _insert(conn, canonical, variants, etype=None, sources=None):
     conn.execute(
-        "INSERT INTO entity_registry (canonical_name, source_names, variant_names) VALUES (?, ?, ?)",
-        (canonical, "[]", json.dumps(variants, ensure_ascii=False)),
+        "INSERT INTO entity_registry "
+        "(canonical_name, source_names, variant_names, entity_type) VALUES (?, ?, ?, ?)",
+        (canonical, json.dumps(sources or [], ensure_ascii=False),
+         json.dumps(variants, ensure_ascii=False), etype),
     )
 
 
@@ -104,6 +107,30 @@ class TestWhitelistCleanup:
         _insert(registry, "保皇党", ["保皇派"])
         mod.clean_common_word_variants(registry, dry_run=False)
         assert mod.clean_common_word_variants(registry, dry_run=False) == []
+
+    def test_same_entity_and_nonperson_canonical_variants_kept(self, registry):
+        mod = _load_clean_module()
+        _insert(registry, "岳医生", ["韦林顿·岳"], etype="person")
+        _insert(registry, "韦林顿·岳", [], etype="person")
+        _insert(registry, "阿特雷德家族", ["厄崔迪家族", "亚崔迪家族"],
+                etype="organization")
+        _insert(registry, "厄崔迪家族", [], etype="organization")
+        _insert(registry, "亚崔迪家族", [], etype="organization")
+        _insert(registry, "沙胡鲁德", ["沙虫"], etype="other")
+        _insert(registry, "沙虫", [], etype="other")
+        _insert(registry, "伊鲁兰公主", ["伊如兰公主"], etype="person")
+        _insert(registry, "伊如兰公主", [], etype="person")
+        assert mod.clean_common_word_variants(registry, dry_run=False) == []
+
+    def test_cross_person_canonical_variant_still_removed(self, registry):
+        mod = _load_clean_module()
+        _insert(registry, "保罗·厄崔迪", ["雷托公爵", "雷托"], etype="person",
+                sources=["Paul Atreides"])
+        _insert(registry, "雷托公爵", [], etype="person", sources=["Duke Leto"])
+        _insert(registry, "雷托", [], etype="person", sources=["Leto"])
+        changes = mod.clean_common_word_variants(registry, dry_run=False)
+        removed = {c: r for c, r in changes}
+        assert set(removed["保罗·厄崔迪"]) == {"雷托公爵", "雷托"}
 
     def test_dry_run_does_not_write(self, registry):
         mod = _load_clean_module()

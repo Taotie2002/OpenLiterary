@@ -1,7 +1,8 @@
-"""
-SagaTrans 配置加载器
-支持：config.yaml + 环境变量覆盖
-环境变量前缀：SAGATRANS_
+"""SagaTrans 配置加载器。
+
+正常使用以项目根 ``.env`` 作为本地密钥源；``config.yaml`` 中的
+``${ENV_NAME}`` 占位符会直接读取该文件。进程环境变量仍保留为可选的
+CI/临时覆盖通道，但不是运行本项目所必需的。
 """
 import json
 import os
@@ -9,16 +10,15 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 import yaml
 
-def _load_dotenv(env_path: 'Path', *, override: bool = False) -> int:
-    """极简 .env 加载器（无外部依赖）。
+def _read_dotenv(env_path: 'Path') -> Dict[str, str]:
+    """读取 .env 到内存字典，不修改 ``os.environ``。
 
-    仅当环境变量未设置时注入（override=False），与 python-dotenv 默认行为一致。
-    支持 KEY=value 格式、# 注释、空行、双引号/单引号包裹的值。
-    返回成功加载的键数。
+    支持 ``KEY=value``、可选 ``export KEY=value``、# 注释、空行以及
+    双引号/单引号包裹的值。缺失文件返回空字典。
     """
+    values: Dict[str, str] = {}
     if not env_path.exists():
-        return 0
-    loaded = 0
+        return values
     with open(env_path, "r", encoding="utf-8") as f:
         for raw in f:
             line = raw.strip()
@@ -28,15 +28,16 @@ def _load_dotenv(env_path: 'Path', *, override: bool = False) -> int:
                 continue
             key, _, val = line.partition("=")
             key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
             val = val.strip()
             # 去引号
             if len(val) >= 2 and val[0] == val[-1] and val[0] in ("\"", "'"):
                 val = val[1:-1]
-            if not override and key in os.environ:
+            if not key:
                 continue
-            os.environ[key] = val
-            loaded += 1
-    return loaded
+            values[key] = val
+    return values
 
 
 # Round 129: 任务级 effort 档位表（各家文档口径 + 2026-10-26/27 实测）。
@@ -62,6 +63,7 @@ class Config:
     """配置单例，惰性加载"""
     _instance: Optional['Config'] = None
     _data: Dict[str, Any] = {}
+    _dotenv_values: Dict[str, str] = {}
     _book_thresh_cache: Dict[str, Any] = {}
 
     def __new__(cls):
@@ -74,15 +76,14 @@ class Config:
             self._load()
 
     def _load(self):
-        # 0. 项目根 .env 自动加载（无外部依赖）。已被 .gitignore 屏蔽，安全。
-        #    override=False：避免覆盖 shell 已显式 export 的同名变量。
+        # 0. 项目根 .env 是本地密钥源；只读入内存，不导出到 os.environ。
         root_dir = Path(__file__).resolve().parent.parent
-        _loaded_keys = _load_dotenv(root_dir / ".env", override=False)
-        if _loaded_keys:
+        self._dotenv_values = _read_dotenv(root_dir / ".env")
+        if self._dotenv_values:
             import logging
             logging.getLogger(__name__).debug(
-                "SagaTrans .env auto-loaded %d key(s) from %s",
-                _loaded_keys, root_dir / ".env",
+                "SagaTrans .env loaded %d value(s) from %s",
+                len(self._dotenv_values), root_dir / ".env",
             )
 
         # 1. 找到项目根目录 (translator_agent.py 的上两级)
@@ -96,7 +97,7 @@ class Config:
             self._data = {}
 
         # 2.5 展开 ${ENV} 占位符（config.yaml 中 api_key: ${DEEPSEEK_API_KEY} 等）
-        self._data = self._expand_env_vars(self._data)
+        self._data = self._expand_env_vars(self._data, self._dotenv_values)
 
         if not self._data:
             self._data = {}
@@ -105,11 +106,14 @@ class Config:
         self._apply_env_overrides()
 
     def _apply_env_overrides(self):
-        """环境变量 SAGATRANS_* 覆盖配置，支持嵌套键用 __ 分隔
-        例：SAGATRANS__MODELS__REASONING_PRIMARY__MODEL_NAME=xxx
+        """应用可选的 ``SAGATRANS_*`` 配置覆盖。
+
+        ``.env`` 中的 ``SAGATRANS__...`` 先应用，随后真实环境变量覆盖；
+        因此日常只需维护 ``.env``，CI 仍可临时用环境变量覆盖。
         """
         prefix = "SAGATRANS_"
-        for env_key, env_val in os.environ.items():
+        sources = list(self._dotenv_values.items()) + list(os.environ.items())
+        for env_key, env_val in sources:
             if not env_key.startswith(prefix):
                 continue
             # 去掉前缀 + 首尾下划线，按 __ 分割为嵌套路径
@@ -142,25 +146,33 @@ class Config:
         return val
 
     @staticmethod
-    def _expand_env_vars(node: Any) -> Any:
-        """递归展开配置值中的 ${ENV} 占位符为环境变量值。
+    def _expand_env_vars(node: Any, dotenv_values: Optional[Dict[str, str]] = None) -> Any:
+        """递归展开配置值中的 ${ENV} 占位符。
 
-        仅当整个字符串就是一个占位符（如 "${DEEPSEEK_API_KEY}"）时整体替换；
-        内嵌形式（如 "prefix-${VAR}-suffix"）也支持。未设置的环境变量
-        保留原样字符串，便于后续暴露配置错误而非静默变成空值。
+        优先使用当前 ``.env`` 字典，其次才使用进程环境变量；未设置的
+        变量保留原样字符串，便于暴露配置错误而非静默变成空值。
         """
         import re
+        values = dotenv_values or {}
 
         if isinstance(node, dict):
-            return {k: Config._expand_env_vars(v) for k, v in node.items()}
+            return {k: Config._expand_env_vars(v, values) for k, v in node.items()}
         if isinstance(node, list):
-            return [Config._expand_env_vars(v) for v in node]
+            return [Config._expand_env_vars(v, values) for v in node]
         if isinstance(node, str):
             def _sub(m: "re.Match") -> str:
-                return os.environ.get(m.group(1), m.group(0))
+                name = m.group(1)
+                if values.get(name):
+                    return values[name]
+                return os.environ.get(name, m.group(0))
 
             return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _sub, node)
         return node
+
+    @property
+    def dotenv_values(self) -> Dict[str, str]:
+        """返回当前进程启动时读到的 .env 值副本（供兼容旁路只读查询）。"""
+        return dict(self._dotenv_values)
 
     @staticmethod
     def _set_nested(d: dict, path: list[str], value: Any):
@@ -277,11 +289,9 @@ class Config:
         """P1-4: per-work 实体异体种子（entity_registry 初始化时合并用；缺失/为空 = 不注入）。"""
         return self.get("entity_variants", {}) or {}
 
-    # Round 86: 移除 Config.paths 和 Config.logging 死 property.
-    # 历史: config.yaml 仍含 paths: 和 logging: 节, 但代码全部用硬编码路径
-    # (Path(__file__).resolve().parent.parent) 或默认 logging.INFO, 从未通过
-    # `config.paths` / `config.logging` 访问. 整个 codebase 0 引用.
-    # 注: yaml 节保留 (向后兼容运维 .yaml 配置, 不破坏现有部署); 仅删除无用的 property.
+    # Round 86: Config.paths / Config.logging 死 property 已移除。
+    # 后续配置审计确认 YAML 中的 paths:/logging: 也无人消费，已一并删除；
+    # 路径统一从 Path(__file__).resolve().parent.parent 派生。
 
     @property
     def openai_api(self) -> Dict[str, Any]:

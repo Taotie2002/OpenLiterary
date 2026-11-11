@@ -24,7 +24,7 @@ _AUDIT_FAIL = "# 转换完整性审计报告 (T1)\n\n- 全书覆盖率: 97.000%\
 
 
 def _mk_project(tmp_path, tasks, finals, merged=_CLEAN, audit=_AUDIT_PASS,
-                qa="", backups=0):
+                qa="", backups=0, critic_backends=None, critic_batch_counts=None):
     db = tmp_path / "db"
     db.mkdir(exist_ok=True)
     sched = TaskScheduler(db_path=str(db / "workflow.db"))
@@ -39,6 +39,15 @@ def _mk_project(tmp_path, tasks, finals, merged=_CLEAN, audit=_AUDIT_PASS,
         d.mkdir(parents=True, exist_ok=True)
         (d / f"{cid}_final.json").write_text(
             json.dumps({"text": text}, ensure_ascii=False), encoding="utf-8")
+        backend_path = (critic_backends or {}).get(cid, "jev")
+        if backend_path is not None:
+            report = {"_backend_path": backend_path}
+            batch_count = (critic_batch_counts or {}).get(cid)
+            if batch_count is not None:
+                report["_backend_diagnostics"] = {"batch_count": batch_count}
+            (d / f"{cid}_critic_report.json").write_text(
+                json.dumps(report, ensure_ascii=False),
+                encoding="utf-8")
     out.mkdir(exist_ok=True)
     if merged is not None:
         (out / "translated_full.md").write_text(merged, encoding="utf-8")
@@ -100,7 +109,90 @@ def test_gate_green(tmp_path, capsys):
     assert res["stats"]["states"] == {"COMPLETED": 1}
     assert res["stats"]["qa_fallbacks"] == 0
     assert res["stats"]["audit_coverage"] == 99.9
+    assert res["stats"]["calibrated_ratio"] == 1.0
     assert "gate 全绿" in capsys.readouterr().out
+
+
+def test_gate_uncalibrated_backend_red(tmp_path):
+    _mk_project(tmp_path,
+                tasks=[("ch01_chunk000", "ch01", "COMPLETED")],
+                finals=[("ch01", "ch01_chunk000", _CLEAN)],
+                critic_backends={"ch01_chunk000": "openai_compat"})
+    res = run_final_gate(project_root=str(tmp_path))
+    assert res["ok"] is False
+    joined = "\n".join(res["failures"])
+    assert "⑧ 校准裁决占比 0.0%" in joined
+    assert "⑧ 章节校准占比不足" in joined
+
+
+def test_gate_calibration_can_be_explicitly_exempted(tmp_path, monkeypatch):
+    from src.pipeline import _config as pipeline_config
+
+    original_get = pipeline_config.get
+
+    def _get(key, default=None):
+        if key == "pipeline.final_gate":
+            return {
+                "enforce_calibrated_ratio": False,
+                "min_calibrated_ratio": 0.95,
+                "calibrated_backends": ["jev"],
+            }
+        return original_get(key, default)
+
+    monkeypatch.setattr(pipeline_config, "get", _get)
+    _mk_project(tmp_path,
+                tasks=[("ch01_chunk000", "ch01", "COMPLETED")],
+                finals=[("ch01", "ch01_chunk000", _CLEAN)],
+                critic_backends={"ch01_chunk000": "openai_compat"})
+    res = run_final_gate(project_root=str(tmp_path))
+    assert res["ok"] is True, res["failures"]
+    assert any("⑧ 校准裁决占比" in w and "enforce_calibrated_ratio=false" in w
+               for w in res["warnings"])
+
+
+def test_gate_missing_critic_report_red(tmp_path):
+    _mk_project(tmp_path,
+                tasks=[("ch01_chunk000", "ch01", "COMPLETED")],
+                finals=[("ch01", "ch01_chunk000", _CLEAN)],
+                critic_backends={"ch01_chunk000": None})
+    res = run_final_gate(project_root=str(tmp_path))
+    assert res["ok"] is False
+    assert "⑧ 校准审计缺少 critic_report 1 个" in "\n".join(res["failures"])
+
+
+def test_gate_multi_batch_is_visible_warning(tmp_path):
+    _mk_project(tmp_path,
+                tasks=[("ch01_chunk000", "ch01", "COMPLETED")],
+                finals=[("ch01", "ch01_chunk000", _CLEAN)],
+                critic_batch_counts={"ch01_chunk000": 4})
+    res = run_final_gate(project_root=str(tmp_path))
+    assert res["ok"] is True, res["failures"]
+    assert res["stats"]["multi_batch_calibrated"] == 1
+    assert any("整批/拆批 A/B" in w for w in res["warnings"])
+
+
+def test_gate_qa_report_read_error_does_not_raise(tmp_path):
+    _mk_project(tmp_path,
+                tasks=[("ch01_chunk000", "ch01", "COMPLETED")],
+                finals=[("ch01", "ch01_chunk000", _CLEAN)])
+    qa = tmp_path / "output" / "QA_REPORT.md"
+    qa.unlink()
+    qa.mkdir()
+    res = run_final_gate(project_root=str(tmp_path))
+    assert res["ok"] is False
+    assert "③ QA_REPORT 读取失败" in "\n".join(res["failures"])
+
+
+def test_gate_audit_read_error_does_not_raise(tmp_path):
+    _mk_project(tmp_path,
+                tasks=[("ch01_chunk000", "ch01", "COMPLETED")],
+                finals=[("ch01", "ch01_chunk000", _CLEAN)])
+    audit = tmp_path / "input" / "_conversion_audit.md"
+    audit.unlink()
+    audit.mkdir()
+    res = run_final_gate(project_root=str(tmp_path))
+    assert res["ok"] is False
+    assert "⑤ 转换审计报告读取失败" in "\n".join(res["failures"])
 
 
 def test_gate_dirty_red(tmp_path):

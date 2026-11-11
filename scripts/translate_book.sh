@@ -29,6 +29,10 @@ set -euo pipefail
 # ===========================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+# 项目统一的 Python 解释器：优先显式 SAGATRANS_PYTHON，其次项目 venv，
+# 最后 PATH 上的 python3。所有子命令必须使用同一个解释器，避免"文档说
+# 用 conda、脚本却用系统 python"的依赖分裂。
+PYTHON="${SAGATRANS_PYTHON:-}"
 EPUB_FILE=""
 OUTPUT_DIR="output"
 FORCE_INIT=false
@@ -209,11 +213,22 @@ parse_args() {
 check_deps() {
     log_info "检查依赖..."
 
-    # Python
-    if ! command -v python3 &>/dev/null; then
-        log_err "需要 python3"
+    # Python：解析一次，后续所有调用复用 "$PYTHON"。
+    if [[ -z "$PYTHON" && -x "$PROJECT_ROOT/.venv/bin/python" ]]; then
+        PYTHON="$PROJECT_ROOT/.venv/bin/python"
+    fi
+    if [[ -z "$PYTHON" ]] && command -v python3 &>/dev/null; then
+        PYTHON="$(command -v python3)"
+    fi
+    if [[ -z "$PYTHON" ]]; then
+        log_err "需要 Python 3.10+；请设置 SAGATRANS_PYTHON=/path/to/python"
         exit 1
     fi
+    if ! "$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' 2>/dev/null; then
+        log_err "Python 版本过低（$PYTHON）；需要 >= 3.10"
+        exit 1
+    fi
+    log_info "Python: $PYTHON ($("$PYTHON" --version 2>&1))"
 
     # 项目依赖
     cd "$PROJECT_ROOT"
@@ -222,17 +237,56 @@ check_deps() {
         exit 1
     fi
 
-    # 核心依赖
-    python3 -c "import yaml, requests, psutil, json_repair" 2>/dev/null || {
+    # 核心依赖（安装到同一个解释器，绝不依赖 PATH 上另一个 pip）
+    if ! "$PYTHON" -c "import yaml, requests, psutil, json_repair" 2>/dev/null; then
         log_warn "缺少核心依赖，尝试安装..."
-        pip install -q -r requirements-core.txt
-    }
+        "$PYTHON" -m pip install -q -r requirements-core.txt || {
+            log_err "核心依赖安装失败：$PYTHON -m pip install -r requirements-core.txt"
+            exit 1
+        }
+    fi
+
+    # System One / MoArk d3 判断后端：非 dry-run、非 merge-only 必装。
+    if [[ "$DRY_RUN" != "true" && "$MERGE_ONLY" != "true" ]]; then
+        if ! "$PYTHON" -c "import typesafe_sdk, httpx2" 2>/dev/null; then
+            log_warn "缺少 System One 判断后端依赖，尝试安装..."
+            "$PYTHON" -m pip install -q -r requirements-core.txt || {
+                log_err "System One 依赖安装失败：$PYTHON -m pip install -r requirements-core.txt"
+                exit 1
+            }
+            if ! "$PYTHON" -c "import typesafe_sdk, httpx2" 2>/dev/null; then
+                log_err "当前解释器仍缺少 typesafe_sdk/httpx2：$PYTHON"
+                exit 1
+            fi
+        fi
+
+        # key 必须能由 .env / config 解析；未解析的 ${MOARK_API_KEY} 不算有效 key。
+        if ! "$PYTHON" - <<'PY'
+import sys
+from src.config import Config
+
+cfg = Config()
+if str(cfg.llm_backend).lower() == "mock":
+    sys.exit(0)
+section = cfg.get_section("typesafe") or {}
+if section.get("enabled", True) is False:
+    sys.exit(0)
+key = str(section.get("api_key") or "").strip()
+if not key or (key.startswith("${") and key.endswith("}")):
+    print("typesafe.api_key unresolved", file=sys.stderr)
+    sys.exit(1)
+PY
+        then
+            log_err "System One 判断后端未配置：请在 .env 设置 MOARK_API_KEY（或 config typesafe.api_key）"
+            exit 1
+        fi
+    fi
 
     # EPUB 转换依赖
     if [[ "$SKIP_EPUB_CONVERT" != "true" ]]; then
-        python3 -c "import ebooklib, bs4, lxml" 2>/dev/null || {
+        "$PYTHON" -c "import ebooklib, bs4, lxml" 2>/dev/null || {
             log_warn "缺少 EPUB 依赖，尝试安装..."
-            pip install -q ebooklib beautifulsoup4 lxml
+            "$PYTHON" -m pip install -q ebooklib beautifulsoup4 lxml
         }
     fi
 
@@ -256,7 +310,7 @@ convert_epub() {
     mkdir -p "$PROJECT_ROOT/$CHAPTERS_DIR"
 
     # 使用聚合脚本的 split 子命令（支持 EPUB/TXT/MD 自动识别）
-    mapfile -t generated < <(cd "$PROJECT_ROOT" && python3 -m src.translator_agent split \
+    mapfile -t generated < <(cd "$PROJECT_ROOT" && "$PYTHON" -m src.translator_agent split \
         --input "$EPUB_FILE" \
         --input-dir "$PROJECT_ROOT/$CHAPTERS_DIR" \
         --input-format auto \
@@ -289,7 +343,7 @@ run_chapter() {
 
     # 1. 初始化（检查退出码）
     log_info "  初始化任务数据库..."
-    if ! run_cmd python3 -m src.translator_agent init --chapter "$ch_id" $force_flag; then
+    if ! run_cmd "$PYTHON" -m src.translator_agent init --chapter "$ch_id" $force_flag; then
         log_err "  初始化失败: $ch_id"
         return 1
     fi
@@ -300,10 +354,10 @@ run_chapter() {
     if [[ "$DRY_RUN" == "true" ]]; then
         log_warn "  [DRY RUN] 跳过实际 LLM 调用"
         # 可以用 mock 后端快速跑完
-        run_cmd env SAGATRANS__LLM_BACKEND=mock python3 -m src.translator_agent pipeline --chapter "$ch_id"
+        run_cmd env SAGATRANS__LLM_BACKEND=mock "$PYTHON" -m src.translator_agent pipeline --chapter "$ch_id"
         pipe_rc=$?
     else
-        run_cmd python3 -m src.translator_agent pipeline --chapter "$ch_id"
+        run_cmd "$PYTHON" -m src.translator_agent pipeline --chapter "$ch_id"
         pipe_rc=$?
     fi
 
@@ -426,14 +480,14 @@ book_output_path() {
     local prefer_existing="${1:-false}"
     (
         cd "$PROJECT_ROOT" || exit 1
-        python3 -c 'import sys; from src.book_lint import resolve_book_output_path; print(resolve_book_output_path(project_root=sys.argv[1], output_dir=sys.argv[2], prefer_existing=(sys.argv[3] == "true")))' \
+        "$PYTHON" -c 'import sys; from src.book_lint import resolve_book_output_path; print(resolve_book_output_path(project_root=sys.argv[1], output_dir=sys.argv[2], prefer_existing=(sys.argv[3] == "true")))' \
             "$PROJECT_ROOT" "$PROJECT_ROOT/$OUTPUT_DIR" "$prefer_existing"
     )
 }
 
 profile_schema_version() {
     # Read only the schema integer; corrupt/missing profiles are treated as 0.
-    python3 -c '
+    "$PYTHON" -c '
 import json, sys
 try:
     with open(sys.argv[1], "r", encoding="utf-8") as fh:
@@ -449,7 +503,7 @@ profile_is_deep() {
 # v2 but have no deep_read block.  New deep artifacts must explicitly say
 # complete=true; failed/empty deep runs are fail-open for translation but still
 # request an upgrade next time.  Early artifacts without the bit stay accepted.
-    python3 -c '
+    "$PYTHON" -c '
 import json, sys
 try:
     with open(sys.argv[1], "r", encoding="utf-8") as fh:
@@ -484,7 +538,7 @@ ensure_book_profile() {
             log_info "跳过全书深读剖面（--skip-deep-profile），沿用现有 input/book_profile.json"
         else
             log_info "跳过全书深读剖面（--skip-deep-profile），抽样生成 v1 input/book_profile.json ..."
-            if ! run_cmd python3 -m src.translator_agent style-profile; then
+            if ! run_cmd "$PYTHON" -m src.translator_agent style-profile; then
                 log_warn "  style-profile 失败 — 本次使用 config.yaml 中性基线（不注入作品特定先验）"
             fi
         fi
@@ -501,7 +555,7 @@ ensure_book_profile() {
         log_info "未找到风格剖面；先抽样建立基础剖面，再全书分段深读生成 v2 ..."
     fi
 
-    if run_cmd python3 -m src.translator_agent style-profile --deep; then
+    if run_cmd "$PYTHON" -m src.translator_agent style-profile --deep; then
         local new_schema=0
         local new_deep=false
         [[ -f "$profile_file" ]] && new_schema=$(profile_schema_version "$profile_file" 2>/dev/null || echo 0)
@@ -515,7 +569,7 @@ ensure_book_profile() {
     fi
     log_warn "全书深读失败（fail-open）；保留已有剖面或回退抽样剖面"
     if [[ ! -f "$profile_file" ]]; then
-        if ! run_cmd python3 -m src.translator_agent style-profile; then
+        if ! run_cmd "$PYTHON" -m src.translator_agent style-profile; then
             log_warn "  抽样 style-profile 亦失败 — 本次使用 config.yaml 中性基线（不注入作品特定先验）"
         fi
     fi
@@ -528,7 +582,7 @@ rebuild_story_graph() {
         return 0
     fi
     log_info "重建全书确定性故事图 (story-graph)..."
-    if run_cmd python3 -m src.translator_agent story-graph; then
+    if run_cmd "$PYTHON" -m src.translator_agent story-graph; then
         log_ok "故事图已更新：input/story_graph.json"
     else
         log_warn "story-graph 构建失败（fail-open：翻译/交付流程继续）"
@@ -578,7 +632,7 @@ merge_output() {
         # 与 DB 任务数交叉校验：章节 final 数应等于 chunk_tasks 该章任务数
         local db_count=0
         if [[ -f "$PROJECT_ROOT/db/workflow.db" ]]; then
-            db_count=$(python3 -c "
+            db_count=$("$PYTHON" -c "
 import sqlite3, sys
 try:
     c = sqlite3.connect('$PROJECT_ROOT/db/workflow.db')
@@ -601,13 +655,13 @@ except Exception:
         # 经循环 stdout 写出（与 python 共用同一重定向 fd，避免 >> 被 > 覆盖）
         # Round 119 T5: 默认双语制式（中文主标题＋原文括注），见 config.book.chapter_titles
         local ch_head=""
-        ch_head=$(python3 -c "from src.book_lint import chapter_heading; print(chapter_heading('$PROJECT_ROOT', '$ch_id'))" 2>/dev/null) || true
+        ch_head=$("$PYTHON" -c "from src.book_lint import chapter_heading; print(chapter_heading('$PROJECT_ROOT', '$ch_id'))" 2>/dev/null) || true
         [[ -z "$ch_head" ]] && ch_head=$(chapter_title "$ch_id")
         echo "# $ch_head"
         echo ""
         local chunk_idx=0
         for final_file in "${chunk_files[@]}"; do
-            FINAL_FILE="$final_file" CH_ID="$ch_id" CH_IDX="$chunk_idx" QA_REPORT_FILE="$qa_report_file" python3 -c '
+            FINAL_FILE="$final_file" CH_ID="$ch_id" CH_IDX="$chunk_idx" QA_REPORT_FILE="$qa_report_file" "$PYTHON" -c '
 import json, os, re
 f = os.environ["FINAL_FILE"]; ch = os.environ["CH_ID"]; idx = os.environ["CH_IDX"]
 data = json.load(open(f, encoding="utf-8"))
@@ -734,7 +788,7 @@ reset_state() {
 # 应急绕过：SAGATRANS_ALLOW_CONCURRENT=1（会打警告，风险自担）。
 # ────────────────────────────────────────────────────────────────────
 acquire_instance_lock() {
-    local lock_file="$PROJECT_ROOT/db/.sagatrans.lock"
+    local lock_file="${SAGATRANS_LOCK_PATH:-$PROJECT_ROOT/db/.sagatrans.lock}"
     mkdir -p "$(dirname "$lock_file")"
     exec 9>>"$lock_file"
     if ! flock -n 9; then
@@ -833,7 +887,7 @@ main() {
         log_info "Dry-run: 跳过 consolidate（避免真实 LLM 调用）"
     else
         log_info "运行全书决策收敛 (consolidate)..."
-        if run_cmd python3 -m src.translator_agent consolidate --max-rounds "${SAGATRANS_CONSOLIDATE_MAX_ROUNDS:-3}"; then
+        if run_cmd "$PYTHON" -m src.translator_agent consolidate --max-rounds "${SAGATRANS_CONSOLIDATE_MAX_ROUNDS:-3}"; then
             log_ok "consolidate 收敛（DIRTY=0）"
         else
             if [[ "$ALLOW_INCOMPLETE" == "true" ]]; then
@@ -845,7 +899,7 @@ main() {
         fi
         # merge 前置硬闸（双保险）: DIRTY>0 且未显式放行 → 中止
         local dirty_count
-        dirty_count=$(python3 -c "
+        dirty_count=$("$PYTHON" -c "
 import sqlite3
 try:
     c = sqlite3.connect('$PROJECT_ROOT/db/workflow.db')
@@ -871,7 +925,7 @@ except Exception:
         log_warn "跳过样式规范化（--no-normalize）"
     else
         log_info "运行成书样式规范化 (finalize)..."
-        if run_cmd python3 -m src.translator_agent finalize --apply; then
+        if run_cmd "$PYTHON" -m src.translator_agent finalize --apply; then
             log_ok "样式规范化完成（详见 output/finalize_diff.md）"
         else
             log_err "finalize 失败"
@@ -887,7 +941,7 @@ except Exception:
 
     # 3.2 Round 121 L5: 章级注释统一（去重/孤儿改锚/顺编号；无 LLM 调用）
     log_info "运行章级注释统一 (notes-normalize)..."
-    if run_cmd python3 -m src.translator_agent notes-normalize --apply; then
+    if run_cmd "$PYTHON" -m src.translator_agent notes-normalize --apply; then
         log_ok "注释统一完成（详见 output/note_policy_diff.md）"
     else
         log_err "注释统一失败"
@@ -896,7 +950,7 @@ except Exception:
 
     # 3.5 T5: 成书级 lint（finals + merged 双跑）
     log_info "运行成书级 lint..."
-    if run_cmd python3 -m src.translator_agent lint; then
+    if run_cmd "$PYTHON" -m src.translator_agent lint; then
         log_ok "lint 全绿"
     else
         if [[ "$ALLOW_INCOMPLETE" == "true" ]]; then
@@ -910,7 +964,7 @@ except Exception:
     # 4. 译后命名一致性校验（可选 --consistency）
     if [[ "$RUN_CONSISTENCY" == "true" ]]; then
         log_info "运行译后命名一致性校验 (consistency)..."
-        run_cmd python3 -m src.translator_agent consistency || {
+        run_cmd "$PYTHON" -m src.translator_agent consistency || {
             log_warn "consistency 检出命名不一致（详见 output/consistency_diff.md），未自动修正"
         }
     fi
@@ -919,16 +973,11 @@ except Exception:
     # 参考人工评分基线的动态阈值，仅 WARN 不阻断（与 consistency 同模式）
     if [[ "$RUN_GOLDEN_GATE" == "true" ]]; then
         log_info "运行 Golden Gate 质量门禁..."
-        if run_cmd python3 -m src.translator_agent golden-gate; then
+        if run_cmd "$PYTHON" -m src.translator_agent golden-gate; then
             log_ok "golden-gate 通过（pipeline pass_rate 满足人工基线动态阈值）"
         else
             log_warn "golden-gate 未通过（pipeline 质量低于人工基线阈值），详见 output/golden_test_report.json"
         fi
-    fi
-
-    # 5. 清理中间产物（仅在 --clean 时）
-    if [[ "$CLEAN_INTERMEDIATE" == "true" ]]; then
-        clean_intermediate
     fi
 
     # 4.8 T4: 交付门禁 (gate) —— 完成信号不变量化，全绿才打 🎉
@@ -937,12 +986,19 @@ except Exception:
         log_info "Dry-run: 跳过 gate"
     else
         log_info "运行交付门禁 (gate)..."
-        if run_cmd python3 -m src.translator_agent gate; then
+        if run_cmd "$PYTHON" -m src.translator_agent gate; then
             log_ok "gate 全绿"
         else
             gate_ok=false
             [[ "$ALLOW_INCOMPLETE" == "true" ]] && log_warn "gate 未通过（--allow-incomplete 放行）"
         fi
+    fi
+
+    # 5. 清理中间产物（仅在 --clean 时）——必须在 gate 之后：
+    # gate ⑧ 需要扫描 *_critic_report.json 的 _backend_path，先清理会让
+    # 校准审计永远缺证。门禁失败时保留中间产物，便于定位。
+    if [[ "$CLEAN_INTERMEDIATE" == "true" ]]; then
+        clean_intermediate
     fi
 
     log_info "========================================"

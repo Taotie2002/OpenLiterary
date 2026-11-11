@@ -114,7 +114,7 @@ def _registry_rows(db_path: Path) -> List[Dict[str, Any]]:
             return []
         wanted = ["id", "canonical_name", "source_names", "variant_names", "entity_type",
                   "pronoun_gender", "confidence", "pending_review", "translation_strategy",
-                  "first_seen_chunk"]
+                  "first_seen_chunk", "quarantined_names"]
         select = ", ".join(c for c in wanted if c in cols)
         rows = con.execute(f"SELECT {select} FROM entity_registry ORDER BY id").fetchall()
         return [dict(r) for r in rows]
@@ -124,13 +124,40 @@ def _registry_rows(db_path: Path) -> List[Dict[str, Any]]:
         con.close()
 
 
-def _entity_aliases(row: Dict[str, Any]) -> List[str]:
+def _entity_aliases(row: Dict[str, Any], canonical_names=(),
+                    quarantined_names=(), entity_types=None,
+                    entity_sources=None) -> List[str]:
     names: List[str] = []
     canonical = str(row.get("canonical_name") or "").strip()
     if canonical:
         names.append(canonical)
-    for raw in (row.get("source_names"), row.get("variant_names")):
-        names.extend(_load_json_list(raw))
+    sources = _load_json_list(row.get("source_names"))
+    variants = _load_json_list(row.get("variant_names"))
+    qt_norms = {str(x).strip().casefold() for x in (quarantined_names or ())
+                if str(x).strip()}
+    # Round 144: source_names 只把 proper 指称画成 alias 节点；variant_names
+    # 先经跨人物过滤。旧库中的 Duke Leto / the Emperor / 保罗 等错误归属
+    # 不能再作为图谱事实扩散。
+    try:
+        from src.core.decision_engine import (
+            filter_entity_variant_names,
+            is_proper_entity_alias,
+        )
+        sources = [
+            s for s in sources
+            if is_proper_entity_alias(s) and str(s).strip().casefold() not in qt_norms
+        ]
+        variants = filter_entity_variant_names(
+            canonical, variants,
+            canonical_names=canonical_names,
+            quarantined_names=quarantined_names,
+            entity_types=entity_types,
+            entity_sources=entity_sources,
+        )
+    except Exception:
+        pass
+    names.extend(sources)
+    names.extend(variants)
     out: List[str] = []
     seen: set = set()
     for name in names:
@@ -403,6 +430,26 @@ def build_story_graph(
     indir = Path(input_dir) if input_dir else root / "input"
     texts = _chapter_texts(indir)
     rows = _registry_rows(dbp)
+    canonical_names = [
+        str(r.get("canonical_name") or "").strip() for r in rows
+        if str(r.get("canonical_name") or "").strip()
+    ]
+    entity_types = {
+        str(r.get("canonical_name") or "").strip(): str(r.get("entity_type") or "")
+        for r in rows if str(r.get("canonical_name") or "").strip()
+    }
+    entity_sources = {
+        str(r.get("canonical_name") or "").strip(): _load_json_list(r.get("source_names"))
+        for r in rows if str(r.get("canonical_name") or "").strip()
+    }
+    global_qt: List[str] = []
+    _qt_seen = set()
+    for r in rows:
+        for name in _load_json_list(r.get("quarantined_names")):
+            key = name.strip().casefold()
+            if key and key not in _qt_seen:
+                _qt_seen.add(key)
+                global_qt.append(name)
     nodes: List[Dict[str, Any]] = []
     edges: List[Dict[str, Any]] = []
     try:
@@ -453,7 +500,11 @@ def build_story_graph(
         canonical = str(row.get("canonical_name") or "").strip()
         if not canonical:
             continue
-        aliases = _entity_aliases(row)
+        aliases = _entity_aliases(
+            row, canonical_names=canonical_names,
+            quarantined_names=global_qt, entity_types=entity_types,
+            entity_sources=entity_sources,
+        )
         aliases_by_entity[eid] = aliases
         entity_by_id[eid] = row
         conf, conf_label = _entity_confidence(row)

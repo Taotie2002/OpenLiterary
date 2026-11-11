@@ -204,12 +204,11 @@ if _config is None:
             "secondary": {"model_name": "Qwen3.8-Flash-Next-SS", "thinking": False},
         }
         openai_api = {"api_base": "http://127.0.0.1:1234/v1", "api_key": "lm-studio",
-                      "max_retries": 3, "retry_delay": 2.0, "request_timeout": 300,
-                      "max_concurrent_requests": 4}
+                      "max_retries": 3, "retry_delay": 2.0, "request_timeout": 300}
         pipeline = {"batch_size": 50, "max_retries": 3, "max_quality_retries": 6, "judge_safety_net_avg_min": 5.5,
                     "poll_interval": 0.5, "entity_hard_fail": True,
                     "version_merit": {"enabled": True, "tolerance": 0.0},
-                    "early_stop": {"enabled": True, "max_low_dims": 3, "low_score_threshold": 3.0, "apply_only_first_round": True}}
+                    "early_stop": {"enabled": True, "max_low_dims": 3, "low_score_threshold": 3.0}}
         chunker = {"soft_limit": 1000, "hard_limit": 2500}
         decision_engine = {"terminology_triggers_backtrack": True,
                            "reference_triggers_backtrack": True,
@@ -229,8 +228,7 @@ if _config is None:
         review_fix = {"structural_p0_bypass_merit": True}
         critic_thresholds = {"fluency": 7.0, "readability": 7.0, "style_compliance": 6.5,
                             "voice_consistency": 7.0, "semantic_preservation": 7.0,
-                            "literal_residue": 7.0,
-                            "average_score_min": 7.0}
+                            "literal_residue": 7.0}
 
         def get(self, key, default=None):
             """Minimal dotted-key access used by pipeline/judgment code."""
@@ -755,6 +753,15 @@ def build_section_11_6() -> str:
     # 注入 _DEFAULT_BACKEND 模块级状态（get_backend 用到）
     out += "from typing import Optional\n"
     out += "_DEFAULT_BACKEND: Optional[\"SystemOneBackend\"] = None\n\n\n"
+    # Round 145: module-level constants/helpers used by the MoArk d3 wiring and
+    # 64-question batching.  AST class extraction does not copy these.
+    for _const in ("DEFAULT_API_BASE", "DEFAULT_MODEL",
+                   "DEFAULT_MAX_QUESTIONS_PER_BATCH"):
+        out += extract_constant(src_be, _const) + "\n\n\n"
+    for _fn in ("_config_text", "normalize_api_root", "_api_base_host",
+                "_typesafe_sdk_module", "classify_backend_error",
+                "_typesafe_sdk_available", "batch_questions"):
+        out += extract_function(src_be, _fn) + "\n\n\n"
     for cls in ["SystemOneBackend", "JevBackend", "OpenAICompatBackend", "MockBackend", "FallbackBackend"]:
         out += extract_class(src_be, cls) + "\n\n\n"
     # Round 87 修复：_confidence_from_probs 是 Mock/OpenAICompat backend 内部使用的 helper,
@@ -1040,7 +1047,9 @@ for _mod_name, _attrs in {
     # build_per_entity_questions / _sanitize_key 函数, 整合脚本中 MockBackend 等位置
     # 的 `from src.judges.primitives import PER_ENTITY_KEY_PREFIX` 触发 ImportError.
     "src.judges.primitives": ["VOICE_DRIFT", "REGISTER_MATCH", "ENTITY_CONSISTENCY", "LITERAL_RESIDUE", "SEMANTIC_LOSS", "STYLE_COMPLIANCE_SCORE", "ALL_PRIMITIVES", "build_question_set", "PER_ENTITY_KEY_PREFIX", "build_per_entity_questions", "_sanitize_key", "aggregate_per_entity_nouls", "entity_present_in_text", "apply_entity_presence_override"],
-    "src.judges.typesafe_backend": ["SystemOneBackend", "JevBackend", "OpenAICompatBackend", "MockBackend", "FallbackBackend", "get_backend", "_DEFAULT_BACKEND"],
+    "src.judges.typesafe_backend": ["SystemOneBackend", "JevBackend", "OpenAICompatBackend", "MockBackend", "FallbackBackend", "get_backend", "_DEFAULT_BACKEND",
+                                    "DEFAULT_API_BASE", "DEFAULT_MODEL", "DEFAULT_MAX_QUESTIONS_PER_BATCH",
+                                    "normalize_api_root", "batch_questions", "classify_backend_error"],
     "src.judges.verdict": ["synthesize_verdict", "DEFAULT_THRESHOLDS",
                            "flagged_entity_labels"],
     "src.judges.judge": ["build_state", "evaluate_chunk", "to_legacy_scores"],
@@ -1049,6 +1058,8 @@ for _mod_name, _attrs in {
                    "PER_ENTITY_KEY_PREFIX", "build_per_entity_questions", "_sanitize_key", "aggregate_per_entity_nouls",
                    "entity_present_in_text", "apply_entity_presence_override",
                    "SystemOneBackend", "JevBackend", "OpenAICompatBackend", "MockBackend", "FallbackBackend", "get_backend",
+                   "DEFAULT_API_BASE", "DEFAULT_MODEL", "DEFAULT_MAX_QUESTIONS_PER_BATCH",
+                   "normalize_api_root", "batch_questions", "classify_backend_error",
                    "synthesize_verdict", "DEFAULT_THRESHOLDS",
                    "build_state", "evaluate_chunk", "to_legacy_scores"],
 }.items():
@@ -1104,6 +1115,16 @@ _SRC_SUBMODULES = {
         "DecisionLevel", "DecisionEngine", "query_high_confidence_entities",
         "query_reviewable_entities", "get_sibling_canonicals_by_source",
         "detect_cross_person_conflicts", "seed_entity_variants", "SEED_ENTITY_VARIANTS",
+        "classify_entity_source_name", "is_proper_entity_alias",
+        "alias_attested_in_text",
+        "load_decision_alias_targets", "_load_decision_alias_targets",
+        "decision_alias_target_canonicals",
+        "decision_alias_conflicts_with_owner", "decision_alias_belongs_to_owner",
+        "canonical_identity_tokens", "canonical_names_related",
+        "canonical_variant_forms_related", "is_cross_person_canonical_variant",
+        "filter_entity_variant_names",
+        "_variant_filter_context", "_alias_norm", "ensure_entity_alias_columns",
+        "_entity_type_is_person_like", "_canonical_name_index",
         # Round 105 P2-2: 同人多规范名归一
         "unify_entity_registry", "_CONF_ORDER",
         # Round 134: 名称统一（pair 判定 / 映射生成 / 正文应用）
@@ -1122,7 +1143,8 @@ _SRC_SUBMODULES = {
                       # L2/L6: pun_audit / literary_metrics 复用的私有 helper
                       "_scan_lines", "_def_key",
                       # Round 121: 注释统一新面（editor_review / 测试复用）
-                      "_split_h1_sections", "normalize_chapter_notes",
+                      "_split_h1_sections", "_normalize_chapter_notes_once",
+                      "normalize_chapter_notes",
                       "normalize_notes_document", "notes_normalize_outputs",
                       "_chapter_note_dupes", "_note_is_dup", "_note_anchor_stop"],
     "src.consistency": ["run_consistency_check", "_load_glossary", "_load_decisions",
@@ -1294,6 +1316,18 @@ def build_section_13() -> str:
         ]),
         ("core/decision_engine.py", [
             "SEED_ENTITY_VARIANTS", "_CONF_ORDER", "load_entity_variant_seeds", "unify_entity_registry",
+            # Round 144: entity alias hygiene（query/reference/pipeline 共用）
+            "classify_entity_source_name", "is_proper_entity_alias",
+            "alias_attested_in_text",
+            "load_decision_alias_targets", "_load_decision_alias_targets",
+            "decision_alias_target_canonicals",
+            "decision_alias_conflicts_with_owner", "decision_alias_belongs_to_owner",
+            "canonical_identity_tokens", "canonical_names_related",
+            "canonical_variant_forms_related", "is_cross_person_canonical_variant",
+            "filter_entity_variant_names",
+            "_variant_filter_context", "_alias_norm", "ensure_entity_alias_columns",
+            "_PERSON_ENTITY_TYPES", "_entity_type_is_person_like", "_canonical_name_index",
+            "_en_role_base", "_EN_NON_NAME_COMMON_WORDS",
             # Round 134: 同人归一 / 音译漂移全链路（通用机制，无作品专名）
             "_EN_ROLE_WORDS", "_EN_RELATION_WORDS", "_EN_GENERIC_MODIFIERS", "_EN_DETERMINERS",
             "_ZH_ROLE_WORDS", "_ZH_GENERIC_MODIFIERS", "_NAME_SEP_CHARS", "_NAME_SEP_RE",
@@ -1329,6 +1363,7 @@ def build_section_13() -> str:
         # Round 130: 单实例守卫（main() 引用，须随 Section 10 一并进入单体）
         ("main.py", [
             "_INSTANCE_LOCK_FD", "_MUTATING_COMMANDS", "_SIGINT_WARNED",
+            "_default_lock_path",
             "acquire_instance_lock", "_install_sigint_guard",
             "_command_needs_lock",
         ]),
@@ -1366,7 +1401,8 @@ def build_section_13() -> str:
             "_note_key", "_note_merge_key",
             "_note_norm", "_note_terms", "_scan_lines", "_split_h1_sections",
             "chapter_heading", "finalize_outputs", "lint_book", "lint_texts",
-            "normalize_chapter_notes", "normalize_final_style", "normalize_notes_document", "notes_normalize_outputs",
+            "_normalize_chapter_notes_once", "normalize_chapter_notes",
+            "normalize_final_style", "normalize_notes_document", "notes_normalize_outputs",
             "postprocess_chunk_text", "sup_run_to_int",
         ]),
     ]

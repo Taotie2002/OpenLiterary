@@ -188,6 +188,11 @@ _MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile", "story-graph
                       "consolidate", "finalize", "notes-normalize", "requeue"}
 
 
+def _default_lock_path() -> Path:
+    """Project-root lock path, independent of the caller's cwd."""
+    return Path(__file__).resolve().parent.parent / "db" / ".sagatrans.lock"
+
+
 def _command_needs_lock(command: str, args: object) -> bool:
     """Return True for commands that can write DB/profile/graph artifacts."""
     if command in _MUTATING_COMMANDS:
@@ -238,13 +243,20 @@ def acquire_instance_lock(lock_path: Optional[Path] = None) -> bool:
         return True
     import fcntl
     import time as _time
-    path = Path(lock_path) if lock_path else Path.cwd() / "db" / ".sagatrans.lock"
+    override = os.environ.get("SAGATRANS_LOCK_PATH")
+    path = Path(lock_path or override) if (lock_path or override) else _default_lock_path()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
     except OSError as e:
-        print(f"⚠️ [Lock] 无法创建锁文件 {path}: {e}（继续执行）", file=sys.stderr)
-        return True
+        if os.environ.get("SAGATRANS_ALLOW_CONCURRENT") == "1":
+            print(f"⚠️ [Lock] 无法创建锁文件 {path}: {e}——"
+                  f"SAGATRANS_ALLOW_CONCURRENT=1 放行", file=sys.stderr)
+            return True
+        print(f"⛔ [Lock] 无法创建锁文件 {path}: {e}", file=sys.stderr)
+        print("   单实例保护不可用，拒绝执行；修复目录权限或设置 SAGATRANS_LOCK_PATH。",
+              file=sys.stderr)
+        return False
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:

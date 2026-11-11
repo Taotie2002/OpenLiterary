@@ -5,14 +5,13 @@
   `self.get("paths", {})` 和 `self.get("logging", {})`. 这两个 property 在整
   个 codebase (src/ + tests/) 0 引用, 是纯粹的 dead code.
 
-  历史: config.yaml 仍含 paths: 和 logging: 节, 但代码全部用硬编码路径
-  (Path(__file__).resolve().parent.parent) 或默认 logging.INFO, 从未通过
-  `config.paths` / `config.logging` 访问.
+  历史: 代码从未通过 `config.paths` / `config.logging` 访问这两个 YAML 节。
 
 修复:
   - 移除 Config.paths @property
   - 移除 Config.logging @property
-  - yaml paths: 和 logging: 节保留 (向后兼容运维 .yaml 配置)
+  - Round 146 后续配置审计进一步删除 yaml paths: 和 logging: 死节；
+    当前部署契约以代码派生路径和默认 logging.INFO 为准。
   - 不影响任何现有行为 (0 引用)
 
 验证:
@@ -210,38 +209,51 @@ class TestIntegratedScriptSynced:
 
 
 # ---------------------------------------------------------------------------
-# Round 86: config.yaml 保留向后兼容 (paths: 和 logging: 节仍存在)
+# Round 86 后续审计: config.yaml 的 paths:/logging: 死节已删除
 # ---------------------------------------------------------------------------
 
-class TestYamlStillBackwardCompatible:
-    """yaml paths: 和 logging: 节仍保留, 运维部署不破坏."""
+class TestYamlDeadSectionsRemoved:
+    """config.yaml 不再保留无读取点的 paths: 和 logging: 节."""
 
-    def test_yaml_paths_section_present(self):
+    def test_yaml_paths_section_removed(self):
         content = Path("config.yaml").read_text(encoding="utf-8")
-        assert "paths:" in content, (
-            "Round 86: config.yaml 不应删除 paths: 节 (向后兼容)"
+        assert "paths:" not in content, (
+            "config.yaml 不应保留 0 读取点的 paths: 节"
         )
 
-    def test_yaml_logging_section_present(self):
+    def test_yaml_logging_section_removed(self):
         content = Path("config.yaml").read_text(encoding="utf-8")
-        assert "logging:" in content, (
-            "Round 86: config.yaml 不应删除 logging: 节 (向后兼容)"
+        assert "logging:" not in content, (
+            "config.yaml 不应保留 0 读取点的 logging: 节"
         )
 
-    def test_yaml_paths_db_dir_defined(self):
-        """config.yaml paths 节仍含 db_dir 配置 (运维可覆盖)."""
+    def test_yaml_paths_db_dir_removed(self):
+        """db_dir 不是可运行配置；路径由项目根派生。"""
         content = Path("config.yaml").read_text(encoding="utf-8")
-        assert "db_dir:" in content, (
-            "Round 86: config.yaml paths 节应保留 db_dir 配置"
+        assert "db_dir:" not in content, (
+            "config.yaml 不应保留未消费的 db_dir 配置"
         )
 
-    def test_yaml_logging_level_defined(self):
-        """config.yaml logging 节仍含 level 配置."""
+    def test_yaml_logging_level_removed(self):
+        """日志级别不由 config.yaml 控制。"""
         content = Path("config.yaml").read_text(encoding="utf-8")
-        # 找 logging: 之后的内容
-        idx = content.find("logging:")
-        assert idx > 0
-        after = content[idx:idx+200]
-        assert "level:" in after, (
-            "Round 86: config.yaml logging 节应保留 level 配置"
+        assert "  level:" not in content, (
+            "config.yaml 不应保留未消费的 logging.level 配置"
         )
+
+    def test_other_audited_dead_keys_removed(self):
+        """配置清理后不得重新引入无读取点的历史开关。"""
+        import yaml
+
+        cfg = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
+        for role in (cfg.get("models") or {}).values():
+            assert "alias" not in role
+        assert "max_concurrent_requests" not in (cfg.get("openai_api") or {})
+        assert "golden_test" not in (cfg.get("task_routing") or {})
+        assert "apply_only_first_round" not in ((cfg.get("pipeline") or {}).get("early_stop") or {})
+        assert "preserve_meta" not in ((cfg.get("pipeline") or {}).get("intermediate_cleanup") or {})
+        assert "respect_scene_breaks" not in (cfg.get("chunker") or {})
+        assert "average_score_min" not in (cfg.get("critic_thresholds") or {})
+        assert "fallback_role" not in (cfg.get("typesafe") or {})
+        stag = ((cfg.get("pipeline") or {}).get("oscillation_detection") or {}).get("stagnation_detection") or {}
+        assert "exact_match_only" not in stag

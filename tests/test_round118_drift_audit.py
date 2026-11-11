@@ -118,7 +118,13 @@ class TestAudit:
 
 class TestJevLayer:
     def test_unavailable_without_key(self, tmp_path, monkeypatch):
-        monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+        import src.judges.typesafe_backend as tb
+
+        # Round 145: config now resolves MOARK_API_KEY, so "no key" must be
+        # simulated at the backend object rather than by deleting one env name.
+        backend = tb.FallbackBackend(allow_mock=False)
+        backend.primary.api_key = ""
+        monkeypatch.setattr(tb, "get_backend", lambda: backend)
         chunks = [("ch01_chunk000", SHORT), ("ch01_chunk001", LONG)]
         out = jev_window_check(chunks, window=1)
         assert out["available"] is False

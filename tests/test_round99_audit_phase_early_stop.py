@@ -103,7 +103,6 @@ def _make_auditing_stub(output_dir, *, early_stop_enabled=True, early_stop_thres
         "enabled": early_stop_enabled,
         "low_score_threshold": early_stop_threshold,
         "max_low_dims": early_stop_max_low,
-        "apply_only_first_round": True,
     }
 
     return pipeline
