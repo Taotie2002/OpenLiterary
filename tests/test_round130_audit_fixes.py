@@ -185,6 +185,8 @@ def _build_gate_project(root: Path, with_pun_watchlist: bool = True) -> None:
         ensure_ascii=False), encoding="utf-8")
     (outch / "ch01_chunk000_critic_report.json").write_text(
         json.dumps({"_backend_path": "jev"}, ensure_ascii=False), encoding="utf-8")
+    (root / "output" / "translated_full.md").write_text(
+        "# 第一章 起点\n\n他说：“你好。”\n", encoding="utf-8")
     (root / "output" / "QA_REPORT.md").write_text("# QA\n\n全部通过\n", encoding="utf-8")
     (root / "input" / "_conversion_audit.md").write_text(
         "全书覆盖率: 100.0%\n\n✅ 通过\n", encoding="utf-8")

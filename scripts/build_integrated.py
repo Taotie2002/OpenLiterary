@@ -35,7 +35,9 @@ SagaTrans 整合脚本自动构建器
 from __future__ import annotations
 
 import argparse
+import builtins
 import re
+import symtable
 import sys
 from pathlib import Path
 
@@ -56,7 +58,7 @@ HEADER = '''#!/usr/bin/env python3
 ║  用途：方便整体上传至会话式 AI（ChatGPT、Gemini 等）进行全量审计  ║
 ║                                                                ║
 ║  生成方式：python scripts/build_integrated.py                  ║
-║  事实源：  src/ 下散装模块（17 个 Python 文件）                  ║
+║  事实源：  src/ 下散装模块（不含本生成文件）                      ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 目录：
@@ -74,6 +76,8 @@ HEADER = '''#!/usr/bin/env python3
   Section 11.5 — 译后命名一致性校正   (run_consistency_check, 子命令 consistency)
   Section 11.6 — typesafe-ai judges   (多原子原语 + verdict 合成 + 三级 fallback)
   Section 12 — 统一入口点            (split_input_to_chapters, 暴露 CLI 参数)
+  Section 13 — 镜像补全区            (book_lint / verse / 拆分器与判据辅助)
+  Section 13.6 — 判断层与图谱        (judgment_layer / story_graph / 深读剖面 / 全书修复)
 """
 
 import os
@@ -85,6 +89,7 @@ import random
 import gc
 import hashlib
 import difflib
+import importlib.util
 import tempfile
 import unicodedata
 import datetime as _dt
@@ -95,6 +100,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import sqlite3
 import psutil
+import requests
 import threading
 from collections import Counter, OrderedDict
 from abc import ABC, abstractmethod
@@ -145,13 +151,13 @@ def print_banner():
     print(r"""
    _____                  ______
   / ___/____ _____ _____ /_  __/________ _____  _____
-  \__ \/ __ `/ __ `/ __ `// / / ___/ __ `/ __ \/ ___/
+  \\__ \\/ __ `/ __ `/ __ `// / / ___/ __ `/ __ \\/ ___/
  ___/ / /_/ / /_/ / /_/ // / / /  / /_/ / / / (__  )
-/____/\__,_/\__, /\__,_//_/ /_/   \__,_/_/ /_/____/
+/____/\\__,_/\\__, /\\__,_//_/ /_/   \\__,_/_/ /_/____/
            /____/
 
   SagaTrans — AI 文学语义编译系统  (单体聚合版)
-  共 13 个模块 | 用于全量代码审计 / 单文件部署
+  散装 src/ 聚合 | 用于全量代码审计 / 单文件部署
 """, file=sys.stderr)
 
 
@@ -507,7 +513,7 @@ def build_section_2() -> str:
     cache = extract_constant(src, "_client_instances")
     # 然后是 class 和 helper 函数（Round 129: 增加配额降级包装器与拆分后的构建函数）
     classes = [extract_class(src, c) for c in [
-        "QuotaExhaustedError", "LLMAdapter", "MockLLMAdapter",
+        "QuotaExhaustedError", "ContentSensitiveError", "LLMAdapter", "MockLLMAdapter",
         "OpenAICompatibleAdapter", "FallbackRoleAdapter",
     ]]
     helpers = [extract_function(src, f) for f in [
@@ -623,6 +629,14 @@ def build_section_7() -> str:
     return section_comment("7", "Pipeline 主流程") + pipeline
 
 
+def build_section_6b() -> str:
+    """Round 147: failure rescue / QA evidence helpers（须先于 Pipeline 内联）。"""
+    body = load_module("rescue.py").strip("\n")
+    if not body:
+        raise SystemExit("❌ Section 6b 空模块: rescue.py")
+    return section_comment("6b", "失败块救援 / QA 证据 / 失败账本") + body + "\n\n\n"
+
+
 def build_section_8() -> str:
     """测试工具"""
     gs_src = load_module("test_golden_set.py")
@@ -634,7 +648,8 @@ def build_section_8() -> str:
         "_levenshtein_distance", "run_golden_test",
         "_extract_confidence_source", "summarize_golden_results",
         "recommend_golden_combo", "run_golden_ab",
-        "compare_injection_arms", "run_injection_ab",
+        "compare_injection_arms", "_snapshot_sqlite_database",
+        "run_injection_ab",
     ]]
     # run_golden_gate 实际定义在 test_memory_pressure.py（散装历史：原 §8.2 拆出去时迁过去的）
     mp_fns = [extract_function(mp_src, f) for f in ["get_system_memory", "get_process_memory", "simulate_memory_load", "run_golden_gate", "test_memory_pressure"]]
@@ -787,9 +802,10 @@ def build_section_11_6() -> str:
     except SyntaxError:
         pass
 
-    # 5) judge — build_state / evaluate_chunk / to_legacy_scores
+    # 5) judge — backend_confidence_source / build_state / evaluate_chunk / to_legacy_scores
     src_j = load_module("judges/judge.py")
-    for fn in ["build_state", "evaluate_chunk", "to_legacy_scores"]:
+    for fn in ["backend_confidence_source", "build_state", "evaluate_chunk",
+               "to_legacy_scores"]:
         out += extract_function(src_j, fn) + "\n\n\n"
 
     # Round 72 修复: synthesize_verdict 调用 aggregate_per_entity_nouls / PER_ENTITY_KEY_PREFIX,
@@ -857,7 +873,7 @@ def compute_cjk_ratio(text: str) -> float:
     if cached is not None:
         return cached
     import re as _re
-    stripped = _re.sub(r"\s+", "", text)
+    stripped = _re.sub(r"\\s+", "", text)
     if not stripped:
         _cjk_ratio_cache_put(text, 0.0)
         return 0.0
@@ -1028,9 +1044,10 @@ for _sub in ("src.utils", "src.config", "src.agents", "src.core", "src.consisten
              # Round 131: prefer the real modules in repo mode.  A pre-created
              # fake module otherwise hides private helpers (e.g. pun_audit's
              # _split_anchors) from later imports in the same interpreter.
-             "src.judgment_layer", "src.story_graph", "src.story_graph_query",
+             "src.judgment_layer", "src.rescue", "src.story_graph", "src.story_graph_query",
              "src.setup_payoff_audit",
-             "src.style_profiler"):
+             "src.style_profiler", "src.recalibrate", "src.proofread",
+             "src.book_repair"):
     _ensure_real_or_fake(_sub)
 # Round 103 P2: src.judges.* shim 不覆盖真实模块, 仅补 attr.
 # R104 P1 修复: 旧条件 `_existing.__path__` 仅对父 package 有效, 子模块
@@ -1052,7 +1069,8 @@ for _mod_name, _attrs in {
                                     "normalize_api_root", "batch_questions", "classify_backend_error"],
     "src.judges.verdict": ["synthesize_verdict", "DEFAULT_THRESHOLDS",
                            "flagged_entity_labels"],
-    "src.judges.judge": ["build_state", "evaluate_chunk", "to_legacy_scores"],
+    "src.judges.judge": ["backend_confidence_source", "build_state",
+                         "evaluate_chunk", "to_legacy_scores"],
     "src.judges": ["NoulAnswer", "ChoiceAnswer", "ScoreAnswer", "CompositeVerdict", "Answer",
                    "VOICE_DRIFT", "REGISTER_MATCH", "ENTITY_CONSISTENCY", "LITERAL_RESIDUE", "SEMANTIC_LOSS", "STYLE_COMPLIANCE_SCORE", "ALL_PRIMITIVES", "build_question_set",
                    "PER_ENTITY_KEY_PREFIX", "build_per_entity_questions", "_sanitize_key", "aggregate_per_entity_nouls",
@@ -1061,7 +1079,8 @@ for _mod_name, _attrs in {
                    "DEFAULT_API_BASE", "DEFAULT_MODEL", "DEFAULT_MAX_QUESTIONS_PER_BATCH",
                    "normalize_api_root", "batch_questions", "classify_backend_error",
                    "synthesize_verdict", "DEFAULT_THRESHOLDS",
-                   "build_state", "evaluate_chunk", "to_legacy_scores"],
+                   "backend_confidence_source", "build_state", "evaluate_chunk",
+                   "to_legacy_scores"],
 }.items():
     _existing = _sys_j.modules.get(_mod_name)
     # R104 P1: 用 __file__ 真值判断 (与 R103 P5 第二块对齐).
@@ -1088,6 +1107,7 @@ _SRC_SUBMODULES = {
     "src.utils.llm_adapter": [
         "get_llm_client", "get_llm_client_for_task", "get_role_model_name", "get_task_extra_body",
         "robust_json_loads", "_build_role_client", "_client_instances",
+        "ContentSensitiveError",
     ],
     # Round 96: 加 text_match shim 让 CJK 比例原语可在整合模式下访问
     # Round 102 P1: 增加 cjk_ratio 缓存相关符号, 让整合模式下也可访问.
@@ -1115,6 +1135,7 @@ _SRC_SUBMODULES = {
         "DecisionLevel", "DecisionEngine", "query_high_confidence_entities",
         "query_reviewable_entities", "get_sibling_canonicals_by_source",
         "detect_cross_person_conflicts", "seed_entity_variants", "SEED_ENTITY_VARIANTS",
+            "repair_false_unify_merges",
         "classify_entity_source_name", "is_proper_entity_alias",
         "alias_attested_in_text",
         "load_decision_alias_targets", "_load_decision_alias_targets",
@@ -1146,7 +1167,9 @@ _SRC_SUBMODULES = {
                       "_split_h1_sections", "_normalize_chapter_notes_once",
                       "normalize_chapter_notes",
                       "normalize_notes_document", "notes_normalize_outputs",
-                      "_chapter_note_dupes", "_note_is_dup", "_note_anchor_stop"],
+                      "_chapter_note_dupes", "_note_is_dup", "_note_anchor_stop",
+                      "_note_key_parts", "_note_mentions_alias",
+                      "_note_keys_compatible"],
     "src.consistency": ["run_consistency_check", "_load_glossary", "_load_decisions",
                         "_scan_finals", "_find_slash_aliases", "_in_quote_or_note",
                         "_NOTE_MARKER_RE",
@@ -1245,10 +1268,22 @@ _SRC_SUBMODULES = {
         "build_deep_profile", "profile_to_style_guide", "save_profile",
         "load_profile", "profile_is_deep", "summary_line", "generate_book_profile",
     ],
+    "src.recalibrate": [
+        "run_recalibrate_critic",
+    ],
+    "src.proofread": [
+        "SCHEMA_VERSION", "REPORT_NAME", "proofread_book",
+        "_scan_text", "_apply_safe", "_ARTIFACT_HEADING_RE",
+    ],
+    "src.book_repair": [
+        "BOOK_REPAIR_SCHEMA_VERSION", "BOOK_REPAIR_REPORT_NAME",
+        "apply_book_repairs", "verify_book_repairs",
+    ],
     "src.test_golden_set": ["GoldenSetEvaluator", "_levenshtein_distance", "run_golden_test",
                             "GOLDEN_AB_MATRIX", "_extract_confidence_source",
                             "summarize_golden_results", "recommend_golden_combo", "run_golden_ab",
-                            "compare_injection_arms", "run_injection_ab",
+                            "compare_injection_arms", "_snapshot_sqlite_database",
+                            "run_injection_ab",
                             "run_golden_gate"],
     "src.test_memory_pressure": ["get_system_memory", "get_process_memory", "simulate_memory_load", "test_memory_pressure"],
 }
@@ -1276,7 +1311,8 @@ from src.judges.typesafe_spec import (NoulAnswer, ChoiceAnswer, ScoreAnswer, Com
 from src.judges.primitives import (VOICE_DRIFT, REGISTER_MATCH, ENTITY_CONSISTENCY, LITERAL_RESIDUE, SEMANTIC_LOSS, STYLE_COMPLIANCE_SCORE, ALL_PRIMITIVES, build_question_set)
 from src.judges.typesafe_backend import (SystemOneBackend, JevBackend, OpenAICompatBackend, MockBackend, FallbackBackend, get_backend)
 from src.judges.verdict import (synthesize_verdict, DEFAULT_THRESHOLDS)
-from src.judges.judge import (build_state, evaluate_chunk, to_legacy_scores)
+from src.judges.judge import (backend_confidence_source, build_state, evaluate_chunk,
+                              to_legacy_scores)
 
 # Round 96: compute_cjk_ratio 在文件顶部 inline 定义, 镜像 src/utils/text_match.py, 避免 shim 后的虚拟 src.utils.text_match 包缺失该符号
 '''
@@ -1305,7 +1341,7 @@ def build_section_13() -> str:
     """
     spec = [
         ("utils/llm_adapter.py", [
-            "_INLINE_THINK_RE", "_QUOTA_HINT_RE", "build_effort_params",
+            "_INLINE_THINK_RE", "_QUOTA_HINT_RE", "_SENSITIVE_HINT_RE", "build_effort_params",
         ]),
         ("utils/text_match.py", [
             "entity_source_name_in_text",
@@ -1316,6 +1352,8 @@ def build_section_13() -> str:
         ]),
         ("core/decision_engine.py", [
             "SEED_ENTITY_VARIANTS", "_CONF_ORDER", "load_entity_variant_seeds", "unify_entity_registry",
+            # Round 149: 修复历史 unify 跨人物误合并（清洗脚本复用）
+            "_repair_names_related", "repair_false_unify_merges",
             # Round 144: entity alias hygiene（query/reference/pipeline 共用）
             "classify_entity_source_name", "is_proper_entity_alias",
             "alias_attested_in_text",
@@ -1398,7 +1436,8 @@ def build_section_13() -> str:
             "_infer_title_zh", "book_title_zh", "resolve_book_output_path",
             "_chapter_dup_notes", "_chapter_note_dupes", "_def_key", "_find_finals",
             "_group_title_units", "_note_anchor_stop", "_note_candidates", "_note_is_dup",
-            "_note_key", "_note_merge_key",
+            "_note_key", "_note_merge_key", "_note_key_parts",
+            "_note_mentions_alias", "_note_keys_compatible",
             "_note_norm", "_note_terms", "_scan_lines", "_split_h1_sections",
             "chapter_heading", "finalize_outputs", "lint_book", "lint_texts",
             "_normalize_chapter_notes_once", "normalize_chapter_notes",
@@ -1424,7 +1463,8 @@ def build_section_13() -> str:
     # below.  Keeping whole modules avoids another hand-maintained symbol list.
     out += section_comment("13.6", "Round 131 全书判断层 / 故事图 / 深读剖面")
     for rel in ("judgment_layer.py", "story_graph.py", "story_graph_query.py",
-                "setup_payoff_audit.py", "style_profiler.py"):
+                "setup_payoff_audit.py", "style_profiler.py", "recalibrate.py",
+                "proofread.py", "book_repair.py"):
         body = load_module(rel).strip("\n")
         if not body:
             raise SystemExit(f"❌ Section 13.6 空模块: {rel}")
@@ -1614,6 +1654,7 @@ def build() -> str:
     parts.append(build_section_5())
     parts.append(build_section_5b())
     parts.append(build_section_6())
+    parts.append(build_section_6b())
     parts.append(build_section_7())
     parts.append(build_section_8())
     parts.append(build_section_9())
@@ -1630,6 +1671,60 @@ def build() -> str:
     return "\n".join(parts)
 
 
+_MODULE_DUNDERS = {
+    "__builtins__", "__cached__", "__doc__", "__file__", "__loader__",
+    "__name__", "__package__", "__spec__",
+}
+
+
+def find_undefined_globals(source: str) -> list[tuple[str, str]]:
+    """Return global names referenced by *source* but never defined/imported.
+
+    The integrated snapshot is assembled from hand-maintained symbol lists.
+    ``compile()`` only proves syntax; it does not prove that every name used
+    inside a function exists at runtime.  ``symtable`` lets us check the exact
+    failure class that produced Round 154's ``importlib``,
+    ``_snapshot_sqlite_database`` and ``backend_confidence_source`` gaps.
+    """
+    table = symtable.symtable(source, str(OUTPUT), "exec")
+    known = {
+        symbol.get_name()
+        for symbol in table.get_symbols()
+        if symbol.is_assigned() or symbol.is_imported() or symbol.is_namespace()
+    }
+    known |= _MODULE_DUNDERS
+    known |= set(dir(builtins))
+
+    missing: dict[str, set[str]] = {}
+
+    def walk(node: symtable.SymbolTable) -> None:
+        for symbol in node.get_symbols():
+            if (symbol.is_referenced() and symbol.is_global()
+                    and symbol.get_name() not in known):
+                missing.setdefault(symbol.get_name(), set()).add(node.get_name())
+        for child in node.get_children():
+            walk(child)
+
+    walk(table)
+    return sorted(
+        (name, ", ".join(sorted(contexts)[:5]))
+        for name, contexts in missing.items()
+    )
+
+
+def validate_generated(source: str, verbose: bool = True) -> bool:
+    """Fail closed when the snapshot has unresolved global names."""
+    missing = find_undefined_globals(source)
+    if not missing:
+        if verbose:
+            print("✅ 自由名完整性: 0 缺失")
+        return True
+    print(f"❌ 自由名完整性: {len(missing)} 个未定义全局名", file=sys.stderr)
+    for name, contexts in missing[:20]:
+        print(f"   - {name} ← {contexts}", file=sys.stderr)
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="SagaTrans 整合脚本构建器")
     parser.add_argument("--check", action="store_true", help="只检查是否一致，不写入文件")
@@ -1637,17 +1732,20 @@ def main():
     args = parser.parse_args()
     
     generated = build()
+    valid = validate_generated(generated, verbose=not args.output)
     
     if args.output:
         sys.stdout.write(generated)
-        return 0
+        return 0 if valid else 1
     
     if args.check:
         if OUTPUT.exists():
             existing = OUTPUT.read_text(encoding="utf-8")
             if existing == generated:
-                print(f"✅ {OUTPUT.name} 与散装一致（{len(generated.splitlines())} 行）")
-                return 0
+                if valid:
+                    print(f"✅ {OUTPUT.name} 与散装一致（{len(generated.splitlines())} 行）")
+                    return 0
+                return 1
             else:
                 print(f"❌ {OUTPUT.name} 与散装不一致")
                 print(f"   当前: {len(existing.splitlines())} 行")
@@ -1657,6 +1755,9 @@ def main():
             print(f"❌ {OUTPUT} 不存在")
             return 1
     
+    if not valid:
+        print("❌ 拒绝写入存在未定义全局名的整合脚本")
+        return 1
     OUTPUT.write_text(generated, encoding="utf-8")
     print(f"✅ {OUTPUT.name} 已重新生成（{len(generated.splitlines())} 行 / {len(generated):,} 字符）")
     return 0

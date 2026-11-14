@@ -151,6 +151,19 @@ class TestMapsApplyGeneric:
         assert "老侯爵已逝" in new_text
         assert st["sep_restore"] >= 1 and st["forms"] >= 1, st
 
+    def test_short_form_does_not_duplicate_inside_canonical(self):
+        from src.core.decision_engine import apply_name_unification
+        maps = {
+            "authorities": ["雷托公爵"],
+            "forms": [["雷托", "雷托公爵", "雷托公爵"]],
+            "tokens": {"雷托": "雷托公爵"},
+        }
+        text = "雷托公爵看着雷托。雷托公爵点头。"
+        new_text, st = apply_name_unification(text, maps)
+        assert "雷托公爵公爵" not in new_text
+        assert new_text == "雷托公爵看着雷托公爵。雷托公爵点头。"
+        assert st["forms"] + st["tokens"] == 1, st
+
 
 class TestScanCandidates:
     @staticmethod

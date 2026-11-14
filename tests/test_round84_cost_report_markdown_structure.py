@@ -19,8 +19,8 @@
   —— 表格不换行, 不分段, 全部挤成一行字面 \\n
 
 修复:
-  将源内 "\\n" (3 chars: \, \, n → Python 解析为 \ + n 字面)
-  改为 "\n" (2 chars: \, n → Python 解析为真换行符 chr(10))
+  将源内 "\\n" (3 chars: \\, \\, n → Python 解析为 \\ + n 字面)
+  改为 "\n" (2 chars: \\, n → Python 解析为真换行符 chr(10))
   让 markdown 渲染为:
     ### est_tokens_per_call 建议值（Round 35）
 

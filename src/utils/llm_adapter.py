@@ -138,6 +138,16 @@ class QuotaExhaustedError(RuntimeError):
     """
 
 
+class ContentSensitiveError(RuntimeError):
+    """Round 148: 上游内容审核拒绝（HTTP 422，典型为 input new_sensitive）。
+
+    这类错误是永久客户端拒绝：同一 provider + 同一 prompt 重试只会重复计费。
+    pipeline 捕获后应立即持久化换角色 override，而不是走普通 API 重试。
+    """
+
+    status_code = 422
+
+
 class LLMAdapter(ABC):
     """大语言模型调用基类"""
     def __init__(self):
@@ -348,6 +358,10 @@ _INLINE_THINK_RE = re.compile(r'<think(.*?)</think>', re.DOTALL)
 
 # Round 129: 配额耗尽关键字（仅配合 402/403 判定；429 走连续计数）
 _QUOTA_HINT_RE = re.compile(r"quota|insufficient|欠费|额度|余额", re.IGNORECASE)
+_SENSITIVE_HINT_RE = re.compile(
+    r"new_sensitive|content[ _-]?sensitive|content[ _-]?policy|unsafe|内容敏感|敏感内容",
+    re.IGNORECASE,
+)
 
 
 class OpenAICompatibleAdapter(LLMAdapter):
@@ -485,6 +499,10 @@ class OpenAICompatibleAdapter(LLMAdapter):
                         )
                 # 429 是限流（属于 4xx 但应重试），其他 4xx 是客户端错误；5xx 由 raise_for_status 抛出后被外层重试逻辑捕获
                 if 400 <= response.status_code < 500 and response.status_code != 429:
+                    if response.status_code == 422 and _SENSITIVE_HINT_RE.search(response.text[:600]):
+                        raise ContentSensitiveError(
+                            f"API 客户端错误 422 (content_sensitive): {response.text[:200]}"
+                        )
                     raise RuntimeError(f"API 客户端错误 {response.status_code}: {response.text[:200]}")
                 response.raise_for_status()
                 self._consecutive_429 = 0

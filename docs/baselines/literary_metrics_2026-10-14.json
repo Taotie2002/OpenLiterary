@@ -1,0 +1,114 @@
+{
+  "chars_cjk": 38420,
+  "ai_flavor_counts": {
+    "仿佛": 10,
+    "彷佛": 0,
+    "似乎": 22,
+    "深深地": 6,
+    "顿时": 1,
+    "瞬间": 1,
+    "微微": 1,
+    "不禁": 0,
+    "蓦然": 0,
+    "旋即": 0,
+    "倏然": 0,
+    "恍惚": 2
+  },
+  "ai_flavor_total": 43,
+  "ai_density_per_1k": 1.119,
+  "intensity_counts": {
+    "非常": 66,
+    "极其": 5,
+    "十分": 10,
+    "格外": 2,
+    "异常": 0,
+    "分外": 0,
+    "无比": 0,
+    "极为": 0,
+    "更加": 0
+  },
+  "translationese_counts": {
+    "进行一次": 0,
+    "对于…来说": 1,
+    "当…的时候": 3,
+    "在…的时候": 5,
+    "作为一个": 0,
+    "被…所…": 2,
+    "…的话": 11,
+    "使得": 0,
+    "的的": 0
+  },
+  "translationese_total": 22,
+  "punct": {
+    "dash_em": 281,
+    "ellipsis": 2,
+    "exclaim": 452,
+    "question": 201
+  },
+  "quotes": {
+    "ascii_double": 14,
+    "curly_open": 1086,
+    "curly_close": 1081,
+    "corner": 34
+  },
+  "notes": {
+    "defs": 54,
+    "sup": 35,
+    "md": 14,
+    "num": 5,
+    "orphans": 8
+  },
+  "ngram4": {
+    "total": 38417,
+    "distinct": 34951,
+    "repeat_rate": 0.09022,
+    "top": [
+      {
+        "gram": "爱丽丝说",
+        "count": 90
+      },
+      {
+        "gram": "仿龟先生",
+        "count": 47
+      },
+      {
+        "gram": "公爵夫人",
+        "count": 43
+      },
+      {
+        "gram": "自言自语",
+        "count": 31
+      },
+      {
+        "gram": "的爱丽丝",
+        "count": 27
+      },
+      {
+        "gram": "爱丽丝想",
+        "count": 26
+      },
+      {
+        "gram": "你愿不愿",
+        "count": 21
+      },
+      {
+        "gram": "愿不愿意",
+        "count": 21
+      },
+      {
+        "gram": "了爱丽丝",
+        "count": 20
+      },
+      {
+        "gram": "龟先生说",
+        "count": 19
+      }
+    ]
+  },
+  "verse": {
+    "manifest_blocks": 0,
+    "manifest_lines": 0
+  },
+  "source": "/home/zyu/projects/SagaTrans/output/translated_full.md",
+  "generated_at": "2026-10-14T21:03:23"
+}

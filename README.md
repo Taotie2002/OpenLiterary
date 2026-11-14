@@ -8,7 +8,8 @@ SagaTrans 把一个长篇小说翻译任务实现为一条**有状态、可审�
 
 ```text
 切分 → 风格剖面 → 直译 → 文学润色 → 多维审计 → 校准裁决
-     → 决策回溯 → 全书收敛 → 合并 → 终审 → 交付门禁 → EPUB3
+     → 决策回溯 → 全书收敛 → 终检修复 → 合并
+     → 注释/机械收口 → QA 重建 → lint → 交付门禁 → 可选 EPUB3
 ```
 
 ---
@@ -32,7 +33,7 @@ SagaTrans 的研究立场是：**把翻译当作编译，把一致性当作事�
 | 判断应当是制品，而不是隐式 prompt 状态 | 全书注记写入 `book_profile.json`，经 L1/L2 验证后供检索与终审使用 |
 | 全局理解不应阻塞局部执行 | 判断层是 advisory 且 fail-open；交付门禁是硬约束且 fail-closed |
 | 不确定性必须可恢复 | 每个 chunk 有版本、备份、merit 比较、DIRTY 队列和 PF 复活预算 |
-| 交付不能依赖“队列看起来跑完了” | 八项确定性 gate 通过才算完成，mock/未校准裁决占比也会被检查 |
+| 交付不能依赖“队列看起来跑完了” | 十一项确定性 gate 通过才算完成，mock/未校准裁决占比、fallback 产物、成书机械排错和全书修复凭证也会被检查 |
 
 ---
 
@@ -58,7 +59,7 @@ SagaTrans 的研究立场是：**把翻译当作编译，把一致性当作事�
 | `literal_translator` | Qwen | 直译、典故/实体召回、轻量分类、判断层 L2 复核 |
 | `secondary` | DeepSeek | 文学润色、考据确认、旧 critic 路径、深读抽取/合并 |
 | `primary` | MiniMax | 最终 LLM 裁决、风格剖面、成书审读、困难片段直译、救稿/双稿 |
-| System One | MoArk `d3-flash` | 校准概率裁决；`d3-turbo` 仅用于同批质量 A/B |
+| System One | MoArk `d3-flash` | 校准概率裁决；`d3-turbo` 仅作历史对照，当前无自动 A/B 实现 |
 
 “思考档位”是任务级参数，例如 `judge_decision=max`、`literary_rewrite=xhigh`、`critic_scoring=none`。具体模型、地址、effort 和 `max_tokens` 都在 `config.yaml` 的 `models` 与 `task_routing` 中调整。
 
@@ -84,7 +85,7 @@ SagaTrans 的研究立场是：**把翻译当作编译，把一致性当作事�
 | 生成层 | `output/chXX/*_raw/literary/critic_report/final.json` | 每个 chunk 的候选稿、审计、裁决和最终稿 | 可检查；不要绕过状态机直接替换 final |
 | 判断/派生层 | `input/book_profile.json`、`input/story_graph.json`、`output/review_dirty.json` | 全书注记、知识图谱、成书审读问题 | advisory；可重建，不反向成为术语事实源 |
 
-`src/` 是代码事实源；`src/translator_agent.py` 是自动生成的单文件镜像。运行产物的默认路径由项目根派生，不在 `config.yaml` 中配置。
+`src/` 是代码事实源；`src/translator_agent.py` 是自动生成的单文件镜像。路径默认以项目根为基准；`story_graph.path` 与 `pipeline.model_probe.path` 可在 `config.yaml` 覆盖，其余默认值见各模块常量。
 
 ### 3.2 Chunk 状态机
 
@@ -97,16 +98,17 @@ PENDING
                           ├─→ JUDGING ─→ COMPLETED
                           ├─→ REWRITING_LITERARY   (质量问题回流)
                           ├─→ FAILED                (API/执行失败，可重试)
-                          └─→ PERMANENTLY_FAILED    (预算耗尽，保留 fallback 稿)
+                          └─→ PERMANENTLY_FAILED    (救援预算耗尽，保留 fallback 稿)
 
 COMPLETED ─→ DIRTY (决策变更/结构 P0 修复触发定向重跑)
 DIRTY     ─→ EXTRACTING_TERMS
 FAILED    ─→ 任一可恢复阶段
+PF        ─→ DIRTY (自动救援：定向续跑 → 整块重跑 → 再隔离)
 ```
 
 - `COMPLETED` 表示 chunk 已通过该轮质量闭环，不等于全书可交付；还需要全书收敛和 gate。
 - `DIRTY` 表示旧稿受新决策或终审结构问题影响，必须重跑后才能再次交付。
-- `PERMANENTLY_FAILED`（PF）是“本次重试预算内的终态”，不是永久黑洞：可以通过 `pf_requeue_max`、`requeue --force` 或后续回溯治理重新进入 DIRTY。
+- `PERMANENTLY_FAILED`（PF）是“救援预算耗尽后的隔离态”，不是永久黑洞：下一章运行会自动尝试定向续跑；只有 `rescue.max_targeted_attempts` 与 `rescue.max_full_requeues` 都耗尽后才保持隔离。也可用 `requeue --chapter`/`--chunks`/`--from-ledger` 显式复活。
 - 回溯重跑的新稿若 critic 均分不如备份稿，`version_merit` 会保留旧版，防止“越修越差”。
 
 ---
@@ -136,26 +138,29 @@ per-chapter pipeline
   └──────────────────────────────────────────────────────────┘
       │                              decision_db.sqlite
       ▼
+per-chapter rescue（PF/fallback 定向续跑） ─► output/rescue/failure_ledger.jsonl
+      │
+      ▼
 consolidate 全书 DIRTY 收敛 ────────► output/consolidation_diff.md
       │
       ▼
 story-graph 重建 ───────────────────► input/story_graph.json
       │
       ▼
-finalize → merge → notes-normalize → lint
+finalize → book-repair → merge → notes-normalize → proofread → qa-report → lint
       │                              output/<中文书名>.md
       ▼
 可选：editor_review / story-graph-query / setup-payoff-audit
       │
       ▼
-gate（8 项 fail-closed） ──► output/book.epub（可选）
+gate（11 项 fail-closed） ──► output/book.epub（可选）
 ```
 
 ---
 
 ## 5. 工作流详解
 
-以下顺序与 `scripts/translate_book.sh` 的实际执行逻辑一致。手工调试时也应遵守“先收敛，再合并，再终审，最后 gate”的顺序。
+以下顺序与 `scripts/translate_book.sh` 的实际执行逻辑一致。手工调试时也应遵守“先收敛，再做终检修复与合并，再完成注释/机械收口和 QA 重建，最后 lint 与 gate”的顺序；`editor_review` 是可选旁路，不在默认一键流程内。
 
 ### 5.1 输入转换与切分
 
@@ -192,7 +197,21 @@ gate（8 项 fail-closed） ──► output/book.epub（可选）
 6. **恢复策略**：CJK 比例闸门、实体硬失败、停滞换模型、振荡/不进步早停、双稿仲裁、pairwise 仲裁和 `no_content` 自动降档共同避免死循环。
 7. **章末收口**：实体审计、注册表冲突诊断、一致性报告、成本报告和中间文件清理。
 
-一次章节运行失败并不等于全部工作丢失：已完成 chunk 留在 DB/final 中，PF 块保留 fallback 稿和中间文件；后续可以用回溯、`consolidate`、`requeue` 或 `pipeline --fix-from-review` 继续修复。
+一次章节运行失败并不等于全部工作丢失：已完成 chunk 留在 DB/final 中，失败块保留 raw/literary/fallback 稿和中间文件；后续可以用自动救援、回溯、`consolidate`、`requeue` 或 `pipeline --fix-from-review` 继续修复。
+
+#### 5.4.1 失败块自动救援（Round 147-148）
+
+失败块不再直接成为不可处理的终点，而是进入受预算约束的救援阶梯：
+
+1. `classify_failure` 把错误归为 `api_or_no_content`、`content_sensitive`、`quality`、`cjk`、`entity`、`structure` 或 `unknown`；
+2. 优先按已有 raw/literary 续跑（`recommended_resume_stage`），避免每次失败都从术语提取重做；
+3. 定向救援最多 `pipeline.rescue.max_targeted_attempts` 次；用完后整块重跑最多 `max_full_requeues` 次；
+4. 本章救援增量耗时受 `chapter_budget_seconds` 限制；预算耗尽才写 `PERMANENTLY_FAILED`；
+5. 每次排队、完成、隔离都追加到 `output/rescue/failure_ledger.jsonl`，并生成 `output/rescue/rescue_report.md` 的根因 cohort。
+
+救援只改状态机和候选稿，不会把失败稿升级为“通过”。如果最终仍有 `fallback=True` / `quality_waived=True` 的 final，gate ⑨ 会硬失败；不能靠 DB 的 `COMPLETED` 或进程退出码洗白。
+
+HTTP 422 且上游返回 `input new_sensitive` 时属于永久客户端拒绝，不进入普通 API 重试：pipeline 在第一次拒绝后立即持久化换角色 override，按 `retry_adaptation.sensitive_fallback_roles` 先跨 provider、再尝试已成功产出 raw 的 Qwen；只有所有备用角色都拒绝才隔离。该 override 按 chunk 落库，进程重启后仍然生效。
 
 ### 5.5 全书收敛与回溯治理
 
@@ -211,10 +230,15 @@ gate（8 项 fail-closed） ──► output/book.epub（可选）
 ### 5.6 合并、终稿规范化与 lint
 
 1. `finalize --apply`：统一引号、脚注制式、清除策略元语和悬空定义；先写 `output/finalize_diff.md` 再落盘。
-2. `merge`：把各章 final 合成为 `output/<中文书名>.md`，同时生成 `output/QA_REPORT.md`；章节标题制式由 `book.chapter_titles` 控制。
-3. `notes-normalize --apply`：章级注释去重、孤儿改锚、顺编号，输出 `output/note_policy_diff.md`。
-4. `lint`：同时检查 chunk 级 final 和合并后的整书，输出 `output/book_lint.md`。
-5. 可选 `consistency --apply`：命名一致性校正；默认只报告，避免普通词被误替换。
+2. `book-repair --apply`：全书终检修复，只处理 source/raw/literary 能逐项证明的姓名错位、机械可证的同位语污染、已证实错误的注释定义、正文已引用但缺少定义冒号的 Markdown 脚注、夹在可靠前后锚点之间且终稿完全没有对应的正文段漏译，以及 profile/实体注册表已确认的规范表面名漂移（例如 `厄拉科斯 → 阿拉基斯`、`贝尼杰瑟里特 → 贝尼·杰瑟里特`）。核心人物错位要求句级上下文一一对应，必要时再由对应英文源文段落作证；漏译恢复要求 raw 段在 final（含注释）中无匹配、前后 raw 段分别映射到相邻 final 段，插入位置不唯一或脚注归属不清时直接阻断。争议中的多套人物译名不进入通用替换，另行做源文锚定复核。不调用 LLM，不改写无法证明的句子。每条改动都写 final 备份、前后 SHA-256 和 `output/book_repair_report.json` / `.md`。仍有待修项、未决高危项或证据缺口时返回非零，禁止合并。
+3. `merge`：把各章 final 合成为 `output/<中文书名>.md`；章节标题制式由 `book.chapter_titles` 控制。
+4. `notes-normalize --apply`：章级注释去重、孤儿改锚、顺编号，输出 `output/note_policy_diff.md`；这一步只改合并稿，不追改 final。
+5. `proofread --apply`：只做确定性机械排错，不做风格优化。检查编码/不可见字符、chunk 拼接残留标题、HTML、重复标点、括号与章节壳等；`--apply` 只删除可证明非正文的残留标题和不可见控制字符，输出 `output/proofread_report.json` 与 `.md`。
+6. `qa-report`：扫描当前 final 集合，重建带 `final_count` 与每块 SHA-256 的机器可核验 `output/QA_REPORT.md`。
+7. `lint`：同时检查 chunk 级 final 和合并后的整书，输出 `output/book_lint.md`。
+8. 可选 `consistency --apply`：命名一致性校正；默认只报告，避免普通词被误替换。
+
+`book-repair` 属于正式工作流，而不是对合并稿做事后补丁：它修的是带 DB source 证据的 final 文件，每次写入都留备份、前后哈希和 manifest，随后再由 finals 重新合并。这样“事后修全书”仍是可重建、可复验的主线产物；若把它留在手工脚本或直接改合并稿，就会产生一个无法从 finals 重建的第二事实源。该阶段只接受可证明的机械/实体修复；无法证明的风格问题和争议译名仍进入人工审读或定向复核，不做批量猜测。
 
 ### 5.7 成书终审与定向修复
 
@@ -236,18 +260,23 @@ python3 -m src.main pipeline --fix-from-review
 
 ### 5.8 交付门禁与清理
 
-`gate` 是 fail-closed 的，默认检查八项：
+`gate` 是 fail-closed 的，默认检查十一项：
 
 1. workflow DB：全部 chunk `COMPLETED` 且 `DIRTY=0`；
 2. 产物数量：每章 `final.json` 数量等于 DB 任务数，且无备份残留；
-3. `QA_REPORT.md` 不包含 fallback 章节；
-4. `book_lint` 全绿；
+3. `QA_REPORT.md`：不记录 fallback，且其 `final_count`、chunk 集合和每块哈希与当前 final 完全一致（防止陈旧报告）；
+4. `book_lint` 无 failure；非阻断 warning 保留在 `output/book_lint.md`，不能把“通过”表述成“零缺陷”；
 5. EPUB 转换审计通过；
 6. 韵文对齐（`verse_lint`）通过；
 7. 双关 watchlist 核销（`pun_audit`）通过；
-8. 校准裁决占比达到 `pipeline.final_gate.min_calibrated_ratio`（默认 0.95，按全书和单章检查；`jev` 是现役 MoArk d3 的兼容标签）。
+8. 校准裁决占比达到 `pipeline.final_gate.min_calibrated_ratio`（默认 0.95，按全书和单章检查；`jev` 是现役 MoArk d3 的兼容标签）。同时核验 critic 报告是否仍对应当前 final：报告中的 `_audit_target` 哈希等于当前 final 为 `exact`；final 经 `book-repair` 改动后，若能用前后哈希、备份和 manifest 证明报告审读的就是修复前的同一文本，则记为 `repaired`；有哈希但证据链断开为 `stale`，直接判红。Round 157 以前没有 `_audit_target` 的 legacy 报告记为 `unbound`，只警告并保留 `_backend_path` 来源证据。
+9. 任意 final 的 `metadata.fallback`、`metadata.quality_waived` 或 `metadata.quality_degraded` 为真，直接判红；final 无法解析也判红。
+10. `proofread` 的机械阻断项为 0：编码损坏、拼接残留标题、原始 HTML、确定性重复标点、括号不平衡、空章/重复 H1 等；gate 的独立复核写入 `output/proofread_gate_report.md`。它不评价文风，也不替代人工文学审读。
+11. `book-repair` 闭环：每个 final 都有 DB source 证据且可解析；没有待修 chunk、未决高危项、正文段漏译或插入歧义，也没有陈旧修复凭证。gate 会从当前 final 重新计算哈希，而不是相信上一次报告。
 
-`--clean` 必须在 gate 之后执行。gate ⑧ 需要读取每个 chunk 的 `critic_report.json` 中的 `_backend_path` 来核算校准来源；提前清理会导致审计缺证。一键脚本已经固定了这个顺序。
+`--clean` 必须在 gate 之后执行，并且只在 gate 全绿时执行。gate ⑧ 需要读取每个 chunk 的 `critic_report.json` 中的 `_backend_path` 和 `_audit_target` 来核算校准来源及其对应的 final；提前清理会导致审计缺证。一键脚本已固定顺序并加了 `gate_ok` 守卫；gate 失败时会保留全部中间产物。
+
+`gate` 全绿表示**没有硬性不变量失败**，不表示 warning 数为 0，也不表示文学质量已经定稿。`book_lint` 可能以非阻断警告通过；legacy `critic_report` 可能以 `unbound` 兼容；`proofread` 的边界引号等警告也可能保留。交付前仍应逐项阅读对应报告，不能用 gate 的绿色状态替代人工文学判断。
 
 ### 5.9 可选 EPUB3 导出
 
@@ -286,8 +315,18 @@ SagaTrans/
 │   ├── chXX/                   # 每章 raw/literary/critic_report/final 制品
 │   ├── <中文书名>.md           # 合并后的成书 Markdown
 │   ├── QA_REPORT.md
+│   ├── rescue/
+│   │   ├── failure_ledger.jsonl  # append-only 失败/救援证据
+│   │   └── rescue_report.md      # 根因 cohort 摘要
 │   ├── book_lint.md
-│   ├── consolidate_diff.md
+│   ├── book_repair_report.json  # 全书终检修复机器报告与哈希 manifest
+│   ├── book_repair_report.md    # 修复规则、证据、备份与未决项
+│   ├── repair_backups/          # book-repair 写入前的逐文件字节备份
+│   ├── proofread_report.json    # 机械排错机器报告
+│   ├── proofread_report.md      # 机械排错人类可读报告
+│   ├── proofread_gate_report.json # gate ⑩ 独立复核
+│   ├── proofread_gate_report.md
+│   ├── consolidation_diff.md
 │   ├── finalize_diff.md
 │   ├── note_policy_diff.md
 │   ├── review_dirty.json
@@ -308,13 +347,19 @@ SagaTrans/
 │   ├── main.py                 # 模块化 CLI
 │   ├── config.py               # YAML/.env/环境变量覆盖加载
 │   ├── pipeline.py             # chunk 状态机、质量闭环、最终 gate
+│   ├── rescue.py               # 失败分类、救援账本、QA 机器证据
 │   ├── judgment_layer.py       # 判断层 schema、L1/L2、切片注入
 │   ├── story_graph.py          # 确定性实体/场景图 + 验证叙事边
 │   ├── story_graph_query.py    # 只读图谱检索与评测
 │   ├── setup_payoff_audit.py   # 伏笔候选审计与受控提升
 │   ├── style_profiler.py       # 抽样/深读风格剖面
+│   ├── recalibrate.py          # 校准裁决重审与证据补齐
+│   ├── proofread.py            # 成书机械排错（纯确定性，无 LLM）
+│   ├── book_repair.py          # 全书证据门控修复与哈希 manifest
 │   ├── book_lint.py            # final/merged lint、finalize、notes-normalize
 │   ├── consistency.py          # 命名一致性校正
+│   ├── splitters.py            # EPUB/TXT/MD 输入切分
+│   ├── drift_audit.py          # 章级语域/句长漂移诊断
 │   ├── verse.py                # 韵文识别与 verse_lint
 │   ├── core/                   # scheduler、decision_engine
 │   ├── agents/                 # reference、rewriter、critic、judge
@@ -379,7 +424,7 @@ python3 -m src.main pipeline --chapter ch01
 | `typesafe` | MoArk d3-flash 判断后端的连接、批大小和 timeout |
 | `book` / `verse` | 成书标题/章节制式与韵文对齐参数 |
 
-`paths`、`logging`、模型 `alias`、历史 `golden_test` 路由块以及若干没有运行读取点的旧开关已从配置删除；路径由项目根派生，运行日志沿用 Python 默认配置。这样配置文件只表达当前真正生效的契约。
+`paths`、`logging`、模型 `alias`、历史 `golden_test` 路由块以及若干没有运行读取点的旧开关已从配置删除；路径默认由项目根派生。`SAGATRANS__LOG_LEVEL`（默认 `INFO`）只由单体入口 `src.translator_agent` 读取；使用散装 `src.main` 时应由宿主或外部 logging 配置接管，不要误以为该环境变量会全局生效。这样配置文件只表达当前真正生效的契约。
 
 ---
 
@@ -406,7 +451,7 @@ preflight 会检查 Python ≥ 3.10、`typesafe_sdk`/`httpx2` 和可解析的 `M
 ### 8.2 一键主流程
 
 ```bash
-# 最常用：完整翻译 + 收敛 + 合并 + notes-normalize + lint + gate
+# 最常用：完整翻译 + 收敛 + 终检修复 + 合并 + notes-normalize + proofread + qa-report + lint + gate
 ./scripts/translate_book.sh book.epub
 
 # 复用已经切分好的 input/chXX.md
@@ -418,10 +463,10 @@ preflight 会检查 Python ≥ 3.10、`typesafe_sdk`/`httpx2` 和可解析的 `M
 # 只跑流程，不调用真实 LLM；split 仍会执行
 ./scripts/translate_book.sh book.epub --dry-run
 
-# 已有 final.json，只做收口：consolidate → 图谱 → finalize → merge → lint → gate
+# 已有 final.json，只做收口：consolidate → 图谱 → finalize → book-repair → merge → notes-normalize → proofread → qa-report → lint → gate
 ./scripts/translate_book.sh --merge-only
 
-# 清理中间产物（必须在 gate 之后；脚本内部 --clean 已按此顺序执行）
+# 清理中间产物（仅在 gate 全绿后执行；gate 失败时保留证据）
 ./scripts/translate_book.sh book.epub --clean
 
 # 只清理旧中间产物，不翻译
@@ -436,7 +481,7 @@ preflight 会检查 Python ≥ 3.10、`typesafe_sdk`/`httpx2` 和可解析的 `M
 | `--dry-run` | 使用 mock 后端；不消耗模型额度，gate 跳过 |
 | `--skip-epub` | 不转换输入，直接使用现有 `input/ch*.md` |
 | `--reset` | 删除历史 DB/output，重新开始 |
-| `--clean` | gate 后清理 raw/literary/critic 等中间文件；保留 final 与 DB |
+| `--clean` | gate 全绿后清理 raw/literary/critic 等中间文件；gate 失败时自动跳过；保留 final 与 DB |
 | `--clean-only` | 独立清理中间文件，不运行翻译 |
 | `--merge-only` | 不翻译，直接收口已有 finals |
 | `--no-normalize` | 跳过 finalize 样式规范化 |
@@ -468,7 +513,9 @@ python3 -m src.main story-graph-query --query "杰西卡如何成为圣母？" -
 # 决策收敛与成书收口
 python3 -m src.main consolidate --max-rounds 3
 python3 -m src.main finalize --apply
-./scripts/translate_book.sh --merge-only      # 合并 + notes-normalize + lint + gate
+python3 -m src.main book-repair --apply      # 仅做有证据的全书终检修复
+./scripts/translate_book.sh --merge-only      # 修复 + 合并 + notes-normalize + proofread + qa-report + lint + gate
+python3 -m src.main proofread --apply        # 仅做机械排错的安全修复
 
 # 诊断与交付
 python3 -m src.main lint
@@ -487,15 +534,20 @@ python3 scripts/build_epub.py --out output/book.epub
 | `pipeline --fix-from-review` | 读取 `review_dirty.json`，二次校验锚句后定向重跑 P0 chunk |
 | `consolidate --max-rounds N` | 消费 pending backtrack，收敛 DIRTY；未收敛返回非零 |
 | `finalize --apply` | 统一成书引号/脚注/策略元语 |
+| `book-repair [--apply]` | 全书证据门控修复；默认只报告，`--apply` 才写 final 并生成哈希 manifest；`--verify` 只复核凭证 |
 | `notes-normalize --apply` | 注释去重、孤儿改锚、顺编号 |
-| `lint` / `gate` | 成书格式检查；八项交付不变量检查 |
+| `proofread [--apply]` | 成书机械排错；默认只报告，`--apply` 仅删拼接残留标题/不可见字符 |
+| `lint` / `gate` | 成书格式检查；十一项交付不变量检查（含 proofread 与 book-repair） |
 | `style-profile [--deep]` | 抽样或全书深读生成/升级 `book_profile.json` |
 | `story-graph` | 确定性重建实体/场景/叙事图；`--require-answerable` 不可答时退出 2 |
 | `story-graph-query` | 只读场景检索、注记匹配、DPP 重排、评测与 trace |
 | `setup-payoff-audit` | 只读候选审计；加 `--llm --l2 --apply` 才受控提升已验证配对 |
 | `editor_review.py --global` | 全书弧线审读；`--review-dirty` 生成可机械修复的 P0 清单 |
 | `editor_review.py --global --retrieval` | 可选注入有界跨章证据；默认关闭，A/B 未显示稳定收益 |
-| `requeue --chapter chXX [--force]` | 将 PF 块放回 DIRTY；消耗 `pf_requeue_max` 预算 |
+| `requeue --chapter chXX [--chunks ...] [--from-ledger] [--force]` | 将指定/账本记录的 PF 块放回 DIRTY；消耗 `pf_requeue_max` 预算 |
+| `rescue [--chapter chXX / --all] [--apply] [--reset-rescue-budget]` | 扫描 PF/FAILED/DIRTY/fallback final；默认只读，`--apply` 执行定向救援；`--reset-rescue-budget` 仅在算法升级后受控复位目标章未完成块的救援/重试预算 |
+| `qa-report` | 从当前 final 重建机器可核验的 QA_REPORT；写命令受单实例锁保护 |
+| `recalibrate-critic --all [--chunks ...] [--force] [--apply]` | 对现有 final 重跑校准裁决并回写 critic 报告；默认只读，`--apply` 才写回，报告写 `output/recalibrate_critic_report.json` |
 | `drift-audit` | 章级语域/句长漂移诊断；`--jev` 是历史参数名，现走 System One 窗口检查 |
 | `golden` / `golden-gate [--ab]` | Golden Set 跑分、模型×effort A/B、人工基线动态门禁 |
 | `golden --judgment-ab --chapter chXX` | 只比较判断层注记 off/on，不乘入模型矩阵 |
@@ -507,7 +559,7 @@ python3 scripts/build_epub.py --out output/book.epub
 python3 -m pytest -q tests/
 
 # 重点契约
-python3 -m pytest -q tests/test_round119_mirror_parity.py
+python3 -m pytest -q tests/test_round119_mirror_parity.py tests/test_round154_*.py tests/test_round156_*.py
 python3 -m pytest -q tests/test_round131_*.py tests/test_round145_*.py
 
 # 修改散装代码后
@@ -519,7 +571,7 @@ python3 scripts/sync_book_lint_mirror.py --check
 python3 -c "import yaml; yaml.safe_load(open('config.yaml', encoding='utf-8'))"
 ```
 
-CI 使用 Python 3.10 和 3.13 两个解释器跑同一套测试；`TestPython310SyntaxCompat` 只检查语法，因此新增代码还应避免依赖仅某个解释器环境里偶然存在的包。真实付费模型 A/B 必须保留报告并区分 mock、legacy、校准 System One 的结果。
+`build_integrated.py` 在生成和 `--check` 时都会做 symtable 自由名扫描：任何“语法合法但函数体引用了未定义全局名”的缺口都会直接失败，不再只比较字节。CI 使用 Python 3.10 和 3.13 两个解释器跑同一套测试；`TestPython310SyntaxCompat` 只检查语法，因此新增代码还应避免依赖仅某个解释器环境里偶然存在的包。真实付费模型 A/B 必须保留报告并区分 mock、legacy、校准 System One 的结果。
 
 ---
 
@@ -559,18 +611,27 @@ CI 使用 Python 3.10 和 3.13 两个解释器跑同一套测试；`TestPython31
 
 ### 10.1 fallback 与 PERMANENTLY_FAILED
 
-质量重试耗尽时，pipeline 会把当时的最佳版本写入 final，并标记 `fallback=True`。这保证“已有产出不丢”，但该 chunk 会进入 `PERMANENTLY_FAILED`，gate ③ 通常不会让整书通过。之后可以通过：
+质量重试耗尽时，pipeline 会把当时的最佳版本写入 final，并标记 `fallback=True`。这保证“已有产出不丢”，但 fallback 不是可交付稿：
 
-- 后续决策回溯或 `consolidate` 触发受控重跑；
-- `requeue --chapter chXX` / `requeue --force` 把 PF 恢复为 DIRTY；
-- 终审 `review_dirty` 只对结构 P0 做定向修复；
-- `version_merit` 在重跑失败时恢复旧备份。
+- 本章下一次 `pipeline` 运行会自动扫描 PF 和 fallback final，按 `pipeline.rescue` 预算进入定向救援；
+- 优先复用 raw/literary 从 `AUDITING`/`REWRITING_LITERARY` 续跑，预算用尽才整块重跑，二者都耗尽才保持 PF；
+- 失败分类、续跑阶段、分数、critic backend 和结果写入 `output/rescue/failure_ledger.jsonl`，`rescue_report.md` 汇总根因 cohort；
+- 手动入口是 `rescue --chapter chXX --apply` 或 `rescue --all --apply`；`requeue --chunks ... --from-ledger` 可只恢复指定块；
+- 终审 `review_dirty` 只对结构 P0 做定向修复；`version_merit` 在重跑失败时恢复旧备份。
 
-因此，一次章节运行中的部分 fallback 不是“最终判决”；但也不能把 fallback 当完成品交付。
+因此，一次章节运行中的部分 fallback 不是“最终判决”，但也不能把 fallback 当完成品交付。只要 final 仍带 fallback/quality_waived，gate ③/⑨ 就会让整书失败；lint 或校准检查不会把降级稿“修成”通过，也不会替代 ⑨ 的硬失败。
 
-### 10.2 零人工审核的前提
+### 10.2 自动门禁能保证什么
 
-本项目追求尽量少的人工干预，但这要求 gate 真的能发现降级：
+`gate` 全绿证明的是交付不变量，不是文学质量：
+
+- 每个 final 有状态机、source 证据、备份和哈希记录，成书可由 finals 重建；
+- 没有 fallback、未校准冒充、阻断性机械错误、待修全书问题或陈旧修复凭证；
+- 任一硬约束失败都会阻止交付，不能以“队列看起来跑完”或进程退出码代替。
+
+它并不证明文风成熟、脚注安排合理、人物声音统一，也不证明每条 legacy critic 报告都绑定了最终字节。warning 不是失败项时仍可能保留在 `book_lint`、`proofread` 或 `unbound` 证据中，必须按报告人工判断。
+
+因此，本项目追求“少人工干预”的边界是**可交付的机械候选稿**；这不等于可以跳过文学定稿。若要守住自动链路，仍需遵守：
 
 - 不能以“进程退出 0”替代“交付成功”；
 - 不能让 mock/openai_compat/legacy 冒充校准 System One；
@@ -579,7 +640,9 @@ CI 使用 Python 3.10 和 3.13 两个解释器跑同一套测试；`TestPython31
 
 ### 10.3 什么时候需要人工介入
 
-以下情况建议人工检查而不是继续自动重跑：转换审计覆盖率异常、实体 registry 硬冲突持续不收敛、gate ⑧ 校准占比低于阈值、连续多章 fallback、终审锚句无法唯一映射、故事图 alias 缺口持续扩大。相关报告都在 `output/` 与 `input/`，且带时间/路径信息。
+以下情况建议人工检查而不是继续自动重跑：转换审计覆盖率异常、实体 registry 硬冲突持续不收敛、gate ⑧ 校准占比低于阈值或出现 `stale` 证据、连续多章 fallback、终审锚句无法唯一映射、故事图 alias 缺口持续扩大，以及 gate ⑩ 报告了无法由安全规则自动修复的编码/结构错误。相关报告都在 `output/` 与 `input/`，且带时间/路径信息。
+
+即使没有上述硬失败，只要目标是文学出版而非内部候选稿，仍需人工双语抽读，重点检查叙述声音、翻译腔、解释性脚注密度、双关与诗性损失、章节标题/编号制式以及跨章人物称谓。机器只能给出证据和告警，不能替代这一层判断。
 
 ---
 
@@ -587,7 +650,7 @@ CI 使用 Python 3.10 和 3.13 两个解释器跑同一套测试；`TestPython31
 
 ### 人类研究者
 
-- 若维护者保留了本地研究笔记，可查阅 `docs/PLAN_round131_global_judgment_layer.md`、`docs/ROUND142_SAG2_RESEARCH.md` 和 `docs/ROUND131_AUTO_ONTOLOGY_NOTES.md`；这些 `docs/*.md` 默认不入库；
+- 若维护者保留了本地研究笔记，可查阅 `docs/PLAN_round131_global_judgment_layer.md`、`docs/ROUND142_SAG2_RESEARCH.md` 和 `docs/ROUND131_AUTO_ONTOLOGY_NOTES.md`；研究计划/审计说明默认不入库，已跟踪的 `docs/probes/**/*.md` 是 A/B 报告例外；
 - 从已跟踪的 `docs/probes/` 看真实付费模型的 A/B 报告；
 - 把“生成质量”“判断可信度”“一致性治理”“交付不变量”分开评价，避免用单一 BLEU/风格分掩盖系统性问题。
 
@@ -610,4 +673,4 @@ CI 使用 Python 3.10 和 3.13 两个解释器跑同一套测试；`TestPython31
 
 ---
 
-**一句话总结：模型提出译文，代码保存事实；判断层提供上下文，交付 gate 决定结果。**
+**一句话总结：模型提出译文，代码保存事实；判断层提供上下文，交付 gate 决定能否交付。gate 不判断文学是否定稿。**

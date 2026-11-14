@@ -59,7 +59,8 @@ lxml>=4.9.0
 # ===========================
 # 备注
 # ===========================
-# 1. 核心管线只需：pyyaml, requests, psutil, json-repair（详见 requirements-core.txt）
+# 1. 核心管线运行时需：pyyaml, requests, psutil, json-repair（详见 requirements-core.txt）
+# 2. System One 判断后端另需：typesafe-sdk, httpx2（生产默认启用，故在 core 中声明）
 # 3. EPUB 预处理需：ebooklib, beautifulsoup4, lxml
 # 4. 标注为 # 的依赖均为可选，未启用功能
 # 5. 生产部署建议锁定版本：pip freeze > requirements.lock

@@ -7,6 +7,8 @@ from src.book_lint import (
     _chapter_note_dupes,
     _note_anchor_stop,
     _note_is_dup,
+    _note_keys_compatible,
+    _note_merge_key,
     lint_book,
     normalize_chapter_notes,
     normalize_notes_document,
@@ -91,8 +93,63 @@ def test_orphan_relocation_reaches_duplicate_fixed_point():
     new, ch, _ = normalize_chapter_notes(body, 1)
     assert ch["dangling_refs_removed"] == 1
     assert ch["md_relocated"] == 1
-    assert ch["merged_dups"] == 1
+    # 两条注虽然共享材料/产地信息，但显式词条分别是“克里姆克尔纤维”
+    # 与“胡富藤”，不能在缺少双语别名证据时合并；保留两条完整注释，
+    # 同时确保重复检测与归一化使用同一兼容性口径。
+    assert ch["merged_dups"] == 0
     assert _chapter_note_dupes(new) == []
+    assert normalize_chapter_notes(new, 1)[0] == new
+
+
+def test_distinct_headwords_are_not_merged_by_shared_context():
+    body = (
+        "正文提到保罗[^a]与圣母[^b]，叙事内容足够长以便通过注释扫描。\n\n"
+        "[^a]: “保罗-穆阿迪布”是保罗·厄崔迪的姓名与宗教称号的合称；"
+        "“圣母”是贝尼·杰瑟里特姐妹会高阶成员的尊称。\n\n"
+        "[^b]: **圣母**：贝尼·杰瑟里特姐妹会高阶女性成员的敬称；此处指杰西卡。\n"
+    )
+    new, changes, _ = normalize_chapter_notes(body, 1)
+
+    assert changes["merged_dups"] == 0
+    assert "保罗-穆阿迪布" in new
+    assert "**圣母**" in new
+
+
+def test_chinese_concept_bridge_cannot_merge_distinct_notes():
+    sisters = ("“贝尼·杰瑟里特姐妹会”是由女性组成的神秘修会，成员彼此以姐妹相称；"
+               "“尊母”是其中的高阶成员称号。")
+    reverend_mother = ("**尊母**：贝尼·杰瑟里特姐妹会中担任领袖与导师的女性，"
+                       "其训练涵盖预知术。")
+    assert not _note_keys_compatible(
+        sisters, reverend_mother,
+        _note_merge_key(sisters), _note_merge_key(reverend_mother))
+    assert _note_keys_compatible(
+        WHITING_A, WHITING_B,
+        _note_merge_key(WHITING_A), _note_merge_key(WHITING_B))
+
+
+def test_cluster_bridge_cannot_collapse_a_third_headword():
+    first = (
+        "**甲一（alpha）**：甲一（alpha）是用于测试的一组术语；本条注释说明二者的关系、"
+        "用法和区别，并补充足够长的解释，以便与另外两条注释形成内容相似但身份不同的"
+        "测试样例；这一条刻意写得更长，以保证聚类时保留不含后续桥接词条的版本。")
+    bridge = (
+        "**alpha（甲一）**：alpha（甲一）是用于测试的一组术语；本条还解释丙三（alpha）"
+        "这组术语的关系、用法和区别，并补充足够长的解释，以便形成相似样例。")
+    third = (
+        "**丙三（alpha）**：丙三（alpha）是用于测试的一组术语；本条注释说明二者的关系、"
+        "用法和区别，并补充足够长的解释，以便与另外两条注释形成内容相似但身份不同的测试样例。")
+    body = (
+        "正文提到甲一[^a]、alpha[^b] 与丙三[^c]，这段叙事足够长以通过注释扫描。\n\n"
+        f"[^a]: {first}\n\n[^b]: {bridge}\n\n[^c]: {third}\n"
+    )
+
+    new, changes, _ = normalize_chapter_notes(body, 1)
+
+    assert changes["merged_dups"] == 1
+    assert new.count("[^1]") == 3
+    assert new.count("[^2]") == 2
+    assert "**丙三（alpha）**" in new
     assert normalize_chapter_notes(new, 1)[0] == new
 
 

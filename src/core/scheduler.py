@@ -156,6 +156,19 @@ class TaskScheduler:
             self.conn.commit()
         except sqlite3.OperationalError:
             pass
+
+        # Round 147: 定向救援预算与续跑阶段。rescue_attempts 记录 cheap-first
+        # 救援次数；rescue_stage 仅在 DIRTY 队列中短暂存在，批处理入口消费后清空。
+        try:
+            cursor.execute('ALTER TABLE chunk_tasks ADD COLUMN rescue_attempts INTEGER DEFAULT 0')
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute('ALTER TABLE chunk_tasks ADD COLUMN rescue_stage TEXT')
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
         
         # 批处理支持索引
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_state ON chunk_tasks(state)')
@@ -354,6 +367,38 @@ class TaskScheduler:
             return cursor.rowcount > 0
         except sqlite3.OperationalError:
             return False
+
+    def reset_rescue_budget(self, chapter_id: str,
+                            chunk_ids: Optional[List[str]] = None) -> List[str]:
+        """Round 148: 复位指定章节/块的救援与执行预算（仅用于算法升级后的受控复活）。
+
+        不改变任务状态，只清空救援计数、普通重试计数与旧 override；调用方
+        仍需经过 _auto_rescue_existing_failures / queue_rescue 的正常门禁。
+        """
+        cursor = self.conn.cursor()
+        params: List[object] = [chapter_id]
+        sql = "SELECT chunk_id FROM chunk_tasks WHERE chapter_id = ?"
+        if chunk_ids:
+            placeholders = ",".join("?" for _ in chunk_ids)
+            sql += f" AND chunk_id IN ({placeholders})"
+            params.extend(chunk_ids)
+        else:
+            sql += " AND state != ?"
+            params.append(TaskState.COMPLETED.value)
+        cursor.execute(sql, tuple(params))
+        targets = [str(row[0]) for row in cursor.fetchall()]
+        if not targets:
+            return []
+        ph = ",".join("?" for _ in targets)
+        cursor.execute(f'''
+            UPDATE chunk_tasks
+            SET rescue_attempts = 0, pf_requeues = 0, retries = 0,
+                quality_retries = 0, retry_effort_overrides = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE chunk_id IN ({ph})
+        ''', tuple(targets))
+        self.conn.commit()
+        return targets
 
     def batch_update_state(self, chunk_ids: List[str], new_state: TaskState, error_msgs: Dict[str, str] = None, quality_retry: bool = False, reset_counters: bool = False):
         """批量更新任务状态 - 减少数据库往返开销
@@ -578,6 +623,73 @@ class TaskScheduler:
             ''', (TaskState.DIRTY.value,) + tuple(requeued))
         self.conn.commit()
         return {"requeued": requeued, "over_cap": over_cap, "skipped": skipped}
+
+    def queue_rescue(self, chunk_id: str, resume_stage: str, reason: str,
+                     increment_attempt: bool = True,
+                     increment_full_requeue: bool = False,
+                     reset_counters: bool = True) -> Dict:
+        """Round 147: 把任意非 COMPLETED 块送入定向救援队列（DIRTY + stage）。
+
+        与普通 requeue 不同，本方法保留 rescue_stage 供 _process_dirty_batch
+        决定从 AUDITING / REWRITING / TRANSLATING_RAW 续跑，而不是每次回到术语提取。
+        这是受控状态迁移：允许 PF → DIRTY，但预算由调用方（pipeline）校验。
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT state, COALESCE(rescue_attempts, 0), COALESCE(pf_requeues, 0) '
+            'FROM chunk_tasks WHERE chunk_id = ?', (chunk_id,))
+        row = cursor.fetchone()
+        if not row:
+            return {"ok": False, "reason": "missing", "attempt": 0, "full_requeues": 0}
+        attempt = int(row[1] or 0)
+        full_requeues = int(row[2] or 0)
+        attempt_new = attempt + (1 if increment_attempt else 0)
+        full_new = full_requeues + (1 if increment_full_requeue else 0)
+        if reset_counters:
+            cursor.execute('''
+                UPDATE chunk_tasks
+                SET state = ?, rescue_stage = ?, rescue_attempts = ?,
+                    pf_requeues = ?, retries = 0, quality_retries = 0,
+                    last_error = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE chunk_id = ?
+            ''', (TaskState.DIRTY.value, resume_stage, attempt_new, full_new,
+                  reason, chunk_id))
+        else:
+            cursor.execute('''
+                UPDATE chunk_tasks
+                SET state = ?, rescue_stage = ?, rescue_attempts = ?,
+                    pf_requeues = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE chunk_id = ?
+            ''', (TaskState.DIRTY.value, resume_stage, attempt_new, full_new,
+                  reason, chunk_id))
+        self.conn.commit()
+        return {
+            "ok": True,
+            "attempt": attempt_new,
+            "full_requeues": full_new,
+            "resume_stage": resume_stage,
+        }
+
+    def stage_rescue_task(self, chunk_id: str, target_state: TaskState,
+                          quality_retries: Optional[int] = None,
+                          last_error: Optional[str] = None) -> bool:
+        """把 DIRTY(rescue_stage) 落到具体执行阶段，并清空一次性 stage 标记。"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT state, rescue_stage FROM chunk_tasks WHERE chunk_id = ?',
+            (chunk_id,))
+        row = cursor.fetchone()
+        if not row or row[0] != TaskState.DIRTY.value or not row[1]:
+            return False
+        cursor.execute('''
+            UPDATE chunk_tasks
+            SET state = ?, rescue_stage = NULL,
+                quality_retries = COALESCE(?, quality_retries),
+                last_error = COALESCE(?, last_error), updated_at = CURRENT_TIMESTAMP
+            WHERE chunk_id = ?
+        ''', (target_state.value, quality_retries, last_error, chunk_id))
+        self.conn.commit()
+        return True
 
     def find_chunks_containing(
         self,

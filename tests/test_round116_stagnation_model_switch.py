@@ -140,7 +140,7 @@ class TestStagnationModelSwitch:
         from src.core.scheduler import TaskState
         p.scheduler.update_task_state.assert_any_call(
             "ch_test_chunk000", TaskState.PERMANENTLY_FAILED,
-            error_msg="rewriter 字节停滞 retry=1",
+            error_msg="[REWRITER_STAGNATED] rewriter 字节停滞 retry=1",
         )
 
     def test_switch_disabled_keeps_old_behavior(self, tmp_path, no_switch_cfg):
@@ -153,7 +153,7 @@ class TestStagnationModelSwitch:
         from src.core.scheduler import TaskState
         p.scheduler.update_task_state.assert_any_call(
             "ch_test_chunk000", TaskState.PERMANENTLY_FAILED,
-            error_msg="rewriter 字节停滞 retry=1",
+            error_msg="[REWRITER_STAGNATED] rewriter 字节停滞 retry=1",
         )
 
     def test_force_fallback_branch_switches_first(self, tmp_path, switch_and_stagnation_cfg):

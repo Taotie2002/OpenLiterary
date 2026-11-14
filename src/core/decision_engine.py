@@ -667,6 +667,15 @@ def build_name_unification_maps(conn, text: str = "", preferred_forms: Optional[
         for v in vns:
             if not isinstance(v, str) or not v:
                 continue
+            # Round 149: 角色/语境称谓不是人名异体，绝不能驱动正文 replace。
+            # 旧库把「真言者」「尊母」挂在 Mohiam 的 variant_names 下，导致
+            # build_name_unification_maps 生成 真言者→盖乌斯、尊母→海伦，
+            # 把普通称谓与 Jessica 一并改坏。保留为 guard/context 即可。
+            if (canonical_is_title_only(v)
+                    or _is_context_reference_word(v)
+                    or v in _ZH_ROLE_WORDS):
+                guards.add(_r134_strip_parens(v))
+                continue
             cls = classify_entity_variant(v, w)
             guards.add(_r134_strip_parens(v))
             if cls["policy"] == "replace":
@@ -987,6 +996,12 @@ def apply_name_unification(text: str, maps: Dict[str, Any]) -> Tuple[str, Dict[s
             got = m.group(0)
             if got == _t:
                 return got
+            # 防「短形吃长形」：variant 是 canonical 的前缀时，不能把
+            # 「雷托公爵」内部的「雷托」再替换成「雷托公爵」。
+            if _t.startswith(got) and len(_t) > len(got):
+                tail = _t[len(got):]
+                if text[m.end():m.end() + len(tail)] == tail:
+                    return got
             counter["n"] += 1
             return _t
 
@@ -998,8 +1013,14 @@ def apply_name_unification(text: str, maps: Dict[str, Any]) -> Tuple[str, Dict[s
         dst = maps["tokens"][src]
         if not src or src == dst or src not in text:
             continue
-        n = text.count(src)
-        text = text.replace(src, dst)
+        if dst.startswith(src) and len(dst) > len(src):
+            tail = re.escape(dst[len(src):])
+            pat = re.compile(re.escape(src) + r"(?!" + tail + r")")
+            n = len(pat.findall(text))
+            text = pat.sub(dst, text)
+        else:
+            n = text.count(src)
+            text = text.replace(src, dst)
         _record("tokens", src, dst, n)
     return text, stats
 
@@ -1108,6 +1129,9 @@ _ZH_ROLE_WORDS = frozenset({
     "祖父", "外祖父", "祖母", "外祖母", "父亲", "母亲", "哥哥", "弟弟",
     "姐姐", "妹妹", "叔叔", "舅舅", "阿姨", "姨妈", "姑姑", "伯父", "伯母",
     "儿子", "女儿", "丈夫", "妻子", "遗孀", "继承人", "圣者", "圣人",
+    # Round 149: 修会职衔不是人名异体（Dune 实锤：真言者/尊母曾被统一成
+    # 盖乌斯/海伦，污染全书）。只允许作为 context/guard，禁止 replace。
+    "真言者", "尊母",
 })
 
 # 中文泛指修饰/前缀（老/大/小…）
@@ -2008,6 +2032,110 @@ def _preferred_alias_root(alias_norm: str, owners, decision_targets: Dict[str, s
     if len(roots) == 1:
         return roots.pop()
     return None
+
+
+def _repair_names_related(a: str, b: str) -> bool:
+    """Conservative same-person test for repairing a prior unify merge."""
+    a = (a or "").strip()
+    b = (b or "").strip()
+    if not a or not b:
+        return False
+    if canonical_names_related(a, b) or a in b or b in a:
+        return True
+    ca, cb = set(a), set(b)
+    if not ca or not cb:
+        return False
+    return (len(ca & cb) / max(1, len(ca | cb))) >= 0.45
+
+
+def repair_false_unify_merges(conn, dry_run: bool = True) -> Dict[str, Any]:
+    """Undo unify merges that joined two unrelated proper-name entities.
+
+    Round 134's unify pass can inherit a polluted source name from a prior
+    extraction and demote a genuinely separate entity.  The dangerous case is
+    narrow and mechanically detectable: the demoted row owns proper source
+    names, the winner owns proper source names, the two sets are disjoint, and
+    the canonical names are not related by identity tokens, containment, or
+    high character overlap.  Legitimate short forms (卡拉丹 → 卡拉丹城堡,
+    拉班 → 野兽拉班, 曾苏尼 → 禅苏尼) fail at least one of those tests.
+
+    On repair, the demoted row becomes active again and its canonical/variant
+    forms are removed from the winner's variant whitelist.  Source names stay
+    on their original row; no aliases are copied across entities.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+    if not {"source_names", "variant_names", "review_reason",
+            "pending_review"} <= cols:
+        return {"rows": 0, "repaired": 0, "changes": []}
+
+    rows = conn.execute(
+        "SELECT id, canonical_name, source_names, variant_names, "
+        "review_reason, pending_review FROM entity_registry"
+    ).fetchall()
+    by_canon: Dict[str, Dict[str, Any]] = {}
+    for rid, canon, src_json, var_json, reason, pending in rows:
+        by_canon[str(canon)] = {
+            "id": rid,
+            "canonical": str(canon),
+            "source_names": robust_json_loads(src_json, expected_type=list) if src_json else [],
+            "variant_names": robust_json_loads(var_json, expected_type=list) if var_json else [],
+            "review_reason": reason or "",
+            "pending_review": int(pending or 0),
+        }
+
+    changes = []
+    for canon, row in by_canon.items():
+        if row["pending_review"] != 1:
+            continue
+        m = re.search(r"Round134 unify:.*并入\s*(\S+)", row["review_reason"])
+        if not m:
+            continue
+        winner = m.group(1)
+        wrow = by_canon.get(winner)
+        if not wrow:
+            continue
+        own_src = {
+            _alias_norm(x) for x in row["source_names"]
+            if isinstance(x, str) and is_proper_entity_alias(x)
+        }
+        win_src = {
+            _alias_norm(x) for x in wrow["source_names"]
+            if isinstance(x, str) and is_proper_entity_alias(x)
+        }
+        if not own_src or not win_src or (own_src & win_src):
+            continue
+        if _repair_names_related(canon, winner):
+            continue
+
+        demoted_forms = {canon, *[v for v in row["variant_names"] if isinstance(v, str)]}
+        new_win_vars = [
+            v for v in wrow["variant_names"]
+            if not (isinstance(v, str) and v in demoted_forms)
+        ]
+        change = {
+            "canonical": canon,
+            "winner": winner,
+            "source_names": sorted(own_src),
+            "winner_source_names": sorted(win_src),
+            "removed_from_winner_variants": sorted(
+                {v for v in wrow["variant_names"] if v in demoted_forms}
+            ),
+        }
+        changes.append(change)
+        if not dry_run:
+            conn.execute(
+                "UPDATE entity_registry SET pending_review=0, "
+                "review_reason=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (f"Round149 unmerge: 独立实体，已从 {winner} 拆回", row["id"]),
+            )
+            conn.execute(
+                "UPDATE entity_registry SET variant_names=?, "
+                "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (json.dumps(new_win_vars, ensure_ascii=False), wrow["id"]),
+            )
+    if not dry_run and changes:
+        conn.commit()
+    return {"rows": len(by_canon), "repaired": len(changes), "changes": changes}
 
 
 def sanitize_entity_registry_aliases(conn, dry_run: bool = True) -> Dict[str, Any]:

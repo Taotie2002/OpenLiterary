@@ -213,6 +213,7 @@ Schema 要求：
         *,
         entity_registry: Optional[Dict] = None,
         entity_variants: Optional[Dict[str, List[str]]] = None,
+        allow_legacy_fallback: bool = True,
     ) -> Dict[str, Any]:
         """多维度文学审计
 
@@ -224,6 +225,8 @@ Schema 要求：
             entity_variants: 【Round 61】可选，{source_name: [variant_zh, ...]}。提供时，
                 critic 会附加 per-entity atomic Noul questions（Jev 在更小 context 上
                 单独评估每个实体一致性，结果通过 max 聚合覆盖 entity_consistency 维度）
+            allow_legacy_fallback: False 时，System One 路径失败直接抛出，不调用旧的
+                LLM 六维评分路径。交付前只读重审使用此模式，避免非校准报告与额外成本。
         """
         # ───── T2 typesafe-ai 路径 ─────
         from src.judges.typesafe_backend import FallbackBackend, JevBackend, OpenAICompatBackend, MockBackend
@@ -402,6 +405,8 @@ Schema 要求：
             # Round 130: 内层引号用单引号——f-string 内嵌套同类引号需 PEP 701（3.12+），
             # README 声明支持 >=3.10，此处曾致 3.10 生产解释器全库 SyntaxError。
             print(f"⚠️ [Jev] typesafe 路径失败 [{diag['category']}]: {diag['msg']} → {diag['action']}", file=sys.stderr)
+            if not allow_legacy_fallback:
+                raise
 
         # ───── 旧 LLM 路径（fallback） ─────
         print(f"🧐 [Critic Agent] 正在对 {chunk_id} 进行多维度文学审计...")

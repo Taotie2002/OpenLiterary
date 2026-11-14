@@ -166,7 +166,8 @@ _BOOK_LINT_FUNCS = [
     '_book_config_for_root', '_profile_title_zh', '_title_from_headings',
     '_infer_title_zh', 'book_title_zh', 'resolve_book_output_path',
     '_note_norm', '_note_key', '_note_merge_key', '_note_anchor_stop',
-    '_note_is_dup', '_note_terms', '_note_candidates',
+    '_note_is_dup', '_note_terms', '_note_candidates', '_note_key_parts',
+    '_note_mentions_alias', '_note_keys_compatible',
     '_group_title_units', '_split_h1_sections', '_normalize_chapter_notes_once',
     'normalize_chapter_notes',
     'normalize_notes_document', 'notes_normalize_outputs', '_chapter_note_dupes',
@@ -183,6 +184,16 @@ _BOOK_LINT_CONSTS = [
     '_NOTE_MERGE_STOP',
     '_BOOK_GENERIC_TITLE_RE', '_BOOK_NON_TITLE_RE', '_BOOK_FILENAME_MAX',
 ]
+
+
+def test_book_lint_mirror_manifest_covers_all_top_level_symbols():
+    import importlib.util
+    path = ROOT / 'scripts' / 'sync_book_lint_mirror.py'
+    spec = importlib.util.spec_from_file_location('sync_book_lint_mirror', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    source_names = module._top_level_names(ROOT / 'src' / 'book_lint.py')
+    assert source_names == set(module.FUNCS + module.CONSTS)
 
 
 def _extract_assign(path: str, name: str) -> str:

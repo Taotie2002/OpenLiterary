@@ -846,6 +846,7 @@ main() {
     log_info "一致性校验: $RUN_CONSISTENCY"
     log_info "允许不完整合并: $ALLOW_INCOMPLETE"
     log_info "样式规范化: $([[ "$NO_NORMALIZE" == "true" ]] && echo 跳过 || echo 启用)"
+    log_info "全书终检修复: 启用（finalize 后、merge 前，有证据才改）"
     log_info "========================================"
 
     cd "$PROJECT_ROOT"
@@ -878,6 +879,17 @@ main() {
                 exit $?
             else
                 log_err "部分章节翻译失败，继续合并（已产出的章节仍会被收录）"
+            fi
+        fi
+
+        # Round 147: 全书失败块救援。每章内已自动救援；这里收口上一轮遗留
+        # PF / 旧 safety-net fallback，预算仍由 pipeline.rescue 统一约束。
+        if [[ "$DRY_RUN" != "true" ]]; then
+            log_info "运行全书残余失败块救援 (rescue)..."
+            if run_cmd "$PYTHON" -m src.translator_agent rescue --apply --all; then
+                log_ok "rescue 完成（无剩余可救援块）"
+            else
+                log_warn "rescue 后仍有隔离失败块；继续进入 consolidate/gate，由门禁拦截"
             fi
         fi
     fi
@@ -933,6 +945,23 @@ except Exception:
         fi
     fi
 
+    # 2.7 全书终检修复（纯确定性，无 LLM）。
+    # 只修 source/raw/literary 能逐项证明的实体错位、机械可证的同位语污染、
+    # 已证实错误的注释定义，以及夹在可靠前后锚点之间的正文段漏译；每条改动
+    # 都有 final.json 备份和哈希 manifest。
+    # 未决高/严重风险必须让流程中止，不能把“检测到了”继续带到 merge。
+    log_info "运行全书终检修复 (book-repair)..."
+    if run_cmd "$PYTHON" -m src.translator_agent book-repair --apply; then
+        log_ok "全书终检修复通过（详见 output/book_repair_report.md）"
+    else
+        if [[ "$ALLOW_INCOMPLETE" == "true" ]]; then
+            log_warn "全书修复仍有未决问题（--allow-incomplete 放行；详见 output/book_repair_report.md）"
+        else
+            log_err "全书修复仍有待修/未决高危项，禁止合并（--allow-incomplete 可强放行）"
+            exit 1
+        fi
+    fi
+
     # 3. 合并输出
     if ! merge_output "$CHAPTERS_DIR"; then
         log_err "翻译产出残缺，流程中止（见上方缺失章节提示）。"
@@ -948,10 +977,28 @@ except Exception:
         exit 1
     fi
 
+    # 3.3 Round 155: 成书机械排错。只删除可证明非正文的拼接残留标题和
+    # 不可见字符；重复标点/括号/章节壳等问题只报告，由 gate ⑩ 硬拦截。
+    log_info "运行成书机械排错 (proofread)..."
+    if run_cmd "$PYTHON" -m src.translator_agent proofread --apply; then
+        log_ok "机械排错全绿（详见 output/proofread_report.md）"
+    else
+        log_warn "机械排错仍有阻断项；继续重建 QA/lint 报告，gate ⑩ 将硬拦截（详见 output/proofread_report.md）"
+    fi
+
+    # QA 必须在 final 集合稳定后重建。notes-normalize / proofread 只改
+    # merged 成书，不追改 final；这里仍按最终文件重算哈希，避免旧报告残留。
+    if [[ "$DRY_RUN" != "true" ]]; then
+        if ! run_cmd "$PYTHON" -m src.translator_agent qa-report; then
+            log_err "QA_REPORT 重建失败"
+            exit 1
+        fi
+    fi
+
     # 3.5 T5: 成书级 lint（finals + merged 双跑）
     log_info "运行成书级 lint..."
     if run_cmd "$PYTHON" -m src.translator_agent lint; then
-        log_ok "lint 全绿"
+        log_ok "lint 通过（警告不阻断；结论以 output/book_lint.md 为准）"
     else
         if [[ "$ALLOW_INCOMPLETE" == "true" ]]; then
             log_warn "lint 未通过（--allow-incomplete 放行；详见 output/book_lint.md）"
@@ -997,15 +1044,17 @@ except Exception:
     # 5. 清理中间产物（仅在 --clean 时）——必须在 gate 之后：
     # gate ⑧ 需要扫描 *_critic_report.json 的 _backend_path，先清理会让
     # 校准审计永远缺证。门禁失败时保留中间产物，便于定位。
-    if [[ "$CLEAN_INTERMEDIATE" == "true" ]]; then
+    if [[ "$CLEAN_INTERMEDIATE" == "true" && "$gate_ok" == "true" ]]; then
         clean_intermediate
+    elif [[ "$CLEAN_INTERMEDIATE" == "true" ]]; then
+        log_warn "gate 未通过：保留 raw/literary/critic 等中间产物，便于复跑诊断（跳过 --clean）"
     fi
 
     log_info "========================================"
     if [[ "$gate_ok" == "true" ]]; then
         log_ok "🎉 翻译全流程完成！"
     else
-        log_err "⛔ 交付门禁未通过（失败项见上方 gate 清单；报告: output/book_lint.md / output/pun_audit.md / input/_conversion_audit.md）"
+        log_err "⛔ 交付门禁未通过（失败项见上方 gate 清单；报告: output/book_lint.md / output/proofread_report.md / output/pun_audit.md / input/_conversion_audit.md）"
         [[ "$ALLOW_INCOMPLETE" == "true" ]] || exit 1
         log_warn "--allow-incomplete 放行：产出保留，请人工复核失败项"
     fi

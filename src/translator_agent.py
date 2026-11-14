@@ -7,7 +7,7 @@
 ║  用途：方便整体上传至会话式 AI（ChatGPT、Gemini 等）进行全量审计  ║
 ║                                                                ║
 ║  生成方式：python scripts/build_integrated.py                  ║
-║  事实源：  src/ 下散装模块（17 个 Python 文件）                  ║
+║  事实源：  src/ 下散装模块（不含本生成文件）                      ║
 ╚══════════════════════════════════════════════════════════════════╝
 
 目录：
@@ -25,6 +25,8 @@
   Section 11.5 — 译后命名一致性校正   (run_consistency_check, 子命令 consistency)
   Section 11.6 — typesafe-ai judges   (多原子原语 + verdict 合成 + 三级 fallback)
   Section 12 — 统一入口点            (split_input_to_chapters, 暴露 CLI 参数)
+  Section 13 — 镜像补全区            (book_lint / verse / 拆分器与判据辅助)
+  Section 13.6 — 判断层与图谱        (judgment_layer / story_graph / 深读剖面 / 全书修复)
 """
 
 import os
@@ -36,6 +38,7 @@ import random
 import gc
 import hashlib
 import difflib
+import importlib.util
 import tempfile
 import unicodedata
 import datetime as _dt
@@ -46,6 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import sqlite3
 import psutil
+import requests
 import threading
 from collections import Counter, OrderedDict
 from abc import ABC, abstractmethod
@@ -102,7 +106,7 @@ def print_banner():
            /____/
 
   SagaTrans — AI 文学语义编译系统  (单体聚合版)
-  共 13 个模块 | 用于全量代码审计 / 单文件部署
+  散装 src/ 聚合 | 用于全量代码审计 / 单文件部署
 """, file=sys.stderr)
 
 
@@ -415,6 +419,17 @@ class QuotaExhaustedError(RuntimeError):
     FallbackRoleAdapter 捕获后把该角色永久降级到 fallback 角色，避免整章翻译
     卡在单一模型的退避重试里（MiniMax 配额按 5 小时窗重置）。
     """
+
+
+
+class ContentSensitiveError(RuntimeError):
+    """Round 148: 上游内容审核拒绝（HTTP 422，典型为 input new_sensitive）。
+
+    这类错误是永久客户端拒绝：同一 provider + 同一 prompt 重试只会重复计费。
+    pipeline 捕获后应立即持久化换角色 override，而不是走普通 API 重试。
+    """
+
+    status_code = 422
 
 
 
@@ -743,6 +758,10 @@ class OpenAICompatibleAdapter(LLMAdapter):
                         )
                 # 429 是限流（属于 4xx 但应重试），其他 4xx 是客户端错误；5xx 由 raise_for_status 抛出后被外层重试逻辑捕获
                 if 400 <= response.status_code < 500 and response.status_code != 429:
+                    if response.status_code == 422 and _SENSITIVE_HINT_RE.search(response.text[:600]):
+                        raise ContentSensitiveError(
+                            f"API 客户端错误 422 (content_sensitive): {response.text[:200]}"
+                        )
                     raise RuntimeError(f"API 客户端错误 {response.status_code}: {response.text[:200]}")
                 response.raise_for_status()
                 self._consecutive_429 = 0
@@ -1089,6 +1108,19 @@ class TaskScheduler:
             self.conn.commit()
         except sqlite3.OperationalError:
             pass
+
+        # Round 147: 定向救援预算与续跑阶段。rescue_attempts 记录 cheap-first
+        # 救援次数；rescue_stage 仅在 DIRTY 队列中短暂存在，批处理入口消费后清空。
+        try:
+            cursor.execute('ALTER TABLE chunk_tasks ADD COLUMN rescue_attempts INTEGER DEFAULT 0')
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute('ALTER TABLE chunk_tasks ADD COLUMN rescue_stage TEXT')
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
         
         # 批处理支持索引
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_state ON chunk_tasks(state)')
@@ -1287,6 +1319,38 @@ class TaskScheduler:
             return cursor.rowcount > 0
         except sqlite3.OperationalError:
             return False
+
+    def reset_rescue_budget(self, chapter_id: str,
+                            chunk_ids: Optional[List[str]] = None) -> List[str]:
+        """Round 148: 复位指定章节/块的救援与执行预算（仅用于算法升级后的受控复活）。
+
+        不改变任务状态，只清空救援计数、普通重试计数与旧 override；调用方
+        仍需经过 _auto_rescue_existing_failures / queue_rescue 的正常门禁。
+        """
+        cursor = self.conn.cursor()
+        params: List[object] = [chapter_id]
+        sql = "SELECT chunk_id FROM chunk_tasks WHERE chapter_id = ?"
+        if chunk_ids:
+            placeholders = ",".join("?" for _ in chunk_ids)
+            sql += f" AND chunk_id IN ({placeholders})"
+            params.extend(chunk_ids)
+        else:
+            sql += " AND state != ?"
+            params.append(TaskState.COMPLETED.value)
+        cursor.execute(sql, tuple(params))
+        targets = [str(row[0]) for row in cursor.fetchall()]
+        if not targets:
+            return []
+        ph = ",".join("?" for _ in targets)
+        cursor.execute(f'''
+            UPDATE chunk_tasks
+            SET rescue_attempts = 0, pf_requeues = 0, retries = 0,
+                quality_retries = 0, retry_effort_overrides = NULL,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE chunk_id IN ({ph})
+        ''', tuple(targets))
+        self.conn.commit()
+        return targets
 
     def batch_update_state(self, chunk_ids: List[str], new_state: TaskState, error_msgs: Dict[str, str] = None, quality_retry: bool = False, reset_counters: bool = False):
         """批量更新任务状态 - 减少数据库往返开销
@@ -1511,6 +1575,73 @@ class TaskScheduler:
             ''', (TaskState.DIRTY.value,) + tuple(requeued))
         self.conn.commit()
         return {"requeued": requeued, "over_cap": over_cap, "skipped": skipped}
+
+    def queue_rescue(self, chunk_id: str, resume_stage: str, reason: str,
+                     increment_attempt: bool = True,
+                     increment_full_requeue: bool = False,
+                     reset_counters: bool = True) -> Dict:
+        """Round 147: 把任意非 COMPLETED 块送入定向救援队列（DIRTY + stage）。
+
+        与普通 requeue 不同，本方法保留 rescue_stage 供 _process_dirty_batch
+        决定从 AUDITING / REWRITING / TRANSLATING_RAW 续跑，而不是每次回到术语提取。
+        这是受控状态迁移：允许 PF → DIRTY，但预算由调用方（pipeline）校验。
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT state, COALESCE(rescue_attempts, 0), COALESCE(pf_requeues, 0) '
+            'FROM chunk_tasks WHERE chunk_id = ?', (chunk_id,))
+        row = cursor.fetchone()
+        if not row:
+            return {"ok": False, "reason": "missing", "attempt": 0, "full_requeues": 0}
+        attempt = int(row[1] or 0)
+        full_requeues = int(row[2] or 0)
+        attempt_new = attempt + (1 if increment_attempt else 0)
+        full_new = full_requeues + (1 if increment_full_requeue else 0)
+        if reset_counters:
+            cursor.execute('''
+                UPDATE chunk_tasks
+                SET state = ?, rescue_stage = ?, rescue_attempts = ?,
+                    pf_requeues = ?, retries = 0, quality_retries = 0,
+                    last_error = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE chunk_id = ?
+            ''', (TaskState.DIRTY.value, resume_stage, attempt_new, full_new,
+                  reason, chunk_id))
+        else:
+            cursor.execute('''
+                UPDATE chunk_tasks
+                SET state = ?, rescue_stage = ?, rescue_attempts = ?,
+                    pf_requeues = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE chunk_id = ?
+            ''', (TaskState.DIRTY.value, resume_stage, attempt_new, full_new,
+                  reason, chunk_id))
+        self.conn.commit()
+        return {
+            "ok": True,
+            "attempt": attempt_new,
+            "full_requeues": full_new,
+            "resume_stage": resume_stage,
+        }
+
+    def stage_rescue_task(self, chunk_id: str, target_state: TaskState,
+                          quality_retries: Optional[int] = None,
+                          last_error: Optional[str] = None) -> bool:
+        """把 DIRTY(rescue_stage) 落到具体执行阶段，并清空一次性 stage 标记。"""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            'SELECT state, rescue_stage FROM chunk_tasks WHERE chunk_id = ?',
+            (chunk_id,))
+        row = cursor.fetchone()
+        if not row or row[0] != TaskState.DIRTY.value or not row[1]:
+            return False
+        cursor.execute('''
+            UPDATE chunk_tasks
+            SET state = ?, rescue_stage = NULL,
+                quality_retries = COALESCE(?, quality_retries),
+                last_error = COALESCE(?, last_error), updated_at = CURRENT_TIMESTAMP
+            WHERE chunk_id = ?
+        ''', (target_state.value, quality_retries, last_error, chunk_id))
+        self.conn.commit()
+        return True
 
     def find_chunks_containing(
         self,
@@ -3761,6 +3892,7 @@ Schema 要求：
         *,
         entity_registry: Optional[Dict] = None,
         entity_variants: Optional[Dict[str, List[str]]] = None,
+        allow_legacy_fallback: bool = True,
     ) -> Dict[str, Any]:
         """多维度文学审计
 
@@ -3772,6 +3904,8 @@ Schema 要求：
             entity_variants: 【Round 61】可选，{source_name: [variant_zh, ...]}。提供时，
                 critic 会附加 per-entity atomic Noul questions（Jev 在更小 context 上
                 单独评估每个实体一致性，结果通过 max 聚合覆盖 entity_consistency 维度）
+            allow_legacy_fallback: False 时，System One 路径失败直接抛出，不调用旧的
+                LLM 六维评分路径。交付前只读重审使用此模式，避免非校准报告与额外成本。
         """
         # ───── T2 typesafe-ai 路径 ─────
         from src.judges.typesafe_backend import FallbackBackend, JevBackend, OpenAICompatBackend, MockBackend
@@ -3950,6 +4084,8 @@ Schema 要求：
             # Round 130: 内层引号用单引号——f-string 内嵌套同类引号需 PEP 701（3.12+），
             # README 声明支持 >=3.10，此处曾致 3.10 生产解释器全库 SyntaxError。
             print(f"⚠️ [Jev] typesafe 路径失败 [{diag['category']}]: {diag['msg']} → {diag['action']}", file=sys.stderr)
+            if not allow_legacy_fallback:
+                raise
 
         # ───── 旧 LLM 路径（fallback） ─────
         print(f"🧐 [Critic Agent] 正在对 {chunk_id} 进行多维度文学审计...")
@@ -4313,6 +4449,473 @@ reject_reason 中说明具体位置与改法。
         result["_backend_path"] = "legacy"
         return result
 
+
+
+
+
+
+# Section 6b — 失败块救援 / QA 证据 / 失败账本
+# ────────────────────────────────────────────────────────────────────
+
+RESCUE_SCHEMA_VERSION = 1
+QA_SCHEMA_VERSION = 1
+QA_JSON_BEGIN = "<!-- SAGATRANS_QA_JSON_BEGIN -->"
+QA_JSON_END = "<!-- SAGATRANS_QA_JSON_END -->"
+
+_API_MARKERS = (
+    "api_failure", "api 调用失败", "connection", "timeout", "timed out",
+    "rate limit", "quota", "429", "502", "503", "504", "no_content",
+    "仅推理", "无正文",
+)
+_SENSITIVE_MARKERS = (
+    "new_sensitive", "content_sensitive", "content policy", "content_policy",
+    "sensitive", "内容敏感", "敏感内容",
+)
+_CJK_MARKERS = ("cjk_retry_exhausted", "cjk 比例过低", "cjk=", "raw_not_chinese")
+_ENTITY_MARKERS = ("entity_violation", "实体一致性", "实体违规", "entity_hard_fail")
+_QUALITY_MARKERS = (
+    "audit_early_stop", "early_stop", "score_decline", "no_progress",
+    "stagnation", "stagnated", "质量重试耗尽", "max_quality_retries",
+    "safety_net_passed", "permanently_failed_after_max_retries",
+)
+_STRUCTURE_MARKERS = ("lint", "footnote", "脚注", "structure", "json 解析失败")
+
+
+def rescue_config() -> Dict[str, Any]:
+    """读取 pipeline.rescue，并补齐不影响旧配置的默认值。"""
+    raw = _config.get("pipeline.rescue", {}) or {}
+    cfg = dict(raw) if isinstance(raw, dict) else {}
+    cfg.setdefault("enabled", True)
+    cfg.setdefault("max_targeted_attempts", 2)
+    cfg.setdefault("max_full_requeues", 1)
+    cfg.setdefault("chapter_budget_seconds", 1800)
+    return cfg
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int_safe(value: Any, default: int) -> int:
+    return _as_int(value, default)
+
+
+def classify_failure(reason: str, stage: str = "") -> str:
+    """把多种历史错误文本归并为稳定的救援类别。"""
+    text = f"{stage or ''} {reason or ''}".lower()
+    if any(m in text for m in _SENSITIVE_MARKERS):
+        return "content_sensitive"
+    if any(m in text for m in _STRUCTURE_MARKERS):
+        return "structure"
+    if any(m in text for m in _CJK_MARKERS):
+        return "cjk"
+    if any(m in text for m in _ENTITY_MARKERS):
+        return "entity"
+    if any(m in text for m in _API_MARKERS):
+        return "api_or_no_content"
+    if any(m in text for m in _QUALITY_MARKERS):
+        return "quality"
+    return "unknown"
+
+
+def _artifact_exists(out_dir: Path, chunk_id: str, name: str) -> bool:
+    return (out_dir / f"{chunk_id}_{name}.json").exists()
+
+
+def recommended_resume_stage(task: Dict[str, Any], failure_class: str,
+                              out_dir: Path, attempt: int = 0) -> str:
+    """按 cheap-first 原则选择续跑阶段。
+
+    第一轮优先复用 raw/literary 重新审计；第二轮才重写润色；没有任何可用
+    中间产物时才回到直译/术语提取。这样评分/后端恢复类失败不会从零重跑。
+    """
+    cid = str(task.get("chunk_id") or "")
+    has_raw = _artifact_exists(out_dir, cid, "raw")
+    has_lit = _artifact_exists(out_dir, cid, "literary")
+    last_error = str(task.get("last_error") or "")
+    if failure_class == "content_sensitive":
+        stage_match = re.match(
+            r"^\[(EXTRACTING_TERMS|TRANSLATING_RAW|REWRITING_LITERARY)\]", last_error)
+        if stage_match and stage_match.group(1) == "TRANSLATING_RAW":
+            return "TRANSLATING_RAW"
+        if has_raw:
+            return "REWRITING_LITERARY"
+        return "TRANSLATING_RAW"
+    if failure_class == "api_or_no_content":
+        m = re.match(r"^\[(EXTRACTING_TERMS|TRANSLATING_RAW|REWRITING_LITERARY|AUDITING|JUDGING)\]", last_error)
+        if m:
+            stage = m.group(1)
+            if stage == "TRANSLATING_RAW" or not has_raw:
+                return "TRANSLATING_RAW"
+            if stage == "REWRITING_LITERARY" or not has_lit:
+                return "REWRITING_LITERARY"
+            return "AUDITING"
+        if has_raw and has_lit:
+            return "AUDITING"
+        if has_raw:
+            return "REWRITING_LITERARY"
+        return "TRANSLATING_RAW"
+    if failure_class == "cjk":
+        return "REWRITING_LITERARY" if has_raw else "TRANSLATING_RAW"
+    if failure_class in ("quality", "entity", "unknown") and attempt <= 0:
+        if has_raw and has_lit:
+            return "AUDITING"
+        if has_raw:
+            return "REWRITING_LITERARY"
+        return "TRANSLATING_RAW"
+    if has_raw:
+        return "REWRITING_LITERARY"
+    return "EXTRACTING_TERMS"
+
+
+def _json_digest(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()
+
+
+def collect_final_status(root: Path, output_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """扫描所有 final.json，返回 fallback 证据与损坏文件。
+
+    这是 gate ⑨ 和 QA_REPORT 的唯一事实源。只读，不依赖 DB 状态或 QA 历史。
+    """
+    out_root = Path(output_dir) if output_dir else Path(root) / "output"
+    finals = sorted(out_root.glob("ch*/*_final.json"))
+    fallbacks: List[Dict[str, Any]] = []
+    final_entries: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    for fp in finals:
+        try:
+            raw = fp.read_bytes()
+            data = json.loads(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            errors.append({"path": str(fp), "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        if not isinstance(data, dict):
+            errors.append({"path": str(fp), "error": "final root is not an object"})
+            continue
+        meta = data.get("metadata")
+        if not isinstance(meta, dict):
+            meta = {}
+        fallback = bool(
+            meta.get("fallback")
+            or meta.get("quality_waived")
+            or meta.get("quality_degraded")
+            or data.get("fallback")
+        )
+        chunk_id = fp.stem.rsplit("_final", 1)[0]
+        final_entries.append({
+            "chunk_id": chunk_id,
+            "chapter": fp.parent.name,
+            "final_sha256": _json_digest(raw),
+            "fallback": fallback,
+        })
+        if not fallback:
+            continue
+        fallbacks.append({
+            "chunk_id": chunk_id,
+            "chapter": fp.parent.name,
+            "reason": str(meta.get("reason") or meta.get("judge_reason") or "unknown")[:500],
+            "final_sha256": _json_digest(raw),
+            "path": str(fp),
+        })
+    fallbacks.sort(key=lambda x: x["chunk_id"])
+    final_entries.sort(key=lambda x: x["chunk_id"])
+    return {
+        "final_count": len(finals),
+        "finals": final_entries,
+        "fallbacks": fallbacks,
+        "errors": errors,
+    }
+
+
+def write_qa_report(root: Path, output_dir: Optional[Path] = None,
+                    qa_path: Optional[Path] = None) -> Dict[str, Any]:
+    """从当前 final 集合重建 QA_REPORT.md；无 fallback 时仍写机器证据。"""
+    root = Path(root)
+    out_root = Path(output_dir) if output_dir else root / "output"
+    qa_file = Path(qa_path) if qa_path else out_root / "QA_REPORT.md"
+    status = collect_final_status(root, out_root)
+    payload = {
+        "schema_version": QA_SCHEMA_VERSION,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "final_count": status["final_count"],
+        "finals": status["finals"],
+        "fallbacks": status["fallbacks"],
+        "errors": status["errors"],
+    }
+    lines = [
+        "# 译文质量验收报告 (QA Report)",
+        "",
+        "本文件由当前 final.json 重新生成；正文文件不包含本报告内容。",
+        "以下 JSON 块是 gate 的机器可核验证据，请勿手工编辑。",
+        "",
+        QA_JSON_BEGIN,
+        "```json",
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        "```",
+        QA_JSON_END,
+        "",
+    ]
+    fallbacks = status["fallbacks"]
+    if fallbacks:
+        lines.append(f"## Fallback 明细 ({len(fallbacks)} 个 chunk)")
+        lines.append("")
+        for item in fallbacks:
+            lines.append(f"### {item['chunk_id']}")
+            lines.append(f"- 状态: 未通过自动化验收（fallback 稿已收录）")
+            lines.append(f"- 原因: {item['reason']}")
+            lines.append(f"- final SHA-256: `{item['final_sha256']}`")
+            lines.append("")
+    else:
+        lines.append("## 结论")
+        lines.append("")
+        lines.append("- 无 fallback chunk；全部 final 来自通过验收的候选稿。")
+        lines.append("")
+    if status["errors"]:
+        lines.append(f"## 无法解析的 final ({len(status['errors'])})")
+        lines.append("")
+        for item in status["errors"]:
+            lines.append(f"- `{item['path']}`: {item['error']}")
+        lines.append("")
+    qa_file.parent.mkdir(parents=True, exist_ok=True)
+    qa_file.write_text("\n".join(lines), encoding="utf-8")
+    return {"ok": not status["errors"], "path": str(qa_file), **status}
+
+
+def parse_qa_report(qa_file: Path) -> Optional[Dict[str, Any]]:
+    """解析 QA 机器 JSON；旧报告或无机器块返回 None。"""
+    try:
+        text = Path(qa_file).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    start = text.find(QA_JSON_BEGIN)
+    end = text.find(QA_JSON_END, start + len(QA_JSON_BEGIN)) if start >= 0 else -1
+    if start < 0 or end < 0:
+        return None
+    body = text[start + len(QA_JSON_BEGIN):end].strip()
+    body = re.sub(r"^```(?:json)?\s*", "", body, flags=re.IGNORECASE)
+    body = re.sub(r"\s*```$", "", body)
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def qa_report_mismatches(root: Path, output_dir: Optional[Path],
+                         qa_file: Path) -> Tuple[List[str], Dict[str, Any]]:
+    """对比 QA 机器证据与当前 final 集合，返回 stale/inconsistent 明细。"""
+    status = collect_final_status(root, output_dir)
+    expected = {x["chunk_id"]: x for x in status["fallbacks"]}
+    payload = parse_qa_report(qa_file)
+    problems: List[str] = []
+    info: Dict[str, Any] = {
+        "machine_readable": payload is not None,
+        "expected_fallbacks": sorted(expected),
+        "reported_fallbacks": [],
+        "expected_final_count": status["final_count"],
+        "reported_final_count": None,
+    }
+    if payload is not None:
+        try:
+            reported_final_count = int(payload.get("final_count"))
+        except (TypeError, ValueError):
+            reported_final_count = -1
+        info["reported_final_count"] = reported_final_count
+        if reported_final_count != status["final_count"]:
+            problems.append(
+                f"QA final_count={reported_final_count} != 当前 {status['final_count']}（报告陈旧）")
+        reported_list = payload.get("fallbacks")
+        reported_list = reported_list if isinstance(reported_list, list) else []
+        reported: Dict[str, Dict[str, Any]] = {}
+        for item in reported_list:
+            if isinstance(item, dict) and item.get("chunk_id"):
+                reported[str(item["chunk_id"])] = item
+        info["reported_fallbacks"] = sorted(reported)
+        reported_finals_raw = payload.get("finals")
+        reported_finals: Dict[str, Dict[str, Any]] = {}
+        if isinstance(reported_finals_raw, list):
+            for item in reported_finals_raw:
+                if isinstance(item, dict) and item.get("chunk_id"):
+                    reported_finals[str(item["chunk_id"])] = item
+        expected_finals = {x["chunk_id"]: x for x in (status.get("finals") or [])}
+        if not reported_finals:
+            problems.append("QA 缺少全量 final 哈希证据")
+        else:
+            missing_finals = sorted(set(expected_finals) - set(reported_finals))
+            extra_finals = sorted(set(reported_finals) - set(expected_finals))
+            if missing_finals:
+                problems.append(f"QA 漏记 final: {missing_finals[:5]}")
+            if extra_finals:
+                problems.append(f"QA 残留过期 final: {extra_finals[:5]}")
+            for cid in sorted(set(expected_finals) & set(reported_finals)):
+                if str(expected_finals[cid].get("final_sha256") or "") != str(
+                        reported_finals[cid].get("final_sha256") or ""):
+                    problems.append(f"QA 与 final 哈希不一致: {cid}")
+        missing = sorted(set(expected) - set(reported))
+        extra = sorted(set(reported) - set(expected))
+        if missing:
+            problems.append(f"QA 漏记 fallback: {missing[:5]}")
+        if extra:
+            problems.append(f"QA 残留过期 fallback: {extra[:5]}")
+        for cid in sorted(set(expected) & set(reported)):
+            exp_sha = str(expected[cid].get("final_sha256") or "")
+            got_sha = str(reported[cid].get("final_sha256") or "")
+            if exp_sha != got_sha:
+                problems.append(f"QA 与 final 哈希不一致: {cid}")
+        reported_errors = payload.get("errors")
+        reported_errors = reported_errors if isinstance(reported_errors, list) else []
+        if len(reported_errors) != len(status["errors"]):
+            problems.append(
+                f"QA 损坏文件数 {len(reported_errors)} != 当前 {len(status['errors'])}")
+        return problems, info
+
+    # 旧格式只有章节级 ## 标题。无 fallback 时它仍可证明“当时全绿”；
+    # 一旦当前出现 fallback，旧报告无法提供 chunk 级证据，必须重生成。
+    try:
+        qa_text = Path(qa_file).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        qa_text = ""
+    legacy = [ln[3:].strip() for ln in qa_text.splitlines() if ln.startswith("## ")]
+    info["legacy_headings"] = legacy
+    if expected:
+        problems.append("QA 无机器可读证据，无法核对 fallback chunk")
+    elif legacy:
+        problems.append(f"QA 旧报告仍含 {len(legacy)} 个 fallback 段（报告陈旧）")
+    return problems, info
+
+
+def ledger_path(root: Path) -> Path:
+    return Path(root) / "output" / "rescue" / "failure_ledger.jsonl"
+
+
+def append_rescue_event(root: Path, event: Dict[str, Any]) -> bool:
+    """append-only 写入失败账本；任何 I/O 异常都 fail-open。"""
+    try:
+        path = ledger_path(root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(event)
+        payload.setdefault("schema_version", RESCUE_SCHEMA_VERSION)
+        payload.setdefault("recorded_at", time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+        line = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
+        with path.open("a", encoding="utf-8") as fh:
+            try:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                pass
+            fh.write(line)
+            fh.flush()
+            try:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+        return True
+    except OSError:
+        return False
+
+
+def read_rescue_events(root: Path) -> List[Dict[str, Any]]:
+    """读取账本；损坏行跳过，不阻塞救援与 gate。"""
+    path = ledger_path(root)
+    if not path.exists():
+        return []
+    events: List[Dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    events.append(item)
+    except OSError:
+        return []
+    return events
+
+
+def latest_events_by_chunk(root: Path) -> Dict[str, Dict[str, Any]]:
+    latest: Dict[str, Dict[str, Any]] = {}
+    for event in read_rescue_events(root):
+        cid = str(event.get("chunk_id") or "")
+        if cid:
+            latest[cid] = event
+    return latest
+
+
+def ledger_requeue_candidates(root: Path, chapter_id: str) -> List[str]:
+    """返回账本中最近一次仍为隔离/失败的 PF 候选。"""
+    out = []
+    for cid, event in latest_events_by_chunk(root).items():
+        if not cid.startswith(f"{chapter_id}_"):
+            continue
+        if str(event.get("result") or "") in ("quarantined", "failed"):
+            out.append(cid)
+    return sorted(out)
+
+
+def failure_cohorts(events: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """按 failure_class + critic backend + 模型角色聚类，供批量修复与报告。"""
+    cohorts: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    for event in events:
+        cls = str(event.get("failure_class") or "unknown")
+        backend = str(event.get("critic_backend") or "unknown")
+        model = str(event.get("model") or event.get("model_role") or "unknown")
+        key = (cls, backend, model)
+        row = cohorts.setdefault(key, {
+            "failure_class": cls,
+            "critic_backend": backend,
+            "model": model,
+            "count": 0,
+            "chunks": [],
+        })
+        row["count"] += 1
+        cid = str(event.get("chunk_id") or "")
+        if cid and cid not in row["chunks"]:
+            row["chunks"].append(cid)
+    return sorted(cohorts.values(), key=lambda x: (-x["count"], x["failure_class"]))
+
+
+def write_rescue_report(root: Path) -> Path:
+    """把账本摘要写到 output/rescue/rescue_report.md。"""
+    events = read_rescue_events(root)
+    latest = latest_events_by_chunk(root)
+    by_result: Dict[str, int] = {}
+    for event in latest.values():
+        result = str(event.get("result") or "unknown")
+        by_result[result] = by_result.get(result, 0) + 1
+    cohorts = failure_cohorts(events)
+    lines = [
+        "# Failure Rescue Report",
+        "",
+        f"- ledger events: {len(events)}",
+        f"- chunks tracked: {len(latest)}",
+        f"- latest results: {json.dumps(by_result, ensure_ascii=False, sort_keys=True)}",
+        f"- ledger: `{ledger_path(root)}`",
+        "",
+        "## Root-cause cohorts",
+        "",
+    ]
+    if cohorts:
+        for row in cohorts[:40]:
+            sample = ", ".join(row["chunks"][:8])
+            lines.append(
+                f"- {row['failure_class']} / {row['critic_backend']} / {row['model']}: "
+                f"{row['count']} event(s); {sample}")
+    else:
+        lines.append("- 无失败账本记录。")
+    lines.append("")
+    path = Path(root) / "output" / "rescue" / "rescue_report.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
 
 
 
@@ -5777,6 +6380,8 @@ class TranslationPipeline:
 
     def run(self) -> bool:
         print(f"🚀 [Pipeline] 启动批处理模式处理章节: {self.chapter_id}")
+        self._run_started_at = time.monotonic()
+        self._rescue_started_at = None
 
         # Round 99 P1: chapter 切换时清空 per-chunk 缓存, 防止跨 chapter 脏数据
         self._reset_per_run_cache()
@@ -5788,6 +6393,12 @@ class TranslationPipeline:
             print(f"❌ [Pipeline] 章节 {self.chapter_id} 无可执行任务（可能 init 被跳过或 DB 无记录），"
                   f"请用 --force 重新初始化。")
             return False
+
+        # Round 147: 上次运行遗留的 PF 块先进入定向救援队列；若预算已用尽则保持隔离。
+        try:
+            self._auto_rescue_existing_failures()
+        except Exception as e:
+            print(f"⚠️ [Rescue] 遗留 PF 扫描异常（不阻塞主流程）: {e}")
 
         # Round 104: 恢复"COMPLETED 但 final.json 缺失"的 chunk (回溯删 final 后重跑失败的残留)
         try:
@@ -5929,6 +6540,12 @@ class TranslationPipeline:
             self._cleanup_intermediates()
         except Exception as e:
             print(f"⚠️ [Pipeline] 中间文件清理异常（不影响主流程）: {e}")
+
+        try:
+            self._record_rescue_completions()
+            write_rescue_report(self._rescue_project_root())
+        except Exception as e:
+            print(f"⚠️ [Rescue] 账本收尾异常（不影响主流程）: {e}")
 
         # 完成后交叉验证：final.json 落盘数应与任务数一致，否则视为假阳性完成
         return self._verify_final_outputs(len(existing_tasks))
@@ -7116,59 +7733,116 @@ class TranslationPipeline:
         chunk_ids = [t['chunk_id'] for t in tasks]
         self.scheduler.batch_update_state(chunk_ids, TaskState.EXTRACTING_TERMS)
 
-    def _process_dirty_batch(self, tasks):
-        for task in tasks:
-            chunk_id = task['chunk_id']
-            print(f"🔄 [Pipeline] {chunk_id} 标记为 DIRTY，重置到术语提取")
-            # Round 108: 清空上一轮的分数历史/最佳版本 — 回溯重跑是新 episode,
-            # 旧历史会污染 streak 早停 (ch08 chunk006: 旧历史 8.157→7.943 与重跑
-            # 7.94 拼成「单调不增」假阳性, 重跑仅 1 次 retry 就被提前 fallback)。
-            self._score_history.pop(chunk_id, None)
-            self._best_lit.pop(chunk_id, None)
-            self._ensure_candidate_pools()
-            self._lit_candidates.pop(chunk_id, None)
-            self._pairwise_info.pop(chunk_id, None)
-            # Round 107 P7: final.json 不删除, 重命名为 final_backup.json.
-            # ch07 倒查: 回溯重跑 (COMPLETED→DIRTY) 删除 final.json 后, 若重跑失败
-            # (NO_PROGRESS_STREAK 等), chunk 从 COMPLETED 降级为 PERMANENTLY_FAILED 且无产出.
-            # 保留备份: 重跑成功会覆盖, 重跑失败则 _restore_dirty_backups 恢复.
-            final_path = self.output_dir / f"{chunk_id}_final.json"
-            backup_path = self.output_dir / f"{chunk_id}_final_backup.json"
-            if final_path.exists():
-                try:
-                    if backup_path.exists():
-                        backup_path.unlink()
-                    final_path.rename(backup_path)
-                    print(f"  💾 已备份 final.json → final_backup.json (重跑失败可恢复)")
-                except OSError as e:
-                    print(f"  ⚠️ 备份 final.json 失败: {e}")
-            # Round 130: critic_report 保留为 *_critic_report_backup.json，
-            # 供章末"版本择优"（_apply_version_merit）对比新旧评分。
-            critic_path = self.output_dir / f"{chunk_id}_critic_report.json"
-            critic_backup = self.output_dir / f"{chunk_id}_critic_report_backup.json"
-            if critic_path.exists():
-                try:
-                    if critic_backup.exists():
-                        critic_backup.unlink()
-                    critic_path.rename(critic_backup)
-                except OSError as e:
-                    print(f"  ⚠️ 备份 critic_report 失败: {e}")
-            for step in ["raw", "literary"]:
+    def _reset_dirty_runtime_state(self, chunk_id: str) -> None:
+        """清理只属于上一 episode 的内存状态（DB 救援预算不重置）。"""
+        # 兼容半初始化实例（测试桩/外部嵌入）；正常 pipeline 一定有这些字典。
+        score_history = getattr(self, "_score_history", None)
+        if isinstance(score_history, dict):
+            score_history.pop(chunk_id, None)
+        best_lit = getattr(self, "_best_lit", None)
+        if isinstance(best_lit, dict):
+            best_lit.pop(chunk_id, None)
+        self._ensure_candidate_pools()
+        self._lit_candidates.pop(chunk_id, None)
+        self._pairwise_info.pop(chunk_id, None)
+
+    def _prepare_dirty_artifacts(self, chunk_id: str, target_stage: TaskState) -> None:
+        """按续跑阶段保留可用中间产物，同时把旧 final/critic 转 backup。
+
+        Round 107 的 final_backup 契约保持不变：重跑失败时章末
+        _restore_dirty_backups 仍可恢复旧版。
+        """
+        self._reset_dirty_runtime_state(chunk_id)
+        final_path = self.output_dir / f"{chunk_id}_final.json"
+        backup_path = self.output_dir / f"{chunk_id}_final_backup.json"
+        if final_path.exists():
+            try:
+                if backup_path.exists():
+                    backup_path.unlink()
+                final_path.rename(backup_path)
+                print("  💾 已备份 final.json → final_backup.json (重跑失败可恢复)")
+            except OSError as e:
+                print(f"  ⚠️ 备份 final.json 失败: {e}")
+        critic_path = self.output_dir / f"{chunk_id}_critic_report.json"
+        critic_backup = self.output_dir / f"{chunk_id}_critic_report_backup.json"
+        if critic_path.exists():
+            try:
+                if critic_backup.exists():
+                    critic_backup.unlink()
+                critic_path.rename(critic_backup)
+            except OSError as e:
+                print(f"  ⚠️ 备份 critic_report 失败: {e}")
+
+        # 从直译/术语重跑必须丢弃下游产物；定向润色/审计保留 raw，润色与
+        # 审计还保留 literary，避免把已有工作重做一遍。
+        if target_stage in (TaskState.EXTRACTING_TERMS, TaskState.TRANSLATING_RAW):
+            for step in ("raw", "literary"):
                 intermediate = self.output_dir / f"{chunk_id}_{step}.json"
                 if intermediate.exists():
                     try:
                         intermediate.unlink()
                     except OSError as e:
                         print(f"  ⚠️ 清理失败 {intermediate}: {e}")
-            # 清理版本历史文件
-            for pattern in [f"{chunk_id}_literary_v*.json", f"{chunk_id}_rewrite_meta_v*.json"]:
-                for f in self.output_dir.glob(pattern):
-                    try:
-                        f.unlink()
-                    except OSError as e:
-                        print(f"  ⚠️ 清理失败 {f}: {e}")
-        chunk_ids = [t['chunk_id'] for t in tasks]
-        self.scheduler.batch_update_state(chunk_ids, TaskState.EXTRACTING_TERMS, reset_counters=True)
+
+        # retry 历史属于上一 episode；保留 text 文件本身，但清掉版本序列。
+        for pattern in (f"{chunk_id}_literary_v*.json", f"{chunk_id}_rewrite_meta_v*.json"):
+            for f in self.output_dir.glob(pattern):
+                try:
+                    f.unlink()
+                except OSError as e:
+                    print(f"  ⚠️ 清理失败 {f}: {e}")
+
+    def _adjust_rescue_stage(self, chunk_id: str, stage: TaskState) -> TaskState:
+        """产物缺失时把定向阶段降级到仍可执行的最早阶段。"""
+        raw_ok = (self.output_dir / f"{chunk_id}_raw.json").exists()
+        lit_ok = (self.output_dir / f"{chunk_id}_literary.json").exists()
+        critic_ok = (self.output_dir / f"{chunk_id}_critic_report.json").exists()
+        if stage == TaskState.JUDGING and (not lit_ok or not critic_ok):
+            stage = TaskState.AUDITING
+        if stage == TaskState.AUDITING and not lit_ok:
+            stage = TaskState.REWRITING_LITERARY if raw_ok else TaskState.TRANSLATING_RAW
+        if stage == TaskState.REWRITING_LITERARY and not raw_ok:
+            stage = TaskState.TRANSLATING_RAW
+        return stage
+
+    def _process_dirty_batch(self, tasks):
+        """Round 147: 普通 DIRTY 全量重跑；rescue DIRTY 按 rescue_stage 续跑。"""
+        normal_ids: List[str] = []
+        rescue_queued = 0
+        has_entity_rescue = False
+        for task in tasks:
+            chunk_id = task['chunk_id']
+            stage_raw = str(task.get("rescue_stage") or "")
+            if stage_raw:
+                try:
+                    target = self._adjust_rescue_stage(chunk_id, TaskState(stage_raw))
+                except ValueError:
+                    target = TaskState.EXTRACTING_TERMS
+                if classify_failure(str(task.get("last_error") or "")) == "entity":
+                    has_entity_rescue = True
+                print(f"🔄 [Pipeline] {chunk_id} 定向救援 → {target.value}")
+                self._prepare_dirty_artifacts(chunk_id, target)
+                q_retries = 1 if target in (TaskState.AUDITING, TaskState.JUDGING) else 0
+                if self.scheduler.stage_rescue_task(
+                        chunk_id, target, quality_retries=q_retries,
+                        last_error=task.get("last_error")):
+                    rescue_queued += 1
+                    continue
+                normal_ids.append(chunk_id)
+            else:
+                print(f"🔄 [Pipeline] {chunk_id} 标记为 DIRTY，重置到术语提取")
+                self._prepare_dirty_artifacts(chunk_id, TaskState.EXTRACTING_TERMS)
+                normal_ids.append(chunk_id)
+        if has_entity_rescue:
+            try:
+                self._maybe_unify_entity_registry()
+            except Exception as e:
+                print(f"  ⚠️ 实体救援前归一异常（继续）: {e}")
+        if normal_ids:
+            self.scheduler.batch_update_state(
+                normal_ids, TaskState.EXTRACTING_TERMS, reset_counters=True)
+        if rescue_queued:
+            print(f"♻️ [Rescue] 本章 {rescue_queued} 个块已进入定向续跑阶段")
 
     def _consolidate_deferred_backtracks(self) -> bool:
         """Round 130: 章末合并式回溯（decision_engine.backtrack_mode=deferred）。
@@ -7245,12 +7919,22 @@ class TranslationPipeline:
     # 只对命中签名的块生效（override 按块持久化），正常块零影响。
     # ────────────────────────────────────────────────────────────────
     _NO_CONTENT_MARKERS = ("无正文", "未闭合 think 块", "reasoning_only")
+    _CONTENT_SENSITIVE_MARKERS = (
+        "new_sensitive", "content_sensitive", "content policy", "content_policy",
+        "sensitive", "内容敏感", "敏感内容",
+    )
 
     @classmethod
     def _is_no_content_signature(cls, err_text) -> bool:
         """判定异常文本是否为「仅推理无正文」签名（thinking 耗尽 max_tokens）。"""
         text = str(err_text or "")
         return any(m in text for m in cls._NO_CONTENT_MARKERS)
+
+    @classmethod
+    def _is_content_sensitive_signature(cls, err_text) -> bool:
+        """Round 148: 判定是否为上游内容审核拒绝（HTTP 422 / input new_sensitive）。"""
+        text = str(err_text or "").lower()
+        return any(m.lower() in text for m in cls._CONTENT_SENSITIVE_MARKERS)
 
     @staticmethod
     def _effort_levels_table() -> Dict[str, tuple]:
@@ -7420,6 +8104,91 @@ class TranslationPipeline:
             else:
                 print(f"🔻 [Pipeline] {chunk_id} no_content 签名（{used_eff or 'default'} 已无更低档）")
 
+    def _content_sensitive_target_role(self, failing_role: str,
+                                       ov: Dict[str, Any]) -> Tuple[Optional[str], List[str]]:
+        """Round 148: 为内容审核拒绝选择尚未尝试的备用角色。
+
+        先跨 provider（MiniMax），再同网关的 Qwen；已试角色写回 override，
+        保证同一 provider + 同一 prompt 不会再次空转。
+        """
+        cfg = self._retry_adapt_cfg()
+        configured = cfg.get("sensitive_fallback_roles") or ["primary", "literal_translator"]
+        candidates = [str(r).strip() for r in configured if str(r).strip()]
+        tried: List[str] = []
+        for role in list(ov.get("sensitive_tried_roles") or []) + [failing_role]:
+            role = str(role or "").strip()
+            if role and role not in tried:
+                tried.append(role)
+        for role in candidates:
+            if role in tried:
+                continue
+            try:
+                role_cfg = _config.get_role_config(role) or {}
+            except Exception:
+                role_cfg = {}
+            if not role_cfg:
+                continue
+            return role, tried
+        return None, tried
+
+    def _record_content_sensitive_signal(self, chunk_id: str, stage: str,
+                                         failing_role: str,
+                                         failing_effort: Optional[str]) -> bool:
+        """Round 148: 内容审核拒绝 → 下一次立即换角色，不再原参数重试。
+
+        返回 True 表示已写入可用的备用角色；返回 False 表示所有配置角色均已
+        尝试过，调用方应直接隔离，而不是继续消耗 retry 预算。
+        """
+        cfg = self._retry_adapt_cfg()
+        if not cfg.get("enabled", True):
+            return False
+        prev = self._get_retry_override(chunk_id)
+        target, tried = self._content_sensitive_target_role(failing_role, prev)
+        payload = dict(prev)
+        payload.update({
+            "sig": "content_sensitive",
+            "stage": stage,
+            "used_role": failing_role,
+            "used_effort": failing_effort,
+            "sensitive_tried_roles": tried,
+            "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+        if target:
+            ladder = self._effort_ladder_for_role(target)
+            mapped = _map_effort_for_fallback(str(failing_effort), ladder) if failing_effort else None
+            if mapped is None:
+                mapped = self._task_default_effort("literary_rewrite")
+            payload.update({
+                "role": target,
+                "effort": mapped,
+                "sensitive_exhausted": False,
+                "sensitive_switch_count": max(0, len(tried)),
+            })
+            ok = self._set_retry_override(chunk_id, payload)
+            if ok:
+                print(
+                    f"🛡️ [Pipeline] {chunk_id} 内容审核拒绝 → 下次换角色 "
+                    f"{failing_role or '?'}@{failing_effort or 'default'} → "
+                    f"{target}@{mapped or 'default'}（已试 {','.join(tried)}）"
+                )
+            return ok
+        payload.update({
+            "role": failing_role,
+            "effort": failing_effort,
+            "sensitive_exhausted": True,
+            "sensitive_switch_count": max(0, len(tried) - 1),
+        })
+        self._set_retry_override(chunk_id, payload)
+        print(
+            f"🧊 [Pipeline] {chunk_id} 内容审核拒绝：备用角色已全部拒绝"
+            f"（{','.join(tried)}），不再重复同题重试"
+        )
+        return False
+
+    def _content_sensitive_exhausted(self, chunk_id: str) -> bool:
+        ov = self._get_retry_override(chunk_id)
+        return bool(ov.get("sig") == "content_sensitive" and ov.get("sensitive_exhausted"))
+
     def _rescue_role_for(self, stage: str, failing_role: str) -> Optional[str]:
         """换角色救稿目标选择（fallback_role_switch）。
 
@@ -7541,13 +8310,280 @@ class TranslationPipeline:
                 continue
         return False
 
+    # ────────────────────────────────────────────────────────────────
+    # Round 147: 失败块自动救援
+    # ────────────────────────────────────────────────────────────────
+    def _rescue_project_root(self) -> Path:
+        root = getattr(self, "_root_dir", None)
+        if root is not None:
+            return Path(root)
+        out = Path(getattr(self, "output_dir", Path.cwd() / "output"))
+        if out.parent.name == "output":
+            return out.parent.parent
+        if out.name == "output":
+            return out.parent
+        # Do not fall back to cwd: a test/external stub must not write rescue
+        # artifacts into the production project output directory.
+        return out
+
+    def _rescue_evidence(self, chunk_id: str) -> Dict[str, Any]:
+        """收集账本所需的低成本证据（只读 final/critic，不调用 LLM）。"""
+        out_dir = Path(getattr(self, "output_dir", Path.cwd()))
+        evidence: Dict[str, Any] = {
+            "best_score": None,
+            "critic_backend": None,
+        }
+        final_path = out_dir / f"{chunk_id}_final.json"
+        try:
+            data = json.loads(final_path.read_text(encoding="utf-8"))
+            meta = data.get("metadata") if isinstance(data, dict) else None
+            if isinstance(meta, dict):
+                score = meta.get("avg_score")
+                if isinstance(score, (int, float)):
+                    evidence["best_score"] = float(score)
+                reason = meta.get("reason") or meta.get("judge_reason")
+                if reason:
+                    evidence["final_reason"] = str(reason)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        critic_path = out_dir / f"{chunk_id}_critic_report.json"
+        try:
+            report = json.loads(critic_path.read_text(encoding="utf-8"))
+            if isinstance(report, dict):
+                evidence["critic_backend"] = report.get("_backend_path")
+                if evidence["best_score"] is None:
+                    scores = report.get("scores") or {}
+                    nums = [float(v) for v in scores.values()
+                            if isinstance(v, (int, float))]
+                    if nums:
+                        evidence["best_score"] = round(sum(nums) / len(nums), 3)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        return evidence
+
+    def _rescue_time_exhausted(self) -> bool:
+        started = getattr(self, "_rescue_started_at", None)
+        if not started:
+            return False
+        budget = _as_int_safe(rescue_config().get("chapter_budget_seconds"), 1800)
+        return budget > 0 and (time.monotonic() - float(started)) >= budget
+
+    def _record_rescue(self, chunk_id: str, task: Dict[str, Any], reason: str,
+                       failure_class: str, action: str, result: str,
+                       resume_stage: Optional[str] = None,
+                       attempt: Optional[int] = None) -> None:
+        root = self._rescue_project_root()
+        evidence = self._rescue_evidence(chunk_id)
+        if not reason and evidence.get("final_reason"):
+            reason = str(evidence["final_reason"])
+        append_rescue_event(root, {
+            "chunk_id": chunk_id,
+            "chapter": str(task.get("chapter_id") or getattr(self, "chapter_id", "")),
+            "stage": str(task.get("state") or ""),
+            "failure_class": failure_class,
+            "reason": str(reason or "unknown")[:2000],
+            "retries": _as_int_safe(task.get("retries"), 0),
+            "quality_retries": _as_int_safe(task.get("quality_retries"), 0),
+            "pf_requeues": _as_int_safe(task.get("pf_requeues"), 0),
+            "rescue_attempts": _as_int_safe(task.get("rescue_attempts"), 0),
+            "critic_backend": evidence.get("critic_backend"),
+            "best_score": evidence.get("best_score"),
+            "action": action,
+            "resume_stage": resume_stage,
+            "result": result,
+            "attempt": attempt,
+        })
+
+    def _schedule_rescue(self, task: Dict[str, Any], reason: str,
+                         failure_class: str, action: str,
+                         resume_stage: Optional[str] = None) -> bool:
+        """写入 DIRTY(rescue_stage)，受 targeted/full requeue 双预算约束。"""
+        cfg = rescue_config()
+        chunk_id = str(task.get("chunk_id") or "")
+        if not cfg.get("enabled", True) or not chunk_id:
+            return False
+        if self._rescue_time_exhausted():
+            print(f"⌛ [Rescue] {chunk_id} 章级救援时间预算已用尽，停止自动重跑")
+            return False
+        attempts = _as_int_safe(task.get("rescue_attempts"), 0)
+        pf_requeues = _as_int_safe(task.get("pf_requeues"), 0)
+        max_targeted = _as_int_safe(cfg.get("max_targeted_attempts"), 2)
+        max_full = _as_int_safe(cfg.get("max_full_requeues"), 1)
+        if action == "targeted":
+            if attempts >= max_targeted:
+                return False
+            stage = resume_stage or recommended_resume_stage(
+                task, failure_class, Path(self.output_dir), attempts)
+            res = self.scheduler.queue_rescue(
+                chunk_id, stage, reason,
+                increment_attempt=True, increment_full_requeue=False,
+                reset_counters=True,
+            )
+            if not res.get("ok"):
+                return False
+            if getattr(self, "_rescue_started_at", None) is None:
+                self._rescue_started_at = time.monotonic()
+            self._record_rescue(
+                chunk_id, task, reason, failure_class, "targeted_rescue",
+                "queued", resume_stage=stage, attempt=res.get("attempt"))
+            print(f"♻️ [Rescue] {chunk_id} {failure_class} → {stage} "
+                  f"(targeted {res.get('attempt')}/{max_targeted})")
+            return True
+        if action == "full":
+            if pf_requeues >= max_full:
+                return False
+            res = self.scheduler.queue_rescue(
+                chunk_id, "EXTRACTING_TERMS", reason,
+                increment_attempt=False, increment_full_requeue=True,
+                reset_counters=True,
+            )
+            if not res.get("ok"):
+                return False
+            if getattr(self, "_rescue_started_at", None) is None:
+                self._rescue_started_at = time.monotonic()
+            self._record_rescue(
+                chunk_id, task, reason, failure_class, "full_requeue",
+                "queued", resume_stage="EXTRACTING_TERMS",
+                attempt=attempts)
+            print(f"♻️ [Rescue] {chunk_id} targeted 预算已用尽 → 整块重跑 "
+                  f"(full {res.get('full_requeues')}/{max_full})")
+            return True
+        return False
+
+    def _enter_rescue_or_pf(self, chunk_id: str, reason: str,
+                            failure_class: Optional[str] = None,
+                            allow_rescue: bool = True) -> bool:
+        """统一终态入口：优先进入救援队列，预算耗尽才写 PERMANENTLY_FAILED。
+
+        Mock/旧 scheduler 没有 get_task 返回 dict 时保持旧行为，避免测试和
+        外部嵌入调用被新机制意外改写。
+        """
+        reason = str(reason or "unknown")
+        cls = failure_class or classify_failure(reason)
+        try:
+            task = self.scheduler.get_task(chunk_id)
+        except Exception:
+            task = None
+        if not isinstance(task, dict):
+            self.scheduler.update_task_state(
+                chunk_id, TaskState.PERMANENTLY_FAILED, error_msg=reason)
+            return False
+        if not allow_rescue:
+            if str(task.get("state") or "") != TaskState.PERMANENTLY_FAILED.value:
+                self.scheduler.update_task_state(
+                    chunk_id, TaskState.PERMANENTLY_FAILED, error_msg=reason)
+            self._record_rescue(
+                chunk_id, task, reason, cls, "quarantine", "quarantined",
+                attempt=_as_int_safe(task.get("rescue_attempts"), 0))
+            print(f"🧊 [Rescue] {chunk_id} 无可用备用路径，直接隔离为 PERMANENTLY_FAILED")
+            return False
+        cfg = rescue_config()
+        attempts = _as_int_safe(task.get("rescue_attempts"), 0)
+        pf_requeues = _as_int_safe(task.get("pf_requeues"), 0)
+        max_targeted = _as_int_safe(cfg.get("max_targeted_attempts"), 2)
+        max_full = _as_int_safe(cfg.get("max_full_requeues"), 1)
+        if cfg.get("enabled", True) and attempts < max_targeted:
+            if self._schedule_rescue(task, reason, cls, "targeted"):
+                return True
+        if cfg.get("enabled", True) and pf_requeues < max_full:
+            if self._schedule_rescue(task, reason, cls, "full"):
+                return True
+        state = str(task.get("state") or "")
+        if state != TaskState.PERMANENTLY_FAILED.value:
+            self.scheduler.update_task_state(
+                chunk_id, TaskState.PERMANENTLY_FAILED, error_msg=reason)
+        self._record_rescue(
+            chunk_id, task, reason, cls, "quarantine", "quarantined",
+            attempt=attempts)
+        print(f"🧊 [Rescue] {chunk_id} 救援预算耗尽，隔离为 PERMANENTLY_FAILED")
+        return False
+
+    def _auto_rescue_existing_failures(self) -> int:
+        """运行开始时复活上一轮遗留的 PF 块；预算与账本跨进程持久。"""
+        cfg = rescue_config()
+        if not cfg.get("enabled", True):
+            return 0
+        queued = 0
+        tasks = self.scheduler.get_all_tasks_by_chapter(self.chapter_id)
+        # collect_final_status expects the output root (output/), not a chapter
+        # directory.  Passing output/ch01 would look for output/ch01/ch*/... and
+        # silently miss every fallback final.
+        out_root = Path(self.output_dir)
+        if out_root.parent.name == "output":
+            out_root = out_root.parent
+        status = collect_final_status(self._rescue_project_root(), out_root)
+        fallback_by_chunk = {
+            str(x.get("chunk_id")): x for x in (status.get("fallbacks") or [])
+        }
+        for task in tasks:
+            cid = str(task.get("chunk_id") or "")
+            is_pf = task.get("state") == TaskState.PERMANENTLY_FAILED.value
+            fallback_item = fallback_by_chunk.get(cid)
+            if not is_pf and not fallback_item:
+                continue
+            attempts = _as_int_safe(task.get("rescue_attempts"), 0)
+            pf_requeues = _as_int_safe(task.get("pf_requeues"), 0)
+            if attempts >= _as_int_safe(cfg.get("max_targeted_attempts"), 2) \
+                    and pf_requeues >= _as_int_safe(cfg.get("max_full_requeues"), 1):
+                continue
+            reason = str(task.get("last_error") or "")
+            if fallback_item and fallback_item.get("reason"):
+                reason = str(fallback_item["reason"])
+            if not reason:
+                reason = str(self._rescue_evidence(cid).get("final_reason") or "legacy PF")
+            cls = classify_failure(reason)
+            if attempts < _as_int_safe(cfg.get("max_targeted_attempts"), 2):
+                if self._schedule_rescue(task, reason, cls, "targeted"):
+                    queued += 1
+            elif pf_requeues < _as_int_safe(cfg.get("max_full_requeues"), 1):
+                if self._schedule_rescue(task, reason, cls, "full"):
+                    queued += 1
+        if queued:
+            print(f"♻️ [Rescue] 章 {self.chapter_id}: 已排队 {queued} 个遗留 PF 块")
+        return queued
+
+    def _record_rescue_completions(self) -> None:
+        """为已恢复的块补一条 completed 结果，保持账本可做 cohort 统计。"""
+        root = self._rescue_project_root()
+        latest = latest_events_by_chunk(root)
+        for task in self.scheduler.get_all_tasks_by_chapter(self.chapter_id):
+            cid = str(task.get("chunk_id") or "")
+            if task.get("state") != TaskState.COMPLETED.value:
+                continue
+            prev = latest.get(cid) or {}
+            if str(prev.get("result") or "") == "completed":
+                continue
+            if _as_int_safe(task.get("rescue_attempts"), 0) <= 0 \
+                    and str(prev.get("action") or "") != "full_requeue":
+                continue
+            self._record_rescue(
+                cid, task, str(prev.get("reason") or "rescue completed"),
+                str(prev.get("failure_class") or "unknown"),
+                "rescue_result", "completed",
+                resume_stage=prev.get("resume_stage"),
+                attempt=_as_int_safe(task.get("rescue_attempts"), 0))
+
     def _process_failed_batch(self, tasks):
         retry_by_stage = {}
-        permanent_fail_ids = []
         max_retries = _config.pipeline.get("max_retries", 3)
         for task in tasks:
             chunk_id = task['chunk_id']
             retries = task.get('retries', 0)
+            last_error = str(task.get("last_error") or "")
+            # Round 148: 内容审核拒绝是永久客户端拒绝。只要还有未尝试的备用角色，
+            # 就立即回润色阶段；全部角色拒绝后才隔离，避免原参数反复计费。
+            if self._is_content_sensitive_signature(last_error):
+                if self._content_sensitive_exhausted(chunk_id):
+                    print(f"🧊 [Pipeline] {chunk_id} 内容审核拒绝且无备用角色，进入隔离")
+                    self._try_fallback_final(chunk_id)
+                    self._enter_rescue_or_pf(
+                        chunk_id, f"[FAILED_CONTENT_SENSITIVE] {last_error}",
+                        "content_sensitive", allow_rescue=False,
+                    )
+                else:
+                    retry_by_stage.setdefault(TaskState.REWRITING_LITERARY, []).append(chunk_id)
+                    print(f"🛡️ [Pipeline] {chunk_id} 内容审核拒绝 → 换角色续跑")
+                continue
             if retries >= max_retries:
                 # Round 133: no_content 签名 + 预算耗尽 → 换角色救稿一次（默认开启）
                 rescue_stage = self._maybe_rescue_no_content(task)
@@ -7555,19 +8591,16 @@ class TranslationPipeline:
                     stage_state = self._get_recovery_stage(f"[{rescue_stage}]")
                     retry_by_stage.setdefault(stage_state, []).append(chunk_id)
                     continue
-                print(f"❌ [Pipeline] {chunk_id} 重试次数过多，转入 PERMANENTLY_FAILED 终态")
+                print(f"⚠️ [Pipeline] {chunk_id} 执行重试预算耗尽，进入失败救援判定")
                 self._try_fallback_final(chunk_id)
-                permanent_fail_ids.append(chunk_id)
+                self._enter_rescue_or_pf(
+                    chunk_id,
+                    f"[FAILED_MAX_RETRIES] {last_error} (retries>={max_retries})",
+                )
             else:
                 recovery_stage = self._get_recovery_stage(task.get('last_error', ''))
                 retry_by_stage.setdefault(recovery_stage, []).append(chunk_id)
                 print(f"🔁 [Pipeline] {chunk_id} 重试中 (第 {retries + 1} 次) → {recovery_stage.value}")
-        if permanent_fail_ids:
-            self.scheduler.batch_update_state(
-                permanent_fail_ids,
-                TaskState.PERMANENTLY_FAILED,
-                error_msgs={cid: f"超过重试上限 (retries>={max_retries})，需人工介入" for cid in permanent_fail_ids}
-            )
         for stage, ids in retry_by_stage.items():
             if ids:
                 print(f"🔁 [Pipeline] {len(ids)} 个任务恢复到 {stage.value}")
@@ -7641,6 +8674,8 @@ class TranslationPipeline:
         entity_feedback: str = ''
         entity_registry_for_rewriter: Dict[str, str] = {}
         for task in tasks:
+            model_role = ""
+            model_effort = None
             try:
                 chunk_id = task['chunk_id']
                 source_text = task['text_content']
@@ -7738,9 +8773,10 @@ class TranslationPipeline:
                                                 "stagnant_categories": sorted(prev_cats),
                                             }
                                         }, source_step="literary")
-                                        self.scheduler.update_task_state(
-                                            chunk_id, TaskState.PERMANENTLY_FAILED,
-                                            error_msg=f"[PRE_REWRITER_STAGNATION] 跳过 rewriter LLM: cats {sorted(prev_cats)} 连续 {stag_consecutive_p73 + 1} 次不变"
+                                        self._enter_rescue_or_pf(
+                                            chunk_id,
+                                            f"[PRE_REWRITER_STAGNATION] 跳过 rewriter LLM: cats {sorted(prev_cats)} 连续 {stag_consecutive_p73 + 1} 次不变",
+                                            "quality",
                                         )
                                         print(f"⏹️ [Pipeline] {chunk_id} pre-rewriter 停滞 (retry={quality_retries}, cats={sorted(prev_cats)}), 跳过 rewriter LLM")
                                         continue
@@ -7767,7 +8803,8 @@ class TranslationPipeline:
                 # Round 133: no_content 重试适配 override（降档/换角救稿）优先于停滞换档；
                 # 降档后若因质量重进润色（quality_retries≥1）→ 升档补偿一次（防死循环）。
                 ov = self._get_retry_override(chunk_id)
-                if ov and ov.get("sig") == "no_content" and ov.get("stage") == "REWRITING_LITERARY":
+                if (ov and ov.get("sig") in ("no_content", "quality_rescue", "content_sensitive")
+                        and ov.get("stage") == "REWRITING_LITERARY"):
                     if ov.get("role"):
                         model_role = ov["role"]
                     if ov.get("effort"):
@@ -7788,9 +8825,15 @@ class TranslationPipeline:
                             ov["escalated"] = True
                             ov["effort"] = up_eff
                             self._set_retry_override(chunk_id, ov)
-                    if model_effort:
+                    if ov.get("sig") == "content_sensitive":
                         print(
-                            f"🔻 [Pipeline] {chunk_id} 重试适配生效: role={model_role} "
+                            f"🛡️ [Pipeline] {chunk_id} 内容审核换角生效: "
+                            f"role={model_role} effort={model_effort or 'default'}"
+                        )
+                    elif model_effort:
+                        print(
+                            f"🔻 [Pipeline] {chunk_id} 救援适配生效"
+                            f"({ov.get('sig')}): role={model_role} "
                             f"effort={model_effort}"
                         )
                 self._note_last_call(
@@ -7873,9 +8916,10 @@ class TranslationPipeline:
                             "quality_retries": quality_retries,
                         }
                     }, source_step="literary")
-                    self.scheduler.update_task_state(
-                        chunk_id, TaskState.PERMANENTLY_FAILED,
-                        error_msg=f"rewriter 字节停滞 retry={quality_retries}"
+                    self._enter_rescue_or_pf(
+                        chunk_id,
+                        f"[REWRITER_STAGNATED] rewriter 字节停滞 retry={quality_retries}",
+                        "quality",
                     )
                     continue
 
@@ -8064,9 +9108,10 @@ class TranslationPipeline:
                     # Round 92: fallback 写入跨 retry 最佳版本, 而非当前被拒 lit_text
                     best_text = self._pairwise_pick_best(chunk_id, lit_text, source_text)
                     self._save_final_with_sanity(chunk_id, best_text)
-                    self.scheduler.update_task_state(
-                        chunk_id, TaskState.PERMANENTLY_FAILED,
-                        error_msg=f"[STAGNATION] {force_reason}，提前 fallback",
+                    self._enter_rescue_or_pf(
+                        chunk_id,
+                        f"[STAGNATION] {force_reason}，提前 fallback",
+                        "quality",
                     )
                     continue  # 跳过 success_ids，不再进 AUDITING
 
@@ -8075,6 +9120,12 @@ class TranslationPipeline:
                 import traceback
                 traceback.print_exc()
                 print(f"❌ [Pipeline] {task['chunk_id']} 润色异常: {e}")
+                if self._is_content_sensitive_signature(e):
+                    self._record_content_sensitive_signal(
+                        task['chunk_id'], "REWRITING_LITERARY",
+                        model_role or _config.get_task_role("literary_rewrite"),
+                        model_effort or self._task_default_effort("literary_rewrite"),
+                    )
                 if self._is_no_content_signature(e):
                     self._record_no_content_signal(task['chunk_id'], "REWRITING_LITERARY")
                 self.scheduler.update_task_state(task['chunk_id'], TaskState.FAILED, error_msg=f"[REWRITING_LITERARY] {e}")
@@ -8901,6 +9952,20 @@ class TranslationPipeline:
                     critic_report["entity_consistency_notes"] = entity_notes
                     print(f"  ⚠️ 实体一致性核查: {len(entity_notes)} 条不一致项")
 
+                # Round 157: record the exact text this critic run scored.  A
+                # later gate can then bind the report to the delivered final
+                # bytes instead of treating ``_backend_path=jev`` as evidence.
+                try:
+                    from src.judgment_layer import sha256_text as _sha256_text
+                    critic_report["_audit_target"] = {
+                        "schema_version": 1,
+                        "source_sha256": _sha256_text(source_text or ""),
+                        "raw_sha256": _sha256_text(raw_text or ""),
+                        "literary_sha256": _sha256_text(lit_text or ""),
+                    }
+                except Exception:
+                    pass
+
                 self._save_intermediate(chunk_id, "critic_report", critic_report)
                 # Round 92: 追踪当前 retry 的 lit_text 与 critic score, fallback 时用最佳版
                 self._update_best_lit(chunk_id, lit_text, critic_report)
@@ -8944,10 +10009,8 @@ class TranslationPipeline:
                                 "quality_retries": quality_retries,
                             }
                         }, source_step="literary")
-                        self.scheduler.update_task_state(
-                            chunk_id, TaskState.PERMANENTLY_FAILED,
-                            error_msg=stop_reason_p99
-                        )
+                        self._enter_rescue_or_pf(
+                            chunk_id, stop_reason_p99, "quality")
                         continue
                 if not critic_report.get("scores"):
                     print(f"⚠️ [Pipeline] {chunk_id} Critic 评分为空（JSON 解析失败），转入 FAILED 等待重试")
@@ -9056,12 +10119,11 @@ class TranslationPipeline:
                             "judge_reason": f"实体违规连续 {entity_stagnation_threshold} 次未修复 (counts={recent_serious})",
                         }
                     }, source_step="literary")
-                    self.scheduler.update_task_state(
-                        chunk_id, TaskState.PERMANENTLY_FAILED,
-                        error_msg=(
-                            f"[ENTITY_VIOLATION_STREAK] 实体违规连续 {entity_stagnation_threshold} 次未修复 "
-                            f"(counts={recent_serious}), 提前 fallback"
-                        )
+                    self._enter_rescue_or_pf(
+                        chunk_id,
+                        f"[ENTITY_VIOLATION_STREAK] 实体违规连续 {entity_stagnation_threshold} 次未修复 "
+                        f"(counts={recent_serious}), 提前 fallback",
+                        "entity",
                     )
                     print(
                         f"⏹️ [Pipeline] {chunk_id} 实体违规连续 {entity_stagnation_threshold} 次未修复 "
@@ -9289,9 +10351,11 @@ class TranslationPipeline:
                             "current_avg": round(current_avg, 2),
                         }
                     }, source_step="literary")
-                    self.scheduler.update_task_state(
-                        chunk_id, TaskState.PERMANENTLY_FAILED,
-                        error_msg=f"[SCORE_DECLINE] 连续 {decline_streak} 次 retry 分数递减, 提前 fallback (history={self._score_history.get(chunk_id, [])[-5:]})"
+                    self._enter_rescue_or_pf(
+                        chunk_id,
+                        f"[SCORE_DECLINE] 连续 {decline_streak} 次 retry 分数递减, 提前 fallback "
+                        f"(history={self._score_history.get(chunk_id, [])[-5:]})",
+                        "quality",
                     )
                     print(f"⏹️ [Pipeline] {chunk_id} 连续 {decline_streak} 次 retry 分数递减, 提前 fallback (current={current_avg:.2f}, history={self._score_history.get(chunk_id, [])[-5:]})")
                     continue
@@ -9315,12 +10379,11 @@ class TranslationPipeline:
                             "no_progress_window": no_progress_window,
                         }
                     }, source_step="literary")
-                    self.scheduler.update_task_state(
-                        chunk_id, TaskState.PERMANENTLY_FAILED,
-                        error_msg=(
-                            f"[NO_PROGRESS_STREAK] 连续 {no_progress_window} 次 retry 单调不增 (含持平), "
-                            f"提前 fallback (history={self._score_history.get(chunk_id, [])[-5:]})"
-                        )
+                    self._enter_rescue_or_pf(
+                        chunk_id,
+                        f"[NO_PROGRESS_STREAK] 连续 {no_progress_window} 次 retry 单调不增 (含持平), "
+                        f"提前 fallback (history={self._score_history.get(chunk_id, [])[-5:]})",
+                        "quality",
                     )
                     print(
                         f"⏹️ [Pipeline] {chunk_id} 连续 {no_progress_window} 次 retry 单调不增, "
@@ -9364,13 +10427,12 @@ class TranslationPipeline:
                             "lit_cjk_ratio": round(compute_cjk_ratio(lit_text), 3),
                         }
                     }, source_step="literary")
-                    self.scheduler.update_task_state(
-                        chunk_id, TaskState.PERMANENTLY_FAILED,
-                        error_msg=(
-                            f"[CJK_RETRY_EXHAUSTED] rewriter 重试 {quality_retries} 次仍输出英文 "
-                            f"(lit cjk={compute_cjk_ratio(lit_text):.2f}), 提前 fallback 到 raw "
-                            f"(raw cjk={raw_cjk:.2f}), 节省 {max_quality_retries - quality_retries} 次 LLM 调用"
-                        )
+                    self._enter_rescue_or_pf(
+                        chunk_id,
+                        f"[CJK_RETRY_EXHAUSTED] rewriter 重试 {quality_retries} 次仍输出英文 "
+                        f"(lit cjk={compute_cjk_ratio(lit_text):.2f}), 提前 fallback 到 raw "
+                        f"(raw cjk={raw_cjk:.2f}), 节省 {max_quality_retries - quality_retries} 次 LLM 调用",
+                        "cjk",
                     )
                     print(
                         f"⏹️ [Pipeline] {chunk_id} CJK 重试耗尽 (lit cjk={compute_cjk_ratio(lit_text):.2f}, "
@@ -9436,8 +10498,13 @@ class TranslationPipeline:
                                 "avg_score": round(avg_score, 2),
                             }
                         }, source_step="literary")
-                        self.scheduler.update_task_state(chunk_id, TaskState.COMPLETED, error_msg=f"[SAFETY_NET] 平均分{avg_score:.2f}≥{safety_net_min}，接近阈值放行")
-                        print(f"🟡 [Pipeline] {chunk_id} 安全网放行（平均分{avg_score:.2f}，未达PERMANENTLY_FAILED）")
+                        self._enter_rescue_or_pf(
+                            chunk_id,
+                            f"[SAFETY_NET_PASSED] 平均分{avg_score:.2f}≥{safety_net_min}，"
+                            f"仍低于质量线，转自动救援",
+                            "quality",
+                        )
+                        print(f"🟡 [Pipeline] {chunk_id} 安全网候选稿已落盘，进入自动救援")
                     else:
                         # Round 92: max retries fallback 也用最佳版本
                         best_text = self._pairwise_pick_best(chunk_id, lit_text, source_text, raw_text=None)
@@ -9450,7 +10517,12 @@ class TranslationPipeline:
                                 "quality_retries": quality_retries,
                             }
                         }, source_step="literary")
-                        self.scheduler.update_task_state(chunk_id, TaskState.PERMANENTLY_FAILED, error_msg=judge_result.get("reject_reason") or "质量重试耗尽")
+                        self._enter_rescue_or_pf(
+                            chunk_id,
+                            f"[PERMANENTLY_FAILED_AFTER_MAX_RETRIES] "
+                            f"{judge_result.get('reject_reason') or '质量重试耗尽'}",
+                            "quality",
+                        )
                         print(f"⚠️ [Pipeline] {chunk_id} 质量重试耗尽，已 fallback 写入 final（最佳一版润色稿）")
                 elif early_stop_enabled and quality_retries == 0:
                     # early_stop 仅在首轮裁决生效：避免 rework 一两次就放弃可恢复的 chunk
@@ -9483,10 +10555,8 @@ class TranslationPipeline:
                                 "quality_retries": quality_retries,
                             }
                         }, source_step="literary")
-                        self.scheduler.update_task_state(
-                            chunk_id, TaskState.PERMANENTLY_FAILED,
-                            error_msg=stop_reason
-                        )
+                        self._enter_rescue_or_pf(
+                            chunk_id, stop_reason, "quality")
                         continue
                     self._fallback_to_rewriter(chunk_id, lit_text, critic_report, judge_result)
                 else:
@@ -10012,6 +11082,33 @@ def compare_injection_arms(
     }
 
 
+def _snapshot_sqlite_database(source: Path, dest: Path) -> Path:
+    """Make a consistent, independent SQLite snapshot for one A/B arm.
+
+    ``ReferenceAgent.process_chunk`` writes decisions and entities while the
+    golden harness runs.  An injection A/B is a diagnostic, so both arms must
+    start from the same production state and any writes must land in private
+    copies.  SQLite's backup API reads a consistent snapshot including WAL.
+    """
+    source = Path(source)
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    if not source.exists():
+        return dest
+    src_con = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    try:
+        dst_con = sqlite3.connect(str(dest))
+        try:
+            src_con.backup(dst_con)
+        finally:
+            dst_con.close()
+    finally:
+        src_con.close()
+    return dest
+
+
 def run_injection_ab(
     chapter_id: str,
     profile: Optional[Dict[str, Any]],
@@ -10461,8 +11558,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="SagaTrans — AI 文学语义编译系统")
     parser.add_argument("command", nargs="?", default="pipeline",
-                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "story-graph", "story-graph-query", "setup-payoff-audit", "drift-audit", "notes-normalize", "requeue"],
-                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, story-graph, story-graph-query, setup-payoff-audit, drift-audit, notes-normalize, requeue")
+                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "story-graph", "story-graph-query", "setup-payoff-audit", "drift-audit", "notes-normalize", "proofread", "book-repair", "requeue", "rescue", "qa-report", "recalibrate-critic"],
+                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, story-graph, story-graph-query, setup-payoff-audit, drift-audit, notes-normalize, proofread, book-repair, requeue, rescue, qa-report, recalibrate-critic")
     parser.add_argument("--chapter", default="ch01", help="章节 ID (默认: ch01)")
     parser.add_argument("--chapters", default=None,
                         help="style-profile 命令：抽样章节，逗号分隔（默认均匀抽 5 章）")
@@ -10508,7 +11605,8 @@ def main():
                         help="pipeline 命令：读取 review_dirty.json，二次校验锚句后定向重跑结构 P0 chunk")
     parser.add_argument("--review-dirty-path", default="output/review_dirty.json",
                         help="pipeline --fix-from-review：review_dirty JSON 路径（默认 output/review_dirty.json）")
-    parser.add_argument("--force", action="store_true", help="强制重新初始化（覆盖已存在的 chunk，重置状态和重试计数）")
+    parser.add_argument("--force", action="store_true",
+                        help="强制重新初始化（init）或强制重审已校准报告（recalibrate-critic）")
     # 新增：split 命令专用参数
     parser.add_argument("--input", help="split 命令：输入文件路径（EPUB/TXT/MD）")
     parser.add_argument("--input-dir", default="input", help="split 命令：输出目录（默认 input/）")
@@ -10519,19 +11617,37 @@ def main():
     parser.add_argument("--min-chapter-size", type=int, default=1000,
                         help="split 命令：短于此字数的章节会被合并到下一章（默认 1000）")
     parser.add_argument("--apply", action="store_true",
-                        help="consistency / notes-normalize 命令：执行自动修正（notes-normalize 默认仅生成差异报告）")
+                        help="consistency / notes-normalize / proofread / book-repair：执行自动修正；book-repair 只做有 source/raw/literary 证据的确定性修复")
+    parser.add_argument("--verify", action="store_true",
+                        help="book-repair：只复核当前 final 与修复 manifest，不写正文")
     parser.add_argument("--window", type=int, default=None,
                         help="drift-audit 命令：滑动窗口大小（默认 config.pipeline.drift_audit.window=5）")
     parser.add_argument("--jev", action="store_true",
                         help="drift-audit 命令：附加 Jev 窗口配对检查（需要 Jev 可用）")
     parser.add_argument("--json-out", default=None,
-                        help="drift-audit / golden --judgment-ab 命令：报告 JSON 输出路径")
+                        help="drift-audit / golden --judgment-ab / proofread / book-repair：报告 JSON 输出路径")
     parser.add_argument("--ab", action="store_true",
                         help="golden/golden-gate 命令：运行 直译模型×thinking 4 组合 A/B 对比")
     parser.add_argument("--judgment-ab", action="store_true",
                         help="golden 命令：仅比较判断层注记注入 on/off（同章同摘录，不乘模型×effort 矩阵）")
     parser.add_argument("--max-rounds", type=int, default=3,
                         help="consolidate 命令：最大收敛轮数（默认 3）")
+    parser.add_argument("--chunks", default=None,
+                        help="requeue 命令：逗号分隔的 chunk_id；与 --from-ledger 二选一或并用")
+    parser.add_argument("--from-ledger", action="store_true",
+                        help="requeue 命令：从 output/rescue/failure_ledger.jsonl 选取仍隔离的 PF 块")
+    parser.add_argument("--all", action="store_true",
+                        help="rescue 命令：扫描全书；省略时只处理 --chapter 指定章节")
+    parser.add_argument("--reset-rescue-budget", action="store_true",
+                        help="rescue 命令：仅复位目标章节未完成块的救援/重试预算（算法升级后受控复活）")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="recalibrate-critic 命令：并行重审线程数（默认 1）")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="recalibrate-critic 命令：最多重审多少个目标 chunk（探针用）")
+    parser.add_argument("--low-score-threshold", type=float, default=7.0,
+                        help="recalibrate-critic 命令：低分报告阈值（默认 7.0）")
+    parser.add_argument("--retries", type=int, default=1,
+                        help="recalibrate-critic 命令：非校准/瞬时失败重试次数（默认 1）")
 
     args = parser.parse_args()
 
@@ -10902,7 +12018,17 @@ def main():
             # final.json 自动转 backup，重跑失败由 _restore_dirty_backups 恢复旧版。
             _rq_root = Path(__file__).resolve().parent.parent
             _rq_sched = TaskScheduler(db_path=str(_rq_root / "db" / "workflow.db"))
-            _rq_res = _rq_sched.requeue_permanently_failed(args.chapter, force=args.force)
+            _rq_chunks = []
+            if args.chunks:
+                _rq_chunks.extend(c.strip() for c in args.chunks.split(",") if c.strip())
+            if args.from_ledger:
+                _ledger_ids = ledger_requeue_candidates(_rq_root, args.chapter)
+                for _cid in _ledger_ids:
+                    if _cid not in _rq_chunks:
+                        _rq_chunks.append(_cid)
+                print(f"📒 requeue ledger: {args.chapter} 发现 {len(_ledger_ids)} 个隔离块")
+            _rq_res = _rq_sched.requeue_permanently_failed(
+                args.chapter, chunk_ids=(_rq_chunks or None), force=args.force)
             _rq_n = len(_rq_res["requeued"])
             print(f"♻️ requeue: {args.chapter} 共 {_rq_n} 个 PF 块恢复 DIRTY")
             if _rq_res["requeued"]:
@@ -10911,6 +12037,114 @@ def main():
             if _rq_res["over_cap"]:
                 print(f"    ⚠️ 复活预算用尽(pf_requeue_max): {', '.join(_rq_res['over_cap'])}（--force 可强制）")
             sys.exit(0 if _rq_n or not _rq_res["over_cap"] else 1)
+        elif args.command == "rescue":
+            _rs_root = Path(__file__).resolve().parent.parent
+            _rs_db = _rs_root / "db" / "workflow.db"
+            _rs_sched = TaskScheduler(db_path=str(_rs_db))
+            if args.reset_rescue_budget:
+                if not args.apply:
+                    print("❌ --reset-rescue-budget 需要与 --apply 同用", file=sys.stderr)
+                    sys.exit(2)
+                _reset_chapters = []
+                if args.all:
+                    _reset_chapters = [row[0] for row in _rs_sched.conn.execute(
+                        "SELECT DISTINCT chapter_id FROM chunk_tasks ORDER BY chapter_id").fetchall()]
+                else:
+                    _reset_chapters = [args.chapter]
+                for _rch in _reset_chapters:
+                    _reset_ids = _rs_sched.reset_rescue_budget(_rch)
+                    print(f"♻️ [Rescue] {_rch}: 已复位 {len(_reset_ids)} 个块的救援/重试预算")
+            _rs_rows = _rs_sched.conn.execute(
+                "SELECT DISTINCT chapter_id, state, chunk_id FROM chunk_tasks "
+                "WHERE state IN ('PERMANENTLY_FAILED','FAILED','DIRTY') "
+                "ORDER BY chapter_id, chunk_id").fetchall()
+            _rs_by_ch = {}
+            for _ch, _st, _cid in _rs_rows:
+                _rs_by_ch.setdefault(_ch, []).append((_cid, _st))
+            _rs_final = collect_final_status(_rs_root, _rs_root / "output")
+            for _item in _rs_final.get("fallbacks", []):
+                _ch = str(_item.get("chapter") or "")
+                if _ch:
+                    _rs_by_ch.setdefault(_ch, [])
+                    _cid = str(_item.get("chunk_id") or "")
+                    _rs_by_ch[_ch].append((_cid, "FALLBACK_FINAL"))
+            if not args.all:
+                _rs_by_ch = {args.chapter: _rs_by_ch.get(args.chapter, [])}
+            _rs_by_ch = {k: v for k, v in _rs_by_ch.items() if v}
+            print(f"🧭 rescue: {len(_rs_by_ch)} 章存在可救援失败块")
+            for _ch in sorted(_rs_by_ch):
+                print(f"   {_ch}: {len(_rs_by_ch[_ch])} 个待判定块")
+            if not args.apply:
+                print("   只读模式；加 --apply 执行定向救援")
+                sys.exit(0)
+            _rs_failed = []
+            for _ch in sorted(_rs_by_ch):
+                print(f"♻️ [Rescue] 处理章节 {_ch}")
+                try:
+                    _ok = TranslationPipeline(chapter_id=_ch).run()
+                except Exception as _rs_exc:
+                    _ok = False
+                    print(f"❌ [Rescue] {_ch} 异常: {_rs_exc}", file=sys.stderr)
+                if not _ok:
+                    _rs_failed.append(_ch)
+            try:
+                write_rescue_report(_rs_root)
+            except Exception:
+                pass
+            # run() may return True when a chapter has a complete fallback set;
+            # that is not a successful rescue.  Re-scan the state machine and
+            # current final artifacts so this command has a truthful exit code.
+            _rs_remaining = []
+            for _ch in sorted(_rs_by_ch):
+                try:
+                    for _task in _rs_sched.get_all_tasks_by_chapter(_ch):
+                        if _task.get("state") != "COMPLETED":
+                            _rs_remaining.append(
+                                (str(_task.get("chunk_id")), str(_task.get("state"))))
+                except Exception as _scan_exc:
+                    print(f"⚠️ [Rescue] {_ch} 残留扫描异常: {_scan_exc}", file=sys.stderr)
+                    _rs_remaining.append((f"{_ch}:scan", "SCAN_ERROR"))
+            _rs_final_left = collect_final_status(_rs_root, _rs_root / "output").get("fallbacks", [])
+            if _rs_remaining or _rs_final_left:
+                print(f"❌ rescue 后仍有 {len(_rs_remaining)} 个非完成块、"
+                      f"{len(_rs_final_left)} 个 fallback final；需进入 gate 判定", file=sys.stderr)
+                if _rs_remaining:
+                    print("   " + ", ".join(f"{cid}:{st}" for cid, st in _rs_remaining[:12]),
+                          file=sys.stderr)
+                if _rs_final_left:
+                    print("   " + ", ".join(str(x.get("chunk_id")) for x in _rs_final_left[:12]),
+                          file=sys.stderr)
+            sys.exit(0 if not _rs_failed and not _rs_remaining and not _rs_final_left else 1)
+        elif args.command == "qa-report":
+            _qa_root = Path(__file__).resolve().parent.parent
+            _qa_res = write_qa_report(_qa_root, _qa_root / "output")
+            print(f"📝 QA_REPORT: fallback={len(_qa_res.get('fallbacks', []))}, "
+                  f"finals={_qa_res.get('final_count', 0)} → {_qa_res.get('path')}")
+            sys.exit(0 if _qa_res.get("ok") else 1)
+        elif args.command == "recalibrate-critic":
+            from src.recalibrate import run_recalibrate_critic
+            _rc_chunks = [c.strip() for c in (args.chunks or "").split(",") if c.strip()]
+            _rc_res = run_recalibrate_critic(
+                chapter_id=args.chapter,
+                all_chapters=bool(args.all),
+                chunk_ids=_rc_chunks or None,
+                limit=args.limit,
+                workers=args.workers,
+                apply=bool(args.apply),
+                low_score_threshold=args.low_score_threshold,
+                retries=args.retries,
+                force=bool(args.force),
+            )
+            _rc_mode = "apply" if _rc_res.get("applied") else "dry-run"
+            print(f"🧪 recalibrate-critic({_rc_mode}): selected={_rc_res.get('selected')} "
+                  f"recalibrated={_rc_res.get('recalibrated')} failed={_rc_res.get('failed')} "
+                  f"low_score={_rc_res.get('low_score')}")
+            if _rc_res.get("report_path"):
+                print(f"   报告: {_rc_res['report_path']}")
+            if _rc_res.get("errors"):
+                for _rc_err in _rc_res["errors"][:12]:
+                    print(f"   ❌ {_rc_err}", file=sys.stderr)
+            sys.exit(0 if _rc_res.get("ok") else 1)
         elif args.command == "gate":
             from src.pipeline import run_final_gate
             _gate_res = run_final_gate()
@@ -10926,6 +12160,50 @@ def main():
             print(f"notes-normalize: files={_nn_stats.get('files', 0)} "
                   f"changed={_nn_stats.get('changed', 0)} → {_nn_res.get('report', '')}")
             sys.exit(0)
+        elif args.command == "proofread":
+            from src.proofread import proofread_book
+            _pr_res = proofread_book(
+                project_root=Path(__file__).resolve().parent.parent,
+                apply=bool(args.apply),
+                json_out=args.json_out,
+            )
+            if _pr_res.get("error"):
+                print(f"❌ proofread: {_pr_res['error']}", file=sys.stderr)
+            sys.exit(0 if _pr_res.get("ok") else 1)
+        elif args.command == "book-repair":
+            from src.book_repair import apply_book_repairs, verify_book_repairs
+            _br_root = Path(__file__).resolve().parent.parent
+            if args.verify:
+                _br_res = verify_book_repairs(
+                    project_root=_br_root,
+                    output_dir=_br_root / "output",
+                )
+                print(
+                    f"🩺 book-repair(verify): scanned={_br_res.get('scanned', 0)} "
+                    f"pending={len(_br_res.get('pending_chunks') or [])} "
+                    f"blocking={len(_br_res.get('blocking_issues') or [])} "
+                    f"manifest_current={_br_res.get('manifest_current')}")
+            else:
+                _br_res = apply_book_repairs(
+                    project_root=_br_root,
+                    output_dir=_br_root / "output",
+                    apply=bool(args.apply),
+                    json_out=args.json_out,
+                )
+            for _br_issue in (_br_res.get("blocking_issues") or [])[:12]:
+                print(
+                    f"   ❌ {_br_issue.get('chunk_id')}: "
+                    f"{_br_issue.get('kind')} — {_br_issue.get('detail')}",
+                    file=sys.stderr)
+            for _br_stale in (_br_res.get("stale_manifest") or [])[:8]:
+                print(
+                    f"   ❌ 修复凭证陈旧: {_br_stale.get('chunk_id')}",
+                    file=sys.stderr)
+            for _br_missing in (_br_res.get("missing_sources") or [])[:8]:
+                print(f"   ❌ 缺少 DB source 证据: {_br_missing}", file=sys.stderr)
+            for _br_bad_final in (_br_res.get("malformed_finals") or [])[:8]:
+                print(f"   ❌ final 无法解析: {_br_bad_final}", file=sys.stderr)
+            sys.exit(0 if _br_res.get("ok") else 1)
         elif args.command == "lint":
             from src.book_lint import lint_book
             sys.exit(0 if lint_book().get("ok") else 1)
@@ -12527,6 +13805,12 @@ _INLINE_THINK_RE = re.compile(r'<think(.*?)</think>', re.DOTALL)
 _QUOTA_HINT_RE = re.compile(r"quota|insufficient|欠费|额度|余额", re.IGNORECASE)
 
 
+_SENSITIVE_HINT_RE = re.compile(
+    r"new_sensitive|content[ _-]?sensitive|content[ _-]?policy|unsafe|内容敏感|敏感内容",
+    re.IGNORECASE,
+)
+
+
 def build_effort_params(api_base: str, model_name: str, effort: Optional[str]) -> Dict[str, Any]:
     if not effort:
         return {}
@@ -12886,6 +14170,110 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
     if not dry_run:
         conn.commit()
     return plan
+
+
+def _repair_names_related(a: str, b: str) -> bool:
+    """Conservative same-person test for repairing a prior unify merge."""
+    a = (a or "").strip()
+    b = (b or "").strip()
+    if not a or not b:
+        return False
+    if canonical_names_related(a, b) or a in b or b in a:
+        return True
+    ca, cb = set(a), set(b)
+    if not ca or not cb:
+        return False
+    return (len(ca & cb) / max(1, len(ca | cb))) >= 0.45
+
+
+def repair_false_unify_merges(conn, dry_run: bool = True) -> Dict[str, Any]:
+    """Undo unify merges that joined two unrelated proper-name entities.
+
+    Round 134's unify pass can inherit a polluted source name from a prior
+    extraction and demote a genuinely separate entity.  The dangerous case is
+    narrow and mechanically detectable: the demoted row owns proper source
+    names, the winner owns proper source names, the two sets are disjoint, and
+    the canonical names are not related by identity tokens, containment, or
+    high character overlap.  Legitimate short forms (卡拉丹 → 卡拉丹城堡,
+    拉班 → 野兽拉班, 曾苏尼 → 禅苏尼) fail at least one of those tests.
+
+    On repair, the demoted row becomes active again and its canonical/variant
+    forms are removed from the winner's variant whitelist.  Source names stay
+    on their original row; no aliases are copied across entities.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(entity_registry)")}
+    if not {"source_names", "variant_names", "review_reason",
+            "pending_review"} <= cols:
+        return {"rows": 0, "repaired": 0, "changes": []}
+
+    rows = conn.execute(
+        "SELECT id, canonical_name, source_names, variant_names, "
+        "review_reason, pending_review FROM entity_registry"
+    ).fetchall()
+    by_canon: Dict[str, Dict[str, Any]] = {}
+    for rid, canon, src_json, var_json, reason, pending in rows:
+        by_canon[str(canon)] = {
+            "id": rid,
+            "canonical": str(canon),
+            "source_names": robust_json_loads(src_json, expected_type=list) if src_json else [],
+            "variant_names": robust_json_loads(var_json, expected_type=list) if var_json else [],
+            "review_reason": reason or "",
+            "pending_review": int(pending or 0),
+        }
+
+    changes = []
+    for canon, row in by_canon.items():
+        if row["pending_review"] != 1:
+            continue
+        m = re.search(r"Round134 unify:.*并入\s*(\S+)", row["review_reason"])
+        if not m:
+            continue
+        winner = m.group(1)
+        wrow = by_canon.get(winner)
+        if not wrow:
+            continue
+        own_src = {
+            _alias_norm(x) for x in row["source_names"]
+            if isinstance(x, str) and is_proper_entity_alias(x)
+        }
+        win_src = {
+            _alias_norm(x) for x in wrow["source_names"]
+            if isinstance(x, str) and is_proper_entity_alias(x)
+        }
+        if not own_src or not win_src or (own_src & win_src):
+            continue
+        if _repair_names_related(canon, winner):
+            continue
+
+        demoted_forms = {canon, *[v for v in row["variant_names"] if isinstance(v, str)]}
+        new_win_vars = [
+            v for v in wrow["variant_names"]
+            if not (isinstance(v, str) and v in demoted_forms)
+        ]
+        change = {
+            "canonical": canon,
+            "winner": winner,
+            "source_names": sorted(own_src),
+            "winner_source_names": sorted(win_src),
+            "removed_from_winner_variants": sorted(
+                {v for v in wrow["variant_names"] if v in demoted_forms}
+            ),
+        }
+        changes.append(change)
+        if not dry_run:
+            conn.execute(
+                "UPDATE entity_registry SET pending_review=0, "
+                "review_reason=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (f"Round149 unmerge: 独立实体，已从 {winner} 拆回", row["id"]),
+            )
+            conn.execute(
+                "UPDATE entity_registry SET variant_names=?, "
+                "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (json.dumps(new_win_vars, ensure_ascii=False), wrow["id"]),
+            )
+    if not dry_run and changes:
+        conn.commit()
+    return {"rows": len(by_canon), "repaired": len(changes), "changes": changes}
 
 
 def classify_entity_source_name(source_name) -> str:
@@ -13406,6 +14794,9 @@ _ZH_ROLE_WORDS = frozenset({
     "祖父", "外祖父", "祖母", "外祖母", "父亲", "母亲", "哥哥", "弟弟",
     "姐姐", "妹妹", "叔叔", "舅舅", "阿姨", "姨妈", "姑姑", "伯父", "伯母",
     "儿子", "女儿", "丈夫", "妻子", "遗孀", "继承人", "圣者", "圣人",
+    # Round 149: 修会职衔不是人名异体（Dune 实锤：真言者/尊母曾被统一成
+    # 盖乌斯/海伦，污染全书）。只允许作为 context/guard，禁止 replace。
+    "真言者", "尊母",
 })
 
 
@@ -13936,6 +15327,15 @@ def build_name_unification_maps(conn, text: str = "", preferred_forms: Optional[
         for v in vns:
             if not isinstance(v, str) or not v:
                 continue
+            # Round 149: 角色/语境称谓不是人名异体，绝不能驱动正文 replace。
+            # 旧库把「真言者」「尊母」挂在 Mohiam 的 variant_names 下，导致
+            # build_name_unification_maps 生成 真言者→盖乌斯、尊母→海伦，
+            # 把普通称谓与 Jessica 一并改坏。保留为 guard/context 即可。
+            if (canonical_is_title_only(v)
+                    or _is_context_reference_word(v)
+                    or v in _ZH_ROLE_WORDS):
+                guards.add(_r134_strip_parens(v))
+                continue
             cls = classify_entity_variant(v, w)
             guards.add(_r134_strip_parens(v))
             if cls["policy"] == "replace":
@@ -14256,6 +15656,12 @@ def apply_name_unification(text: str, maps: Dict[str, Any]) -> Tuple[str, Dict[s
             got = m.group(0)
             if got == _t:
                 return got
+            # 防「短形吃长形」：variant 是 canonical 的前缀时，不能把
+            # 「雷托公爵」内部的「雷托」再替换成「雷托公爵」。
+            if _t.startswith(got) and len(_t) > len(got):
+                tail = _t[len(got):]
+                if text[m.end():m.end() + len(tail)] == tail:
+                    return got
             counter["n"] += 1
             return _t
 
@@ -14267,8 +15673,14 @@ def apply_name_unification(text: str, maps: Dict[str, Any]) -> Tuple[str, Dict[s
         dst = maps["tokens"][src]
         if not src or src == dst or src not in text:
             continue
-        n = text.count(src)
-        text = text.replace(src, dst)
+        if dst.startswith(src) and len(dst) > len(src):
+            tail = re.escape(dst[len(src):])
+            pat = re.compile(re.escape(src) + r"(?!" + tail + r")")
+            n = len(pat.findall(text))
+            text = pat.sub(dst, text)
+        else:
+            n = text.count(src)
+            text = text.replace(src, dst)
         _record("tokens", src, dst, n)
     return text, stats
 
@@ -14823,6 +16235,12 @@ def run_final_gate(
     ⑥ L1 韵文对齐（verse_lint，门禁内联自动运行）
     ⑦ L2 双关核销（pun_audit，门禁内联自动运行；Round 130 起无需手动补跑）
     ⑧ 裁决校准占比（最终稿必须主要由 confidence_source=jev 的校准后端产出）
+    ⑨ fallback/质量降级产物：任意 final 标 fallback/quality_waived 即红
+    ⑩ 成书机械排错：编码损坏、拼接残留标题、HTML、重复标点、括号/章节壳等
+       阻断项为 0（纯确定性，不调用 LLM，不改写正文）
+    ⑪ 全书修复闭环：每个 final 都有源文证据且可解析；当前 final 不再有
+       待修项、未决高危姓名错位或正文段漏译/插入歧义；若存在 book_repair
+       manifest，其 final 哈希必须与当前文件一致
     任一为红 → ok=False（translate_book.sh 以非零退出中止 / ⛔）。
     """
     root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
@@ -14873,19 +16291,32 @@ def run_final_gate(
         failures.append(f"② 残留 final_backup {len(backups)} 个: {backups[:5]}")
 
     # ③ QA_REPORT
+    qa_read_ok = False
     if not qa_file.exists():
         failures.append(f"③ QA_REPORT 不存在: {qa_file}")
     else:
         try:
             qa_text = qa_file.read_text(encoding="utf-8")
+            qa_read_ok = True
         except (OSError, UnicodeDecodeError) as exc:
             failures.append(f"③ QA_REPORT 读取失败: {exc}")
         else:
             falls = [ln[3:].strip() for ln in qa_text.split("\n")
                      if ln.startswith("## ")]
-            stats["qa_fallbacks"] = len(falls)
-            if falls:
-                failures.append(f"③ QA_REPORT 记录 {len(falls)} 个 fallback 章节: {falls[:5]}")
+            _qa_payload = parse_qa_report(qa_file)
+            if isinstance(_qa_payload, dict) and isinstance(_qa_payload.get("fallbacks"), list):
+                stats["qa_fallbacks"] = len(_qa_payload["fallbacks"])
+            else:
+                stats["qa_fallbacks"] = len(falls)
+            if stats["qa_fallbacks"]:
+                failures.append(
+                    f"③ QA_REPORT 记录 {stats['qa_fallbacks']} 个 fallback 章节: {falls[:5]}")
+    if qa_read_ok:
+        _qa_problems, _qa_info = qa_report_mismatches(root, out_root, qa_file)
+        stats["qa_consistency"] = _qa_info
+        if _qa_problems:
+            failures.append(
+                f"③ QA_REPORT 与当前 final 不一致: {_qa_problems[:5]}")
 
     # ④ T5 lint
     try:
@@ -15026,8 +16457,15 @@ def run_final_gate(
     _chapter_cal: dict = {}
     _missing_reports = []
     _bad_reports = []
+    _critic_evidence = {"exact": 0, "repaired": 0, "unbound": 0,
+                        "stale": 0, "missing_final": 0}
+    _stale_evidence = []
     _calibrated_n = 0
     _multi_batch_calibrated = 0
+    try:
+        from src.recalibrate import critic_evidence_state
+    except Exception:
+        critic_evidence_state = None
     for _ch, _cid in task_ids:
         _report_path = out_root / _ch / f"{_cid}_critic_report.json"
         _chapter_cal.setdefault(_ch, {"total": 0, "calibrated": 0})
@@ -15042,6 +16480,23 @@ def run_final_gate(
             continue
         _bp = str((_report or {}).get("_backend_path") or "unknown")
         _backend_counts[_bp] = _backend_counts.get(_bp, 0) + 1
+        if critic_evidence_state is not None:
+            _evidence = critic_evidence_state(
+                _report,
+                out_root / _ch / f"{_cid}_final.json",
+                project_root=root,
+            )
+            _status = str(_evidence.get("status") or "unbound")
+            _critic_evidence[_status] = _critic_evidence.get(_status, 0) + 1
+            if _status == "stale":
+                _stale_evidence.append({
+                    "chapter": _ch,
+                    "chunk_id": _cid,
+                    "field": _evidence.get("field"),
+                    "audited_sha256": _evidence.get("audited_sha256"),
+                    "current_sha256": _evidence.get("current_sha256"),
+                    "reason": _evidence.get("reason"),
+                })
         if _bp in _cal_sources:
             _calibrated_n += 1
             _chapter_cal[_ch]["calibrated"] += 1
@@ -15053,6 +16508,8 @@ def run_final_gate(
                 pass
 
     stats["backend_paths"] = _backend_counts
+    stats["critic_evidence"] = _critic_evidence
+    stats["stale_critic_evidence"] = _stale_evidence
     stats["multi_batch_calibrated"] = _multi_batch_calibrated
     stats["calibrated_ratio"] = (
         _calibrated_n / len(task_ids) if task_ids else None)
@@ -15067,6 +16524,11 @@ def run_final_gate(
         if _bad_reports:
             failures.append(
                 f"⑧ critic_report 读取/解析失败 {len(_bad_reports)} 个: {_bad_reports[:5]}")
+        if _stale_evidence:
+            _ids = [f"{x['chapter']}/{x['chunk_id']}" for x in _stale_evidence[:8]]
+            failures.append(
+                f"⑧ critic 证据与当前 final 不符 {len(_stale_evidence)} 个: "
+                f"{_ids}")
         _ratio = float(stats["calibrated_ratio"] or 0.0)
         if _ratio < _min_cal:
             _msg = (f"⑧ 校准裁决占比 {_ratio:.1%} < {_min_cal:.1%} "
@@ -15087,6 +16549,107 @@ def run_final_gate(
             warnings.append(
                 f"⑧ 多批 System One 裁决 {_multi_batch_calibrated} 个：跨批概率尺度尚未做整批/拆批 A/B，"
                 "当前按同一校准来源处理")
+        if _critic_evidence.get("unbound"):
+            warnings.append(
+                f"⑧ {_critic_evidence['unbound']} 个 legacy critic_report 未记录 audited final 哈希；"
+                "backend 来源可审计，但不能作为当前 final 的逐字节证据")
+
+    # ⑨ fallback 产物是硬失败：状态机 COMPLETED 或章节退出码都不能洗白降级稿。
+    _final_status = collect_final_status(root, out_root)
+    _fallbacks = _final_status.get("fallbacks") or []
+    _final_errors = _final_status.get("errors") or []
+    stats["fallback_finals"] = len(_fallbacks)
+    stats["final_scan_errors"] = len(_final_errors)
+    if _final_errors:
+        failures.append(
+            f"⑨ final.json 读取/解析失败 {len(_final_errors)} 个: "
+            f"{[x.get('path') for x in _final_errors[:5]]}")
+    if _fallbacks:
+        _fallback_ids = [str(x.get('chunk_id')) for x in _fallbacks]
+        failures.append(
+            f"⑨ 检测到 fallback/quality_waived final {len(_fallbacks)} 个: "
+            f"{_fallback_ids[:8]}")
+
+    # ⑩ 成书机械排错：只查可机械判定的文字/符号/排版错误，不做风格优化。
+    try:
+        from src.proofread import proofread_book
+        _proof_gate_report = out_root / "proofread_gate_report.json"
+        _proof = proofread_book(
+            project_root=root, output_dir=out_root, apply=False,
+            json_out=_proof_gate_report)
+        _proof_summary = _proof.get("summary") or {}
+        _proof_blocking = int(_proof_summary.get("blocking", 0) or 0)
+        stats["proofread"] = {
+            "blocking": _proof_blocking,
+            "warning": int(_proof_summary.get("warning", 0) or 0),
+            "by_rule": _proof_summary.get("by_rule") or {},
+            "report": _proof.get("report_path"),
+        }
+        if _proof.get("error"):
+            failures.append(f"⑩ proofread 执行失败: {_proof['error']}")
+        elif not _proof.get("ok"):
+            _rules = stats["proofread"]["by_rule"]
+            _rule_text = ", ".join(
+                f"{rule}={count}" for rule, count in sorted(_rules.items()) if count)
+            failures.append(
+                f"⑩ 机械排错阻断 {_proof_blocking} 项"
+                f"（{_rule_text or '见报告'}；详见 output/proofread_gate_report.md）")
+    except Exception as _proof_exc:
+        stats["proofread"] = {"error": str(_proof_exc)}
+        failures.append(f"⑩ proofread 执行异常: {_proof_exc}")
+
+    # ⑪ 全书语义修复闭环：不能只在外部脚本里“修过”，必须能从当前 final
+    # 重新证明。manifest 哈希不一致时同样失败，防止修复后被另一阶段改回。
+    try:
+        from src.book_repair import verify_book_repairs
+        _br = verify_book_repairs(project_root=root, output_dir=out_root)
+        stats["book_repair"] = {
+            "scanned": _br.get("scanned", 0),
+            "pending_chunks": len(_br.get("pending_chunks") or []),
+            "blocking_issues": len(_br.get("blocking_issues") or []),
+            "manifest_present": bool(_br.get("manifest_present")),
+            "manifest_current": bool(_br.get("manifest_current")),
+            "stale_manifest": len(_br.get("stale_manifest") or []),
+            "missing_sources": len(_br.get("missing_sources") or []),
+            "malformed_finals": len(_br.get("malformed_finals") or []),
+        }
+        if _br.get("stale_manifest"):
+            _stale_ids = [
+                str(item.get("chunk_id") or item.get("kind"))
+                for item in (_br.get("stale_manifest") or [])[:8]
+            ]
+            failures.append(
+                f"⑪ 全书修复凭证已陈旧（final 哈希与 manifest 不一致）: {_stale_ids}")
+        _br_pending = stats["book_repair"]["pending_chunks"]
+        if _br_pending:
+            failures.append(
+                f"⑪ 全书修复仍有 {_br_pending} 个待修 chunk: "
+                f"{( _br.get('pending_chunks') or [])[:8]}")
+        _br_blocking = _br.get("blocking_issues") or []
+        if _br_blocking:
+            _br_rules = {}
+            for _issue in _br_blocking:
+                _kind = str(_issue.get("kind") or "unknown")
+                _br_rules[_kind] = _br_rules.get(_kind, 0) + 1
+            failures.append(
+                f"⑪ 全书修复未决高危项 {len(_br_blocking)} 个: {_br_rules}")
+        _br_missing_sources = _br.get("missing_sources") or []
+        if _br_missing_sources:
+            failures.append(
+                f"⑪ 全书修复缺少 DB source 证据 {len(_br_missing_sources)} 个: "
+                f"{_br_missing_sources[:8]}")
+        _br_malformed = _br.get("malformed_finals") or []
+        if _br_malformed:
+            failures.append(
+                f"⑪ 全书修复无法解析 final {len(_br_malformed)} 个: "
+                f"{_br_malformed[:8]}")
+        if not _br.get("manifest_present") and _br.get("ok"):
+            warnings.append(
+                "⑪ 未找到 output/book_repair_report.json；当前状态可复算为干净，"
+                "但一键流程必须重跑 book-repair --apply 生成修复凭证")
+    except Exception as _br_exc:
+        stats["book_repair"] = {"error": str(_br_exc)}
+        failures.append(f"⑪ 全书修复复核异常: {_br_exc}")
 
     if stats["tasks"] == 0 and db_file.exists():
         failures.append("① workflow.db 无任务行（未 init？）")
@@ -15110,8 +16673,26 @@ def run_final_gate(
         print(f"  ⑦ 双关核销: covered={_ps.get('covered', 0)}/{_ps.get('total', 0)}, "
               f"waived={_ps.get('waived', 0)}, uncovered={_ps.get('uncovered_nonwaived', 0)}")
     if stats.get("calibrated_ratio") is not None:
+        _ce = stats.get("critic_evidence") or {}
         print(f"  ⑧ 校准裁决: {stats['calibrated_ratio']:.1%} "
-              f"(min={_min_cal:.0%}, backends={stats.get('backend_paths')})")
+              f"(min={_min_cal:.0%}, backends={stats.get('backend_paths')}, "
+              f"exact={_ce.get('exact', 0)}, repaired={_ce.get('repaired', 0)}, "
+              f"stale={_ce.get('stale', 0)}, unbound={_ce.get('unbound', 0)})")
+    print(f"  ⑨ fallback final: {stats.get('fallback_finals', 0)}, "
+          f"final 解析错误: {stats.get('final_scan_errors', 0)}")
+    _proof_stats = stats.get("proofread") or {}
+    if _proof_stats.get("error"):
+        print(f"  ⑩ 机械排错: 异常 {_proof_stats['error']}")
+    else:
+        print(f"  ⑩ 机械排错: blocking={_proof_stats.get('blocking', 0)}, "
+              f"warning={_proof_stats.get('warning', 0)}")
+    _br_stats = stats.get("book_repair") or {}
+    if _br_stats.get("error"):
+        print(f"  ⑪ 全书修复: 异常 {_br_stats['error']}")
+    else:
+        print(f"  ⑪ 全书修复: pending={_br_stats.get('pending_chunks', 0)}, "
+              f"blocking={_br_stats.get('blocking_issues', 0)}, "
+              f"manifest={_br_stats.get('manifest_current', False)}")
     for f in failures:
         print(f"  ❌ {f}")
     if result["ok"]:
@@ -15123,7 +16704,9 @@ _INSTANCE_LOCK_FD: Optional[int] = None
 
 
 _MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile", "story-graph",
-                      "consolidate", "finalize", "notes-normalize", "requeue"}
+                      "consolidate", "finalize", "notes-normalize", "requeue",
+                      "rescue", "qa-report", "recalibrate-critic", "proofread",
+                      "book-repair"}
 
 
 _SIGINT_WARNED = False
@@ -15221,6 +16804,8 @@ def _command_needs_lock(command: str, args: object) -> bool:
     if command == "consistency" and getattr(args, "apply", False):
         return True
     if command == "setup-payoff-audit" and getattr(args, "apply", False):
+        return True
+    if command == "book-repair" and getattr(args, "apply", False):
         return True
     return False
 
@@ -16374,7 +17959,10 @@ def _chapter_note_dupes(text: str) -> list:
             if ki and ki == kj:
                 out.append("同键重复注: {0} ~ {1}".format(
                     ki[:18], kj[:18]))
-            elif _note_is_dup(cand[i]['content'], cand[j]['content'], stop=_stop):
+            elif (_note_keys_compatible(
+                    cand[i]['content'], cand[j]['content'], ki, kj)
+                  and _note_is_dup(
+                      cand[i]['content'], cand[j]['content'], stop=_stop)):
                 out.append("重复注: {0} ~ {1}".format(
                     _note_key(cand[i]['content'])[:18],
                     _note_key(cand[j]['content'])[:18]))
@@ -16553,6 +18141,67 @@ def _note_merge_key(content: str) -> str:
     if len(key) < 2 or key in _NOTE_MERGE_STOP:
         return ""
     return key
+
+
+def _note_key_parts(key: str) -> list:
+    """Split a compound headword into independently meaningful labels."""
+    return [part.strip() for part in re.split(
+        r'[/／|｜、,，;；:：()（）]+', key)
+        if len(part.strip()) >= 2]
+
+
+def _note_mentions_alias(content: str, term: str) -> bool:
+    """Whether ``term`` is introduced as an alias, not merely mentioned.
+
+    A parenthetical gloss (``牙鳕（whiting）``) and the common explanatory
+    markers (``指``/``即``/``英文``/``原文``/``缩写`` …) count as evidence.
+    A bare co-occurrence in the same sentence does not: an explanation of one
+    concept often mentions another concept without defining it as a synonym.
+    """
+    for match in re.finditer(re.escape(term), content):
+        prefix = content[max(0, match.start() - 32):match.start()]
+        if re.search(r'[（(]\s*$', prefix):
+            return True
+        if content[match.end():match.end() + 1] in ('（', '('):
+            return True
+        if re.search(
+                r'(?:指|即|又称|亦称|英文|原文|缩写|全称|称为|是)'
+                r'[^。！？；;\n]{0,18}[“「『]?\s*$', prefix):
+            return True
+    return False
+
+
+def _note_keys_compatible(a: str, b: str, ka: str, kb: str) -> bool:
+    """Whether two headwords may denote the same note entry.
+
+    Exact/nested labels (``CHOAM`` / ``CHOAM公司``) are compatible.  A
+    cross-label merge also needs mutual evidence and a bilingual anchor: a
+    label (or one of its slash-separated parts) from each definition must occur
+    in the other definition, and at least one of those labels must contain a
+    Latin-script token on exactly one side.  This keeps ``牙鳕`` and
+    ``whiting`` together while refusing to collapse two distinct Chinese
+    concepts that merely explain one another (for example
+    ``贝尼·杰瑟里特姐妹会`` and ``尊母``).  The conditions are intentionally
+    conservative: a missed synonym merge leaves two readable notes, while a
+    false merge corrupts every reference in the chapter.
+    """
+    if ka == kb:
+        return True
+    if not ka or not kb:
+        return True
+    if ka in kb or kb in ka:
+        return True
+    a_parts = _note_key_parts(ka)
+    b_parts = _note_key_parts(kb)
+    mutual_alias = (
+        any(_note_mentions_alias(b, part) for part in a_parts)
+        and any(_note_mentions_alias(a, part) for part in b_parts)
+    )
+    if not mutual_alias:
+        return False
+    a_latin = any(re.search(r'[A-Za-z]', part) for part in a_parts)
+    b_latin = any(re.search(r'[A-Za-z]', part) for part in b_parts)
+    return a_latin != b_latin
 
 
 def _note_norm(content: str) -> str:
@@ -16813,9 +18462,16 @@ def lint_book(project_root=None, output_dir=None, merged_path=None) -> dict:
     else:
         warnings.append("merged 未生成（{0} 缺失），跳过整书级检查".format(default_merged.name))
 
-    result = {"ok": not failures, "failures": failures, "warnings": warnings, "stats": stats}
+    clean = not failures and not warnings
+    result = {"ok": not failures, "clean": clean,
+              "failures": failures, "warnings": warnings, "stats": stats}
     lines = ["# 成书 lint 报告 (book_lint)", ""]
-    lines.append(f"- 结论: {'✅ 全绿' if result['ok'] else '❌ 未通过'}")
+    if result["ok"]:
+        conclusion = ("✅ 全绿" if clean
+                      else f"✅ 通过（有 {len(warnings)} 条非阻断警告）")
+    else:
+        conclusion = "❌ 未通过"
+    lines.append(f"- 结论: {conclusion}")
     lines.append(f"- 扫描 final.json: {stats['finals']} 个")
     lines.append("")
     if failures:
@@ -16877,6 +18533,34 @@ def _normalize_chapter_notes_once(text: str, start_num: int = 1):
             x = parent[x]
         return x
 
+    # Each cluster carries every explicit headword seen inside it.  A union is
+    # legal only when *all* cross-cluster headword pairs are compatible; thus a
+    # bridge note cannot gradually collapse A--B--C when A and C are distinct.
+    # Empty keys contribute no identity evidence and therefore cannot make a
+    # conflict disappear.
+    cluster_keys = {}
+    for i, u in enumerate(cand):
+        key = _note_merge_key(u['content'])
+        cluster_keys[i] = ({key: u['content']} if key else {})
+
+    def _clusters_compatible(ri, rj):
+        for key_i, content_i in cluster_keys.get(ri, {}).items():
+            for key_j, content_j in cluster_keys.get(rj, {}).items():
+                if not _note_keys_compatible(
+                        content_i, content_j, key_i, key_j):
+                    return False
+        return True
+
+    def _union(ri, rj):
+        if ri == rj or not _clusters_compatible(ri, rj):
+            return False
+        parent[rj] = ri
+        merged = dict(cluster_keys.get(ri, {}))
+        merged.update(cluster_keys.get(rj, {}))
+        cluster_keys[ri] = merged
+        cluster_keys.pop(rj, None)
+        return True
+
     # 1a) 同词条合并：同一章内同一术语的多种注释写法只保留一条。
     # 分块翻译会在不同 chunk 各自加注；merge 后再按章归并，避免成书出现
     # "门泰特 ×17" 这类重复条目。跨章各留一条，保持章内自包含。
@@ -16891,17 +18575,26 @@ def _normalize_chapter_notes_once(text: str, start_num: int = 1):
         base = _root(members[0])
         for mi in members[1:]:
             ri = _root(mi)
-            if ri != base:
-                parent[ri] = base
+            if _union(_root(base), ri):
+                base = _root(base)
                 changes["same_key_merges"] += 1
 
     _stop = _note_anchor_stop([c['content'] for c in cand])
     for i in range(len(cand)):
         for j in range(i + 1, len(cand)):
+            # Different explicit headwords are distinct entries even when their
+            # definitions share context (for example, a note about a person and
+            # a note about the order she belongs to).  Content-level matching is
+            # still allowed across a prose/tr note and an md definition, where
+            # the same explanation may have been emitted in two carriers.
+            ki = _note_merge_key(cand[i]['content'])
+            kj = _note_merge_key(cand[j]['content'])
+            if not _note_keys_compatible(
+                    cand[i]['content'], cand[j]['content'], ki, kj):
+                continue
             if _note_is_dup(cand[i]['content'], cand[j]['content'], stop=_stop):
                 ri, rj = _root(i), _root(j)
-                if ri != rj:
-                    parent[rj] = ri
+                _union(ri, rj)
     clusters = {}
     for i in range(len(cand)):
         clusters.setdefault(_root(i), []).append(i)
@@ -23282,6 +24975,2364 @@ def generate_book_profile(
     }
 
 
+def _utc_now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _read_json(path: Path) -> Optional[dict]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    tmp = path.with_name(path.name + ".tmp-recalibrate")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _score_average(report: Optional[dict]) -> Optional[float]:
+    scores = (report or {}).get("scores") or {}
+    vals = [float(v) for v in scores.values() if isinstance(v, (int, float))]
+    if not vals:
+        return None
+    return round(sum(vals) / len(vals), 2)
+
+
+def _calibrated_backends() -> set:
+    try:
+        from src.config import config as _config
+        gate_cfg = _config.get("pipeline.final_gate", {}) or {}
+        raw = gate_cfg.get("calibrated_backends") or ["jev"]
+    except Exception:
+        raw = ["jev"]
+    if isinstance(raw, str):
+        raw = [raw]
+    return {str(x) for x in raw}
+
+
+def _iter_chapter_ids(scheduler) -> List[str]:
+    rows = scheduler.conn.execute(
+        "SELECT DISTINCT chapter_id FROM chunk_tasks ORDER BY chapter_id"
+    ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def _report_matches_final(report: Optional[dict], final_path: Path) -> bool:
+    """Return False when a re-audit report was produced for different final text.
+
+    Reports written by ``recalibrate-critic`` carry the SHA-256 of the final
+    text they audited.  Repairs performed after that audit make the scores
+    stale even though ``_backend_path`` still says ``jev``.  Older reports
+    without ``_reaudit.final_sha256`` cannot be checked this way; they are
+    treated as current unless ``--force`` is requested.
+    """
+    audited_sha = str(((report or {}).get("_reaudit") or {}).get("final_sha256") or "")
+    if not audited_sha:
+        return True
+    final_text = _load_final_text(final_path)
+    if final_text is None:
+        return False
+    return _sha256_text(final_text) == audited_sha
+
+
+def critic_evidence_state(
+    report: Optional[dict],
+    final_path: Path,
+    project_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Classify whether a critic report is evidence for the *current* final.
+
+    A critic report written before ``finalize`` / ``book-repair`` is not
+    sufficient merely because it still says ``_backend_path=jev``.  When a
+    report carries an explicit final hash, the gate must either (a) match the
+    current final exactly, or (b) prove a chain of verified ``book_repair``
+    rewrites from the audited text to the current text.  The chain is only
+    accepted when every link's before/after hashes and byte backup agree.
+
+    Reports without any explicit binding are returned as ``unbound``.  They
+    are legacy evidence: the backend provenance is retained, but they cannot
+    claim to have audited the delivered bytes.
+    """
+    final_path = Path(final_path)
+    final_payload = _read_json(final_path)
+    if not final_payload or not isinstance(final_payload.get("text"), str):
+        return {
+            "status": "missing_final",
+            "audited_sha256": None,
+            "current_sha256": None,
+            "field": None,
+            "reason": "final 缺少可用 text",
+        }
+
+    current_sha = _sha256_text(final_payload["text"])
+    report = report or {}
+    binding = report.get("_final_binding") or {}
+    reaudit = report.get("_reaudit") or {}
+    target = report.get("_audit_target") or {}
+
+    # An explicit final binding is the strongest statement.  If it names a
+    # different byte sequence than the one on disk, a later stage edited the
+    # final without recording a replacement binding.
+    binding_final = str(binding.get("final_sha256") or "")
+    if binding_final:
+        if binding_final != current_sha:
+            return {
+                "status": "stale",
+                "audited_sha256": binding_final,
+                "current_sha256": current_sha,
+                "field": "_final_binding.final_sha256",
+                "reason": "final binding 与当前 final 哈希不一致",
+            }
+        # A binding may carry the original audited hash as well.  If it does
+        # not, the binding itself is the only available final-level evidence.
+        audited_sha = str(binding.get("audited_sha256") or "")
+        if not audited_sha:
+            return {
+                "status": "exact",
+                "audited_sha256": current_sha,
+                "current_sha256": current_sha,
+                "field": "_final_binding.final_sha256",
+                "reason": "final binding 与当前 final 完全一致",
+            }
+    else:
+        audited_sha = ""
+
+    field = ""
+    if not audited_sha:
+        audited_sha = str(reaudit.get("final_sha256") or "")
+        if audited_sha:
+            field = "_reaudit.final_sha256"
+    if not audited_sha:
+        audited_sha = str(target.get("literary_sha256") or "")
+        if audited_sha:
+            field = "_audit_target.literary_sha256"
+    if not audited_sha:
+        audited_sha = str(binding.get("before_sha256") or "")
+        if audited_sha:
+            field = "_final_binding.before_sha256"
+
+    if not audited_sha:
+        return {
+            "status": "unbound",
+            "audited_sha256": None,
+            "current_sha256": current_sha,
+            "field": None,
+            "reason": "critic_report 未记录 audited final 哈希",
+        }
+
+    if audited_sha == current_sha:
+        return {
+            "status": "exact",
+            "audited_sha256": audited_sha,
+            "current_sha256": current_sha,
+            "field": field,
+            "reason": "audited final 哈希与当前 final 完全一致",
+        }
+
+    root = Path(project_root) if project_root else final_path.parent.parent.parent
+    payload = final_payload
+    path = final_path
+    chain: List[Dict[str, str]] = []
+    seen = set()
+    for _depth in range(16):
+        path_key = str(path.resolve())
+        if path_key in seen:
+            break
+        seen.add(path_key)
+        metadata = payload.get("metadata") or {}
+        repair = metadata.get("book_repair") or {}
+        before = str(repair.get("before_sha256") or "")
+        after = str(repair.get("after_sha256") or "")
+        text = payload.get("text") if isinstance(payload.get("text"), str) else ""
+        actual = _sha256_text(text)
+        if not before or not after or after != actual:
+            break
+        chain.append({
+            "path": str(path),
+            "before_sha256": before,
+            "after_sha256": after,
+        })
+        backup = repair.get("backup")
+        if not backup:
+            break
+        backup_path = Path(str(backup))
+        if not backup_path.is_absolute():
+            backup_path = root / backup_path
+        backup_payload = _read_json(backup_path)
+        if not backup_payload or not isinstance(backup_payload.get("text"), str):
+            break
+        if _sha256_text(backup_payload["text"]) != before:
+            break
+        if before == audited_sha:
+            return {
+                "status": "repaired",
+                "audited_sha256": audited_sha,
+                "current_sha256": current_sha,
+                "field": field,
+                "repair_chain": chain,
+                "reason": "audited final 经可验证 book-repair 链到达当前 final",
+            }
+        path = backup_path
+        payload = backup_payload
+
+    return {
+        "status": "stale",
+        "audited_sha256": audited_sha,
+        "current_sha256": current_sha,
+        "field": field,
+        "repair_chain": chain,
+        "reason": "audited final 与当前 final 不同，且无完整 book-repair 链",
+    }
+
+
+def _select_targets(root: Path, scheduler, chapters: Iterable[str],
+                    chunk_ids: Optional[Iterable[str]], calibrated: set,
+                    force: bool = False) -> List[dict]:
+    wanted = {str(c) for c in (chunk_ids or []) if str(c)}
+    targets: List[dict] = []
+    for chapter_id in chapters:
+        out_dir = root / "output" / chapter_id
+        for task in scheduler.get_all_tasks_by_chapter(chapter_id):
+            cid = str(task.get("chunk_id") or "")
+            if not cid or (wanted and cid not in wanted):
+                continue
+            final_path = out_dir / f"{cid}_final.json"
+            report_path = out_dir / f"{cid}_critic_report.json"
+            if not final_path.exists():
+                targets.append({
+                    "chapter": chapter_id,
+                    "chunk_id": cid,
+                    "reason": "missing_final",
+                    "old_backend": None,
+                    "report_path": str(report_path),
+                    "final_path": str(final_path),
+                })
+                continue
+            report = _read_json(report_path) if report_path.exists() else None
+            old_backend = str((report or {}).get("_backend_path") or "missing")
+            stale = report is not None and not _report_matches_final(report, final_path)
+            if report is not None and old_backend in calibrated and not force and not stale:
+                continue
+            reason = "missing_report" if report is None else "uncalibrated_report"
+            if stale and old_backend in calibrated:
+                reason = "stale_report"
+            targets.append({
+                "chapter": chapter_id,
+                "chunk_id": cid,
+                "reason": reason,
+                "old_backend": None if report is None else old_backend,
+                "old_avg": _score_average(report),
+                "report_path": str(report_path),
+                "final_path": str(final_path),
+            })
+    return targets
+
+
+def _load_final_text(path: Path) -> Optional[str]:
+    data = _read_json(path)
+    if not data:
+        return None
+    text = data.get("text")
+    return text if isinstance(text, str) and text.strip() else None
+
+
+def _load_intermediate_text(path: Path) -> Optional[str]:
+    data = _read_json(path)
+    if not data:
+        return None
+    text = data.get("text")
+    if isinstance(text, str) and text.strip():
+        return text
+    return None
+
+
+def _is_retryable_result(report: dict) -> bool:
+    diag = report.get("_backend_diagnostics") or {}
+    categories = set()
+    for value in diag.values():
+        if isinstance(value, dict) and value.get("category"):
+            categories.add(str(value.get("category")))
+    if categories & {"auth", "dependency", "model_access", "request_schema"}:
+        return False
+    return True
+
+
+def _is_retryable_exception(exc: Exception) -> bool:
+    try:
+        from src.judges.typesafe_backend import classify_backend_error
+        category = str((classify_backend_error(exc) or {}).get("category") or "")
+    except Exception:
+        category = ""
+    return category not in {"auth", "dependency", "model_access", "request_schema"}
+
+
+class _WorkerState:
+    def __init__(self, root: Path, low_score_threshold: float) -> None:
+        self.root = root
+        self.low_score_threshold = low_score_threshold
+        self.local = threading.local()
+
+    def pipeline(self, chapter_id: str):
+        if not hasattr(self.local, "pipelines"):
+            self.local.pipelines = {}
+        pipelines = self.local.pipelines
+        if chapter_id not in pipelines:
+            from src.pipeline import TranslationPipeline
+            pipelines[chapter_id] = TranslationPipeline(chapter_id=chapter_id)
+        return pipelines[chapter_id]
+
+
+def _process_one(state: _WorkerState, target: dict, calibrated: set,
+                 retries: int) -> dict:
+    chapter_id = target["chapter"]
+    cid = target["chunk_id"]
+    final_path = Path(target["final_path"])
+    report_path = Path(target["report_path"])
+    row = dict(target)
+    row.update({"status": "failed", "new_backend": None, "new_avg": None,
+                "error": None})
+
+    final_text = _load_final_text(final_path)
+    if final_text is None:
+        row["error"] = "final.json 缺少可用 text"
+        return row
+    final_hash_before = _sha256_text(final_text)
+    row["final_sha256"] = final_hash_before
+
+    try:
+        pipeline = state.pipeline(chapter_id)
+        task = pipeline.scheduler.get_task(cid) or {}
+        source_text = task.get("text_content") or ""
+        if not source_text.strip():
+            raise RuntimeError("workflow.db 缺少 chunk source_text")
+
+        raw_text = _load_intermediate_text(final_path.with_name(f"{cid}_raw.json"))
+        raw_source = "raw" if raw_text is not None else "final"
+        if raw_text is None:
+            raw_text = final_text
+
+        entity_registry = pipeline._build_entity_registry_for_rewriter(source_text)
+        entity_variants = pipeline._build_entity_variants_for_critic(source_text)
+
+        report: dict = {}
+        attempts_used = 0
+        attempts = max(0, int(retries)) + 1
+        for attempt in range(attempts):
+            attempts_used = attempt + 1
+            try:
+                report = pipeline.critic_agent.process_chunk(
+                    cid,
+                    source_text,
+                    raw_text,
+                    final_text,
+                    pipeline.style_guide,
+                    entity_registry=entity_registry,
+                    entity_variants=entity_variants,
+                    allow_legacy_fallback=False,
+                )
+            except Exception as exc:
+                if attempt + 1 >= attempts or not _is_retryable_exception(exc):
+                    raise
+                time.sleep(min(2 ** attempt, 8))
+                continue
+            backend = str((report or {}).get("_backend_path") or "")
+            scores = (report or {}).get("scores") or {}
+            if backend in calibrated and scores:
+                break
+            if attempt + 1 >= attempts or not _is_retryable_result(report or {}):
+                break
+            time.sleep(min(2 ** attempt, 8))
+
+        from src.splitters import _normalize_scores
+        if isinstance(report, dict) and "scores" in report:
+            report["scores"] = _normalize_scores(report.get("scores"))
+
+        backend = str((report or {}).get("_backend_path") or "unknown")
+        avg = _score_average(report)
+        row["new_backend"] = backend
+        row["new_avg"] = avg
+        row["low_score"] = bool(avg is not None and avg < state.low_score_threshold)
+
+        if backend not in calibrated or not (report or {}).get("scores"):
+            row["error"] = f"重审仍非校准后端: {backend}"
+            return row
+
+        report["_reaudit"] = {
+            "tool": "recalibrate-critic",
+            "schema_version": 1,
+            "at": _utc_now(),
+            "previous_backend_path": target.get("old_backend"),
+            "previous_score_avg": target.get("old_avg"),
+            "final_sha256": final_hash_before,
+            "raw_input": raw_source,
+            "literary_input": "final",
+            "attempts_allowed": attempts,
+            "attempts_used": attempts_used,
+        }
+        report["_audit_target"] = {
+            "schema_version": 1,
+            "source_sha256": _sha256_text(source_text),
+            "raw_sha256": _sha256_text(raw_text),
+            "literary_sha256": final_hash_before,
+        }
+        _atomic_write_json(report_path, report)
+
+        final_text_after = _load_final_text(final_path)
+        final_hash_after = _sha256_text(final_text_after or "")
+        if final_hash_after != final_hash_before:
+            row["error"] = "内部错误：final 文本哈希发生变化"
+            return row
+        row["status"] = "recalibrated"
+        return row
+    except Exception as exc:
+        row["error"] = f"{type(exc).__name__}: {exc}"
+        return row
+
+
+def run_recalibrate_critic(
+    *,
+    chapter_id: Optional[str] = None,
+    all_chapters: bool = False,
+    chunk_ids: Optional[Iterable[str]] = None,
+    limit: Optional[int] = None,
+    workers: int = 1,
+    apply: bool = False,
+    low_score_threshold: float = 7.0,
+    retries: int = 1,
+    force: bool = False,
+    project_root: Optional[Path] = None,
+) -> dict:
+    """Re-audit missing/uncalibrated critic reports without touching finals."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    root = Path(project_root).resolve() if project_root else Path(__file__).resolve().parent.parent
+    if not all_chapters and not chapter_id:
+        raise ValueError("recalibrate-critic 需要 --chapter 或 --all")
+
+    from src.core.scheduler import TaskScheduler
+    scheduler = TaskScheduler(db_path=str(root / "db" / "workflow.db"))
+    try:
+        chapters = _iter_chapter_ids(scheduler) if all_chapters else [str(chapter_id)]
+        calibrated = _calibrated_backends()
+        targets = _select_targets(root, scheduler, chapters, chunk_ids, calibrated,
+                                  force=force)
+        if limit is not None:
+            targets = targets[:max(0, int(limit))]
+
+        summary = {
+            "ok": True,
+            "applied": bool(apply),
+            "chapters": chapters,
+            "calibrated_backends": sorted(calibrated),
+            "selected": len(targets),
+            "recalibrated": 0,
+            "failed": 0,
+            "low_score": 0,
+            "low_score_threshold": float(low_score_threshold),
+            "workers": max(1, int(workers)),
+            "rows": [],
+            "errors": [],
+            "low_scores": [],
+            "started_at": _utc_now(),
+        }
+        if not apply:
+            summary["dry_run"] = True
+            summary["rows"] = targets
+            return summary
+
+        merged_before = None
+        merged_path = root / "output" / "沙丘.md"
+        if merged_path.exists():
+            merged_before = _sha256_file(merged_path)
+
+        state = _WorkerState(root, float(low_score_threshold))
+        rows: List[dict] = []
+        total = len(targets)
+        if total:
+            with ThreadPoolExecutor(max_workers=max(1, int(workers))) as pool:
+                futures = {
+                    pool.submit(_process_one, state, target, calibrated, retries): target
+                    for target in targets
+                }
+                done = 0
+                for fut in as_completed(futures):
+                    row = fut.result()
+                    rows.append(row)
+                    done += 1
+                    if row.get("status") != "recalibrated" or row.get("low_score"):
+                        print(
+                            f"  ⚠️ {row['chunk_id']}: {row.get('status')} "
+                            f"backend={row.get('new_backend')} avg={row.get('new_avg')} "
+                            f"{row.get('error') or ''}".rstrip()
+                        )
+                    if done % 10 == 0 or done == total:
+                        print(f"  … recalibrate-critic {done}/{total}")
+
+        rows.sort(key=lambda r: (r.get("chapter") or "", r.get("chunk_id") or ""))
+        summary["rows"] = rows
+        summary["recalibrated"] = sum(1 for r in rows if r.get("status") == "recalibrated")
+        summary["failed"] = sum(1 for r in rows if r.get("status") != "recalibrated")
+        summary["low_scores"] = [
+            {"chapter": r.get("chapter"), "chunk_id": r.get("chunk_id"),
+             "avg": r.get("new_avg"), "backend": r.get("new_backend")}
+            for r in rows if r.get("low_score")
+        ]
+        summary["low_score"] = len(summary["low_scores"])
+        summary["errors"] = [
+            {"chapter": r.get("chapter"), "chunk_id": r.get("chunk_id"),
+             "error": r.get("error")}
+            for r in rows if r.get("status") != "recalibrated"
+        ]
+
+        if merged_before is not None:
+            merged_after = _sha256_file(merged_path) if merged_path.exists() else None
+            summary["merged_sha256_before"] = merged_before
+            summary["merged_sha256_after"] = merged_after
+            if merged_after != merged_before:
+                summary["ok"] = False
+                summary["errors"].append({"error": "output/沙丘.md 哈希发生变化"})
+        if summary["failed"]:
+            summary["ok"] = False
+        summary["finished_at"] = _utc_now()
+
+        report_path = root / "output" / "recalibrate_critic_report.json"
+        _atomic_write_json(report_path, summary)
+        summary["report_path"] = str(report_path)
+        return summary
+    finally:
+        try:
+            scheduler.conn.close()
+        except Exception:
+            pass
+
+
+SCHEMA_VERSION = 1
+REPORT_NAME = "proofread_report.json"
+
+_ARTIFACT_HEADING_RE = re.compile(
+    r'^\s*#{2,6}\s*(?:译文|注释|正文|原文|脚注|译注)\s*$')
+_PIPELINE_META_HEADER_RE = re.compile(
+    r'^\s*\*{0,2}术语处理说明\*{0,2}\s*$')
+_PIPELINE_META_LINE_RE = re.compile(
+    r'^\s*(?:>\s*)?\*{0,2}(?:译名冲突说明|原指令中|实体译名登记表)')
+_REPLACEMENT_RE = re.compile('\ufffd')
+_INVISIBLE_RE = re.compile('[\u200b\u200c\u200d\ufeff]')
+_CONTROL_RE = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]')
+_HTML_TAG_RE = re.compile(r'</?[A-Za-z][^>\n]{0,120}>')
+_DUP_PUNCT_RE = re.compile(r'([，。；：、])\1+')
+_REPEAT_EMPHASIS_RE = re.compile(r'([？！])\1+')
+_SPACE_BEFORE_PUNCT_RE = re.compile(r'[ \t]+[，。；：、？！]')
+_HALF_PUNCT_RE = re.compile(r'(?<=[\u4e00-\u9fff])[;:!?,](?=[\u4e00-\u9fff\s]|$)')
+_FOOTNOTE_REF_RE = re.compile(r'\[\^[^\]]+\]')
+_TERMINAL_RE = re.compile(r'[。！？…”’」』）】》.!?;:—]$')
+
+_BRACKET_PAIRS: Tuple[Tuple[str, str, str], ...] = (
+    ('（', '）', '圆括号'),
+    ('【', '】', '方头括号'),
+    ('《', '》', '书名号'),
+)
+_QUOTE_PAIRS: Tuple[Tuple[str, str, str], ...] = (
+    ('“', '”', '双引号'),
+    ('‘', '’', '单引号'),
+)
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _line_of(text: str, pos: int) -> int:
+    return text.count('\n', 0, pos) + 1
+
+
+def _chapter_map(text: str) -> Tuple[List[str], List[Tuple[int, str, int, int]]]:
+    """Return per-line chapter labels and H1 section spans."""
+    lines = text.split('\n')
+    labels: List[str] = []
+    current = '(前置)'
+    sections: List[Tuple[int, str, int, int]] = []
+    for idx, line in enumerate(lines):
+        if line.startswith('# '):
+            current = line.strip()
+            sections.append((idx, current, idx + 1, len(lines)))
+        labels.append(current)
+    # Fix section ends now that all headings are known.
+    fixed: List[Tuple[int, str, int, int]] = []
+    for n, (start, heading, body_start, _end) in enumerate(sections):
+        end = sections[n + 1][0] if n + 1 < len(sections) else len(lines)
+        fixed.append((start, heading, body_start, end))
+    return labels, fixed
+
+
+def _excerpt(line: str, limit: int = 120) -> str:
+    return re.sub(r'\s+', ' ', line.strip())[:limit]
+
+
+def _add_issue(issues: List[dict], *, rule: str, severity: str,
+               message: str, chapter: str, line: int, excerpt: str,
+               fixable: bool = False) -> None:
+    issues.append({
+        "rule": rule,
+        "severity": severity,
+        "chapter": chapter,
+        "line": int(line),
+        "message": message,
+        "excerpt": excerpt,
+        "fixable": bool(fixable),
+    })
+
+
+def _scan_text(text: str, input_lengths: Optional[Dict[str, int]] = None) -> List[dict]:
+    """Return deterministic proofreading findings for *text*."""
+    issues: List[dict] = []
+    lines = text.split('\n')
+    labels, sections = _chapter_map(text)
+
+    def chapter_at(pos: int) -> Tuple[str, int]:
+        line = _line_of(text, pos)
+        return labels[line - 1] if 0 < line <= len(labels) else '(前置)', line
+
+    # Invisible/control/encoding damage.
+    for rule, regex, severity, message, fixable in (
+        ("replacement_char", _REPLACEMENT_RE, "blocking",
+         "Unicode 替换字符 U+FFFD（编码损坏）", False),
+        ("invisible_char", _INVISIBLE_RE, "blocking",
+         "零宽/BOM 不可见字符", True),
+        ("control_char", _CONTROL_RE, "blocking",
+         "C0/C1 控制字符", True),
+    ):
+        for match in regex.finditer(text):
+            chapter, line = chapter_at(match.start())
+            _add_issue(
+                issues, rule=rule, severity=severity, message=message,
+                chapter=chapter, line=line,
+                excerpt=_excerpt(lines[line - 1]), fixable=fixable)
+
+    # Chunk-assembly artifact headings.
+    for idx, line in enumerate(lines, 1):
+        if _ARTIFACT_HEADING_RE.match(line):
+            _add_issue(
+                issues, rule="artifact_heading", severity="blocking",
+                message="chunk 拼接残留标题（不是正文）", chapter=labels[idx - 1],
+                line=idx, excerpt=_excerpt(line), fixable=True)
+        if _PIPELINE_META_HEADER_RE.match(line):
+            _add_issue(
+                issues, rule="pipeline_meta_block", severity="blocking",
+                message="流水线术语处理说明残留（不是正文）", chapter=labels[idx - 1],
+                line=idx, excerpt=_excerpt(line), fixable=True)
+        if _PIPELINE_META_LINE_RE.match(line):
+            _add_issue(
+                issues, rule="pipeline_meta_line", severity="blocking",
+                message="流水线/实体登记说明残留（不是正文）", chapter=labels[idx - 1],
+                line=idx, excerpt=_excerpt(line), fixable=True)
+
+    # Raw HTML and repeated punctuation.
+    for match in _HTML_TAG_RE.finditer(text):
+        chapter, line = chapter_at(match.start())
+        _add_issue(
+            issues, rule="html_tag", severity="blocking",
+            message="正文残留 HTML 标签", chapter=chapter, line=line,
+            excerpt=_excerpt(lines[line - 1]))
+    for match in _DUP_PUNCT_RE.finditer(text):
+        chapter, line = chapter_at(match.start())
+        _add_issue(
+            issues, rule="duplicate_punctuation", severity="blocking",
+            message="连续重复标点", chapter=chapter, line=line,
+            excerpt=_excerpt(lines[line - 1]))
+    for match in _REPEAT_EMPHASIS_RE.finditer(text):
+        chapter, line = chapter_at(match.start())
+        _add_issue(
+            issues, rule="repeated_emphasis", severity="warning",
+            message="连续重复问号/叹号（可能是刻意强调，需确认）",
+            chapter=chapter, line=line,
+            excerpt=_excerpt(lines[line - 1]))
+
+    # Layout warnings: half-width punctuation and spaces before CJK punctuation.
+    for match in _HALF_PUNCT_RE.finditer(text):
+        chapter, line = chapter_at(match.start())
+        _add_issue(
+            issues, rule="halfwidth_punctuation", severity="warning",
+            message="中文正文中混入半角标点", chapter=chapter, line=line,
+            excerpt=_excerpt(lines[line - 1]))
+    for match in _SPACE_BEFORE_PUNCT_RE.finditer(text):
+        chapter, line = chapter_at(match.start())
+        _add_issue(
+            issues, rule="space_before_punctuation", severity="warning",
+            message="中文标点前有多余空格", chapter=chapter, line=line,
+            excerpt=_excerpt(lines[line - 1]))
+
+    # Paired symbols.  Bracket imbalance is objective; quote imbalance is a
+    # warning because multi-paragraph speeches are legitimate in some editions.
+    for _start, heading, body_start, body_end in sections:
+        body = '\n'.join(lines[body_start:body_end])
+        for open_c, close_c, label in _BRACKET_PAIRS:
+            if body.count(open_c) != body.count(close_c):
+                _add_issue(
+                    issues, rule="unbalanced_bracket", severity="blocking",
+                    message=f"{label}不成对（{open_c}{body.count(open_c)}/{close_c}{body.count(close_c)}）",
+                    chapter=heading, line=body_start + 1,
+                    excerpt=_excerpt(heading))
+        for open_c, close_c, label in _QUOTE_PAIRS:
+            if body.count(open_c) != body.count(close_c):
+                _add_issue(
+                    issues, rule="unbalanced_quote", severity="warning",
+                    message=f"{label}数量不平衡（{open_c}{body.count(open_c)}/{close_c}{body.count(close_c)}），需人工确认是否跨段引语",
+                    chapter=heading, line=body_start + 1,
+                    excerpt=_excerpt(heading))
+
+    # Chapter shell: duplicates, empty sections, blank line after H1.
+    seen_headings: Dict[str, int] = {}
+    for _start, heading, body_start, body_end in sections:
+        seen_headings[heading] = seen_headings.get(heading, 0) + 1
+        if body_end <= body_start or not '\n'.join(lines[body_start:body_end]).strip():
+            _add_issue(
+                issues, rule="empty_chapter", severity="blocking",
+                message="章节正文为空", chapter=heading, line=_start + 1,
+                excerpt=_excerpt(heading))
+        if body_start < len(lines) and lines[body_start].strip():
+            _add_issue(
+                issues, rule="heading_spacing", severity="warning",
+                message="H1 标题后缺少空行", chapter=heading, line=_start + 1,
+                excerpt=_excerpt(heading))
+    for heading, count in seen_headings.items():
+        if count > 1:
+            _add_issue(
+                issues, rule="duplicate_heading", severity="blocking",
+                message=f"H1 标题重复 {count} 次", chapter=heading, line=1,
+                excerpt=_excerpt(heading))
+    if not sections and text.strip():
+        _add_issue(
+            issues, rule="missing_heading", severity="blocking",
+            message="成书没有任何 H1 章节标题", chapter="(全书)", line=1,
+            excerpt=_excerpt(text.split('\n', 1)[0]))
+
+    # Chapter length sanity (only when input chapter files are available).
+    if input_lengths:
+        ordered_inputs = [input_lengths[k] for k in sorted(input_lengths)]
+        if len(ordered_inputs) == len(sections):
+            for (_start, heading, body_start, body_end), src_len in zip(sections, ordered_inputs):
+                body_len = len('\n'.join(lines[body_start:body_end]))
+                if src_len <= 0:
+                    continue
+                ratio = body_len / src_len
+                if ratio < 0.20 or ratio > 1.20:
+                    _add_issue(
+                        issues, rule="chapter_length", severity="warning",
+                        message=f"章节长度比例异常（译文/原文={ratio:.2f}）",
+                        chapter=heading, line=_start + 1, excerpt=_excerpt(heading))
+
+    # A single-line paragraph ending in a CJK character without terminal
+    # punctuation is a conservative missing-punctuation signal.
+    for idx, line in enumerate(lines):
+        s = line.strip()
+        if not s or len(s) < 20:
+            continue
+        if idx > 0 and lines[idx - 1].strip():
+            continue
+        if idx + 1 < len(lines) and lines[idx + 1].strip():
+            continue
+        if s.startswith(('#', '>', '-', '*', '|', '[^', '——', '= =')):
+            continue
+        if _FOOTNOTE_REF_RE.sub('', s).rstrip().endswith(('。', '！', '？', '…', '”', '’', '」', '』', '）', '】', '》', '.', '!', '?', ':', '—')):
+            continue
+        if _TERMINAL_RE.search(s):
+            continue
+        if re.search(r'[\u4e00-\u9fff]$', s):
+            _add_issue(
+                issues, rule="paragraph_end", severity="warning",
+                message="单行段落末尾缺少终止标点", chapter=labels[idx],
+                line=idx + 1, excerpt=_excerpt(s))
+
+    # Report trailing whitespace once per chapter, not once per line.
+    trailing: Dict[str, int] = {}
+    for idx, line in enumerate(lines):
+        if line == line.rstrip():
+            continue
+        tail = line[len(line.rstrip()):]
+        # Exactly two trailing spaces are the standard Markdown hard-break
+        # marker (used by verse in this corpus), not a formatting defect.
+        if line.strip() and tail == '  ':
+            continue
+        trailing[labels[idx]] = trailing.get(labels[idx], 0) + 1
+    for chapter, count in trailing.items():
+        _add_issue(
+            issues, rule="trailing_whitespace", severity="warning",
+            message=f"异常行尾空白 {count} 行（已排除两个空格的 Markdown 硬换行）",
+            chapter=chapter, line=1, excerpt="")
+
+    return issues
+
+
+def _apply_safe(text: str) -> Tuple[str, List[dict]]:
+    """Remove only deterministic, non-semantic artifacts."""
+    fixed: List[dict] = []
+    lines = text.split('\n')
+    kept: List[str] = []
+    skip_pipeline_block = False
+    for idx, line in enumerate(lines, 1):
+        if _PIPELINE_META_HEADER_RE.match(line):
+            fixed.append({"rule": "pipeline_meta_block", "line": idx,
+                          "action": "removed", "excerpt": _excerpt(line)})
+            skip_pipeline_block = True
+            continue
+        if skip_pipeline_block:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("- "):
+                if stripped:
+                    fixed.append({"rule": "pipeline_meta_block", "line": idx,
+                                  "action": "removed", "excerpt": _excerpt(line)})
+                continue
+            skip_pipeline_block = False
+        if _PIPELINE_META_LINE_RE.match(line):
+            fixed.append({"rule": "pipeline_meta_line", "line": idx,
+                          "action": "removed", "excerpt": _excerpt(line)})
+            continue
+        if _ARTIFACT_HEADING_RE.match(line):
+            fixed.append({"rule": "artifact_heading", "line": idx,
+                          "action": "removed", "excerpt": _excerpt(line)})
+            continue
+        kept.append(line)
+    new_text = '\n'.join(kept)
+    for rule, regex, action in (
+        ("invisible_char", _INVISIBLE_RE, "removed"),
+        ("control_char", _CONTROL_RE, "removed"),
+    ):
+        new_text, count = regex.subn('', new_text)
+        if count:
+            fixed.append({"rule": rule, "line": 0, "action": action,
+                          "count": count})
+    return new_text, fixed
+
+
+def proofread_book(
+    project_root: Optional[Any] = None,
+    output_dir: Optional[Any] = None,
+    merged_path: Optional[Any] = None,
+    apply: bool = False,
+    json_out: Optional[Any] = None,
+) -> Dict[str, Any]:
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    out_root = Path(output_dir) if output_dir else root / "output"
+    merged = (Path(merged_path) if merged_path
+              else resolve_book_output_path(root, out_root))
+    if not merged.exists():
+        return {"ok": False, "error": f"merged_not_found: {merged}",
+                "issues": [], "summary": {"blocking": 0, "warning": 0, "fixed": 0}}
+
+    try:
+        original = merged.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return {"ok": False, "error": f"merged_read_error: {exc}",
+                "issues": [], "summary": {"blocking": 0, "warning": 0, "fixed": 0}}
+    text = original
+    fixed: List[dict] = []
+    if apply:
+        text, fixed = _apply_safe(text)
+        if text != original:
+            atomic_write_text(merged, text)
+
+    input_lengths: Dict[str, int] = {}
+    input_dir = root / "input"
+    if input_dir.exists():
+        for path in sorted(input_dir.glob("ch*.md")):
+            try:
+                input_lengths[path.stem] = len(path.read_text(encoding="utf-8"))
+            except OSError:
+                pass
+
+    issues = _scan_text(text, input_lengths=input_lengths)
+    blocking = sum(1 for issue in issues if issue["severity"] == "blocking")
+    warnings = sum(1 for issue in issues if issue["severity"] == "warning")
+    by_rule: Dict[str, int] = {}
+    for issue in issues:
+        by_rule[issue["rule"]] = by_rule.get(issue["rule"], 0) + 1
+
+    merged_sha = _sha256_bytes(text.encode("utf-8"))
+    report_path = (Path(json_out) if json_out
+                   else out_root / REPORT_NAME)
+    report = {
+        "schema_version": SCHEMA_VERSION,
+        "ok": blocking == 0,
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "merged_path": str(merged),
+        "original_sha256": _sha256_bytes(original.encode("utf-8")),
+        "merged_sha256": merged_sha,
+        "changed": text != original,
+        "apply": bool(apply),
+        "summary": {
+            "blocking": blocking,
+            "warning": warnings,
+            "fixed": len(fixed),
+            "by_rule": by_rule,
+        },
+        "issues": issues,
+        "fixed": fixed,
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(report_path, report)
+
+    md_lines = ["# 成书机械排错报告 (proofread)", ""]
+    md_lines.append(f"- 模式: {'APPLY (安全修复已写入)' if apply else 'DRY RUN (仅报告)'}")
+    md_lines.append(f"- 成书: `{merged}`")
+    md_lines.append(f"- SHA-256: `{merged_sha}`")
+    md_lines.append(f"- 阻断项: {blocking}；警告: {warnings}；安全修复: {len(fixed)}")
+    md_lines.append("")
+    if blocking or warnings:
+        md_lines.append("## 发现")
+        md_lines.append("")
+        for issue in issues[:200]:
+            md_lines.append(
+                f"- [{issue['severity']}] `{issue['rule']}` {issue['chapter']}:"
+                f"{issue['line']} — {issue['message']}：{issue['excerpt']}")
+        if len(issues) > 200:
+            md_lines.append(f"- ……另有 {len(issues) - 200} 条，见 JSON 报告")
+    else:
+        md_lines.append("（未发现机械性错误）")
+    if fixed:
+        md_lines += ["", "## 安全修复", ""]
+        for item in fixed[:100]:
+            md_lines.append(
+                f"- `{item.get('rule')}` line={item.get('line')} "
+                f"{item.get('action')} {item.get('excerpt', '')}".rstrip())
+    md_lines += ["", "---", "*由 proofread 子命令自动生成*", ""]
+    atomic_write_text(report_path.with_suffix(".md"), "\n".join(md_lines))
+
+    print(f"🧹 proofread({'apply' if apply else 'dry-run'}): "
+          f"blocking={blocking}, warning={warnings}, fixed={len(fixed)}")
+    print(f"   报告: {report_path}")
+    return {
+        "ok": blocking == 0,
+        "changed": text != original,
+        "merged_path": str(merged),
+        "merged_sha256": merged_sha,
+        "report_path": str(report_path),
+        "issues": issues,
+        "fixed": fixed,
+        "summary": report["summary"],
+    }
+
+
+BOOK_REPAIR_SCHEMA_VERSION = 1
+BOOK_REPAIR_REPORT_NAME = "book_repair_report.json"
+
+_BR_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "LETO": (
+        "雷托·厄崔迪公爵", "雷托·厄崔迪斯", "雷托·厄崔迪", "雷托公爵", "雷托",
+    ),
+    "PAUL": (
+        "保罗·厄崔迪", "保罗·亚崔迪", "保罗·阿特雷迪斯", "保罗·厄崔迪斯",
+        "保罗·阿特雷德斯", "保罗",
+    ),
+    "JESSICA": ("杰西卡夫人", "杰西卡"),
+    "MOHIAM": (
+        "盖乌斯·海伦·莫希阿姆", "盖乌斯夫人", "莫希阿姆", "盖乌斯", "海伦",
+    ),
+    "FEYD": (
+        "菲德-罗萨", "费德-罗萨", "菲德·罗萨", "费德·罗萨", "菲德", "费德",
+    ),
+    # Bare "戈姆" is intentionally omitted: it also occurs in legitimate
+    # weapon/glossary contexts.  Only the full person-shaped surface is audited.
+    "GOM": ("戈姆·贾巴尔",),
+    "PITER": ("皮特", "彼得"),
+    "TRUTHSAYER": ("真言者", "真言师"),
+}
+_BR_TERMS: Tuple[Tuple[str, str], ...] = tuple(sorted(
+    ((surface, key) for key, aliases in _BR_ALIASES.items() for surface in aliases),
+    key=lambda item: len(item[0]), reverse=True,
+))
+
+_BR_EN_NAMES: Dict[str, Tuple[str, ...]] = {
+    "LETO": ("Leto",),
+    "PAUL": ("Paul",),
+    "JESSICA": ("Jessica",),
+    "MOHIAM": ("Mohiam", "Gaius"),
+    "FEYD": ("Feyd",),
+    "GOM": ("Gom Jabbar",),
+    "PITER": ("Piter",),
+    "TRUTHSAYER": ("Truthsayer",),
+}
+
+# Only these directions are accepted by the sequence-based core-person rule.
+# FEYD is handled separately because the literary draft itself can carry the
+# historical Gom contamination.
+_BR_SAFE_SUBSTITUTIONS: Dict[str, str] = {
+    "MOHIAM": "JESSICA",
+    "PAUL": "LETO",
+}
+_BR_CANONICAL_SURFACE: Dict[str, str] = {
+    "FEYD": "菲德-罗萨",
+    "LETO": "雷托",
+    "PAUL": "保罗",
+    "JESSICA": "杰西卡",
+    "MOHIAM": "盖乌斯·海伦·莫希阿姆",
+}
+
+_BR_GOM_NOTE = "戈姆·贾巴尔：贝尼·杰瑟里特姐妹会用于测试人类与动物之别的毒针武器。"
+_BR_GOM_ALIAS_NOTE = (
+    "戈姆刺（戈姆·贾巴尔，gom jabbar）：贝尼·杰瑟里特姐妹会用于测试人类与动物之别的毒针武器。"
+)
+_BR_GOM_SURFACES = ("戈姆·贾巴尔", "戈姆刺")
+_BR_FAUFRELUCHES_NOTE = (
+    "“法弗勒鲁奇”（Faufreluches）：帝国社会等级制度的统称，规定各阶层与家族的地位及往来规范。"
+)
+_BR_GOM_WRONG_MARKERS = (
+    "弗雷曼传说", "弗雷曼的传说", "禁忌体系", "沙虫", "沙虫之牙",
+)
+
+# These are not contextual titles or free translation choices.  They are
+# alternate surface forms for the same source entity, with the canonical
+# direction established by the work profile and entity registry.  Keep this
+# list deliberately small: ambiguous person names belong in a separate,
+# evidence-mapped review rather than a generic find/replace pass.
+_BR_CANONICAL_ALIAS_RULES: Tuple[Tuple[str, str, str, str], ...] = (
+    ("厄拉科斯", "阿拉基斯", "Arrakis",
+     "profile: Arrakis=阿拉基斯; registry: Arrakis id=5"),
+    ("贝尼杰瑟里特", "贝尼·杰瑟里特", "Bene Gesserit",
+     "profile: Bene Gesserit=贝尼·杰瑟里特; registry variant"),
+    ("沙杜特梅普斯", "沙杜特·梅普斯", "Shadout Mapes",
+     "registry: Shadout Mapes canonical=沙杜特·梅普斯"),
+    # Feyd-Rautha has three surface forms in the current final corpus:
+    # 菲德-罗萨 (first full introduction in ch01_chunk021), 费德-劳萨
+    # (the dominant later drift), and 菲德-劳萨.  Use the stable first-use
+    # transliteration; the question-mark form is an EPUB extraction artifact.
+    ("费德-劳萨", "菲德-罗萨", "Feyd",
+     "first-use ch01_chunk021; Feyd-Rautha; variants 费德-劳萨/菲德-劳萨/费德-？劳萨"),
+    ("菲德-劳萨", "菲德-罗萨", "Feyd",
+     "first-use ch01_chunk021; Feyd-Rautha; variants 费德-劳萨/菲德-劳萨/费德-？劳萨"),
+    ("费德-？劳萨", "菲德-罗萨", "Feyd",
+     "first-use ch01_chunk021; Feyd-Rautha; EPUB extraction artifact"),
+)
+
+_BR_MD_DEF_RE = re.compile(r"^\s*\[\^([^\]]+)\]:\s?")
+_BR_MALFORMED_MD_DEF_RE = re.compile(
+    r"^(\s*\[\^([^\]]+)\]\s+)(\S.*?)(\r?\n?)$")
+_BR_BODY_REF_RE = re.compile(r"\[\^([^\]]+)\](?!:)")
+_BR_LEGACY_NOTE_RE = re.compile(
+    r"^\s*[\u00b9\u00b2\u00b3\u2070-\u2079]+(?:[\.、:：]|\s)")
+_BR_OMISSION_MIN_CHARS = 60
+_BR_OMISSION_MAX_MATCH = 0.03
+_BR_OMISSION_MIN_ANCHOR = 0.20
+_BR_OMISSION_NGRAM_SIZE = 4
+
+
+def _br_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _br_excerpt(text: str, limit: int = 180) -> str:
+    return re.sub(r"\s+", " ", str(text)).strip()[:limit]
+
+
+def _br_read_json(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _br_atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
+    tmp = path.with_name(path.name + ".tmp-book-repair")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def _br_load_sources(root: Path) -> Dict[str, str]:
+    db = root / "db" / "workflow.db"
+    if not db.exists():
+        return {}
+    out: Dict[str, str] = {}
+    connection = sqlite3.connect(str(db))
+    try:
+        for chunk_id, text in connection.execute(
+                "SELECT chunk_id, text_content FROM chunk_tasks"):
+            if isinstance(chunk_id, str) and isinstance(text, str):
+                out[chunk_id] = text
+    finally:
+        connection.close()
+    return out
+
+
+def _br_source_counts(source: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for key, names in _BR_EN_NAMES.items():
+        total = 0
+        for name in names:
+            pattern = r"\b" + re.escape(name).replace(r"\ ", r"[-\s]+") + r"\b"
+            total += len(re.findall(pattern, source, re.IGNORECASE))
+        counts[key] = total
+    return counts
+
+
+def _br_note_spans(text: str) -> List[Tuple[int, int]]:
+    spans: List[Tuple[int, int]] = []
+    for match in re.finditer(r"(?m)^\s*\[\^[^\]]+\]:.*$", text):
+        spans.append((match.start(), match.end()))
+    return spans
+
+
+def _br_scan_mentions(
+    text: str, body_only: bool = False,
+) -> List[Tuple[int, int, str, str]]:
+    """Return ``(start, end, entity_key, surface)`` for explicit names."""
+    note_spans = _br_note_spans(text) if body_only else []
+
+    def in_note(position: int) -> bool:
+        return any(start <= position < end for start, end in note_spans)
+
+    out: List[Tuple[int, int, str, str]] = []
+    cursor = 0
+    length = len(text)
+    while cursor < length:
+        hit = next((item for item in _BR_TERMS if text.startswith(item[0], cursor)), None)
+        if hit is None:
+            cursor += 1
+            continue
+        surface, key = hit
+        end = cursor + len(surface)
+        if not body_only or not in_note(cursor):
+            out.append((cursor, end, key, surface))
+        cursor = end
+    return out
+
+
+def _br_key_counts(text: str, body_only: bool = False) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for _start, _end, key, _surface in _br_scan_mentions(text, body_only=body_only):
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _br_apply_span_changes(
+    text: str, changes: Iterable[Dict[str, Any]],
+) -> str:
+    ordered = sorted(changes, key=lambda item: int(item["start"]), reverse=True)
+    repaired = text
+    for change in ordered:
+        repaired = (repaired[:int(change["start"])] + str(change["to"])
+                    + repaired[int(change["end"]):])
+    return repaired
+
+
+_BR_SENTENCE_DELIMS = "\n。！？!?"
+
+
+def _br_sentence_spans(text: str) -> List[Tuple[int, int]]:
+    spans: List[Tuple[int, int]] = []
+    start = 0
+    for index, char in enumerate(text):
+        if char not in _BR_SENTENCE_DELIMS:
+            continue
+        end = index + 1
+        if text[start:end].strip():
+            spans.append((start, end))
+        start = end
+    if start < len(text) and text[start:].strip():
+        spans.append((start, len(text)))
+    return spans
+
+
+def _br_sentence_mentions(
+    text: str, start: int, end: int,
+    mentions: Iterable[Tuple[int, int, str, str]],
+) -> List[Tuple[int, int, str, str]]:
+    return [item for item in mentions if start <= item[0] < end]
+
+
+def _br_mask_entity_surfaces(text: str) -> str:
+    masked = text
+    for surface, _key in _BR_TERMS:
+        masked = masked.replace(surface, "<ENTITY>")
+    return re.sub(r"\s+", "", masked)
+
+
+def _br_paragraphs(text: str) -> List[str]:
+    return [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+
+
+def _br_paragraph_index(text: str, position: int) -> int:
+    return len(re.findall(r"\n\s*\n", text[:position]))
+
+
+def _br_is_note_block(text: str) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    if (_BR_MD_DEF_RE.match(lines[0])
+            or _BR_MALFORMED_MD_DEF_RE.match(lines[0])
+            or _BR_LEGACY_NOTE_RE.match(lines[0])):
+        return True
+    return all(
+        _BR_MD_DEF_RE.match(line)
+        or _BR_MALFORMED_MD_DEF_RE.match(line)
+        or _BR_LEGACY_NOTE_RE.match(line)
+        for line in lines
+    )
+
+
+def _br_paragraph_records(text: str) -> List[Dict[str, Any]]:
+    """Return non-empty paragraphs with exact source offsets and note kind."""
+    records: List[Dict[str, Any]] = []
+    offset = 0
+    for part in re.split(r"(\n\s*\n)", text):
+        if not part:
+            continue
+        if re.fullmatch(r"\n\s*\n", part):
+            offset += len(part)
+            continue
+        if part.strip():
+            lead = len(part) - len(part.lstrip())
+            trail = len(part) - len(part.rstrip())
+            content = part[lead:len(part) - trail]
+            records.append({
+                "text": content,
+                "start": offset + lead,
+                "end": offset + len(part) - trail,
+                "kind": "note" if _br_is_note_block(content) else "body",
+            })
+        offset += len(part)
+    return records
+
+
+def _br_similarity_text(text: str) -> str:
+    """Normalize only format noise that cannot carry paragraph identity."""
+    clean = re.sub(r"(?m)^\s*#+\s*", "", text)
+    clean = re.sub(r"(?m)^\s*\[\^[^\]]+\]:\s*", "", clean)
+    clean = re.sub(r"(?m)^\s*[\u00b9\u00b2\u00b3\u2070-\u2079]+\s*", "", clean)
+    clean = re.sub(r"\[\^[^\]]+\]", "", clean)
+    return re.sub(r"\s+", "", clean)
+
+
+def _br_ngrams(text: str) -> set:
+    normalized = _br_similarity_text(text)
+    if not normalized:
+        return set()
+    if len(normalized) <= _BR_OMISSION_NGRAM_SIZE:
+        return {normalized}
+    return {
+        normalized[index:index + _BR_OMISSION_NGRAM_SIZE]
+        for index in range(len(normalized) - _BR_OMISSION_NGRAM_SIZE + 1)
+    }
+
+
+def _br_jaccard(left: set, right: set) -> float:
+    if not left or not right:
+        return 0.0
+    union = left | right
+    return len(left & right) / len(union) if union else 0.0
+
+
+def _br_best_paragraph_matches(
+    grams: set, candidate_grams: List[set], limit: int = 2,
+) -> List[Tuple[int, float]]:
+    scores = [
+        (_index, _br_jaccard(grams, candidate))
+        for _index, candidate in enumerate(candidate_grams)
+    ]
+    scores.sort(key=lambda item: (-item[1], item[0]))
+    return scores[:limit]
+
+
+def _br_omission_insert_position(
+    text: str, final_records: List[Dict[str, Any]],
+    final_body: List[Dict[str, Any]], gap_index: int,
+) -> int:
+    if gap_index < len(final_body):
+        return int(final_body[gap_index]["start"])
+    if final_body:
+        last_end = int(final_body[-1]["end"])
+        for record in final_records:
+            if record["kind"] == "note" and int(record["start"]) >= last_end:
+                return int(record["start"])
+    return len(text)
+
+
+def _br_apply_paragraph_insertions(
+    text: str, insertions: List[Tuple[int, List[str]]],
+) -> str:
+    repaired = text
+    for position, paragraphs in sorted(
+            insertions, key=lambda item: item[0], reverse=True):
+        block = "\n\n".join(paragraphs)
+        before = repaired[:position]
+        prefix = "" if (not before or re.search(r"\n\s*\n\Z", before)) else "\n\n"
+        suffix = "\n\n" if position < len(repaired) else "\n"
+        repaired = (before + prefix + block + suffix + repaired[position:])
+    return repaired
+
+
+def _br_plan_omissions(
+    text: str, raw: str, source: str, literary: str,
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Restore a raw paragraph only when a final gap is structurally provable.
+
+    Raw and final share a language, while ordinary literary rewriting keeps
+    enough four-character overlap for reliable paragraph anchors.  A candidate
+    must be substantial, have no match anywhere in final (including footnote
+    blocks), and sit between two raw neighbours that map one paragraph apart.
+    Multiple adjacent mappings mean the insertion point is ambiguous and block
+    delivery instead of being guessed.
+    """
+    if not text.strip() or not raw.strip():
+        return text, [], []
+    final_records = _br_paragraph_records(text)
+    raw_records = _br_paragraph_records(raw)
+    final_body = [record for record in final_records if record["kind"] == "body"]
+    raw_body = [record for record in raw_records if record["kind"] == "body"]
+    if len(final_body) < 2 or len(raw_body) < 3:
+        return text, [], []
+
+    final_body_grams = [_br_ngrams(record["text"]) for record in final_body]
+    final_all_grams = [_br_ngrams(record["text"]) for record in final_records]
+    raw_matches: List[Dict[str, Any]] = []
+    for record in raw_body:
+        grams = _br_ngrams(record["text"])
+        raw_matches.append({
+            "grams": grams,
+            "normalized_chars": len(_br_similarity_text(record["text"])),
+            "all_best": _br_best_paragraph_matches(grams, final_all_grams, limit=1),
+            "body_best": _br_best_paragraph_matches(grams, final_body_grams, limit=2),
+        })
+
+    candidate_indices = []
+    for index, match in enumerate(raw_matches):
+        if match["normalized_chars"] < _BR_OMISSION_MIN_CHARS:
+            continue
+        all_best = match["all_best"]
+        body_best = match["body_best"]
+        if not all_best or not body_best:
+            continue
+        if (all_best[0][1] < _BR_OMISSION_MAX_MATCH
+                and body_best[0][1] < _BR_OMISSION_MAX_MATCH):
+            candidate_indices.append(index)
+    if not candidate_indices:
+        return text, [], []
+
+    groups: List[List[int]] = []
+    for index in candidate_indices:
+        if groups and index == groups[-1][-1] + 1:
+            groups[-1].append(index)
+        else:
+            groups.append([index])
+
+    source_body = [
+        record for record in _br_paragraph_records(source)
+        if record["kind"] == "body"
+    ]
+    source_aligned = len(source_body) == len(raw_body)
+    literary_body = [
+        record for record in _br_paragraph_records(literary)
+        if record["kind"] == "body"
+    ]
+    literary_grams = [_br_ngrams(record["text"]) for record in literary_body]
+    final_defs = set()
+    for record in final_records:
+        if record["kind"] != "note":
+            continue
+        final_defs.update(re.findall(r"(?m)^\s*\[\^([^\]]+)\]:", record["text"]))
+
+    changes: List[Dict[str, Any]] = []
+    blocking: List[Dict[str, Any]] = []
+    insertions: List[Tuple[int, List[str]]] = []
+    for group in groups:
+        start, end = group[0], group[-1]
+        if start <= 0 or end + 1 >= len(raw_body):
+            continue
+        previous = raw_matches[start - 1]["body_best"]
+        following = raw_matches[end + 1]["body_best"]
+        if not previous or not following:
+            continue
+        previous_index, previous_score = previous[0]
+        following_index, following_score = following[0]
+        if (previous_score < _BR_OMISSION_MIN_ANCHOR
+                or following_score < _BR_OMISSION_MIN_ANCHOR
+                or following_index != previous_index + 1):
+            continue
+
+        plausible = sorted({
+            (prev_index, next_index)
+            for prev_index, prev_score in previous
+            if prev_score >= _BR_OMISSION_MIN_ANCHOR
+            for next_index, next_score in following
+            if next_score >= _BR_OMISSION_MIN_ANCHOR
+            and next_index == prev_index + 1
+        })
+        gap_index = following_index
+        group_texts = [raw_body[index]["text"] for index in group]
+        excerpt = _br_excerpt(" / ".join(group_texts))
+        if len(plausible) > 1:
+            blocking.append({
+                "kind": "source_paragraph_omitted",
+                "severity": "high",
+                "detail": (
+                    f"raw 段 {group} 无 final 对应，但候选插入位置不唯一: "
+                    f"{plausible[:4]}；拒绝猜测"),
+            })
+            continue
+
+        unresolved_refs: List[str] = []
+        has_note_lines = False
+        for index in group:
+            candidate_text = raw_body[index]["text"]
+            if re.search(
+                    r"(?m)^\s*(?:\[\^[^\]]+\]:|[\u00b9\u00b2\u00b3\u2070-\u2079]+\s)",
+                    candidate_text):
+                has_note_lines = True
+            refs = set(_BR_BODY_REF_RE.findall(candidate_text))
+            unresolved_refs.extend(sorted(refs - final_defs))
+        if has_note_lines or unresolved_refs:
+            reason = ("含脚注定义，需先确定注释归属"
+                      if has_note_lines
+                      else f"脚注引用未在 final 定义: {sorted(set(unresolved_refs))}")
+            blocking.append({
+                "kind": "source_paragraph_omitted",
+                "severity": "high",
+                "detail": f"raw 段 {group} 无 final 对应，但{reason}；拒绝猜测",
+            })
+            continue
+
+        source_supported = bool(
+            source_aligned
+            and all(_br_similarity_text(source_body[index]["text"])
+                    for index in group)
+        )
+        literary_supported = any(
+            _br_best_paragraph_matches(
+                raw_matches[index]["grams"], literary_grams, limit=1)[0][1]
+            >= _BR_OMISSION_MIN_ANCHOR
+            for index in group
+        ) if literary_grams else False
+        insert_position = _br_omission_insert_position(
+            text, final_records, final_body, gap_index)
+        insertions.append((insert_position, group_texts))
+        for index in group:
+            match = raw_matches[index]
+            source_index = index if source_aligned else None
+            changes.append({
+                "rule": "source_paragraph_restored",
+                "from": "(final 中缺失)",
+                "to": _br_excerpt(raw_body[index]["text"]),
+                "count": 1,
+                "start": insert_position,
+                "raw_paragraph_index": index,
+                "final_insert_before": gap_index,
+                "evidence": {
+                    "best_final_similarity": round(match["body_best"][0][1], 4),
+                    "previous_anchor_similarity": round(previous_score, 4),
+                    "next_anchor_similarity": round(following_score, 4),
+                    "source_paragraph_index": source_index,
+                    "source_supported": source_supported,
+                    "literary_supported": literary_supported,
+                },
+                "context": (
+                    f"raw 段 {index} 位于 final 段 {previous_index} 与 "
+                    f"{following_index} 之间；候选位置 {plausible}"),
+            })
+
+    if not changes:
+        return text, [], blocking
+    repaired = _br_apply_paragraph_insertions(text, insertions)
+    return repaired, changes, blocking
+
+
+def _br_english_count(text: str, key: str) -> int:
+    total = 0
+    for name in _BR_EN_NAMES.get(key, ()):
+        pattern = r"\b" + re.escape(name).replace(r"\ ", r"[-\s]+") + r"\b"
+        total += len(re.findall(pattern, text, re.IGNORECASE))
+    return total
+
+
+def _br_plan_sentence_core_swaps(
+    text: str, literary: str, source: str,
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Repair one-for-one identity swaps inside locally matching sentences.
+
+    Whole-chunk mention sequences can drift when a translator splits paragraphs,
+    so the older sequence-only matcher misses genuine cases and rejects some
+    corroborated ones.  This pass aligns complete sentences instead: all entity
+    differences must be accepted safe-substitution directions, and a sentence
+    is changed only when its masked text closely matches a literary sentence.
+    A lower similarity threshold is allowed only when the corresponding source
+    paragraph independently supports the target name over the wrong one.
+    """
+    final_mentions = _br_scan_mentions(text, body_only=True)
+    literary_mentions = _br_scan_mentions(literary, body_only=True)
+    if not final_mentions or not literary_mentions:
+        return text, [], []
+
+    final_records: List[Dict[str, Any]] = []
+    for start, end in _br_sentence_spans(text):
+        mentions = _br_sentence_mentions(
+            text, start, end, final_mentions)
+        keys = [item[2] for item in mentions]
+        if not keys or not any(key in _BR_SAFE_SUBSTITUTIONS for key in keys):
+            continue
+        final_records.append({
+            "start": start,
+            "end": end,
+            "mentions": mentions,
+            "keys": keys,
+            "masked": _br_mask_entity_surfaces(text[start:end]),
+        })
+    if not final_records:
+        return text, [], []
+
+    literary_by_length: Dict[int, List[Dict[str, Any]]] = {}
+    for start, end in _br_sentence_spans(literary):
+        mentions = _br_sentence_mentions(
+            literary, start, end, literary_mentions)
+        if not mentions:
+            continue
+        keys = [item[2] for item in mentions]
+        literary_by_length.setdefault(len(keys), []).append({
+            "start": start,
+            "end": end,
+            "mentions": mentions,
+            "keys": keys,
+            "masked": _br_mask_entity_surfaces(literary[start:end]),
+        })
+
+    source_paragraphs = _br_paragraphs(source)
+    changes: List[Dict[str, Any]] = []
+    for final_record in final_records:
+        final_keys = final_record["keys"]
+        scored: List[Tuple[float, Dict[str, Any], List[Tuple[int, str, str]]]] = []
+        for literary_record in literary_by_length.get(len(final_keys), ()):
+            literary_keys = literary_record["keys"]
+            diffs = [
+                (index, wrong, target)
+                for index, (wrong, target) in enumerate(
+                    zip(final_keys, literary_keys))
+                if wrong != target
+            ]
+            if not diffs:
+                continue
+            if any(_BR_SAFE_SUBSTITUTIONS.get(wrong) != target
+                   for _index, wrong, target in diffs):
+                continue
+            if any(_br_english_count(source, target) <= 0
+                   for _index, _wrong, target in diffs):
+                continue
+            ratio = difflib.SequenceMatcher(
+                None, final_record["masked"], literary_record["masked"],
+                autojunk=False).ratio()
+            scored.append((ratio, literary_record, diffs))
+        if not scored:
+            continue
+        scored.sort(key=lambda item: item[0], reverse=True)
+        best_ratio, best_literary, best_diffs = scored[0]
+        second_ratio = scored[1][0] if len(scored) > 1 else 0.0
+        if best_ratio - second_ratio < 0.02 and best_ratio < 0.90:
+            continue
+
+        paragraph_index = min(
+            _br_paragraph_index(text, final_record["start"]),
+            max(0, len(source_paragraphs) - 1),
+        )
+        source_paragraph = (source_paragraphs[paragraph_index]
+                            if source_paragraphs else "")
+        paragraph_support = all(
+            _br_english_count(source_paragraph, target)
+            > _br_english_count(source_paragraph, wrong)
+            for _index, wrong, target in best_diffs
+        )
+        if not (best_ratio >= 0.75 or
+                (best_ratio >= 0.55 and paragraph_support)):
+            continue
+
+        for index, wrong, target in best_diffs:
+            start, end, _key, surface = final_record["mentions"][index]
+            literary_surface = best_literary["mentions"][index][3]
+            changes.append({
+                "rule": f"sentence_core_person_{wrong.lower()}_to_{target.lower()}",
+                "from": surface,
+                "to": literary_surface,
+                "count": 1,
+                "start": start,
+                "end": end,
+                "entity": target,
+                "evidence": {
+                    "sentence_similarity": round(best_ratio, 4),
+                    "paragraph_supported": bool(paragraph_support),
+                },
+                "context": _br_excerpt(
+                    text[max(0, start - 50):min(len(text), end + 70)]),
+            })
+    if not changes:
+        return text, [], []
+    repaired = _br_apply_span_changes(text, changes)
+    return repaired, changes, []
+
+
+def _br_plan_note_repairs(text: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """Correct only note definitions whose factual predicate is provably wrong."""
+    changes: List[Dict[str, Any]] = []
+    out_lines: List[str] = []
+    for line in text.splitlines(keepends=True):
+        match = re.match(r"^(\s*\[\^[^\]]+\]:\s*)(.*?)(\r?\n?)$", line)
+        if match is None:
+            out_lines.append(line)
+            continue
+        prefix, content, suffix = match.groups()
+        replacement: Optional[str] = None
+        rule = ""
+        gom_surface = next(
+            (surface for surface in _BR_GOM_SURFACES if surface in content), None)
+        if (gom_surface is not None
+                and any(marker in content for marker in _BR_GOM_WRONG_MARKERS)
+                and "贝尼" not in content and "姐妹会" not in content):
+            replacement = (_BR_GOM_NOTE if gom_surface == "戈姆·贾巴尔"
+                           else _BR_GOM_ALIAS_NOTE)
+            rule = "gom_jabbar_fact_repair"
+        elif ("法弗勒鲁奇" in content
+              and ("弗雷曼对外来者" in content or "贬称" in content)):
+            replacement = _BR_FAUFRELUCHES_NOTE
+            rule = "faufreluches_fact_repair"
+        if replacement is None:
+            out_lines.append(line)
+            continue
+        out_lines.append(prefix + replacement + suffix)
+        changes.append({
+            "rule": rule,
+            "from": _br_excerpt(content),
+            "to": _br_excerpt(replacement),
+            "count": 1,
+            "context": "footnote_definition",
+        })
+    return "".join(out_lines), changes
+
+
+def _br_source_term_count(source: str, term: str) -> int:
+    pattern = r"\b" + re.escape(term).replace(r"\ ", r"[-\s]+") + r"\b"
+    return len(re.findall(pattern, source, re.IGNORECASE))
+
+
+def _br_plan_canonical_aliases(
+    text: str, source: str,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Normalize only canonical surface aliases confirmed by the work profile.
+
+    This pass intentionally excludes person names whose canonical choice is
+    disputed.  Every entry here is a spelling/transliteration drift for the
+    same source entity, not a contextual title such as ``公爵``.
+
+    A registry/profile match alone is insufficient: each alias is applied only
+    when the corresponding source term occurs in this chunk's source evidence.
+    """
+    working = text
+    changes: List[Dict[str, Any]] = []
+    for wrong, right, source_term, basis in _BR_CANONICAL_ALIAS_RULES:
+        count = working.count(wrong)
+        if not count:
+            continue
+        source_count = _br_source_term_count(source, source_term)
+        if source_count <= 0:
+            # A profile/registry alias is not sufficient by itself: the source
+            # segment must contain the corresponding term.  Otherwise a stale
+            # rule or mismatched source slice could rewrite unrelated prose.
+            continue
+        first = working.find(wrong)
+        working = working.replace(wrong, right)
+        changes.append({
+            "rule": "canonical_surface_restore",
+            "from": wrong,
+            "to": right,
+            "count": count,
+            "context": _br_excerpt(
+                text[max(0, first - 50):min(len(text), first + len(wrong) + 80)]),
+            "evidence": {
+                "source_term": source_term,
+                "source_occurrences": source_count,
+                "source_supported": source_count > 0,
+                "basis": basis,
+            },
+        })
+    return working, changes
+
+
+def _br_plan_malformed_footnotes(
+    text: str,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Restore the colon in ``[^id] note`` definitions when the body cites ``id``.
+
+    A missing colon makes the line ordinary prose to Markdown and the reader.
+    The repair is deliberately limited to a definition-shaped line whose id is
+    cited in the body, is not already defined properly, and whose content looks
+    like a note rather than a normal paragraph beginning with a reference.
+    """
+    lines = text.splitlines(keepends=True)
+    valid_defs = {
+        match.group(1)
+        for line in lines
+        if (match := _BR_MD_DEF_RE.match(line))
+    }
+    body_parts = []
+    malformed = []
+    for index, line in enumerate(lines):
+        if _BR_MD_DEF_RE.match(line):
+            continue
+        match = _BR_MALFORMED_MD_DEF_RE.match(line)
+        if match is not None:
+            malformed.append((index, match))
+            continue
+        body_parts.append(line)
+    refs = set(_BR_BODY_REF_RE.findall("".join(body_parts)))
+    if not malformed or not refs:
+        return text, []
+
+    changes: List[Dict[str, Any]] = []
+    repaired_lines = list(lines)
+    for index, match in malformed:
+        prefix, ident, content, suffix = match.groups()
+        stripped = content.strip()
+        if ident not in refs or ident in valid_defs or len(stripped) < 4:
+            continue
+        first = stripped[:1]
+        if first not in '“"「『*（(' and not re.match(
+                r"[\u4e00-\u9fffA-Za-z]", first):
+            continue
+        replacement = prefix.rstrip() + ": " + stripped + suffix
+        repaired_lines[index] = replacement
+        changes.append({
+            "rule": "malformed_md_footnote_definition",
+            "from": _br_excerpt(lines[index]),
+            "to": _br_excerpt(replacement),
+            "count": 1,
+            "footnote_id": ident,
+            "context": "footnote_definition",
+        })
+    if not changes:
+        return text, []
+    return "".join(repaired_lines), changes
+
+
+def _br_first_content_line(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip().lstrip("\ufeff")
+        if stripped:
+            return stripped
+    return ""
+
+
+def _br_plan_appositive(
+    text: str, raw: str, literary: str, source: str,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Remove ``杰西卡，那位老妇人`` when all drafts and source say old woman."""
+    source_flat = re.sub(r"\s+", " ", source)
+    if "The old woman was let in" not in source_flat:
+        return text, []
+    if re.search(r"Jessica\s+was\s+let\s+in", source_flat, re.IGNORECASE):
+        return text, []
+    if not text.lstrip("\ufeff \t\r\n").startswith("杰西卡，那位老妇人"):
+        return text, []
+    raw_lead = _br_first_content_line(raw)
+    literary_lead = _br_first_content_line(literary)
+    if not raw_lead.startswith(("老妇人", "那位老妇人", "那个老妇人")):
+        return text, []
+    if not literary_lead.startswith(("老妇人", "那位老妇人", "那个老妇人")):
+        return text, []
+    before = "杰西卡，那位老妇人"
+    position = text.find(before)
+    if position < 0:
+        return text, []
+    repaired = text[:position] + "那位老妇人" + text[position + len(before):]
+    change = {
+        "rule": "appositive_old_woman_not_jessica",
+        "from": before,
+        "to": "那位老妇人",
+        "count": 1,
+        "context": _br_excerpt(text[max(0, position - 40):position + 100]),
+    }
+    return repaired, [change]
+
+
+def _br_plan_gom_to_feyd(
+    text: str, raw: str, source: str,
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    source_counts = _br_source_counts(source)
+    final_mentions = _br_scan_mentions(text, body_only=True)
+    final_has_gom = any(item[2] == "GOM" for item in final_mentions)
+    if not final_has_gom:
+        return text, [], []
+    if source_counts.get("GOM", 0) or source_counts.get("FEYD", 0) <= 0:
+        return text, [], []
+
+    raw_mentions = _br_scan_mentions(raw, body_only=True)
+    if not raw_mentions:
+        return text, [], [{
+            "kind": "feyd_gom_unresolved",
+            "severity": "high",
+            "detail": ("final 将 Feyd 写成戈姆·贾巴尔，但 raw 缺失，"
+                       "无法完成逐项序列证明"),
+        }]
+
+    final_keys = [item[2] for item in final_mentions]
+    raw_keys = [item[2] for item in raw_mentions]
+    normalized = ["FEYD" if key == "GOM" else key for key in final_keys]
+    if normalized != raw_keys:
+        return text, [], [{
+            "kind": "feyd_gom_alignment_requires_review",
+            "severity": "high",
+            "detail": f"final={final_keys[:24]} raw={raw_keys[:24]}",
+        }]
+
+    changes: List[Dict[str, Any]] = []
+    for index, mention in enumerate(final_mentions):
+        start, end, key, surface = mention
+        if key != "GOM":
+            continue
+        raw_key = raw_mentions[index][2]
+        if raw_key != "FEYD":
+            return text, [], [{
+                "kind": "feyd_gom_alignment_requires_review",
+                "severity": "high",
+                "detail": f"occurrence {index}: final=GOM raw={raw_key}",
+            }]
+        target_surface = raw_mentions[index][3] or _BR_CANONICAL_SURFACE["FEYD"]
+        changes.append({
+            "rule": "gom_jabbar_to_feyd",
+            "from": surface,
+            "to": target_surface,
+            "count": 1,
+            "start": start,
+            "end": end,
+            "entity": "FEYD",
+            "context": _br_excerpt(text[max(0, start - 50):min(len(text), end + 70)]),
+        })
+    if not changes:
+        return text, [], []
+    repaired = _br_apply_span_changes(text, changes)
+    if any(item[2] == "GOM" for item in _br_scan_mentions(repaired, body_only=True)):
+        return text, [], [{
+            "kind": "feyd_gom_verification_failed",
+            "severity": "high",
+            "detail": "替换后仍残留戈姆·贾巴尔",
+        }]
+    return repaired, changes, []
+
+
+def _br_support_core_swap(
+    target: str, raw_counts: Dict[str, int], source_counts: Dict[str, int],
+) -> bool:
+    if source_counts.get(target, 0) <= 0 or raw_counts.get(target, 0) <= 0:
+        return False
+    if target == "JESSICA":
+        return (raw_counts.get("MOHIAM", 0) == 0
+                and source_counts.get("MOHIAM", 0) == 0)
+    if target == "LETO":
+        return raw_counts.get("LETO", 0) >= raw_counts.get("PAUL", 0)
+    return False
+
+
+def _br_plan_core_swaps(
+    text: str, literary: str, raw: str, source: str,
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    final_mentions = _br_scan_mentions(text, body_only=True)
+    literary_mentions = _br_scan_mentions(literary, body_only=True)
+    if not final_mentions or not literary_mentions:
+        return text, [], []
+    final_keys = [item[2] for item in final_mentions]
+    literary_keys = [item[2] for item in literary_mentions]
+    if final_keys == literary_keys:
+        return text, [], []
+
+    raw_counts = _br_key_counts(raw, body_only=True)
+    source_counts = _br_source_counts(source)
+    changes: List[Dict[str, Any]] = []
+    blocking: List[Dict[str, Any]] = []
+    matcher = difflib.SequenceMatcher(None, literary_keys, final_keys, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag != "replace" or (i2 - i1) != (j2 - j1):
+            continue
+        for literary_index, final_index in zip(range(i1, i2), range(j1, j2)):
+            target = literary_keys[literary_index]
+            wrong = final_keys[final_index]
+            expected_target = _BR_SAFE_SUBSTITUTIONS.get(wrong)
+            if expected_target is None:
+                # Unrelated name differences are not treated as substitutions.
+                continue
+            if expected_target != target:
+                blocking.append({
+                    "kind": "identity_swap_direction_mismatch",
+                    "severity": "critical",
+                    "detail": f"{wrong}->{target} (expected {expected_target})",
+                })
+                continue
+            if not _br_support_core_swap(target, raw_counts, source_counts):
+                blocking.append({
+                    "kind": "identity_swap_without_corroboration",
+                    "severity": "high",
+                    "detail": f"{wrong}->{target} not supported by source/raw",
+                })
+                continue
+            start, end, _key, surface = final_mentions[final_index]
+            target_surface = literary_mentions[literary_index][3]
+            changes.append({
+                "rule": f"core_person_{wrong.lower()}_to_{target.lower()}",
+                "from": surface,
+                "to": target_surface,
+                "count": 1,
+                "start": start,
+                "end": end,
+                "entity": target,
+                "context": _br_excerpt(text[max(0, start - 50):min(len(text), end + 70)]),
+            })
+    if not changes:
+        return text, [], blocking
+    repaired = _br_apply_span_changes(text, changes)
+    repaired_keys = [item[2] for item in _br_scan_mentions(repaired, body_only=True)]
+    if repaired_keys != literary_keys:
+        return text, [], blocking + [{
+            "kind": "identity_swap_verification_failed",
+            "severity": "high",
+            "detail": "sequence after repair does not match literary draft",
+        }]
+    return repaired, changes, blocking
+
+
+def _br_remaining_blocking(
+    text: str, raw: str, literary: str, source: str,
+) -> List[Dict[str, Any]]:
+    blocking: List[Dict[str, Any]] = []
+    source_counts = _br_source_counts(source)
+    final_counts = _br_key_counts(text, body_only=True)
+    if (source_counts.get("GOM", 0) == 0
+            and final_counts.get("GOM", 0) > 0
+            and source_counts.get("FEYD", 0) > 0):
+        blocking.append({
+            "kind": "feyd_gom_unresolved",
+            "severity": "high",
+            "detail": ("source 以 Feyd 为主且无 Gom Jabbar，final 仍有完整"
+                       "戈姆·贾巴尔人名，需人工/证据复核"),
+        })
+    return blocking
+
+
+def _br_plan_text(
+    chunk_id: str, final: str, literary: str, raw: str, source: str,
+) -> Dict[str, Any]:
+    working = final
+    changes: List[Dict[str, Any]] = []
+    blocking: List[Dict[str, Any]] = []
+
+    working, note_changes = _br_plan_note_repairs(working)
+    changes.extend(note_changes)
+
+    working, footnote_changes = _br_plan_malformed_footnotes(working)
+    changes.extend(footnote_changes)
+
+    working, omission_changes, omission_blocking = _br_plan_omissions(
+        working, raw=raw, source=source, literary=literary)
+    changes.extend(omission_changes)
+    blocking.extend(omission_blocking)
+
+    working, alias_changes = _br_plan_canonical_aliases(working, source=source)
+    changes.extend(alias_changes)
+
+    working, appositive_changes = _br_plan_appositive(
+        working, raw=raw, literary=literary, source=source)
+    changes.extend(appositive_changes)
+
+    working, gom_changes, gom_blocking = _br_plan_gom_to_feyd(
+        working, raw=raw, source=source)
+    changes.extend(gom_changes)
+    blocking.extend(gom_blocking)
+
+    working, sentence_changes, sentence_blocking = _br_plan_sentence_core_swaps(
+        working, literary=literary, source=source)
+    changes.extend(sentence_changes)
+    blocking.extend(sentence_blocking)
+
+    working, core_changes, core_blocking = _br_plan_core_swaps(
+        working, literary=literary, raw=raw, source=source)
+    changes.extend(core_changes)
+    blocking.extend(core_blocking)
+
+    blocking.extend(_br_remaining_blocking(
+        working, raw=raw, literary=literary, source=source))
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for issue in blocking:
+        marker = (issue.get("kind"), issue.get("detail"))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        deduped.append(issue)
+    return {
+        "chunk_id": chunk_id,
+        "before_text": final,
+        "repaired_text": working,
+        "changes": changes,
+        "blocking": deduped,
+        "before_sha256": _br_sha256(final),
+        "repaired_sha256": _br_sha256(working),
+    }
+
+
+def _br_scan_all(
+    root: Path, out_root: Path, chapter: Optional[str] = None,
+) -> Dict[str, Any]:
+    sources = _br_load_sources(root)
+    pattern = f"{chapter}/*_final.json" if chapter else "ch*/*_final.json"
+    rows: List[Dict[str, Any]] = []
+    blocking_issues: List[Dict[str, Any]] = []
+    current_hashes: Dict[str, str] = {}
+    missing_sources: List[str] = []
+    malformed: List[str] = []
+
+    for final_path in sorted(out_root.glob(pattern)):
+        chunk_id = final_path.stem.rsplit("_final", 1)[0]
+        data = _br_read_json(final_path)
+        if data is None or not isinstance(data.get("text"), str):
+            malformed.append(str(final_path))
+            continue
+        final_text = data["text"]
+        current_hashes[chunk_id] = _br_sha256(final_text)
+        source = sources.get(chunk_id, "")
+        if not source:
+            missing_sources.append(chunk_id)
+            continue
+        literary_data = _br_read_json(final_path.with_name(f"{chunk_id}_literary.json"))
+        raw_data = _br_read_json(final_path.with_name(f"{chunk_id}_raw.json"))
+        literary = (literary_data or {}).get("text", "")
+        raw = (raw_data or {}).get("text", "")
+        if not isinstance(literary, str):
+            literary = ""
+        if not isinstance(raw, str):
+            raw = ""
+        plan = _br_plan_text(chunk_id, final_text, literary, raw, source)
+        if plan["changes"] or plan["blocking"]:
+            row = {
+                "chunk_id": chunk_id,
+                "chapter": chunk_id.split("_", 1)[0],
+                "path": str(final_path.relative_to(root)),
+                "before_sha256": plan["before_sha256"],
+                "repaired_sha256": plan["repaired_sha256"],
+                "changes": plan["changes"],
+                "blocking": plan["blocking"],
+                "repaired_text": plan["repaired_text"],
+            }
+            rows.append(row)
+            for issue in plan["blocking"]:
+                blocking_issues.append({
+                    "chunk_id": chunk_id,
+                    **issue,
+                })
+
+    return {
+        "scanned": len(current_hashes),
+        "rows": rows,
+        "blocking_issues": blocking_issues,
+        "missing_sources": missing_sources,
+        "malformed_finals": malformed,
+        "current_hashes": current_hashes,
+    }
+
+
+def _br_public_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    public: List[Dict[str, Any]] = []
+    for row in rows:
+        item = {key: value for key, value in row.items() if key != "repaired_text"}
+        public.append(item)
+    return public
+
+
+def _br_render_markdown(payload: Dict[str, Any]) -> str:
+    summary = payload.get("summary") or {}
+    lines = [
+        "# 全书终检修复报告 (book_repair)",
+        "",
+        f"- 模式: {payload.get('mode')}",
+        f"- 扫描 final: {summary.get('scanned', 0)} 个",
+        f"- 有修复计划/已修复 chunk: {summary.get('changed_chunks', 0)} 个",
+        f"- 替换项: {summary.get('changes', 0)} 个",
+        f"- 待修 chunk: {summary.get('pending_chunks', 0)} 个",
+        f"- 未决高/严重风险: {summary.get('blocking_issues', 0)} 个",
+        f"- 缺少 DB source 证据: {summary.get('missing_sources', 0)} 个",
+        f"- 无法解析 final: {summary.get('malformed_finals', 0)} 个",
+        f"- 修复凭证: {'当前' if summary.get('manifest_current') else '缺失/陈旧'}",
+        "",
+    ]
+    by_rule = summary.get("by_rule") or {}
+    if by_rule:
+        lines.append("## 规则统计")
+        lines.append("")
+        for rule, count in sorted(by_rule.items()):
+            lines.append(f"- `{rule}`: {count}")
+        lines.append("")
+
+    changes = payload.get("changes") or []
+    if changes:
+        lines.append("## 修复明细")
+        lines.append("")
+        for row in changes[:120]:
+            lines.append(f"### `{row['chunk_id']}`")
+            for change in row.get("changes") or []:
+                lines.append(
+                    f"- `{change.get('rule')}`: `{change.get('from')}` → "
+                    f"`{change.get('to')}`")
+                if change.get("context"):
+                    lines.append(f"  - 语境: {change['context']}")
+                if change.get("evidence"):
+                    evidence = change["evidence"]
+                    rendered = ", ".join(
+                        f"{key}={value}" for key, value in evidence.items()
+                        if value is not None)
+                    lines.append(f"  - 证据: {rendered}")
+            if row.get("backup"):
+                lines.append(f"- 备份: `{row['backup']}`")
+            lines.append("")
+        if len(changes) > 120:
+            lines.append(f"（另有 {len(changes) - 120} 个 chunk，见 JSON）")
+            lines.append("")
+
+    blocking = payload.get("blocking_issues") or []
+    if blocking:
+        lines.append("## 未决风险（阻断）")
+        lines.append("")
+        for issue in blocking[:120]:
+            lines.append(
+                f"- `{issue.get('chunk_id')}` [{issue.get('severity')}] "
+                f"`{issue.get('kind')}`: {issue.get('detail')}")
+        if len(blocking) > 120:
+            lines.append(f"（另有 {len(blocking) - 120} 项，见 JSON）")
+        lines.append("")
+    elif not changes:
+        lines.append("（未发现可修或未决项目）")
+        lines.append("")
+
+    missing_sources = payload.get("missing_sources") or []
+    malformed_finals = payload.get("malformed_finals") or []
+    if missing_sources or malformed_finals:
+        lines.append("## 证据缺口（阻断）")
+        lines.append("")
+        if missing_sources:
+            lines.append("- 缺少 DB source: " + ", ".join(
+                f"`{chunk_id}`" for chunk_id in missing_sources[:80]))
+        if malformed_finals:
+            lines.append("- 无法解析 final: " + ", ".join(
+                f"`{path}`" for path in malformed_finals[:80]))
+        lines.append("")
+
+    lines += ["---", "*由 book-repair 子命令自动生成；修复凭证以 current_hashes 为准*", ""]
+    return "\n".join(lines)
+
+
+def apply_book_repairs(
+    project_root: Optional[Any] = None,
+    output_dir: Optional[Any] = None,
+    apply: bool = False,
+    chapter: Optional[str] = None,
+    json_out: Optional[Any] = None,
+    report: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Plan or apply deterministic book repairs; always write a manifest report."""
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    out_root = Path(output_dir) if output_dir else root / "output"
+    planned = _br_scan_all(root, out_root, chapter=chapter)
+    public_rows = _br_public_rows(planned["rows"])
+    changed_chunks = sum(1 for row in public_rows if row.get("changes"))
+    pending_before = changed_chunks
+    applied_chunks = 0
+    backup_root: Optional[Path] = None
+    now = datetime.datetime.now().astimezone()
+
+    if apply and changed_chunks:
+        backup_root = out_root / "repair_backups" / (
+            "book_repair_" + now.strftime("%Y%m%d_%H%M%S"))
+        for row in public_rows:
+            if not row.get("changes"):
+                continue
+            source_row = next(
+                item for item in planned["rows"] if item["chunk_id"] == row["chunk_id"])
+            final_path = root / row["path"]
+            try:
+                original_bytes = final_path.read_bytes()
+            except OSError as exc:
+                row["status"] = f"read_error: {exc}"
+                continue
+            data = _br_read_json(final_path)
+            if data is None or not isinstance(data.get("text"), str):
+                row["status"] = "json_error"
+                continue
+            if _br_sha256(data["text"]) != row["before_sha256"]:
+                row["status"] = "stale_since_plan"
+                continue
+            backup_path = backup_root / row["chapter"] / final_path.name
+            backup_path.parent.mkdir(parents=True, exist_ok=True)
+            backup_path.write_bytes(original_bytes)
+            data["text"] = source_row["repaired_text"]
+            metadata = data.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["book_repair"] = {
+                "schema_version": BOOK_REPAIR_SCHEMA_VERSION,
+                "applied_at": now.isoformat(),
+                "before_sha256": row["before_sha256"],
+                "after_sha256": row["repaired_sha256"],
+                "rules": sorted({c.get("rule", "") for c in row.get("changes") or []}),
+                "backup": str(backup_path.relative_to(root)),
+            }
+            data["metadata"] = metadata
+            _br_atomic_write_json(final_path, data)
+            row["status"] = "applied"
+            row["backup"] = str(backup_path.relative_to(root))
+            applied_chunks += 1
+
+    verified = _br_scan_all(root, out_root, chapter=chapter)
+    pending_chunks = sum(1 for row in verified["rows"] if row.get("changes"))
+    blocking_issues = verified["blocking_issues"]
+    by_rule: Dict[str, int] = {}
+    for row in public_rows:
+        for change in row.get("changes") or []:
+            rule = str(change.get("rule") or "unknown")
+            by_rule[rule] = by_rule.get(rule, 0) + 1
+    mode = "apply" if apply else "dry-run"
+    summary = {
+        "scanned": verified["scanned"],
+        "changed_chunks": changed_chunks,
+        "changes": sum(len(row.get("changes") or []) for row in public_rows),
+        "pending_chunks": pending_chunks,
+        "blocking_issues": len(blocking_issues),
+        "applied_chunks": applied_chunks,
+        "by_rule": by_rule,
+        "missing_sources": len(verified["missing_sources"]),
+        "malformed_finals": len(verified["malformed_finals"]),
+        "manifest_current": True,
+    }
+    missing_sources = verified["missing_sources"]
+    malformed_finals = verified["malformed_finals"]
+    ok = (not blocking_issues and not missing_sources and not malformed_finals
+          and (not apply or pending_chunks == 0))
+    payload = {
+        "schema_version": BOOK_REPAIR_SCHEMA_VERSION,
+        "generated_at": now.isoformat(),
+        "mode": mode,
+        "ok": ok,
+        "summary": summary,
+        "current_hashes": verified["current_hashes"],
+        "changes": public_rows,
+        "pending_chunks": [
+            row["chunk_id"] for row in verified["rows"] if row.get("changes")
+        ],
+        "blocking_issues": blocking_issues,
+        "missing_sources": missing_sources,
+        "malformed_finals": malformed_finals,
+    }
+    json_path = Path(json_out) if json_out else out_root / BOOK_REPAIR_REPORT_NAME
+    report_path = (Path(report) if report
+                   else json_path.with_suffix(".md"))
+    try:
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        _br_atomic_write_json(json_path, payload)
+        report_path.write_text(_br_render_markdown(payload), encoding="utf-8")
+    except OSError as exc:
+        return {
+            "ok": False,
+            "error": f"report_write_error: {exc}",
+            "report_path": str(json_path),
+            "summary": summary,
+            "changes": public_rows,
+            "blocking_issues": blocking_issues,
+            "missing_sources": missing_sources,
+            "malformed_finals": malformed_finals,
+        }
+    print(
+        f"🩺 book-repair({mode}): scanned={summary['scanned']} "
+        f"changed_chunks={changed_chunks} changes={summary['changes']} "
+        f"pending={pending_chunks} blocking={len(blocking_issues)}")
+    print(f"   报告: {json_path}")
+    return {
+        "ok": ok,
+        "error": None,
+        "report_path": str(json_path),
+        "markdown_path": str(report_path),
+        "summary": summary,
+        "changes": public_rows,
+        "blocking_issues": blocking_issues,
+        "pending_chunks": payload["pending_chunks"],
+        "current_hashes": verified["current_hashes"],
+        "missing_sources": missing_sources,
+        "malformed_finals": malformed_finals,
+        "manifest_current": True,
+    }
+
+
+def verify_book_repairs(
+    project_root: Optional[Any] = None,
+    output_dir: Optional[Any] = None,
+    chapter: Optional[str] = None,
+    manifest_path: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Re-plan current finals and verify they still match the repair manifest."""
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    out_root = Path(output_dir) if output_dir else root / "output"
+    planned = _br_scan_all(root, out_root, chapter=chapter)
+    pending = [row["chunk_id"] for row in planned["rows"] if row.get("changes")]
+    blocking = planned["blocking_issues"]
+    manifest_file = (Path(manifest_path) if manifest_path
+                     else out_root / BOOK_REPAIR_REPORT_NAME)
+    manifest = _br_read_json(manifest_file) if manifest_file.exists() else None
+    stale: List[Dict[str, Any]] = []
+    if manifest is not None:
+        expected = manifest.get("current_hashes")
+        if not isinstance(expected, dict):
+            stale.append({"kind": "manifest_schema", "detail": "current_hashes missing"})
+        else:
+            actual = planned["current_hashes"]
+            for chunk_id in sorted(set(expected) | set(actual)):
+                if expected.get(chunk_id) != actual.get(chunk_id):
+                    stale.append({
+                        "kind": "manifest_stale",
+                        "chunk_id": chunk_id,
+                        "expected": expected.get(chunk_id),
+                        "actual": actual.get(chunk_id),
+                    })
+    missing_sources = planned["missing_sources"]
+    malformed_finals = planned["malformed_finals"]
+    ok = (not pending and not blocking and not stale
+          and not missing_sources and not malformed_finals)
+    return {
+        "ok": ok,
+        "mode": "verify",
+        "manifest_path": str(manifest_file),
+        "manifest_present": manifest is not None,
+        "manifest_current": bool(manifest is not None and not stale),
+        "stale_manifest": stale,
+        "scanned": planned["scanned"],
+        "pending_chunks": pending,
+        "blocking_issues": blocking,
+        "current_hashes": planned["current_hashes"],
+        "missing_sources": missing_sources,
+        "malformed_finals": malformed_finals,
+    }
+
+
 
 try:
     from typesafe_sdk import (
@@ -24927,6 +28978,18 @@ def synthesize_verdict(
     )
 
 
+def backend_confidence_source(backend) -> str:
+    """Round 118 P1-1: 取 backend 的概率来源标识（供 verdict 分档）。
+
+    FallbackBackend 在 evaluate() 成功后写 last_backend；非 fallback 的
+    单后端用类属性 backend_kind（JevBackend/OpenAICompatBackend/MockBackend）。
+    """
+    last = getattr(backend, "last_backend", None)
+    if last:
+        return str(last)
+    return str(getattr(backend, "backend_kind", type(backend).__name__))
+
+
 def build_state(
     source_text: str,
     raw_translation: str,
@@ -25494,9 +29557,10 @@ for _sub in ("src.utils", "src.config", "src.agents", "src.core", "src.consisten
              # Round 131: prefer the real modules in repo mode.  A pre-created
              # fake module otherwise hides private helpers (e.g. pun_audit's
              # _split_anchors) from later imports in the same interpreter.
-             "src.judgment_layer", "src.story_graph", "src.story_graph_query",
+             "src.judgment_layer", "src.rescue", "src.story_graph", "src.story_graph_query",
              "src.setup_payoff_audit",
-             "src.style_profiler"):
+             "src.style_profiler", "src.recalibrate", "src.proofread",
+             "src.book_repair"):
     _ensure_real_or_fake(_sub)
 # Round 103 P2: src.judges.* shim 不覆盖真实模块, 仅补 attr.
 # R104 P1 修复: 旧条件 `_existing.__path__` 仅对父 package 有效, 子模块
@@ -25518,7 +29582,8 @@ for _mod_name, _attrs in {
                                     "normalize_api_root", "batch_questions", "classify_backend_error"],
     "src.judges.verdict": ["synthesize_verdict", "DEFAULT_THRESHOLDS",
                            "flagged_entity_labels"],
-    "src.judges.judge": ["build_state", "evaluate_chunk", "to_legacy_scores"],
+    "src.judges.judge": ["backend_confidence_source", "build_state",
+                         "evaluate_chunk", "to_legacy_scores"],
     "src.judges": ["NoulAnswer", "ChoiceAnswer", "ScoreAnswer", "CompositeVerdict", "Answer",
                    "VOICE_DRIFT", "REGISTER_MATCH", "ENTITY_CONSISTENCY", "LITERAL_RESIDUE", "SEMANTIC_LOSS", "STYLE_COMPLIANCE_SCORE", "ALL_PRIMITIVES", "build_question_set",
                    "PER_ENTITY_KEY_PREFIX", "build_per_entity_questions", "_sanitize_key", "aggregate_per_entity_nouls",
@@ -25527,7 +29592,8 @@ for _mod_name, _attrs in {
                    "DEFAULT_API_BASE", "DEFAULT_MODEL", "DEFAULT_MAX_QUESTIONS_PER_BATCH",
                    "normalize_api_root", "batch_questions", "classify_backend_error",
                    "synthesize_verdict", "DEFAULT_THRESHOLDS",
-                   "build_state", "evaluate_chunk", "to_legacy_scores"],
+                   "backend_confidence_source", "build_state", "evaluate_chunk",
+                   "to_legacy_scores"],
 }.items():
     _existing = _sys_j.modules.get(_mod_name)
     # R104 P1: 用 __file__ 真值判断 (与 R103 P5 第二块对齐).
@@ -25554,6 +29620,7 @@ _SRC_SUBMODULES = {
     "src.utils.llm_adapter": [
         "get_llm_client", "get_llm_client_for_task", "get_role_model_name", "get_task_extra_body",
         "robust_json_loads", "_build_role_client", "_client_instances",
+        "ContentSensitiveError",
     ],
     # Round 96: 加 text_match shim 让 CJK 比例原语可在整合模式下访问
     # Round 102 P1: 增加 cjk_ratio 缓存相关符号, 让整合模式下也可访问.
@@ -25581,6 +29648,7 @@ _SRC_SUBMODULES = {
         "DecisionLevel", "DecisionEngine", "query_high_confidence_entities",
         "query_reviewable_entities", "get_sibling_canonicals_by_source",
         "detect_cross_person_conflicts", "seed_entity_variants", "SEED_ENTITY_VARIANTS",
+            "repair_false_unify_merges",
         "classify_entity_source_name", "is_proper_entity_alias",
         "alias_attested_in_text",
         "load_decision_alias_targets", "_load_decision_alias_targets",
@@ -25612,7 +29680,9 @@ _SRC_SUBMODULES = {
                       "_split_h1_sections", "_normalize_chapter_notes_once",
                       "normalize_chapter_notes",
                       "normalize_notes_document", "notes_normalize_outputs",
-                      "_chapter_note_dupes", "_note_is_dup", "_note_anchor_stop"],
+                      "_chapter_note_dupes", "_note_is_dup", "_note_anchor_stop",
+                      "_note_key_parts", "_note_mentions_alias",
+                      "_note_keys_compatible"],
     "src.consistency": ["run_consistency_check", "_load_glossary", "_load_decisions",
                         "_scan_finals", "_find_slash_aliases", "_in_quote_or_note",
                         "_NOTE_MARKER_RE",
@@ -25711,10 +29781,22 @@ _SRC_SUBMODULES = {
         "build_deep_profile", "profile_to_style_guide", "save_profile",
         "load_profile", "profile_is_deep", "summary_line", "generate_book_profile",
     ],
+    "src.recalibrate": [
+        "run_recalibrate_critic",
+    ],
+    "src.proofread": [
+        "SCHEMA_VERSION", "REPORT_NAME", "proofread_book",
+        "_scan_text", "_apply_safe", "_ARTIFACT_HEADING_RE",
+    ],
+    "src.book_repair": [
+        "BOOK_REPAIR_SCHEMA_VERSION", "BOOK_REPAIR_REPORT_NAME",
+        "apply_book_repairs", "verify_book_repairs",
+    ],
     "src.test_golden_set": ["GoldenSetEvaluator", "_levenshtein_distance", "run_golden_test",
                             "GOLDEN_AB_MATRIX", "_extract_confidence_source",
                             "summarize_golden_results", "recommend_golden_combo", "run_golden_ab",
-                            "compare_injection_arms", "run_injection_ab",
+                            "compare_injection_arms", "_snapshot_sqlite_database",
+                            "run_injection_ab",
                             "run_golden_gate"],
     "src.test_memory_pressure": ["get_system_memory", "get_process_memory", "simulate_memory_load", "test_memory_pressure"],
 }
@@ -25742,7 +29824,8 @@ from src.judges.typesafe_spec import (NoulAnswer, ChoiceAnswer, ScoreAnswer, Com
 from src.judges.primitives import (VOICE_DRIFT, REGISTER_MATCH, ENTITY_CONSISTENCY, LITERAL_RESIDUE, SEMANTIC_LOSS, STYLE_COMPLIANCE_SCORE, ALL_PRIMITIVES, build_question_set)
 from src.judges.typesafe_backend import (SystemOneBackend, JevBackend, OpenAICompatBackend, MockBackend, FallbackBackend, get_backend)
 from src.judges.verdict import (synthesize_verdict, DEFAULT_THRESHOLDS)
-from src.judges.judge import (build_state, evaluate_chunk, to_legacy_scores)
+from src.judges.judge import (backend_confidence_source, build_state, evaluate_chunk,
+                              to_legacy_scores)
 
 # Round 96: compute_cjk_ratio 在文件顶部 inline 定义, 镜像 src/utils/text_match.py, 避免 shim 后的虚拟 src.utils.text_match 包缺失该符号
 

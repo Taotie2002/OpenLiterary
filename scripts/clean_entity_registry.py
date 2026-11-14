@@ -33,6 +33,7 @@ from src.utils.entity_stopwords import (  # noqa: E402
 from src.core.decision_engine import (  # noqa: E402
     entity_registry_alias_report,
     is_cross_person_canonical_variant,
+    repair_false_unify_merges,
     sanitize_entity_registry_aliases,
     sanitize_entity_registry_variants,
     unify_entity_registry,
@@ -178,6 +179,14 @@ def main() -> int:
 
     conn = sqlite3.connect(args.db)
     try:
+        # 0. 修复历史 unify 的跨人物误合并（Round 149）
+        print("\n⓪.5 修复错误 unify 合并…")
+        ures = repair_false_unify_merges(conn, dry_run=dry_run)
+        print(f"   rows={ures['rows']} repaired={ures['repaired']}")
+        for ex in ures.get("changes", [])[:8]:
+            print(f"   - {ex['canonical']} ← 拆回自 {ex['winner']} "
+                  f"（winner variants 移除 {ex['removed_from_winner_variants']}）")
+
         # 0. 别名分层清理（Round 144）：proper / context / quarantined
         if not args.no_alias_sanitize:
             print("\n⓪ 清理 source_names 跨人物污染…")

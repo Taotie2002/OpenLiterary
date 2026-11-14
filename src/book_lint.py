@@ -579,9 +579,16 @@ def lint_book(project_root=None, output_dir=None, merged_path=None) -> dict:
     else:
         warnings.append("merged 未生成（{0} 缺失），跳过整书级检查".format(default_merged.name))
 
-    result = {"ok": not failures, "failures": failures, "warnings": warnings, "stats": stats}
+    clean = not failures and not warnings
+    result = {"ok": not failures, "clean": clean,
+              "failures": failures, "warnings": warnings, "stats": stats}
     lines = ["# 成书 lint 报告 (book_lint)", ""]
-    lines.append(f"- 结论: {'✅ 全绿' if result['ok'] else '❌ 未通过'}")
+    if result["ok"]:
+        conclusion = ("✅ 全绿" if clean
+                      else f"✅ 通过（有 {len(warnings)} 条非阻断警告）")
+    else:
+        conclusion = "❌ 未通过"
+    lines.append(f"- 结论: {conclusion}")
     lines.append(f"- 扫描 final.json: {stats['finals']} 个")
     lines.append("")
     if failures:
@@ -750,6 +757,67 @@ def _note_merge_key(content: str) -> str:
     if len(key) < 2 or key in _NOTE_MERGE_STOP:
         return ""
     return key
+
+
+def _note_key_parts(key: str) -> list:
+    """Split a compound headword into independently meaningful labels."""
+    return [part.strip() for part in re.split(
+        r'[/／|｜、,，;；:：()（）]+', key)
+        if len(part.strip()) >= 2]
+
+
+def _note_mentions_alias(content: str, term: str) -> bool:
+    """Whether ``term`` is introduced as an alias, not merely mentioned.
+
+    A parenthetical gloss (``牙鳕（whiting）``) and the common explanatory
+    markers (``指``/``即``/``英文``/``原文``/``缩写`` …) count as evidence.
+    A bare co-occurrence in the same sentence does not: an explanation of one
+    concept often mentions another concept without defining it as a synonym.
+    """
+    for match in re.finditer(re.escape(term), content):
+        prefix = content[max(0, match.start() - 32):match.start()]
+        if re.search(r'[（(]\s*$', prefix):
+            return True
+        if content[match.end():match.end() + 1] in ('（', '('):
+            return True
+        if re.search(
+                r'(?:指|即|又称|亦称|英文|原文|缩写|全称|称为|是)'
+                r'[^。！？；;\n]{0,18}[“「『]?\s*$', prefix):
+            return True
+    return False
+
+
+def _note_keys_compatible(a: str, b: str, ka: str, kb: str) -> bool:
+    """Whether two headwords may denote the same note entry.
+
+    Exact/nested labels (``CHOAM`` / ``CHOAM公司``) are compatible.  A
+    cross-label merge also needs mutual evidence and a bilingual anchor: a
+    label (or one of its slash-separated parts) from each definition must occur
+    in the other definition, and at least one of those labels must contain a
+    Latin-script token on exactly one side.  This keeps ``牙鳕`` and
+    ``whiting`` together while refusing to collapse two distinct Chinese
+    concepts that merely explain one another (for example
+    ``贝尼·杰瑟里特姐妹会`` and ``尊母``).  The conditions are intentionally
+    conservative: a missed synonym merge leaves two readable notes, while a
+    false merge corrupts every reference in the chapter.
+    """
+    if ka == kb:
+        return True
+    if not ka or not kb:
+        return True
+    if ka in kb or kb in ka:
+        return True
+    a_parts = _note_key_parts(ka)
+    b_parts = _note_key_parts(kb)
+    mutual_alias = (
+        any(_note_mentions_alias(b, part) for part in a_parts)
+        and any(_note_mentions_alias(a, part) for part in b_parts)
+    )
+    if not mutual_alias:
+        return False
+    a_latin = any(re.search(r'[A-Za-z]', part) for part in a_parts)
+    b_latin = any(re.search(r'[A-Za-z]', part) for part in b_parts)
+    return a_latin != b_latin
 
 
 def _note_anchor_stop(contents) -> set:
@@ -936,6 +1004,34 @@ def _normalize_chapter_notes_once(text: str, start_num: int = 1):
             x = parent[x]
         return x
 
+    # Each cluster carries every explicit headword seen inside it.  A union is
+    # legal only when *all* cross-cluster headword pairs are compatible; thus a
+    # bridge note cannot gradually collapse A--B--C when A and C are distinct.
+    # Empty keys contribute no identity evidence and therefore cannot make a
+    # conflict disappear.
+    cluster_keys = {}
+    for i, u in enumerate(cand):
+        key = _note_merge_key(u['content'])
+        cluster_keys[i] = ({key: u['content']} if key else {})
+
+    def _clusters_compatible(ri, rj):
+        for key_i, content_i in cluster_keys.get(ri, {}).items():
+            for key_j, content_j in cluster_keys.get(rj, {}).items():
+                if not _note_keys_compatible(
+                        content_i, content_j, key_i, key_j):
+                    return False
+        return True
+
+    def _union(ri, rj):
+        if ri == rj or not _clusters_compatible(ri, rj):
+            return False
+        parent[rj] = ri
+        merged = dict(cluster_keys.get(ri, {}))
+        merged.update(cluster_keys.get(rj, {}))
+        cluster_keys[ri] = merged
+        cluster_keys.pop(rj, None)
+        return True
+
     # 1a) 同词条合并：同一章内同一术语的多种注释写法只保留一条。
     # 分块翻译会在不同 chunk 各自加注；merge 后再按章归并，避免成书出现
     # "门泰特 ×17" 这类重复条目。跨章各留一条，保持章内自包含。
@@ -950,17 +1046,26 @@ def _normalize_chapter_notes_once(text: str, start_num: int = 1):
         base = _root(members[0])
         for mi in members[1:]:
             ri = _root(mi)
-            if ri != base:
-                parent[ri] = base
+            if _union(_root(base), ri):
+                base = _root(base)
                 changes["same_key_merges"] += 1
 
     _stop = _note_anchor_stop([c['content'] for c in cand])
     for i in range(len(cand)):
         for j in range(i + 1, len(cand)):
+            # Different explicit headwords are distinct entries even when their
+            # definitions share context (for example, a note about a person and
+            # a note about the order she belongs to).  Content-level matching is
+            # still allowed across a prose/tr note and an md definition, where
+            # the same explanation may have been emitted in two carriers.
+            ki = _note_merge_key(cand[i]['content'])
+            kj = _note_merge_key(cand[j]['content'])
+            if not _note_keys_compatible(
+                    cand[i]['content'], cand[j]['content'], ki, kj):
+                continue
             if _note_is_dup(cand[i]['content'], cand[j]['content'], stop=_stop):
                 ri, rj = _root(i), _root(j)
-                if ri != rj:
-                    parent[rj] = ri
+                _union(ri, rj)
     clusters = {}
     for i in range(len(cand)):
         clusters.setdefault(_root(i), []).append(i)
@@ -1370,7 +1475,10 @@ def _chapter_note_dupes(text: str) -> list:
             if ki and ki == kj:
                 out.append("同键重复注: {0} ~ {1}".format(
                     ki[:18], kj[:18]))
-            elif _note_is_dup(cand[i]['content'], cand[j]['content'], stop=_stop):
+            elif (_note_keys_compatible(
+                    cand[i]['content'], cand[j]['content'], ki, kj)
+                  and _note_is_dup(
+                      cand[i]['content'], cand[j]['content'], stop=_stop)):
                 out.append("重复注: {0} ~ {1}".format(
                     _note_key(cand[i]['content'])[:18],
                     _note_key(cand[j]['content'])[:18]))

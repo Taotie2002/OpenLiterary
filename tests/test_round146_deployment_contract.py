@@ -37,3 +37,9 @@ def test_gate_runs_before_clean_intermediate():
     gate_idx = text.index("# 4.8 T4: 交付门禁 (gate)")
     clean_idx = text.index("# 5. 清理中间产物")
     assert gate_idx < clean_idx
+
+
+def test_clean_runs_only_after_green_gate():
+    text = _script()
+    assert 'if [[ "$CLEAN_INTERMEDIATE" == "true" && "$gate_ok" == "true" ]]' in text
+    assert "gate 未通过：保留 raw/literary/critic" in text

@@ -40,6 +40,12 @@ from src.config import config as _config
 from src.utils.chunker import SmartChunker
 from src.core.scheduler import TaskScheduler
 from src.pipeline import TranslationPipeline
+from src.rescue import (
+    collect_final_status,
+    ledger_requeue_candidates,
+    write_qa_report,
+    write_rescue_report,
+)
 from src.test_golden_set import run_golden_ab, run_golden_test, run_injection_ab
 from src.test_memory_pressure import test_memory_pressure, run_golden_gate
 from src.splitters import (
@@ -185,7 +191,9 @@ def print_banner():
 _INSTANCE_LOCK_FD: Optional[int] = None
 
 _MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile", "story-graph",
-                      "consolidate", "finalize", "notes-normalize", "requeue"}
+                      "consolidate", "finalize", "notes-normalize", "requeue",
+                      "rescue", "qa-report", "recalibrate-critic", "proofread",
+                      "book-repair"}
 
 
 def _default_lock_path() -> Path:
@@ -200,6 +208,8 @@ def _command_needs_lock(command: str, args: object) -> bool:
     if command == "consistency" and getattr(args, "apply", False):
         return True
     if command == "setup-payoff-audit" and getattr(args, "apply", False):
+        return True
+    if command == "book-repair" and getattr(args, "apply", False):
         return True
     return False
 
@@ -294,8 +304,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="SagaTrans — AI 文学语义编译系统")
     parser.add_argument("command", nargs="?", default="pipeline",
-                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "story-graph", "story-graph-query", "setup-payoff-audit", "drift-audit", "notes-normalize", "requeue"],
-                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, story-graph, story-graph-query, setup-payoff-audit, drift-audit, notes-normalize, requeue")
+                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "story-graph", "story-graph-query", "setup-payoff-audit", "drift-audit", "notes-normalize", "proofread", "book-repair", "requeue", "rescue", "qa-report", "recalibrate-critic"],
+                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, story-graph, story-graph-query, setup-payoff-audit, drift-audit, notes-normalize, proofread, book-repair, requeue, rescue, qa-report, recalibrate-critic")
     parser.add_argument("--chapter", default="ch01", help="章节 ID (默认: ch01)")
     parser.add_argument("--chapters", default=None,
                         help="style-profile 命令：抽样章节，逗号分隔（默认均匀抽 5 章）")
@@ -341,7 +351,8 @@ def main():
                         help="pipeline 命令：读取 review_dirty.json，二次校验锚句后定向重跑结构 P0 chunk")
     parser.add_argument("--review-dirty-path", default="output/review_dirty.json",
                         help="pipeline --fix-from-review：review_dirty JSON 路径（默认 output/review_dirty.json）")
-    parser.add_argument("--force", action="store_true", help="强制重新初始化（覆盖已存在的 chunk，重置状态和重试计数）")
+    parser.add_argument("--force", action="store_true",
+                        help="强制重新初始化（init）或强制重审已校准报告（recalibrate-critic）")
     # 新增：split 命令专用参数
     parser.add_argument("--input", help="split 命令：输入文件路径（EPUB/TXT/MD）")
     parser.add_argument("--input-dir", default="input", help="split 命令：输出目录（默认 input/）")
@@ -352,19 +363,37 @@ def main():
     parser.add_argument("--min-chapter-size", type=int, default=1000,
                         help="split 命令：短于此字数的章节会被合并到下一章（默认 1000）")
     parser.add_argument("--apply", action="store_true",
-                        help="consistency / notes-normalize 命令：执行自动修正（notes-normalize 默认仅生成差异报告）")
+                        help="consistency / notes-normalize / proofread / book-repair：执行自动修正；book-repair 只做有 source/raw/literary 证据的确定性修复")
+    parser.add_argument("--verify", action="store_true",
+                        help="book-repair：只复核当前 final 与修复 manifest，不写正文")
     parser.add_argument("--window", type=int, default=None,
                         help="drift-audit 命令：滑动窗口大小（默认 config.pipeline.drift_audit.window=5）")
     parser.add_argument("--jev", action="store_true",
                         help="drift-audit 命令：附加 Jev 窗口配对检查（需要 Jev 可用）")
     parser.add_argument("--json-out", default=None,
-                        help="drift-audit / golden --judgment-ab 命令：报告 JSON 输出路径")
+                        help="drift-audit / golden --judgment-ab / proofread / book-repair：报告 JSON 输出路径")
     parser.add_argument("--ab", action="store_true",
                         help="golden/golden-gate 命令：运行 直译模型×thinking 4 组合 A/B 对比")
     parser.add_argument("--judgment-ab", action="store_true",
                         help="golden 命令：仅比较判断层注记注入 on/off（同章同摘录，不乘模型×effort 矩阵）")
     parser.add_argument("--max-rounds", type=int, default=3,
                         help="consolidate 命令：最大收敛轮数（默认 3）")
+    parser.add_argument("--chunks", default=None,
+                        help="requeue 命令：逗号分隔的 chunk_id；与 --from-ledger 二选一或并用")
+    parser.add_argument("--from-ledger", action="store_true",
+                        help="requeue 命令：从 output/rescue/failure_ledger.jsonl 选取仍隔离的 PF 块")
+    parser.add_argument("--all", action="store_true",
+                        help="rescue 命令：扫描全书；省略时只处理 --chapter 指定章节")
+    parser.add_argument("--reset-rescue-budget", action="store_true",
+                        help="rescue 命令：仅复位目标章节未完成块的救援/重试预算（算法升级后受控复活）")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="recalibrate-critic 命令：并行重审线程数（默认 1）")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="recalibrate-critic 命令：最多重审多少个目标 chunk（探针用）")
+    parser.add_argument("--low-score-threshold", type=float, default=7.0,
+                        help="recalibrate-critic 命令：低分报告阈值（默认 7.0）")
+    parser.add_argument("--retries", type=int, default=1,
+                        help="recalibrate-critic 命令：非校准/瞬时失败重试次数（默认 1）")
 
     args = parser.parse_args()
 
@@ -735,7 +764,17 @@ def main():
             # final.json 自动转 backup，重跑失败由 _restore_dirty_backups 恢复旧版。
             _rq_root = Path(__file__).resolve().parent.parent
             _rq_sched = TaskScheduler(db_path=str(_rq_root / "db" / "workflow.db"))
-            _rq_res = _rq_sched.requeue_permanently_failed(args.chapter, force=args.force)
+            _rq_chunks = []
+            if args.chunks:
+                _rq_chunks.extend(c.strip() for c in args.chunks.split(",") if c.strip())
+            if args.from_ledger:
+                _ledger_ids = ledger_requeue_candidates(_rq_root, args.chapter)
+                for _cid in _ledger_ids:
+                    if _cid not in _rq_chunks:
+                        _rq_chunks.append(_cid)
+                print(f"📒 requeue ledger: {args.chapter} 发现 {len(_ledger_ids)} 个隔离块")
+            _rq_res = _rq_sched.requeue_permanently_failed(
+                args.chapter, chunk_ids=(_rq_chunks or None), force=args.force)
             _rq_n = len(_rq_res["requeued"])
             print(f"♻️ requeue: {args.chapter} 共 {_rq_n} 个 PF 块恢复 DIRTY")
             if _rq_res["requeued"]:
@@ -744,6 +783,114 @@ def main():
             if _rq_res["over_cap"]:
                 print(f"    ⚠️ 复活预算用尽(pf_requeue_max): {', '.join(_rq_res['over_cap'])}（--force 可强制）")
             sys.exit(0 if _rq_n or not _rq_res["over_cap"] else 1)
+        elif args.command == "rescue":
+            _rs_root = Path(__file__).resolve().parent.parent
+            _rs_db = _rs_root / "db" / "workflow.db"
+            _rs_sched = TaskScheduler(db_path=str(_rs_db))
+            if args.reset_rescue_budget:
+                if not args.apply:
+                    print("❌ --reset-rescue-budget 需要与 --apply 同用", file=sys.stderr)
+                    sys.exit(2)
+                _reset_chapters = []
+                if args.all:
+                    _reset_chapters = [row[0] for row in _rs_sched.conn.execute(
+                        "SELECT DISTINCT chapter_id FROM chunk_tasks ORDER BY chapter_id").fetchall()]
+                else:
+                    _reset_chapters = [args.chapter]
+                for _rch in _reset_chapters:
+                    _reset_ids = _rs_sched.reset_rescue_budget(_rch)
+                    print(f"♻️ [Rescue] {_rch}: 已复位 {len(_reset_ids)} 个块的救援/重试预算")
+            _rs_rows = _rs_sched.conn.execute(
+                "SELECT DISTINCT chapter_id, state, chunk_id FROM chunk_tasks "
+                "WHERE state IN ('PERMANENTLY_FAILED','FAILED','DIRTY') "
+                "ORDER BY chapter_id, chunk_id").fetchall()
+            _rs_by_ch = {}
+            for _ch, _st, _cid in _rs_rows:
+                _rs_by_ch.setdefault(_ch, []).append((_cid, _st))
+            _rs_final = collect_final_status(_rs_root, _rs_root / "output")
+            for _item in _rs_final.get("fallbacks", []):
+                _ch = str(_item.get("chapter") or "")
+                if _ch:
+                    _rs_by_ch.setdefault(_ch, [])
+                    _cid = str(_item.get("chunk_id") or "")
+                    _rs_by_ch[_ch].append((_cid, "FALLBACK_FINAL"))
+            if not args.all:
+                _rs_by_ch = {args.chapter: _rs_by_ch.get(args.chapter, [])}
+            _rs_by_ch = {k: v for k, v in _rs_by_ch.items() if v}
+            print(f"🧭 rescue: {len(_rs_by_ch)} 章存在可救援失败块")
+            for _ch in sorted(_rs_by_ch):
+                print(f"   {_ch}: {len(_rs_by_ch[_ch])} 个待判定块")
+            if not args.apply:
+                print("   只读模式；加 --apply 执行定向救援")
+                sys.exit(0)
+            _rs_failed = []
+            for _ch in sorted(_rs_by_ch):
+                print(f"♻️ [Rescue] 处理章节 {_ch}")
+                try:
+                    _ok = TranslationPipeline(chapter_id=_ch).run()
+                except Exception as _rs_exc:
+                    _ok = False
+                    print(f"❌ [Rescue] {_ch} 异常: {_rs_exc}", file=sys.stderr)
+                if not _ok:
+                    _rs_failed.append(_ch)
+            try:
+                write_rescue_report(_rs_root)
+            except Exception:
+                pass
+            # run() may return True when a chapter has a complete fallback set;
+            # that is not a successful rescue.  Re-scan the state machine and
+            # current final artifacts so this command has a truthful exit code.
+            _rs_remaining = []
+            for _ch in sorted(_rs_by_ch):
+                try:
+                    for _task in _rs_sched.get_all_tasks_by_chapter(_ch):
+                        if _task.get("state") != "COMPLETED":
+                            _rs_remaining.append(
+                                (str(_task.get("chunk_id")), str(_task.get("state"))))
+                except Exception as _scan_exc:
+                    print(f"⚠️ [Rescue] {_ch} 残留扫描异常: {_scan_exc}", file=sys.stderr)
+                    _rs_remaining.append((f"{_ch}:scan", "SCAN_ERROR"))
+            _rs_final_left = collect_final_status(_rs_root, _rs_root / "output").get("fallbacks", [])
+            if _rs_remaining or _rs_final_left:
+                print(f"❌ rescue 后仍有 {len(_rs_remaining)} 个非完成块、"
+                      f"{len(_rs_final_left)} 个 fallback final；需进入 gate 判定", file=sys.stderr)
+                if _rs_remaining:
+                    print("   " + ", ".join(f"{cid}:{st}" for cid, st in _rs_remaining[:12]),
+                          file=sys.stderr)
+                if _rs_final_left:
+                    print("   " + ", ".join(str(x.get("chunk_id")) for x in _rs_final_left[:12]),
+                          file=sys.stderr)
+            sys.exit(0 if not _rs_failed and not _rs_remaining and not _rs_final_left else 1)
+        elif args.command == "qa-report":
+            _qa_root = Path(__file__).resolve().parent.parent
+            _qa_res = write_qa_report(_qa_root, _qa_root / "output")
+            print(f"📝 QA_REPORT: fallback={len(_qa_res.get('fallbacks', []))}, "
+                  f"finals={_qa_res.get('final_count', 0)} → {_qa_res.get('path')}")
+            sys.exit(0 if _qa_res.get("ok") else 1)
+        elif args.command == "recalibrate-critic":
+            from src.recalibrate import run_recalibrate_critic
+            _rc_chunks = [c.strip() for c in (args.chunks or "").split(",") if c.strip()]
+            _rc_res = run_recalibrate_critic(
+                chapter_id=args.chapter,
+                all_chapters=bool(args.all),
+                chunk_ids=_rc_chunks or None,
+                limit=args.limit,
+                workers=args.workers,
+                apply=bool(args.apply),
+                low_score_threshold=args.low_score_threshold,
+                retries=args.retries,
+                force=bool(args.force),
+            )
+            _rc_mode = "apply" if _rc_res.get("applied") else "dry-run"
+            print(f"🧪 recalibrate-critic({_rc_mode}): selected={_rc_res.get('selected')} "
+                  f"recalibrated={_rc_res.get('recalibrated')} failed={_rc_res.get('failed')} "
+                  f"low_score={_rc_res.get('low_score')}")
+            if _rc_res.get("report_path"):
+                print(f"   报告: {_rc_res['report_path']}")
+            if _rc_res.get("errors"):
+                for _rc_err in _rc_res["errors"][:12]:
+                    print(f"   ❌ {_rc_err}", file=sys.stderr)
+            sys.exit(0 if _rc_res.get("ok") else 1)
         elif args.command == "gate":
             from src.pipeline import run_final_gate
             _gate_res = run_final_gate()
@@ -759,6 +906,50 @@ def main():
             print(f"notes-normalize: files={_nn_stats.get('files', 0)} "
                   f"changed={_nn_stats.get('changed', 0)} → {_nn_res.get('report', '')}")
             sys.exit(0)
+        elif args.command == "proofread":
+            from src.proofread import proofread_book
+            _pr_res = proofread_book(
+                project_root=Path(__file__).resolve().parent.parent,
+                apply=bool(args.apply),
+                json_out=args.json_out,
+            )
+            if _pr_res.get("error"):
+                print(f"❌ proofread: {_pr_res['error']}", file=sys.stderr)
+            sys.exit(0 if _pr_res.get("ok") else 1)
+        elif args.command == "book-repair":
+            from src.book_repair import apply_book_repairs, verify_book_repairs
+            _br_root = Path(__file__).resolve().parent.parent
+            if args.verify:
+                _br_res = verify_book_repairs(
+                    project_root=_br_root,
+                    output_dir=_br_root / "output",
+                )
+                print(
+                    f"🩺 book-repair(verify): scanned={_br_res.get('scanned', 0)} "
+                    f"pending={len(_br_res.get('pending_chunks') or [])} "
+                    f"blocking={len(_br_res.get('blocking_issues') or [])} "
+                    f"manifest_current={_br_res.get('manifest_current')}")
+            else:
+                _br_res = apply_book_repairs(
+                    project_root=_br_root,
+                    output_dir=_br_root / "output",
+                    apply=bool(args.apply),
+                    json_out=args.json_out,
+                )
+            for _br_issue in (_br_res.get("blocking_issues") or [])[:12]:
+                print(
+                    f"   ❌ {_br_issue.get('chunk_id')}: "
+                    f"{_br_issue.get('kind')} — {_br_issue.get('detail')}",
+                    file=sys.stderr)
+            for _br_stale in (_br_res.get("stale_manifest") or [])[:8]:
+                print(
+                    f"   ❌ 修复凭证陈旧: {_br_stale.get('chunk_id')}",
+                    file=sys.stderr)
+            for _br_missing in (_br_res.get("missing_sources") or [])[:8]:
+                print(f"   ❌ 缺少 DB source 证据: {_br_missing}", file=sys.stderr)
+            for _br_bad_final in (_br_res.get("malformed_finals") or [])[:8]:
+                print(f"   ❌ final 无法解析: {_br_bad_final}", file=sys.stderr)
+            sys.exit(0 if _br_res.get("ok") else 1)
         elif args.command == "lint":
             from src.book_lint import lint_book
             sys.exit(0 if lint_book().get("ok") else 1)

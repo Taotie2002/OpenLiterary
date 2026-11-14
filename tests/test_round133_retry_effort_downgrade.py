@@ -241,9 +241,25 @@ class TestFailedBatchIntegration:
         assert _state_of(pipeline, cid) == "TRANSLATING_RAW"
         assert pipeline.scheduler.get_retry_override(cid)["rescue_used"] is True
 
-    def test_pf_when_no_signature(self, pipeline):
+    def test_targeted_rescue_when_no_signature(self, pipeline):
         cid = "ch_test_chunk002"
         _insert_failed(pipeline, cid, 3, "[TRANSLATING_RAW] Read timed out. (read timeout=300)")
+        pipeline._try_fallback_final = MagicMock(return_value=False)
+        tasks = pipeline.scheduler.get_tasks_by_state(TaskState.FAILED, 10)
+        pipeline._process_failed_batch(tasks)
+        assert _state_of(pipeline, cid) == "DIRTY"
+        row = pipeline.scheduler.get_task(cid)
+        assert row["rescue_stage"] == "TRANSLATING_RAW"
+        assert row["rescue_attempts"] == 1
+        assert pipeline.scheduler.get_retry_override(cid) is None
+
+    def test_pf_after_rescue_budget_exhausted(self, pipeline):
+        cid = "ch_test_chunk003"
+        _insert_failed(pipeline, cid, 3, "[TRANSLATING_RAW] Read timed out. (read timeout=300)")
+        pipeline.scheduler.conn.execute(
+            "UPDATE chunk_tasks SET rescue_attempts = 2, pf_requeues = 1 "
+            "WHERE chunk_id = ?", (cid,))
+        pipeline.scheduler.conn.commit()
         pipeline._try_fallback_final = MagicMock(return_value=False)
         tasks = pipeline.scheduler.get_tasks_by_state(TaskState.FAILED, 10)
         pipeline._process_failed_batch(tasks)

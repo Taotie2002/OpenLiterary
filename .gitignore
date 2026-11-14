@@ -31,6 +31,8 @@ db/*.sqlite-wal
 db/*.sqlite-shm
 db/*.db-wal
 db/*.db-shm
+db/*.sqlite.bak-*
+db/repair_backups/
 db/.sagatrans.lock
 src/db/*.db
 src/db/*.sqlite
@@ -39,6 +41,9 @@ src/db/*.sqlite
 input/ch*.md
 input/_chapters_summary.txt
 output/ch*/
+output/repair_backups/
+output/rescue/
+output/*_cache.jsonl
 output/golden_test_report.json
 output/translated_full.md
 output/._.DS_Store
@@ -85,7 +90,9 @@ input/entity_variants.yaml
 input/verse_manifest.json
 output/*.md
 output/*.json
-docs/baselines/
+# 稳定的测试夹具：test_round119_guard_registry.py 硬依赖，其他基线仍忽略
+docs/baselines/*
+!docs/baselines/literary_metrics_2026-10-14.json
 
 # 本地工作文档（不入库）
 LESSONS_*.md

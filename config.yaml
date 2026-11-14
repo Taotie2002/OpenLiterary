@@ -12,9 +12,11 @@
 #
 # 主要分区：
 #   models / llm_backend / openai_api / task_routing   模型与任务路由
-#   pipeline / judgment_injection / story_graph      生成、判断与知识图谱
-#   decision_engine / critic_thresholds / typesafe   一致性与质量门槛
-#   style_guide / typesafe / book / verse            全局风格与交付形态
+#   pipeline / review_fix / judgment_injection       生成、回流与判断注入
+#   story_graph / chunker / input_prep               知识图谱、切分与输入准备
+#   decision_engine / critic_thresholds              一致性与质量门槛
+#   typesafe_thresholds / typesafe                   System One 阈值与后端
+#   style_guide / book / verse                       全局风格与交付形态
 #
 # 思考档位（effort）是任务级参数，写在 task_routing.<task>.effort：
 #   MiniMax:  low / medium / high / xhigh / max（无 none）
@@ -200,6 +202,19 @@ pipeline:
     fallback_role_switch: true
     minimax_protect: true
     quality_escalate_back: true
+    # HTTP 422 / input new_sensitive 是永久客户端拒绝：首个拒绝即换角色，
+    # 不在同一 provider + 同一 prompt 上空转。首选跨 provider 的 primary，
+    # 再试已成功产出 raw 的 literal_translator（Qwen）。
+    sensitive_fallback_roles: ["primary", "literal_translator"]
+
+  # 失败块自动救援：先复用 raw/literary 做 cheap-first 续跑，再整块重跑。
+  # targeted 用完后仍失败则整块重跑一次；两者都耗尽才进入隔离态 PF。
+  # chapter_budget_seconds 是单章救援增量墙钟上限，防止失败块拖垮整书。
+  rescue:
+    enabled: true
+    max_targeted_attempts: 2
+    max_full_requeues: 1
+    chapter_budget_seconds: 1800
 
   # tools/probe_llm_efforts.py 的探测结果；pipeline 只读，过期则忽略。
   model_probe:
@@ -416,7 +431,9 @@ critic_thresholds:
   literal_residue: 6.5
 
 # ── System One 裁决阈值 ────────────────────────────────────────────
-# 与 src/judges/verdict.py::DEFAULT_THRESHOLDS 对应；概率是校准值，不是 LLM 自报。
+# 以 src/judges/verdict.py::DEFAULT_THRESHOLDS 为基线；概率是校准值，不是 LLM 自报。
+# literal_residue_noul / semantic_loss_noul 在本作品上高于默认值（0.5/0.4），
+# 是有意放宽 hard-reject 边界、提高容忍阈值以降低误杀，不要为了“与默认同步”而改回。
 typesafe_thresholds:
   voice_drift_severe_prob: 0.5
   voice_drift_subtle_prob: 0.7
@@ -478,7 +495,7 @@ typesafe:
   enabled: true
   api_base: https://api.moark.com      # SDK 会拼接 /v1/systemone
   api_key: ${MOARK_API_KEY}
-  model_name: d3-flash                 # d3-turbo 仅用于同批质量 A/B
+  model_name: d3-flash                 # d3-turbo 仅作历史对照，当前无自动 A/B 实现
   max_questions_per_batch: 64
   allow_mock: false                    # 生产禁止未校准启发式冒充裁决
   allow_openai_fallback: false         # OpenAICompat 无校准概率，默认不走

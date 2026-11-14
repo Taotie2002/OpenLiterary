@@ -49,6 +49,19 @@ from src.utils.text_match import (
     extract_reject_categories,
     reset_cjk_ratio_cache,
 )
+from src.rescue import (
+    _as_int_safe,
+    append_rescue_event,
+    classify_failure,
+    collect_final_status,
+    latest_events_by_chunk,
+    parse_qa_report,
+    qa_report_mismatches,
+    recommended_resume_stage,
+    rescue_config,
+    write_qa_report,
+    write_rescue_report,
+)
 
 
 class TranslationPipeline:
@@ -1507,6 +1520,8 @@ class TranslationPipeline:
 
     def run(self) -> bool:
         print(f"🚀 [Pipeline] 启动批处理模式处理章节: {self.chapter_id}")
+        self._run_started_at = time.monotonic()
+        self._rescue_started_at = None
 
         # Round 99 P1: chapter 切换时清空 per-chunk 缓存, 防止跨 chapter 脏数据
         self._reset_per_run_cache()
@@ -1518,6 +1533,12 @@ class TranslationPipeline:
             print(f"❌ [Pipeline] 章节 {self.chapter_id} 无可执行任务（可能 init 被跳过或 DB 无记录），"
                   f"请用 --force 重新初始化。")
             return False
+
+        # Round 147: 上次运行遗留的 PF 块先进入定向救援队列；若预算已用尽则保持隔离。
+        try:
+            self._auto_rescue_existing_failures()
+        except Exception as e:
+            print(f"⚠️ [Rescue] 遗留 PF 扫描异常（不阻塞主流程）: {e}")
 
         # Round 104: 恢复"COMPLETED 但 final.json 缺失"的 chunk (回溯删 final 后重跑失败的残留)
         try:
@@ -1659,6 +1680,12 @@ class TranslationPipeline:
             self._cleanup_intermediates()
         except Exception as e:
             print(f"⚠️ [Pipeline] 中间文件清理异常（不影响主流程）: {e}")
+
+        try:
+            self._record_rescue_completions()
+            write_rescue_report(self._rescue_project_root())
+        except Exception as e:
+            print(f"⚠️ [Rescue] 账本收尾异常（不影响主流程）: {e}")
 
         # 完成后交叉验证：final.json 落盘数应与任务数一致，否则视为假阳性完成
         return self._verify_final_outputs(len(existing_tasks))
@@ -2846,59 +2873,116 @@ class TranslationPipeline:
         chunk_ids = [t['chunk_id'] for t in tasks]
         self.scheduler.batch_update_state(chunk_ids, TaskState.EXTRACTING_TERMS)
 
-    def _process_dirty_batch(self, tasks):
-        for task in tasks:
-            chunk_id = task['chunk_id']
-            print(f"🔄 [Pipeline] {chunk_id} 标记为 DIRTY，重置到术语提取")
-            # Round 108: 清空上一轮的分数历史/最佳版本 — 回溯重跑是新 episode,
-            # 旧历史会污染 streak 早停 (ch08 chunk006: 旧历史 8.157→7.943 与重跑
-            # 7.94 拼成「单调不增」假阳性, 重跑仅 1 次 retry 就被提前 fallback)。
-            self._score_history.pop(chunk_id, None)
-            self._best_lit.pop(chunk_id, None)
-            self._ensure_candidate_pools()
-            self._lit_candidates.pop(chunk_id, None)
-            self._pairwise_info.pop(chunk_id, None)
-            # Round 107 P7: final.json 不删除, 重命名为 final_backup.json.
-            # ch07 倒查: 回溯重跑 (COMPLETED→DIRTY) 删除 final.json 后, 若重跑失败
-            # (NO_PROGRESS_STREAK 等), chunk 从 COMPLETED 降级为 PERMANENTLY_FAILED 且无产出.
-            # 保留备份: 重跑成功会覆盖, 重跑失败则 _restore_dirty_backups 恢复.
-            final_path = self.output_dir / f"{chunk_id}_final.json"
-            backup_path = self.output_dir / f"{chunk_id}_final_backup.json"
-            if final_path.exists():
-                try:
-                    if backup_path.exists():
-                        backup_path.unlink()
-                    final_path.rename(backup_path)
-                    print(f"  💾 已备份 final.json → final_backup.json (重跑失败可恢复)")
-                except OSError as e:
-                    print(f"  ⚠️ 备份 final.json 失败: {e}")
-            # Round 130: critic_report 保留为 *_critic_report_backup.json，
-            # 供章末"版本择优"（_apply_version_merit）对比新旧评分。
-            critic_path = self.output_dir / f"{chunk_id}_critic_report.json"
-            critic_backup = self.output_dir / f"{chunk_id}_critic_report_backup.json"
-            if critic_path.exists():
-                try:
-                    if critic_backup.exists():
-                        critic_backup.unlink()
-                    critic_path.rename(critic_backup)
-                except OSError as e:
-                    print(f"  ⚠️ 备份 critic_report 失败: {e}")
-            for step in ["raw", "literary"]:
+    def _reset_dirty_runtime_state(self, chunk_id: str) -> None:
+        """清理只属于上一 episode 的内存状态（DB 救援预算不重置）。"""
+        # 兼容半初始化实例（测试桩/外部嵌入）；正常 pipeline 一定有这些字典。
+        score_history = getattr(self, "_score_history", None)
+        if isinstance(score_history, dict):
+            score_history.pop(chunk_id, None)
+        best_lit = getattr(self, "_best_lit", None)
+        if isinstance(best_lit, dict):
+            best_lit.pop(chunk_id, None)
+        self._ensure_candidate_pools()
+        self._lit_candidates.pop(chunk_id, None)
+        self._pairwise_info.pop(chunk_id, None)
+
+    def _prepare_dirty_artifacts(self, chunk_id: str, target_stage: TaskState) -> None:
+        """按续跑阶段保留可用中间产物，同时把旧 final/critic 转 backup。
+
+        Round 107 的 final_backup 契约保持不变：重跑失败时章末
+        _restore_dirty_backups 仍可恢复旧版。
+        """
+        self._reset_dirty_runtime_state(chunk_id)
+        final_path = self.output_dir / f"{chunk_id}_final.json"
+        backup_path = self.output_dir / f"{chunk_id}_final_backup.json"
+        if final_path.exists():
+            try:
+                if backup_path.exists():
+                    backup_path.unlink()
+                final_path.rename(backup_path)
+                print("  💾 已备份 final.json → final_backup.json (重跑失败可恢复)")
+            except OSError as e:
+                print(f"  ⚠️ 备份 final.json 失败: {e}")
+        critic_path = self.output_dir / f"{chunk_id}_critic_report.json"
+        critic_backup = self.output_dir / f"{chunk_id}_critic_report_backup.json"
+        if critic_path.exists():
+            try:
+                if critic_backup.exists():
+                    critic_backup.unlink()
+                critic_path.rename(critic_backup)
+            except OSError as e:
+                print(f"  ⚠️ 备份 critic_report 失败: {e}")
+
+        # 从直译/术语重跑必须丢弃下游产物；定向润色/审计保留 raw，润色与
+        # 审计还保留 literary，避免把已有工作重做一遍。
+        if target_stage in (TaskState.EXTRACTING_TERMS, TaskState.TRANSLATING_RAW):
+            for step in ("raw", "literary"):
                 intermediate = self.output_dir / f"{chunk_id}_{step}.json"
                 if intermediate.exists():
                     try:
                         intermediate.unlink()
                     except OSError as e:
                         print(f"  ⚠️ 清理失败 {intermediate}: {e}")
-            # 清理版本历史文件
-            for pattern in [f"{chunk_id}_literary_v*.json", f"{chunk_id}_rewrite_meta_v*.json"]:
-                for f in self.output_dir.glob(pattern):
-                    try:
-                        f.unlink()
-                    except OSError as e:
-                        print(f"  ⚠️ 清理失败 {f}: {e}")
-        chunk_ids = [t['chunk_id'] for t in tasks]
-        self.scheduler.batch_update_state(chunk_ids, TaskState.EXTRACTING_TERMS, reset_counters=True)
+
+        # retry 历史属于上一 episode；保留 text 文件本身，但清掉版本序列。
+        for pattern in (f"{chunk_id}_literary_v*.json", f"{chunk_id}_rewrite_meta_v*.json"):
+            for f in self.output_dir.glob(pattern):
+                try:
+                    f.unlink()
+                except OSError as e:
+                    print(f"  ⚠️ 清理失败 {f}: {e}")
+
+    def _adjust_rescue_stage(self, chunk_id: str, stage: TaskState) -> TaskState:
+        """产物缺失时把定向阶段降级到仍可执行的最早阶段。"""
+        raw_ok = (self.output_dir / f"{chunk_id}_raw.json").exists()
+        lit_ok = (self.output_dir / f"{chunk_id}_literary.json").exists()
+        critic_ok = (self.output_dir / f"{chunk_id}_critic_report.json").exists()
+        if stage == TaskState.JUDGING and (not lit_ok or not critic_ok):
+            stage = TaskState.AUDITING
+        if stage == TaskState.AUDITING and not lit_ok:
+            stage = TaskState.REWRITING_LITERARY if raw_ok else TaskState.TRANSLATING_RAW
+        if stage == TaskState.REWRITING_LITERARY and not raw_ok:
+            stage = TaskState.TRANSLATING_RAW
+        return stage
+
+    def _process_dirty_batch(self, tasks):
+        """Round 147: 普通 DIRTY 全量重跑；rescue DIRTY 按 rescue_stage 续跑。"""
+        normal_ids: List[str] = []
+        rescue_queued = 0
+        has_entity_rescue = False
+        for task in tasks:
+            chunk_id = task['chunk_id']
+            stage_raw = str(task.get("rescue_stage") or "")
+            if stage_raw:
+                try:
+                    target = self._adjust_rescue_stage(chunk_id, TaskState(stage_raw))
+                except ValueError:
+                    target = TaskState.EXTRACTING_TERMS
+                if classify_failure(str(task.get("last_error") or "")) == "entity":
+                    has_entity_rescue = True
+                print(f"🔄 [Pipeline] {chunk_id} 定向救援 → {target.value}")
+                self._prepare_dirty_artifacts(chunk_id, target)
+                q_retries = 1 if target in (TaskState.AUDITING, TaskState.JUDGING) else 0
+                if self.scheduler.stage_rescue_task(
+                        chunk_id, target, quality_retries=q_retries,
+                        last_error=task.get("last_error")):
+                    rescue_queued += 1
+                    continue
+                normal_ids.append(chunk_id)
+            else:
+                print(f"🔄 [Pipeline] {chunk_id} 标记为 DIRTY，重置到术语提取")
+                self._prepare_dirty_artifacts(chunk_id, TaskState.EXTRACTING_TERMS)
+                normal_ids.append(chunk_id)
+        if has_entity_rescue:
+            try:
+                self._maybe_unify_entity_registry()
+            except Exception as e:
+                print(f"  ⚠️ 实体救援前归一异常（继续）: {e}")
+        if normal_ids:
+            self.scheduler.batch_update_state(
+                normal_ids, TaskState.EXTRACTING_TERMS, reset_counters=True)
+        if rescue_queued:
+            print(f"♻️ [Rescue] 本章 {rescue_queued} 个块已进入定向续跑阶段")
 
     def _consolidate_deferred_backtracks(self) -> bool:
         """Round 130: 章末合并式回溯（decision_engine.backtrack_mode=deferred）。
@@ -2975,12 +3059,22 @@ class TranslationPipeline:
     # 只对命中签名的块生效（override 按块持久化），正常块零影响。
     # ────────────────────────────────────────────────────────────────
     _NO_CONTENT_MARKERS = ("无正文", "未闭合 think 块", "reasoning_only")
+    _CONTENT_SENSITIVE_MARKERS = (
+        "new_sensitive", "content_sensitive", "content policy", "content_policy",
+        "sensitive", "内容敏感", "敏感内容",
+    )
 
     @classmethod
     def _is_no_content_signature(cls, err_text) -> bool:
         """判定异常文本是否为「仅推理无正文」签名（thinking 耗尽 max_tokens）。"""
         text = str(err_text or "")
         return any(m in text for m in cls._NO_CONTENT_MARKERS)
+
+    @classmethod
+    def _is_content_sensitive_signature(cls, err_text) -> bool:
+        """Round 148: 判定是否为上游内容审核拒绝（HTTP 422 / input new_sensitive）。"""
+        text = str(err_text or "").lower()
+        return any(m.lower() in text for m in cls._CONTENT_SENSITIVE_MARKERS)
 
     @staticmethod
     def _effort_levels_table() -> Dict[str, tuple]:
@@ -3150,6 +3244,91 @@ class TranslationPipeline:
             else:
                 print(f"🔻 [Pipeline] {chunk_id} no_content 签名（{used_eff or 'default'} 已无更低档）")
 
+    def _content_sensitive_target_role(self, failing_role: str,
+                                       ov: Dict[str, Any]) -> Tuple[Optional[str], List[str]]:
+        """Round 148: 为内容审核拒绝选择尚未尝试的备用角色。
+
+        先跨 provider（MiniMax），再同网关的 Qwen；已试角色写回 override，
+        保证同一 provider + 同一 prompt 不会再次空转。
+        """
+        cfg = self._retry_adapt_cfg()
+        configured = cfg.get("sensitive_fallback_roles") or ["primary", "literal_translator"]
+        candidates = [str(r).strip() for r in configured if str(r).strip()]
+        tried: List[str] = []
+        for role in list(ov.get("sensitive_tried_roles") or []) + [failing_role]:
+            role = str(role or "").strip()
+            if role and role not in tried:
+                tried.append(role)
+        for role in candidates:
+            if role in tried:
+                continue
+            try:
+                role_cfg = _config.get_role_config(role) or {}
+            except Exception:
+                role_cfg = {}
+            if not role_cfg:
+                continue
+            return role, tried
+        return None, tried
+
+    def _record_content_sensitive_signal(self, chunk_id: str, stage: str,
+                                         failing_role: str,
+                                         failing_effort: Optional[str]) -> bool:
+        """Round 148: 内容审核拒绝 → 下一次立即换角色，不再原参数重试。
+
+        返回 True 表示已写入可用的备用角色；返回 False 表示所有配置角色均已
+        尝试过，调用方应直接隔离，而不是继续消耗 retry 预算。
+        """
+        cfg = self._retry_adapt_cfg()
+        if not cfg.get("enabled", True):
+            return False
+        prev = self._get_retry_override(chunk_id)
+        target, tried = self._content_sensitive_target_role(failing_role, prev)
+        payload = dict(prev)
+        payload.update({
+            "sig": "content_sensitive",
+            "stage": stage,
+            "used_role": failing_role,
+            "used_effort": failing_effort,
+            "sensitive_tried_roles": tried,
+            "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
+        if target:
+            ladder = self._effort_ladder_for_role(target)
+            mapped = _map_effort_for_fallback(str(failing_effort), ladder) if failing_effort else None
+            if mapped is None:
+                mapped = self._task_default_effort("literary_rewrite")
+            payload.update({
+                "role": target,
+                "effort": mapped,
+                "sensitive_exhausted": False,
+                "sensitive_switch_count": max(0, len(tried)),
+            })
+            ok = self._set_retry_override(chunk_id, payload)
+            if ok:
+                print(
+                    f"🛡️ [Pipeline] {chunk_id} 内容审核拒绝 → 下次换角色 "
+                    f"{failing_role or '?'}@{failing_effort or 'default'} → "
+                    f"{target}@{mapped or 'default'}（已试 {','.join(tried)}）"
+                )
+            return ok
+        payload.update({
+            "role": failing_role,
+            "effort": failing_effort,
+            "sensitive_exhausted": True,
+            "sensitive_switch_count": max(0, len(tried) - 1),
+        })
+        self._set_retry_override(chunk_id, payload)
+        print(
+            f"🧊 [Pipeline] {chunk_id} 内容审核拒绝：备用角色已全部拒绝"
+            f"（{','.join(tried)}），不再重复同题重试"
+        )
+        return False
+
+    def _content_sensitive_exhausted(self, chunk_id: str) -> bool:
+        ov = self._get_retry_override(chunk_id)
+        return bool(ov.get("sig") == "content_sensitive" and ov.get("sensitive_exhausted"))
+
     def _rescue_role_for(self, stage: str, failing_role: str) -> Optional[str]:
         """换角色救稿目标选择（fallback_role_switch）。
 
@@ -3271,13 +3450,280 @@ class TranslationPipeline:
                 continue
         return False
 
+    # ────────────────────────────────────────────────────────────────
+    # Round 147: 失败块自动救援
+    # ────────────────────────────────────────────────────────────────
+    def _rescue_project_root(self) -> Path:
+        root = getattr(self, "_root_dir", None)
+        if root is not None:
+            return Path(root)
+        out = Path(getattr(self, "output_dir", Path.cwd() / "output"))
+        if out.parent.name == "output":
+            return out.parent.parent
+        if out.name == "output":
+            return out.parent
+        # Do not fall back to cwd: a test/external stub must not write rescue
+        # artifacts into the production project output directory.
+        return out
+
+    def _rescue_evidence(self, chunk_id: str) -> Dict[str, Any]:
+        """收集账本所需的低成本证据（只读 final/critic，不调用 LLM）。"""
+        out_dir = Path(getattr(self, "output_dir", Path.cwd()))
+        evidence: Dict[str, Any] = {
+            "best_score": None,
+            "critic_backend": None,
+        }
+        final_path = out_dir / f"{chunk_id}_final.json"
+        try:
+            data = json.loads(final_path.read_text(encoding="utf-8"))
+            meta = data.get("metadata") if isinstance(data, dict) else None
+            if isinstance(meta, dict):
+                score = meta.get("avg_score")
+                if isinstance(score, (int, float)):
+                    evidence["best_score"] = float(score)
+                reason = meta.get("reason") or meta.get("judge_reason")
+                if reason:
+                    evidence["final_reason"] = str(reason)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        critic_path = out_dir / f"{chunk_id}_critic_report.json"
+        try:
+            report = json.loads(critic_path.read_text(encoding="utf-8"))
+            if isinstance(report, dict):
+                evidence["critic_backend"] = report.get("_backend_path")
+                if evidence["best_score"] is None:
+                    scores = report.get("scores") or {}
+                    nums = [float(v) for v in scores.values()
+                            if isinstance(v, (int, float))]
+                    if nums:
+                        evidence["best_score"] = round(sum(nums) / len(nums), 3)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        return evidence
+
+    def _rescue_time_exhausted(self) -> bool:
+        started = getattr(self, "_rescue_started_at", None)
+        if not started:
+            return False
+        budget = _as_int_safe(rescue_config().get("chapter_budget_seconds"), 1800)
+        return budget > 0 and (time.monotonic() - float(started)) >= budget
+
+    def _record_rescue(self, chunk_id: str, task: Dict[str, Any], reason: str,
+                       failure_class: str, action: str, result: str,
+                       resume_stage: Optional[str] = None,
+                       attempt: Optional[int] = None) -> None:
+        root = self._rescue_project_root()
+        evidence = self._rescue_evidence(chunk_id)
+        if not reason and evidence.get("final_reason"):
+            reason = str(evidence["final_reason"])
+        append_rescue_event(root, {
+            "chunk_id": chunk_id,
+            "chapter": str(task.get("chapter_id") or getattr(self, "chapter_id", "")),
+            "stage": str(task.get("state") or ""),
+            "failure_class": failure_class,
+            "reason": str(reason or "unknown")[:2000],
+            "retries": _as_int_safe(task.get("retries"), 0),
+            "quality_retries": _as_int_safe(task.get("quality_retries"), 0),
+            "pf_requeues": _as_int_safe(task.get("pf_requeues"), 0),
+            "rescue_attempts": _as_int_safe(task.get("rescue_attempts"), 0),
+            "critic_backend": evidence.get("critic_backend"),
+            "best_score": evidence.get("best_score"),
+            "action": action,
+            "resume_stage": resume_stage,
+            "result": result,
+            "attempt": attempt,
+        })
+
+    def _schedule_rescue(self, task: Dict[str, Any], reason: str,
+                         failure_class: str, action: str,
+                         resume_stage: Optional[str] = None) -> bool:
+        """写入 DIRTY(rescue_stage)，受 targeted/full requeue 双预算约束。"""
+        cfg = rescue_config()
+        chunk_id = str(task.get("chunk_id") or "")
+        if not cfg.get("enabled", True) or not chunk_id:
+            return False
+        if self._rescue_time_exhausted():
+            print(f"⌛ [Rescue] {chunk_id} 章级救援时间预算已用尽，停止自动重跑")
+            return False
+        attempts = _as_int_safe(task.get("rescue_attempts"), 0)
+        pf_requeues = _as_int_safe(task.get("pf_requeues"), 0)
+        max_targeted = _as_int_safe(cfg.get("max_targeted_attempts"), 2)
+        max_full = _as_int_safe(cfg.get("max_full_requeues"), 1)
+        if action == "targeted":
+            if attempts >= max_targeted:
+                return False
+            stage = resume_stage or recommended_resume_stage(
+                task, failure_class, Path(self.output_dir), attempts)
+            res = self.scheduler.queue_rescue(
+                chunk_id, stage, reason,
+                increment_attempt=True, increment_full_requeue=False,
+                reset_counters=True,
+            )
+            if not res.get("ok"):
+                return False
+            if getattr(self, "_rescue_started_at", None) is None:
+                self._rescue_started_at = time.monotonic()
+            self._record_rescue(
+                chunk_id, task, reason, failure_class, "targeted_rescue",
+                "queued", resume_stage=stage, attempt=res.get("attempt"))
+            print(f"♻️ [Rescue] {chunk_id} {failure_class} → {stage} "
+                  f"(targeted {res.get('attempt')}/{max_targeted})")
+            return True
+        if action == "full":
+            if pf_requeues >= max_full:
+                return False
+            res = self.scheduler.queue_rescue(
+                chunk_id, "EXTRACTING_TERMS", reason,
+                increment_attempt=False, increment_full_requeue=True,
+                reset_counters=True,
+            )
+            if not res.get("ok"):
+                return False
+            if getattr(self, "_rescue_started_at", None) is None:
+                self._rescue_started_at = time.monotonic()
+            self._record_rescue(
+                chunk_id, task, reason, failure_class, "full_requeue",
+                "queued", resume_stage="EXTRACTING_TERMS",
+                attempt=attempts)
+            print(f"♻️ [Rescue] {chunk_id} targeted 预算已用尽 → 整块重跑 "
+                  f"(full {res.get('full_requeues')}/{max_full})")
+            return True
+        return False
+
+    def _enter_rescue_or_pf(self, chunk_id: str, reason: str,
+                            failure_class: Optional[str] = None,
+                            allow_rescue: bool = True) -> bool:
+        """统一终态入口：优先进入救援队列，预算耗尽才写 PERMANENTLY_FAILED。
+
+        Mock/旧 scheduler 没有 get_task 返回 dict 时保持旧行为，避免测试和
+        外部嵌入调用被新机制意外改写。
+        """
+        reason = str(reason or "unknown")
+        cls = failure_class or classify_failure(reason)
+        try:
+            task = self.scheduler.get_task(chunk_id)
+        except Exception:
+            task = None
+        if not isinstance(task, dict):
+            self.scheduler.update_task_state(
+                chunk_id, TaskState.PERMANENTLY_FAILED, error_msg=reason)
+            return False
+        if not allow_rescue:
+            if str(task.get("state") or "") != TaskState.PERMANENTLY_FAILED.value:
+                self.scheduler.update_task_state(
+                    chunk_id, TaskState.PERMANENTLY_FAILED, error_msg=reason)
+            self._record_rescue(
+                chunk_id, task, reason, cls, "quarantine", "quarantined",
+                attempt=_as_int_safe(task.get("rescue_attempts"), 0))
+            print(f"🧊 [Rescue] {chunk_id} 无可用备用路径，直接隔离为 PERMANENTLY_FAILED")
+            return False
+        cfg = rescue_config()
+        attempts = _as_int_safe(task.get("rescue_attempts"), 0)
+        pf_requeues = _as_int_safe(task.get("pf_requeues"), 0)
+        max_targeted = _as_int_safe(cfg.get("max_targeted_attempts"), 2)
+        max_full = _as_int_safe(cfg.get("max_full_requeues"), 1)
+        if cfg.get("enabled", True) and attempts < max_targeted:
+            if self._schedule_rescue(task, reason, cls, "targeted"):
+                return True
+        if cfg.get("enabled", True) and pf_requeues < max_full:
+            if self._schedule_rescue(task, reason, cls, "full"):
+                return True
+        state = str(task.get("state") or "")
+        if state != TaskState.PERMANENTLY_FAILED.value:
+            self.scheduler.update_task_state(
+                chunk_id, TaskState.PERMANENTLY_FAILED, error_msg=reason)
+        self._record_rescue(
+            chunk_id, task, reason, cls, "quarantine", "quarantined",
+            attempt=attempts)
+        print(f"🧊 [Rescue] {chunk_id} 救援预算耗尽，隔离为 PERMANENTLY_FAILED")
+        return False
+
+    def _auto_rescue_existing_failures(self) -> int:
+        """运行开始时复活上一轮遗留的 PF 块；预算与账本跨进程持久。"""
+        cfg = rescue_config()
+        if not cfg.get("enabled", True):
+            return 0
+        queued = 0
+        tasks = self.scheduler.get_all_tasks_by_chapter(self.chapter_id)
+        # collect_final_status expects the output root (output/), not a chapter
+        # directory.  Passing output/ch01 would look for output/ch01/ch*/... and
+        # silently miss every fallback final.
+        out_root = Path(self.output_dir)
+        if out_root.parent.name == "output":
+            out_root = out_root.parent
+        status = collect_final_status(self._rescue_project_root(), out_root)
+        fallback_by_chunk = {
+            str(x.get("chunk_id")): x for x in (status.get("fallbacks") or [])
+        }
+        for task in tasks:
+            cid = str(task.get("chunk_id") or "")
+            is_pf = task.get("state") == TaskState.PERMANENTLY_FAILED.value
+            fallback_item = fallback_by_chunk.get(cid)
+            if not is_pf and not fallback_item:
+                continue
+            attempts = _as_int_safe(task.get("rescue_attempts"), 0)
+            pf_requeues = _as_int_safe(task.get("pf_requeues"), 0)
+            if attempts >= _as_int_safe(cfg.get("max_targeted_attempts"), 2) \
+                    and pf_requeues >= _as_int_safe(cfg.get("max_full_requeues"), 1):
+                continue
+            reason = str(task.get("last_error") or "")
+            if fallback_item and fallback_item.get("reason"):
+                reason = str(fallback_item["reason"])
+            if not reason:
+                reason = str(self._rescue_evidence(cid).get("final_reason") or "legacy PF")
+            cls = classify_failure(reason)
+            if attempts < _as_int_safe(cfg.get("max_targeted_attempts"), 2):
+                if self._schedule_rescue(task, reason, cls, "targeted"):
+                    queued += 1
+            elif pf_requeues < _as_int_safe(cfg.get("max_full_requeues"), 1):
+                if self._schedule_rescue(task, reason, cls, "full"):
+                    queued += 1
+        if queued:
+            print(f"♻️ [Rescue] 章 {self.chapter_id}: 已排队 {queued} 个遗留 PF 块")
+        return queued
+
+    def _record_rescue_completions(self) -> None:
+        """为已恢复的块补一条 completed 结果，保持账本可做 cohort 统计。"""
+        root = self._rescue_project_root()
+        latest = latest_events_by_chunk(root)
+        for task in self.scheduler.get_all_tasks_by_chapter(self.chapter_id):
+            cid = str(task.get("chunk_id") or "")
+            if task.get("state") != TaskState.COMPLETED.value:
+                continue
+            prev = latest.get(cid) or {}
+            if str(prev.get("result") or "") == "completed":
+                continue
+            if _as_int_safe(task.get("rescue_attempts"), 0) <= 0 \
+                    and str(prev.get("action") or "") != "full_requeue":
+                continue
+            self._record_rescue(
+                cid, task, str(prev.get("reason") or "rescue completed"),
+                str(prev.get("failure_class") or "unknown"),
+                "rescue_result", "completed",
+                resume_stage=prev.get("resume_stage"),
+                attempt=_as_int_safe(task.get("rescue_attempts"), 0))
+
     def _process_failed_batch(self, tasks):
         retry_by_stage = {}
-        permanent_fail_ids = []
         max_retries = _config.pipeline.get("max_retries", 3)
         for task in tasks:
             chunk_id = task['chunk_id']
             retries = task.get('retries', 0)
+            last_error = str(task.get("last_error") or "")
+            # Round 148: 内容审核拒绝是永久客户端拒绝。只要还有未尝试的备用角色，
+            # 就立即回润色阶段；全部角色拒绝后才隔离，避免原参数反复计费。
+            if self._is_content_sensitive_signature(last_error):
+                if self._content_sensitive_exhausted(chunk_id):
+                    print(f"🧊 [Pipeline] {chunk_id} 内容审核拒绝且无备用角色，进入隔离")
+                    self._try_fallback_final(chunk_id)
+                    self._enter_rescue_or_pf(
+                        chunk_id, f"[FAILED_CONTENT_SENSITIVE] {last_error}",
+                        "content_sensitive", allow_rescue=False,
+                    )
+                else:
+                    retry_by_stage.setdefault(TaskState.REWRITING_LITERARY, []).append(chunk_id)
+                    print(f"🛡️ [Pipeline] {chunk_id} 内容审核拒绝 → 换角色续跑")
+                continue
             if retries >= max_retries:
                 # Round 133: no_content 签名 + 预算耗尽 → 换角色救稿一次（默认开启）
                 rescue_stage = self._maybe_rescue_no_content(task)
@@ -3285,19 +3731,16 @@ class TranslationPipeline:
                     stage_state = self._get_recovery_stage(f"[{rescue_stage}]")
                     retry_by_stage.setdefault(stage_state, []).append(chunk_id)
                     continue
-                print(f"❌ [Pipeline] {chunk_id} 重试次数过多，转入 PERMANENTLY_FAILED 终态")
+                print(f"⚠️ [Pipeline] {chunk_id} 执行重试预算耗尽，进入失败救援判定")
                 self._try_fallback_final(chunk_id)
-                permanent_fail_ids.append(chunk_id)
+                self._enter_rescue_or_pf(
+                    chunk_id,
+                    f"[FAILED_MAX_RETRIES] {last_error} (retries>={max_retries})",
+                )
             else:
                 recovery_stage = self._get_recovery_stage(task.get('last_error', ''))
                 retry_by_stage.setdefault(recovery_stage, []).append(chunk_id)
                 print(f"🔁 [Pipeline] {chunk_id} 重试中 (第 {retries + 1} 次) → {recovery_stage.value}")
-        if permanent_fail_ids:
-            self.scheduler.batch_update_state(
-                permanent_fail_ids,
-                TaskState.PERMANENTLY_FAILED,
-                error_msgs={cid: f"超过重试上限 (retries>={max_retries})，需人工介入" for cid in permanent_fail_ids}
-            )
         for stage, ids in retry_by_stage.items():
             if ids:
                 print(f"🔁 [Pipeline] {len(ids)} 个任务恢复到 {stage.value}")
@@ -3371,6 +3814,8 @@ class TranslationPipeline:
         entity_feedback: str = ''
         entity_registry_for_rewriter: Dict[str, str] = {}
         for task in tasks:
+            model_role = ""
+            model_effort = None
             try:
                 chunk_id = task['chunk_id']
                 source_text = task['text_content']
@@ -3468,9 +3913,10 @@ class TranslationPipeline:
                                                 "stagnant_categories": sorted(prev_cats),
                                             }
                                         }, source_step="literary")
-                                        self.scheduler.update_task_state(
-                                            chunk_id, TaskState.PERMANENTLY_FAILED,
-                                            error_msg=f"[PRE_REWRITER_STAGNATION] 跳过 rewriter LLM: cats {sorted(prev_cats)} 连续 {stag_consecutive_p73 + 1} 次不变"
+                                        self._enter_rescue_or_pf(
+                                            chunk_id,
+                                            f"[PRE_REWRITER_STAGNATION] 跳过 rewriter LLM: cats {sorted(prev_cats)} 连续 {stag_consecutive_p73 + 1} 次不变",
+                                            "quality",
                                         )
                                         print(f"⏹️ [Pipeline] {chunk_id} pre-rewriter 停滞 (retry={quality_retries}, cats={sorted(prev_cats)}), 跳过 rewriter LLM")
                                         continue
@@ -3497,7 +3943,8 @@ class TranslationPipeline:
                 # Round 133: no_content 重试适配 override（降档/换角救稿）优先于停滞换档；
                 # 降档后若因质量重进润色（quality_retries≥1）→ 升档补偿一次（防死循环）。
                 ov = self._get_retry_override(chunk_id)
-                if ov and ov.get("sig") == "no_content" and ov.get("stage") == "REWRITING_LITERARY":
+                if (ov and ov.get("sig") in ("no_content", "quality_rescue", "content_sensitive")
+                        and ov.get("stage") == "REWRITING_LITERARY"):
                     if ov.get("role"):
                         model_role = ov["role"]
                     if ov.get("effort"):
@@ -3518,9 +3965,15 @@ class TranslationPipeline:
                             ov["escalated"] = True
                             ov["effort"] = up_eff
                             self._set_retry_override(chunk_id, ov)
-                    if model_effort:
+                    if ov.get("sig") == "content_sensitive":
                         print(
-                            f"🔻 [Pipeline] {chunk_id} 重试适配生效: role={model_role} "
+                            f"🛡️ [Pipeline] {chunk_id} 内容审核换角生效: "
+                            f"role={model_role} effort={model_effort or 'default'}"
+                        )
+                    elif model_effort:
+                        print(
+                            f"🔻 [Pipeline] {chunk_id} 救援适配生效"
+                            f"({ov.get('sig')}): role={model_role} "
                             f"effort={model_effort}"
                         )
                 self._note_last_call(
@@ -3603,9 +4056,10 @@ class TranslationPipeline:
                             "quality_retries": quality_retries,
                         }
                     }, source_step="literary")
-                    self.scheduler.update_task_state(
-                        chunk_id, TaskState.PERMANENTLY_FAILED,
-                        error_msg=f"rewriter 字节停滞 retry={quality_retries}"
+                    self._enter_rescue_or_pf(
+                        chunk_id,
+                        f"[REWRITER_STAGNATED] rewriter 字节停滞 retry={quality_retries}",
+                        "quality",
                     )
                     continue
 
@@ -3794,9 +4248,10 @@ class TranslationPipeline:
                     # Round 92: fallback 写入跨 retry 最佳版本, 而非当前被拒 lit_text
                     best_text = self._pairwise_pick_best(chunk_id, lit_text, source_text)
                     self._save_final_with_sanity(chunk_id, best_text)
-                    self.scheduler.update_task_state(
-                        chunk_id, TaskState.PERMANENTLY_FAILED,
-                        error_msg=f"[STAGNATION] {force_reason}，提前 fallback",
+                    self._enter_rescue_or_pf(
+                        chunk_id,
+                        f"[STAGNATION] {force_reason}，提前 fallback",
+                        "quality",
                     )
                     continue  # 跳过 success_ids，不再进 AUDITING
 
@@ -3805,6 +4260,12 @@ class TranslationPipeline:
                 import traceback
                 traceback.print_exc()
                 print(f"❌ [Pipeline] {task['chunk_id']} 润色异常: {e}")
+                if self._is_content_sensitive_signature(e):
+                    self._record_content_sensitive_signal(
+                        task['chunk_id'], "REWRITING_LITERARY",
+                        model_role or _config.get_task_role("literary_rewrite"),
+                        model_effort or self._task_default_effort("literary_rewrite"),
+                    )
                 if self._is_no_content_signature(e):
                     self._record_no_content_signal(task['chunk_id'], "REWRITING_LITERARY")
                 self.scheduler.update_task_state(task['chunk_id'], TaskState.FAILED, error_msg=f"[REWRITING_LITERARY] {e}")
@@ -4631,6 +5092,20 @@ class TranslationPipeline:
                     critic_report["entity_consistency_notes"] = entity_notes
                     print(f"  ⚠️ 实体一致性核查: {len(entity_notes)} 条不一致项")
 
+                # Round 157: record the exact text this critic run scored.  A
+                # later gate can then bind the report to the delivered final
+                # bytes instead of treating ``_backend_path=jev`` as evidence.
+                try:
+                    from src.judgment_layer import sha256_text as _sha256_text
+                    critic_report["_audit_target"] = {
+                        "schema_version": 1,
+                        "source_sha256": _sha256_text(source_text or ""),
+                        "raw_sha256": _sha256_text(raw_text or ""),
+                        "literary_sha256": _sha256_text(lit_text or ""),
+                    }
+                except Exception:
+                    pass
+
                 self._save_intermediate(chunk_id, "critic_report", critic_report)
                 # Round 92: 追踪当前 retry 的 lit_text 与 critic score, fallback 时用最佳版
                 self._update_best_lit(chunk_id, lit_text, critic_report)
@@ -4674,10 +5149,8 @@ class TranslationPipeline:
                                 "quality_retries": quality_retries,
                             }
                         }, source_step="literary")
-                        self.scheduler.update_task_state(
-                            chunk_id, TaskState.PERMANENTLY_FAILED,
-                            error_msg=stop_reason_p99
-                        )
+                        self._enter_rescue_or_pf(
+                            chunk_id, stop_reason_p99, "quality")
                         continue
                 if not critic_report.get("scores"):
                     print(f"⚠️ [Pipeline] {chunk_id} Critic 评分为空（JSON 解析失败），转入 FAILED 等待重试")
@@ -4786,12 +5259,11 @@ class TranslationPipeline:
                             "judge_reason": f"实体违规连续 {entity_stagnation_threshold} 次未修复 (counts={recent_serious})",
                         }
                     }, source_step="literary")
-                    self.scheduler.update_task_state(
-                        chunk_id, TaskState.PERMANENTLY_FAILED,
-                        error_msg=(
-                            f"[ENTITY_VIOLATION_STREAK] 实体违规连续 {entity_stagnation_threshold} 次未修复 "
-                            f"(counts={recent_serious}), 提前 fallback"
-                        )
+                    self._enter_rescue_or_pf(
+                        chunk_id,
+                        f"[ENTITY_VIOLATION_STREAK] 实体违规连续 {entity_stagnation_threshold} 次未修复 "
+                        f"(counts={recent_serious}), 提前 fallback",
+                        "entity",
                     )
                     print(
                         f"⏹️ [Pipeline] {chunk_id} 实体违规连续 {entity_stagnation_threshold} 次未修复 "
@@ -5019,9 +5491,11 @@ class TranslationPipeline:
                             "current_avg": round(current_avg, 2),
                         }
                     }, source_step="literary")
-                    self.scheduler.update_task_state(
-                        chunk_id, TaskState.PERMANENTLY_FAILED,
-                        error_msg=f"[SCORE_DECLINE] 连续 {decline_streak} 次 retry 分数递减, 提前 fallback (history={self._score_history.get(chunk_id, [])[-5:]})"
+                    self._enter_rescue_or_pf(
+                        chunk_id,
+                        f"[SCORE_DECLINE] 连续 {decline_streak} 次 retry 分数递减, 提前 fallback "
+                        f"(history={self._score_history.get(chunk_id, [])[-5:]})",
+                        "quality",
                     )
                     print(f"⏹️ [Pipeline] {chunk_id} 连续 {decline_streak} 次 retry 分数递减, 提前 fallback (current={current_avg:.2f}, history={self._score_history.get(chunk_id, [])[-5:]})")
                     continue
@@ -5045,12 +5519,11 @@ class TranslationPipeline:
                             "no_progress_window": no_progress_window,
                         }
                     }, source_step="literary")
-                    self.scheduler.update_task_state(
-                        chunk_id, TaskState.PERMANENTLY_FAILED,
-                        error_msg=(
-                            f"[NO_PROGRESS_STREAK] 连续 {no_progress_window} 次 retry 单调不增 (含持平), "
-                            f"提前 fallback (history={self._score_history.get(chunk_id, [])[-5:]})"
-                        )
+                    self._enter_rescue_or_pf(
+                        chunk_id,
+                        f"[NO_PROGRESS_STREAK] 连续 {no_progress_window} 次 retry 单调不增 (含持平), "
+                        f"提前 fallback (history={self._score_history.get(chunk_id, [])[-5:]})",
+                        "quality",
                     )
                     print(
                         f"⏹️ [Pipeline] {chunk_id} 连续 {no_progress_window} 次 retry 单调不增, "
@@ -5094,13 +5567,12 @@ class TranslationPipeline:
                             "lit_cjk_ratio": round(compute_cjk_ratio(lit_text), 3),
                         }
                     }, source_step="literary")
-                    self.scheduler.update_task_state(
-                        chunk_id, TaskState.PERMANENTLY_FAILED,
-                        error_msg=(
-                            f"[CJK_RETRY_EXHAUSTED] rewriter 重试 {quality_retries} 次仍输出英文 "
-                            f"(lit cjk={compute_cjk_ratio(lit_text):.2f}), 提前 fallback 到 raw "
-                            f"(raw cjk={raw_cjk:.2f}), 节省 {max_quality_retries - quality_retries} 次 LLM 调用"
-                        )
+                    self._enter_rescue_or_pf(
+                        chunk_id,
+                        f"[CJK_RETRY_EXHAUSTED] rewriter 重试 {quality_retries} 次仍输出英文 "
+                        f"(lit cjk={compute_cjk_ratio(lit_text):.2f}), 提前 fallback 到 raw "
+                        f"(raw cjk={raw_cjk:.2f}), 节省 {max_quality_retries - quality_retries} 次 LLM 调用",
+                        "cjk",
                     )
                     print(
                         f"⏹️ [Pipeline] {chunk_id} CJK 重试耗尽 (lit cjk={compute_cjk_ratio(lit_text):.2f}, "
@@ -5166,8 +5638,13 @@ class TranslationPipeline:
                                 "avg_score": round(avg_score, 2),
                             }
                         }, source_step="literary")
-                        self.scheduler.update_task_state(chunk_id, TaskState.COMPLETED, error_msg=f"[SAFETY_NET] 平均分{avg_score:.2f}≥{safety_net_min}，接近阈值放行")
-                        print(f"🟡 [Pipeline] {chunk_id} 安全网放行（平均分{avg_score:.2f}，未达PERMANENTLY_FAILED）")
+                        self._enter_rescue_or_pf(
+                            chunk_id,
+                            f"[SAFETY_NET_PASSED] 平均分{avg_score:.2f}≥{safety_net_min}，"
+                            f"仍低于质量线，转自动救援",
+                            "quality",
+                        )
+                        print(f"🟡 [Pipeline] {chunk_id} 安全网候选稿已落盘，进入自动救援")
                     else:
                         # Round 92: max retries fallback 也用最佳版本
                         best_text = self._pairwise_pick_best(chunk_id, lit_text, source_text, raw_text=None)
@@ -5180,7 +5657,12 @@ class TranslationPipeline:
                                 "quality_retries": quality_retries,
                             }
                         }, source_step="literary")
-                        self.scheduler.update_task_state(chunk_id, TaskState.PERMANENTLY_FAILED, error_msg=judge_result.get("reject_reason") or "质量重试耗尽")
+                        self._enter_rescue_or_pf(
+                            chunk_id,
+                            f"[PERMANENTLY_FAILED_AFTER_MAX_RETRIES] "
+                            f"{judge_result.get('reject_reason') or '质量重试耗尽'}",
+                            "quality",
+                        )
                         print(f"⚠️ [Pipeline] {chunk_id} 质量重试耗尽，已 fallback 写入 final（最佳一版润色稿）")
                 elif early_stop_enabled and quality_retries == 0:
                     # early_stop 仅在首轮裁决生效：避免 rework 一两次就放弃可恢复的 chunk
@@ -5213,10 +5695,8 @@ class TranslationPipeline:
                                 "quality_retries": quality_retries,
                             }
                         }, source_step="literary")
-                        self.scheduler.update_task_state(
-                            chunk_id, TaskState.PERMANENTLY_FAILED,
-                            error_msg=stop_reason
-                        )
+                        self._enter_rescue_or_pf(
+                            chunk_id, stop_reason, "quality")
                         continue
                     self._fallback_to_rewriter(chunk_id, lit_text, critic_report, judge_result)
                 else:
@@ -5418,6 +5898,12 @@ def run_final_gate(
     ⑥ L1 韵文对齐（verse_lint，门禁内联自动运行）
     ⑦ L2 双关核销（pun_audit，门禁内联自动运行；Round 130 起无需手动补跑）
     ⑧ 裁决校准占比（最终稿必须主要由 confidence_source=jev 的校准后端产出）
+    ⑨ fallback/质量降级产物：任意 final 标 fallback/quality_waived 即红
+    ⑩ 成书机械排错：编码损坏、拼接残留标题、HTML、重复标点、括号/章节壳等
+       阻断项为 0（纯确定性，不调用 LLM，不改写正文）
+    ⑪ 全书修复闭环：每个 final 都有源文证据且可解析；当前 final 不再有
+       待修项、未决高危姓名错位或正文段漏译/插入歧义；若存在 book_repair
+       manifest，其 final 哈希必须与当前文件一致
     任一为红 → ok=False（translate_book.sh 以非零退出中止 / ⛔）。
     """
     root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
@@ -5468,19 +5954,32 @@ def run_final_gate(
         failures.append(f"② 残留 final_backup {len(backups)} 个: {backups[:5]}")
 
     # ③ QA_REPORT
+    qa_read_ok = False
     if not qa_file.exists():
         failures.append(f"③ QA_REPORT 不存在: {qa_file}")
     else:
         try:
             qa_text = qa_file.read_text(encoding="utf-8")
+            qa_read_ok = True
         except (OSError, UnicodeDecodeError) as exc:
             failures.append(f"③ QA_REPORT 读取失败: {exc}")
         else:
             falls = [ln[3:].strip() for ln in qa_text.split("\n")
                      if ln.startswith("## ")]
-            stats["qa_fallbacks"] = len(falls)
-            if falls:
-                failures.append(f"③ QA_REPORT 记录 {len(falls)} 个 fallback 章节: {falls[:5]}")
+            _qa_payload = parse_qa_report(qa_file)
+            if isinstance(_qa_payload, dict) and isinstance(_qa_payload.get("fallbacks"), list):
+                stats["qa_fallbacks"] = len(_qa_payload["fallbacks"])
+            else:
+                stats["qa_fallbacks"] = len(falls)
+            if stats["qa_fallbacks"]:
+                failures.append(
+                    f"③ QA_REPORT 记录 {stats['qa_fallbacks']} 个 fallback 章节: {falls[:5]}")
+    if qa_read_ok:
+        _qa_problems, _qa_info = qa_report_mismatches(root, out_root, qa_file)
+        stats["qa_consistency"] = _qa_info
+        if _qa_problems:
+            failures.append(
+                f"③ QA_REPORT 与当前 final 不一致: {_qa_problems[:5]}")
 
     # ④ T5 lint
     try:
@@ -5621,8 +6120,15 @@ def run_final_gate(
     _chapter_cal: dict = {}
     _missing_reports = []
     _bad_reports = []
+    _critic_evidence = {"exact": 0, "repaired": 0, "unbound": 0,
+                        "stale": 0, "missing_final": 0}
+    _stale_evidence = []
     _calibrated_n = 0
     _multi_batch_calibrated = 0
+    try:
+        from src.recalibrate import critic_evidence_state
+    except Exception:
+        critic_evidence_state = None
     for _ch, _cid in task_ids:
         _report_path = out_root / _ch / f"{_cid}_critic_report.json"
         _chapter_cal.setdefault(_ch, {"total": 0, "calibrated": 0})
@@ -5637,6 +6143,23 @@ def run_final_gate(
             continue
         _bp = str((_report or {}).get("_backend_path") or "unknown")
         _backend_counts[_bp] = _backend_counts.get(_bp, 0) + 1
+        if critic_evidence_state is not None:
+            _evidence = critic_evidence_state(
+                _report,
+                out_root / _ch / f"{_cid}_final.json",
+                project_root=root,
+            )
+            _status = str(_evidence.get("status") or "unbound")
+            _critic_evidence[_status] = _critic_evidence.get(_status, 0) + 1
+            if _status == "stale":
+                _stale_evidence.append({
+                    "chapter": _ch,
+                    "chunk_id": _cid,
+                    "field": _evidence.get("field"),
+                    "audited_sha256": _evidence.get("audited_sha256"),
+                    "current_sha256": _evidence.get("current_sha256"),
+                    "reason": _evidence.get("reason"),
+                })
         if _bp in _cal_sources:
             _calibrated_n += 1
             _chapter_cal[_ch]["calibrated"] += 1
@@ -5648,6 +6171,8 @@ def run_final_gate(
                 pass
 
     stats["backend_paths"] = _backend_counts
+    stats["critic_evidence"] = _critic_evidence
+    stats["stale_critic_evidence"] = _stale_evidence
     stats["multi_batch_calibrated"] = _multi_batch_calibrated
     stats["calibrated_ratio"] = (
         _calibrated_n / len(task_ids) if task_ids else None)
@@ -5662,6 +6187,11 @@ def run_final_gate(
         if _bad_reports:
             failures.append(
                 f"⑧ critic_report 读取/解析失败 {len(_bad_reports)} 个: {_bad_reports[:5]}")
+        if _stale_evidence:
+            _ids = [f"{x['chapter']}/{x['chunk_id']}" for x in _stale_evidence[:8]]
+            failures.append(
+                f"⑧ critic 证据与当前 final 不符 {len(_stale_evidence)} 个: "
+                f"{_ids}")
         _ratio = float(stats["calibrated_ratio"] or 0.0)
         if _ratio < _min_cal:
             _msg = (f"⑧ 校准裁决占比 {_ratio:.1%} < {_min_cal:.1%} "
@@ -5682,6 +6212,107 @@ def run_final_gate(
             warnings.append(
                 f"⑧ 多批 System One 裁决 {_multi_batch_calibrated} 个：跨批概率尺度尚未做整批/拆批 A/B，"
                 "当前按同一校准来源处理")
+        if _critic_evidence.get("unbound"):
+            warnings.append(
+                f"⑧ {_critic_evidence['unbound']} 个 legacy critic_report 未记录 audited final 哈希；"
+                "backend 来源可审计，但不能作为当前 final 的逐字节证据")
+
+    # ⑨ fallback 产物是硬失败：状态机 COMPLETED 或章节退出码都不能洗白降级稿。
+    _final_status = collect_final_status(root, out_root)
+    _fallbacks = _final_status.get("fallbacks") or []
+    _final_errors = _final_status.get("errors") or []
+    stats["fallback_finals"] = len(_fallbacks)
+    stats["final_scan_errors"] = len(_final_errors)
+    if _final_errors:
+        failures.append(
+            f"⑨ final.json 读取/解析失败 {len(_final_errors)} 个: "
+            f"{[x.get('path') for x in _final_errors[:5]]}")
+    if _fallbacks:
+        _fallback_ids = [str(x.get('chunk_id')) for x in _fallbacks]
+        failures.append(
+            f"⑨ 检测到 fallback/quality_waived final {len(_fallbacks)} 个: "
+            f"{_fallback_ids[:8]}")
+
+    # ⑩ 成书机械排错：只查可机械判定的文字/符号/排版错误，不做风格优化。
+    try:
+        from src.proofread import proofread_book
+        _proof_gate_report = out_root / "proofread_gate_report.json"
+        _proof = proofread_book(
+            project_root=root, output_dir=out_root, apply=False,
+            json_out=_proof_gate_report)
+        _proof_summary = _proof.get("summary") or {}
+        _proof_blocking = int(_proof_summary.get("blocking", 0) or 0)
+        stats["proofread"] = {
+            "blocking": _proof_blocking,
+            "warning": int(_proof_summary.get("warning", 0) or 0),
+            "by_rule": _proof_summary.get("by_rule") or {},
+            "report": _proof.get("report_path"),
+        }
+        if _proof.get("error"):
+            failures.append(f"⑩ proofread 执行失败: {_proof['error']}")
+        elif not _proof.get("ok"):
+            _rules = stats["proofread"]["by_rule"]
+            _rule_text = ", ".join(
+                f"{rule}={count}" for rule, count in sorted(_rules.items()) if count)
+            failures.append(
+                f"⑩ 机械排错阻断 {_proof_blocking} 项"
+                f"（{_rule_text or '见报告'}；详见 output/proofread_gate_report.md）")
+    except Exception as _proof_exc:
+        stats["proofread"] = {"error": str(_proof_exc)}
+        failures.append(f"⑩ proofread 执行异常: {_proof_exc}")
+
+    # ⑪ 全书语义修复闭环：不能只在外部脚本里“修过”，必须能从当前 final
+    # 重新证明。manifest 哈希不一致时同样失败，防止修复后被另一阶段改回。
+    try:
+        from src.book_repair import verify_book_repairs
+        _br = verify_book_repairs(project_root=root, output_dir=out_root)
+        stats["book_repair"] = {
+            "scanned": _br.get("scanned", 0),
+            "pending_chunks": len(_br.get("pending_chunks") or []),
+            "blocking_issues": len(_br.get("blocking_issues") or []),
+            "manifest_present": bool(_br.get("manifest_present")),
+            "manifest_current": bool(_br.get("manifest_current")),
+            "stale_manifest": len(_br.get("stale_manifest") or []),
+            "missing_sources": len(_br.get("missing_sources") or []),
+            "malformed_finals": len(_br.get("malformed_finals") or []),
+        }
+        if _br.get("stale_manifest"):
+            _stale_ids = [
+                str(item.get("chunk_id") or item.get("kind"))
+                for item in (_br.get("stale_manifest") or [])[:8]
+            ]
+            failures.append(
+                f"⑪ 全书修复凭证已陈旧（final 哈希与 manifest 不一致）: {_stale_ids}")
+        _br_pending = stats["book_repair"]["pending_chunks"]
+        if _br_pending:
+            failures.append(
+                f"⑪ 全书修复仍有 {_br_pending} 个待修 chunk: "
+                f"{( _br.get('pending_chunks') or [])[:8]}")
+        _br_blocking = _br.get("blocking_issues") or []
+        if _br_blocking:
+            _br_rules = {}
+            for _issue in _br_blocking:
+                _kind = str(_issue.get("kind") or "unknown")
+                _br_rules[_kind] = _br_rules.get(_kind, 0) + 1
+            failures.append(
+                f"⑪ 全书修复未决高危项 {len(_br_blocking)} 个: {_br_rules}")
+        _br_missing_sources = _br.get("missing_sources") or []
+        if _br_missing_sources:
+            failures.append(
+                f"⑪ 全书修复缺少 DB source 证据 {len(_br_missing_sources)} 个: "
+                f"{_br_missing_sources[:8]}")
+        _br_malformed = _br.get("malformed_finals") or []
+        if _br_malformed:
+            failures.append(
+                f"⑪ 全书修复无法解析 final {len(_br_malformed)} 个: "
+                f"{_br_malformed[:8]}")
+        if not _br.get("manifest_present") and _br.get("ok"):
+            warnings.append(
+                "⑪ 未找到 output/book_repair_report.json；当前状态可复算为干净，"
+                "但一键流程必须重跑 book-repair --apply 生成修复凭证")
+    except Exception as _br_exc:
+        stats["book_repair"] = {"error": str(_br_exc)}
+        failures.append(f"⑪ 全书修复复核异常: {_br_exc}")
 
     if stats["tasks"] == 0 and db_file.exists():
         failures.append("① workflow.db 无任务行（未 init？）")
@@ -5705,8 +6336,26 @@ def run_final_gate(
         print(f"  ⑦ 双关核销: covered={_ps.get('covered', 0)}/{_ps.get('total', 0)}, "
               f"waived={_ps.get('waived', 0)}, uncovered={_ps.get('uncovered_nonwaived', 0)}")
     if stats.get("calibrated_ratio") is not None:
+        _ce = stats.get("critic_evidence") or {}
         print(f"  ⑧ 校准裁决: {stats['calibrated_ratio']:.1%} "
-              f"(min={_min_cal:.0%}, backends={stats.get('backend_paths')})")
+              f"(min={_min_cal:.0%}, backends={stats.get('backend_paths')}, "
+              f"exact={_ce.get('exact', 0)}, repaired={_ce.get('repaired', 0)}, "
+              f"stale={_ce.get('stale', 0)}, unbound={_ce.get('unbound', 0)})")
+    print(f"  ⑨ fallback final: {stats.get('fallback_finals', 0)}, "
+          f"final 解析错误: {stats.get('final_scan_errors', 0)}")
+    _proof_stats = stats.get("proofread") or {}
+    if _proof_stats.get("error"):
+        print(f"  ⑩ 机械排错: 异常 {_proof_stats['error']}")
+    else:
+        print(f"  ⑩ 机械排错: blocking={_proof_stats.get('blocking', 0)}, "
+              f"warning={_proof_stats.get('warning', 0)}")
+    _br_stats = stats.get("book_repair") or {}
+    if _br_stats.get("error"):
+        print(f"  ⑪ 全书修复: 异常 {_br_stats['error']}")
+    else:
+        print(f"  ⑪ 全书修复: pending={_br_stats.get('pending_chunks', 0)}, "
+              f"blocking={_br_stats.get('blocking_issues', 0)}, "
+              f"manifest={_br_stats.get('manifest_current', False)}")
     for f in failures:
         print(f"  ❌ {f}")
     if result["ok"]:

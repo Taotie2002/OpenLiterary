@@ -27,7 +27,8 @@ FUNCS = [
     '_book_config_for_root', '_profile_title_zh', '_title_from_headings',
     '_infer_title_zh', 'book_title_zh', 'resolve_book_output_path',
     '_note_norm', '_note_key', '_note_merge_key', '_note_anchor_stop',
-    '_note_is_dup', '_note_terms', '_note_candidates',
+    '_note_is_dup', '_note_terms', '_note_candidates', '_note_key_parts',
+    '_note_mentions_alias', '_note_keys_compatible',
     '_group_title_units', '_split_h1_sections', '_normalize_chapter_notes_once',
     'normalize_chapter_notes',
     'normalize_notes_document', 'notes_normalize_outputs', '_chapter_note_dupes',
@@ -57,13 +58,40 @@ def _segments(path: Path, names: list) -> dict:
             for t in node.targets:
                 if isinstance(t, ast.Name) and t.id in names:
                     out[t.id] = ast.get_source_segment(src, node)
+        elif (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+              and node.target.id in names):
+            out[node.target.id] = ast.get_source_segment(src, node)
     return out
+
+
+def _top_level_names(path: Path) -> set:
+    """Return every module-level function/constant name in a source file."""
+    tree = ast.parse(path.read_text(encoding='utf-8'))
+    names = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    names.add(target.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument('--check', action='store_true')
     args = ap.parse_args(argv)
+
+    declared = set(FUNCS + CONSTS)
+    source_names = _top_level_names(SRC)
+    unlisted = sorted(source_names - declared)
+    undefined = sorted(declared - source_names)
+    if unlisted or undefined:
+        print(f'❌ book_lint 镜像清单不完整: unlisted={unlisted} undefined={undefined}')
+        return 1
 
     want = _segments(SRC, FUNCS + CONSTS)
     have = _segments(DST, FUNCS + CONSTS)
@@ -88,6 +116,9 @@ def main(argv=None) -> int:
                 for t in node.targets:
                     if isinstance(t, ast.Name) and t.id == name:
                         return node.lineno - 1, (node.end_lineno or node.lineno)
+            if (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+                    and node.target.id == name):
+                return node.lineno - 1, (node.end_lineno or node.lineno)
         return None
 
     # 1) 逐个替换既有条目（自底向上）
