@@ -15047,6 +15047,12 @@ def _apply_name_unification_pass(
            "approved": [], "rejected": [], "pending": [], "clusters": 0,
            "dry_run": bool(dry_run), "skipped_dirty": 0,
            "skipped_dirty_chunks": []}
+    run_id = (
+        datetime.now().astimezone().strftime("name-unify-%Y%m%dT%H%M%S-%f")
+        + "-" + str(os.getpid())
+    )
+    backup_root = Path(report_path).resolve().parent / "name_unification" / run_id
+    out["run_id"] = run_id
     tmp_path = None
     conn = None
     try:
@@ -15120,11 +15126,38 @@ def _apply_name_unification_pass(
                             Path(fin["path"]).read_text(encoding="utf-8"), expected_type=dict,
                         )
                         if data:
+                            old_text = str(data.get("text") or "")
+                            if old_text != str(fin.get("text") or ""):
+                                raise ValueError("final text 与扫描视图不一致")
+                            before_sha = _sha256_text(old_text)
+                            after_sha = _sha256_text(new_text)
+                            chunk_id = _chunk_id_from_final(fin) or Path(fin["path"]).stem
+                            backup_path = backup_root / (chunk_id + "_before.json")
+                            _copy_file_atomic(Path(fin["path"]), backup_path)
                             data["text"] = new_text
                             meta = data.get("metadata")
                             if not isinstance(meta, dict):
                                 meta = {}
                             n_patch = st["sep_restore"] + st["forms"] + st["tokens"]
+                            provenance = meta.get("name_unification")
+                            if not isinstance(provenance, list):
+                                provenance = []
+                            provenance.append({
+                                "schema_version": 1,
+                                "run_id": run_id,
+                                "source": "consistency.apply_name_unification",
+                                "before_sha256": before_sha,
+                                "after_sha256": after_sha,
+                                "backup": str(backup_path),
+                                "patches": {
+                                    "sep_restore": int(st["sep_restore"]),
+                                    "forms": int(st["forms"]),
+                                    "tokens": int(st["tokens"]),
+                                },
+                                "at": datetime.now().astimezone().isoformat(
+                                    timespec="seconds"),
+                            })
+                            meta["name_unification"] = provenance
                             meta["name_unification_patched"] = True
                             meta["name_unification_patches"] = int(meta.get("name_unification_patches", 0)) + n_patch
                             meta["name_unification_at"] = datetime.now().isoformat(timespec="seconds")
@@ -40660,6 +40693,71 @@ def critic_evidence_state(
             }
         path = backup_path
         payload = backup_payload
+
+    # ``consistency.apply_name_unification`` is a deterministic post-audit
+    # pass (separator restoration / approved name forms).  It records a
+    # verified before/after chain because the critic report was produced
+    # before that pass.  Accept the chain only when every link is backed by
+    # a byte-identical backup and no token-level drift was involved; token
+    # candidates must still be re-audited instead of certified here.
+    for _depth in range(16):
+        metadata = payload.get("metadata") or {}
+        links = metadata.get("name_unification") or []
+        if not isinstance(links, list):
+            break
+        progressed = False
+        actual = _sha256_text(
+            payload.get("text") if isinstance(payload.get("text"), str) else "")
+        for link in reversed(links):
+            if not isinstance(link, dict):
+                continue
+            after = str(link.get("after_sha256") or "")
+            before = str(link.get("before_sha256") or "")
+            patches = link.get("patches") or {}
+            source = str(link.get("source") or "")
+            if not after or not before or after != actual:
+                continue
+            if not isinstance(patches, dict):
+                break
+            try:
+                token_patches = int(patches.get("tokens") or 0)
+            except (TypeError, ValueError):
+                break
+            if token_patches != 0:
+                break
+            if not source.startswith("consistency.apply_name_unification"):
+                break
+            backup = str(link.get("backup") or "")
+            if not backup:
+                break
+            backup_path = Path(backup)
+            if not backup_path.is_absolute():
+                backup_path = root / backup_path
+            backup_payload = _read_json(backup_path)
+            if not backup_payload or not isinstance(backup_payload.get("text"), str):
+                break
+            if _sha256_text(backup_payload["text"]) != before:
+                break
+            chain.append({
+                "path": str(backup_path),
+                "before_sha256": before,
+                "after_sha256": after,
+                "repair_kind": "name_unification",
+            })
+            if before == audited_sha:
+                return {
+                    "status": "repaired",
+                    "audited_sha256": audited_sha,
+                    "current_sha256": current_sha,
+                    "field": field,
+                    "repair_chain": chain,
+                    "reason": "audited final 经可验证 name-unification 链到达当前 final",
+                }
+            payload = backup_payload
+            progressed = True
+            break
+        if not progressed:
+            break
 
     return {
         "status": "stale",

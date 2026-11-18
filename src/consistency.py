@@ -15,12 +15,26 @@ import json
 import os
 import sys
 import re
+import hashlib
+import shutil
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 
 from src.utils.llm_adapter import robust_json_loads
 from typing import Any, Dict, List, Optional, Tuple
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _copy_file_atomic(source: Path, target: Path) -> None:
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    shutil.copy2(str(source), str(temporary))
+    os.replace(str(temporary), str(target))
 
 
 # Section 11.5 — 译后命名一致性校正
@@ -593,6 +607,12 @@ def _apply_name_unification_pass(
            "approved": [], "rejected": [], "pending": [], "clusters": 0,
            "dry_run": bool(dry_run), "skipped_dirty": 0,
            "skipped_dirty_chunks": []}
+    run_id = (
+        datetime.now().astimezone().strftime("name-unify-%Y%m%dT%H%M%S-%f")
+        + "-" + str(os.getpid())
+    )
+    backup_root = Path(report_path).resolve().parent / "name_unification" / run_id
+    out["run_id"] = run_id
     tmp_path = None
     conn = None
     try:
@@ -666,11 +686,38 @@ def _apply_name_unification_pass(
                             Path(fin["path"]).read_text(encoding="utf-8"), expected_type=dict,
                         )
                         if data:
+                            old_text = str(data.get("text") or "")
+                            if old_text != str(fin.get("text") or ""):
+                                raise ValueError("final text 与扫描视图不一致")
+                            before_sha = _sha256_text(old_text)
+                            after_sha = _sha256_text(new_text)
+                            chunk_id = _chunk_id_from_final(fin) or Path(fin["path"]).stem
+                            backup_path = backup_root / (chunk_id + "_before.json")
+                            _copy_file_atomic(Path(fin["path"]), backup_path)
                             data["text"] = new_text
                             meta = data.get("metadata")
                             if not isinstance(meta, dict):
                                 meta = {}
                             n_patch = st["sep_restore"] + st["forms"] + st["tokens"]
+                            provenance = meta.get("name_unification")
+                            if not isinstance(provenance, list):
+                                provenance = []
+                            provenance.append({
+                                "schema_version": 1,
+                                "run_id": run_id,
+                                "source": "consistency.apply_name_unification",
+                                "before_sha256": before_sha,
+                                "after_sha256": after_sha,
+                                "backup": str(backup_path),
+                                "patches": {
+                                    "sep_restore": int(st["sep_restore"]),
+                                    "forms": int(st["forms"]),
+                                    "tokens": int(st["tokens"]),
+                                },
+                                "at": datetime.now().astimezone().isoformat(
+                                    timespec="seconds"),
+                            })
+                            meta["name_unification"] = provenance
                             meta["name_unification_patched"] = True
                             meta["name_unification_patches"] = int(meta.get("name_unification_patches", 0)) + n_patch
                             meta["name_unification_at"] = datetime.now().isoformat(timespec="seconds")

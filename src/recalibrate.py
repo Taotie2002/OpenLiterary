@@ -240,6 +240,71 @@ def critic_evidence_state(
         path = backup_path
         payload = backup_payload
 
+    # ``consistency.apply_name_unification`` is a deterministic post-audit
+    # pass (separator restoration / approved name forms).  It records a
+    # verified before/after chain because the critic report was produced
+    # before that pass.  Accept the chain only when every link is backed by
+    # a byte-identical backup and no token-level drift was involved; token
+    # candidates must still be re-audited instead of certified here.
+    for _depth in range(16):
+        metadata = payload.get("metadata") or {}
+        links = metadata.get("name_unification") or []
+        if not isinstance(links, list):
+            break
+        progressed = False
+        actual = _sha256_text(
+            payload.get("text") if isinstance(payload.get("text"), str) else "")
+        for link in reversed(links):
+            if not isinstance(link, dict):
+                continue
+            after = str(link.get("after_sha256") or "")
+            before = str(link.get("before_sha256") or "")
+            patches = link.get("patches") or {}
+            source = str(link.get("source") or "")
+            if not after or not before or after != actual:
+                continue
+            if not isinstance(patches, dict):
+                break
+            try:
+                token_patches = int(patches.get("tokens") or 0)
+            except (TypeError, ValueError):
+                break
+            if token_patches != 0:
+                break
+            if not source.startswith("consistency.apply_name_unification"):
+                break
+            backup = str(link.get("backup") or "")
+            if not backup:
+                break
+            backup_path = Path(backup)
+            if not backup_path.is_absolute():
+                backup_path = root / backup_path
+            backup_payload = _read_json(backup_path)
+            if not backup_payload or not isinstance(backup_payload.get("text"), str):
+                break
+            if _sha256_text(backup_payload["text"]) != before:
+                break
+            chain.append({
+                "path": str(backup_path),
+                "before_sha256": before,
+                "after_sha256": after,
+                "repair_kind": "name_unification",
+            })
+            if before == audited_sha:
+                return {
+                    "status": "repaired",
+                    "audited_sha256": audited_sha,
+                    "current_sha256": current_sha,
+                    "field": field,
+                    "repair_chain": chain,
+                    "reason": "audited final 经可验证 name-unification 链到达当前 final",
+                }
+            payload = backup_payload
+            progressed = True
+            break
+        if not progressed:
+            break
+
     return {
         "status": "stale",
         "audited_sha256": audited_sha,

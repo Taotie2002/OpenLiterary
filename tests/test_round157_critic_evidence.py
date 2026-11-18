@@ -102,6 +102,53 @@ class TestCriticEvidenceState:
         assert state["status"] == "repaired"
         assert len(state["repair_chain"]) == 1
 
+    def test_verified_name_unification_chain_is_repaired(self, tmp_path):
+        old_text = CLEAN_BOOK + "旧名。\n"
+        backup = tmp_path / "output" / "name_unification" / "run" / "old.json"
+        _write_json(backup, old_text)
+        final = tmp_path / "output" / "ch01" / f"{CHUNK}_final.json"
+        _write_json(final, CLEAN_BOOK, metadata={
+            "name_unification": [{
+                "schema_version": 1,
+                "run_id": "fixture-run",
+                "source": "consistency.apply_name_unification",
+                "before_sha256": _sha(old_text),
+                "after_sha256": _sha(CLEAN_BOOK),
+                "backup": "output/name_unification/run/old.json",
+                "patches": {"sep_restore": 1, "forms": 0, "tokens": 0},
+            }],
+        })
+        state = critic_evidence_state(
+            {"_audit_target": {"literary_sha256": _sha(old_text)}},
+            final,
+            project_root=tmp_path,
+        )
+        assert state["status"] == "repaired"
+        assert state["repair_chain"][0]["repair_kind"] == "name_unification"
+
+    def test_name_unification_token_patch_requires_reaudit(self, tmp_path):
+        old_text = CLEAN_BOOK + "旧名。\n"
+        backup = tmp_path / "output" / "name_unification" / "run" / "old.json"
+        _write_json(backup, old_text)
+        final = tmp_path / "output" / "ch01" / f"{CHUNK}_final.json"
+        _write_json(final, CLEAN_BOOK, metadata={
+            "name_unification": [{
+                "schema_version": 1,
+                "run_id": "fixture-run",
+                "source": "consistency.apply_name_unification",
+                "before_sha256": _sha(old_text),
+                "after_sha256": _sha(CLEAN_BOOK),
+                "backup": "output/name_unification/run/old.json",
+                "patches": {"sep_restore": 0, "forms": 0, "tokens": 1},
+            }],
+        })
+        state = critic_evidence_state(
+            {"_audit_target": {"literary_sha256": _sha(old_text)}},
+            final,
+            project_root=tmp_path,
+        )
+        assert state["status"] == "stale"
+
     def test_chain_with_missing_backup_is_stale(self, tmp_path):
         final = tmp_path / "output" / "ch01" / f"{CHUNK}_final.json"
         _write_json(final, CLEAN_BOOK, metadata={

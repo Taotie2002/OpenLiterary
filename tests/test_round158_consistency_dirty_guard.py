@@ -2,10 +2,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from pathlib import Path
 
 import src.consistency as consistency
+from src.recalibrate import critic_evidence_state
+
+
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _make_decision_db(path: Path) -> None:
@@ -104,6 +110,20 @@ def test_name_unification_defers_dirty_final_but_updates_completed(
     assert "佐恩·巴列离开" in json.loads(
         Path(clean_final["path"]).read_text(encoding="utf-8"))["text"]
     assert result["files"] == 1
+    clean_payload = json.loads(
+        Path(clean_final["path"]).read_text(encoding="utf-8"))
+    provenance = clean_payload["metadata"]["name_unification"]
+    assert len(provenance) == 1
+    assert provenance[0]["before_sha256"] == _sha256("佐恩·巴勒离开。")
+    assert provenance[0]["patches"]["tokens"] == 0
+    assert Path(provenance[0]["backup"]).exists()
+    evidence = critic_evidence_state(
+        {"_audit_target": {"literary_sha256": _sha256("佐恩·巴勒离开。")}},
+        Path(clean_final["path"]),
+        project_root=tmp_path,
+    )
+    assert evidence["status"] == "repaired"
+    assert evidence["repair_chain"][0]["repair_kind"] == "name_unification"
 
 
 def test_legacy_issue_patch_skips_dirty_path(tmp_path: Path):

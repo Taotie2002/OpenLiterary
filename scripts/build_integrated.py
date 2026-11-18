@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import builtins
+import os
 import re
 import symtable
 import sys
@@ -1867,7 +1868,12 @@ def main():
     if not valid:
         print("❌ 拒绝写入存在未定义全局名的整合脚本")
         return 1
-    OUTPUT.write_text(generated, encoding="utf-8")
+    # Publish the snapshot atomically.  A long-running production driver may
+    # launch the next chapter subprocess while this rebuild is in progress;
+    # an in-place write would expose a partially generated module.
+    temporary = OUTPUT.with_name(OUTPUT.name + ".tmp")
+    temporary.write_text(generated, encoding="utf-8")
+    os.replace(str(temporary), str(OUTPUT))
     print(f"✅ {OUTPUT.name} 已重新生成（{len(generated.splitlines())} 行 / {len(generated):,} 字符）")
     return 0
 
