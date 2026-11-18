@@ -525,6 +525,40 @@ def test_numbered_footnote_does_not_satisfy_decision_target(tmp_path: Path):
     assert entry["target_present"] is False
 
 
+def test_inline_footnote_marker_does_not_break_decision_target(tmp_path: Path):
+    _make_workflow(tmp_path / "db" / "workflow.db", [
+        ("ch01_chunk023", "ch01", "She sipped from her stillsuit’s catchpockets.",
+         "COMPLETED"),
+    ])
+    _make_decision_db(tmp_path / "db" / "decision_db.sqlite")
+    con = sqlite3.connect(str(tmp_path / "db" / "decision_db.sqlite"))
+    try:
+        con.execute(
+            "INSERT INTO decision_db (id, level, source_key, translation, "
+            "updated_at, locked) VALUES (23, 2, 'stillsuit’s catchpockets', "
+            "'蒸馏服的集水袋', '2026-11-16 12:00:00', 0)")
+        con.execute(
+            "INSERT INTO pending_backtrack (chunk_id, decision_id, source_key, "
+            "queue_rounds, created_at, updated_at) VALUES "
+            "('ch01_chunk023', 23, 'stillsuit’s catchpockets', 1, "
+            "'2026-11-16 12:00:00', '2026-11-16 12:00:00')")
+        con.commit()
+    finally:
+        con.close()
+    _write_final(
+        tmp_path, "ch01_chunk023",
+        "她停下来，从蒸馏服[^1]的集水袋里抿了一口。\n\n"
+        "[^1]: 蒸馏服：回收水分的生命维持服装。")
+
+    result = classify_pending_snapshot(load_pending_context(tmp_path))
+    entry = next(e for e in result["entries"]
+                 if e["chunk_id"] == "ch01_chunk023")
+
+    assert entry["status"] == "satisfied"
+    assert entry["reason"] == "target_present"
+    assert entry["target_present"] is True
+
+
 def test_missing_final_on_nonterminal_chunk_is_covered_not_blocked(tmp_path: Path):
     root = _fixture(tmp_path)
     wf = sqlite3.connect(str(root / "db" / "workflow.db"))

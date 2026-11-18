@@ -26878,9 +26878,12 @@ def _name_key(text: Any) -> str:
 
     It keeps phrase boundaries useful (``贝尼杰赛里特`` contains no separator)
     while making the many legal Dune spellings ``·`` / ``-`` / ``－`` equal for
-    an audit.  This helper is not a translation policy and never rewrites text.
+    an audit.  Inline ``[^n]`` references are markup, not part of a Chinese
+    name: ``蒸馏服[^1]的集水袋`` must match ``蒸馏服的集水袋``.  This helper is
+    not a translation policy and never rewrites text.
     """
-    raw = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    raw = re.sub(r"\[\^[^\]]+\]", "", str(text or ""))
+    raw = unicodedata.normalize("NFKC", raw).casefold()
     raw = (raw.replace("’", "'").replace("‘", "'")
               .replace("“", '"').replace("”", '"'))
     raw = re.sub(r"[\s" + re.escape(_NAME_SEP_CHARS) + r"]+", "", raw)
