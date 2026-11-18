@@ -1035,6 +1035,22 @@ except Exception:
         fi
     fi
 
+    # 2.8 Round 158: re-audit critic reports made stale by deterministic
+    # post-critic name repair.  Only stale/uncalibrated reports are selected;
+    # exact/repaired reports are skipped.  Run after book-repair and before
+    # merge so gate ⑧ sees evidence bound to the delivered finals.
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "Dry-run: 跳过 critic 证据重审"
+    else
+        log_info "重审陈旧/未校准 critic 证据 (recalibrate-critic)..."
+        if run_cmd "$PYTHON" -m src.translator_agent recalibrate-critic \
+            --all --apply --workers "${SAGATRANS_RECALIBRATE_WORKERS:-2}"; then
+            log_ok "critic 证据重审完成（详见 output/recalibrate_critic_report.json）"
+        else
+            log_warn "仍有 critic 证据未重审通过；gate ⑧ 将硬拦截"
+        fi
+    fi
+
     # 3. 合并输出
     if ! merge_output "$CHAPTERS_DIR"; then
         log_err "翻译产出残缺，流程中止（见上方缺失章节提示）。"

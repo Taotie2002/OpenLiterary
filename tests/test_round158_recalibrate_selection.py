@@ -9,6 +9,9 @@ from src.core.scheduler import TaskScheduler
 from src.recalibrate import run_recalibrate_critic
 
 
+ROOT = Path(__file__).resolve().parent.parent
+
+
 def _make_project(tmp_path: Path, chunk_ids: list[str]) -> tuple[Path, Path]:
     root = tmp_path / "project"
     out = root / "output" / "ch01"
@@ -77,3 +80,15 @@ class TestRecalibrateSelection:
         assert plain["selected"] == 0
         assert forced["selected"] == 1
         assert forced["rows"][0]["reason"] == "uncalibrated_report"
+
+
+def test_shell_recalibrates_stale_evidence_after_repair_before_merge():
+    shell = (ROOT / "scripts" / "translate_book.sh").read_text(encoding="utf-8")
+    repair_at = shell.index("translator_agent book-repair --apply")
+    recalibrate_at = shell.index("translator_agent recalibrate-critic", repair_at)
+    merge_at = shell.index('merge_output "$CHAPTERS_DIR"', recalibrate_at)
+    assert repair_at < recalibrate_at < merge_at
+    command = shell[recalibrate_at:merge_at]
+    assert "--all --apply" in command
+    assert 'SAGATRANS_RECALIBRATE_WORKERS:-2' in command
+    assert "gate ⑧ 将硬拦截" in command
