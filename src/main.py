@@ -37,6 +37,8 @@ from src.consistency import run_consistency_check
 #
 #   设计原则: 散装 = 事实源. 散装入口必须能跑; 整合脚本用于外部审计/单文件部署.
 from src.config import config as _config
+from src.inflight_recovery import audit_and_write
+from src.task_logging import TaskLoggingError, make_logger, set_active_logger
 from src.utils.chunker import SmartChunker
 from src.core.scheduler import TaskScheduler
 from src.pipeline import TranslationPipeline
@@ -193,7 +195,11 @@ _INSTANCE_LOCK_FD: Optional[int] = None
 _MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile", "story-graph",
                       "consolidate", "finalize", "notes-normalize", "requeue",
                       "rescue", "qa-report", "recalibrate-critic", "proofread",
-                      "book-repair"}
+                      "book-repair", "book-link-audit", "name-authority-align",
+                      "decision-authority-align",
+                      "decision-target-authority-repair", "term-form-contract",
+                      "query-gold-set", "locked-target-authority-repair",
+                      "confirmed-term-drift-repair"}
 
 
 def _default_lock_path() -> Path:
@@ -210,6 +216,10 @@ def _command_needs_lock(command: str, args: object) -> bool:
     if command == "setup-payoff-audit" and getattr(args, "apply", False):
         return True
     if command == "book-repair" and getattr(args, "apply", False):
+        return True
+    if command in {"pending-reconcile", "name-only-fastpath",
+                   "completed-name-repair"} and getattr(
+            args, "apply", False):
         return True
     return False
 
@@ -304,8 +314,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="SagaTrans — AI 文学语义编译系统")
     parser.add_argument("command", nargs="?", default="pipeline",
-                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "story-graph", "story-graph-query", "setup-payoff-audit", "drift-audit", "notes-normalize", "proofread", "book-repair", "requeue", "rescue", "qa-report", "recalibrate-critic"],
-                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, story-graph, story-graph-query, setup-payoff-audit, drift-audit, notes-normalize, proofread, book-repair, requeue, rescue, qa-report, recalibrate-critic")
+                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "story-graph", "story-graph-query", "setup-payoff-audit", "drift-audit", "notes-normalize", "proofread", "book-repair", "book-link-audit", "pending-reconcile", "name-only-fastpath", "completed-name-repair", "confirmed-term-drift-repair", "name-authority-audit", "name-authority-align", "decision-authority-align", "decision-target-authority-repair", "locked-target-authority-repair", "term-form-audit", "locked-target-authority-audit", "term-form-contract", "query-gold-set", "requeue", "rescue", "qa-report", "recalibrate-critic"],
+                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, story-graph, story-graph-query, setup-payoff-audit, drift-audit, notes-normalize, proofread, book-repair, book-link-audit, pending-reconcile, name-only-fastpath, completed-name-repair, confirmed-term-drift-repair, name-authority-audit, name-authority-align, decision-authority-align, decision-target-authority-repair, locked-target-authority-repair, term-form-audit, locked-target-authority-audit, term-form-contract, query-gold-set, requeue, rescue, qa-report, recalibrate-critic")
     parser.add_argument("--chapter", default="ch01", help="章节 ID (默认: ch01)")
     parser.add_argument("--chapters", default=None,
                         help="style-profile 命令：抽样章节，逗号分隔（默认均匀抽 5 章）")
@@ -315,8 +325,12 @@ def main():
                         help="style-profile --deep：单段原文字符上限（默认 60000）")
     parser.add_argument("--deep-overlap-chars", type=int, default=2000,
                         help="style-profile --deep：相邻分段重叠字符数（默认 2000）")
+    parser.add_argument("--derive-digests", action="store_true",
+                        help="style-profile：不调用 LLM，从 style_profile_audit.json 确定性回填章源哈希与 chapter_digests")
     parser.add_argument("--graph-path", default=None,
                         help="story-graph / story-graph-query 命令：图路径（默认读取 config.story_graph.path）")
+    parser.add_argument("--allow-stale", action="store_true",
+                        help="story-graph-query / setup-payoff-audit：允许读取 stale 图作研究用途（不能用于交付或 --apply）")
     parser.add_argument("--require-answerable", action="store_true",
                         help="story-graph 命令：实体覆盖率不可答时返回 2")
     parser.add_argument("--query", "--question", "--claim", dest="query", default=None,
@@ -335,6 +349,22 @@ def main():
                         help="story-graph-query 命令：关闭问题→已验证注记的相似度种子（严格别名模式）")
     parser.add_argument("--eval-cases", default=None,
                         help="story-graph-query 命令：运行 gold-span 评测 JSON")
+    parser.add_argument("--manifest-path", default=None,
+                        help="book-link-audit：build manifest 路径（默认 output/build_manifest.json）")
+    parser.add_argument("--merged-path", default=None,
+                        help="book-link-audit：merged 成书路径（--write-manifest 时必需）")
+    parser.add_argument("--write-manifest", action="store_true",
+                        help="book-link-audit：merge 后写 output/build_manifest.json")
+    parser.add_argument("--update-merged", action="store_true",
+                        help="book-link-audit：仅更新 manifest 的 merged 哈希（notes-normalize/proofread 后）")
+    parser.add_argument("--contracts-path", default=None,
+                        help="term-form-contract：合同制品路径（默认 input/term_form_contracts.json）")
+    parser.add_argument("--stage", default="postprocess",
+                        help="book-link-audit --update-merged：合并后处理阶段标签")
+    parser.add_argument("--require-sealed", action="store_true",
+                        help="book-link-audit：要求任务日志已封存且哈希一致")
+    parser.add_argument("--require-current", action="store_true",
+                        help="book-link-audit：profile/story graph stale 也判失败")
     parser.add_argument("--profile-path", default=None,
                         help="setup-payoff-audit 命令：book_profile.json 路径（默认 input/book_profile.json）")
     parser.add_argument("--top-n", type=int, default=5,
@@ -364,6 +394,10 @@ def main():
                         help="split 命令：短于此字数的章节会被合并到下一章（默认 1000）")
     parser.add_argument("--apply", action="store_true",
                         help="consistency / notes-normalize / proofread / book-repair：执行自动修正；book-repair 只做有 source/raw/literary 证据的确定性修复")
+    parser.add_argument("--safe-only", action="store_true",
+                        help="pending-reconcile --apply：只消费 satisfied / 已 DIRTY 的 covered，outstanding 一律保留且不触发 DIRTY")
+    parser.add_argument("--locked-target-only", action="store_true",
+                        help="pending-reconcile --apply：只把 locked_decision_target_missing 行转 DIRTY，其余行全部保留")
     parser.add_argument("--verify", action="store_true",
                         help="book-repair：只复核当前 final 与修复 manifest，不写正文")
     parser.add_argument("--window", type=int, default=None,
@@ -371,7 +405,7 @@ def main():
     parser.add_argument("--jev", action="store_true",
                         help="drift-audit 命令：附加 Jev 窗口配对检查（需要 Jev 可用）")
     parser.add_argument("--json-out", default=None,
-                        help="drift-audit / golden --judgment-ab / proofread / book-repair：报告 JSON 输出路径")
+                        help="drift-audit / golden --judgment-ab / proofread / book-repair / query-gold-set：报告 JSON 输出路径")
     parser.add_argument("--ab", action="store_true",
                         help="golden/golden-gate 命令：运行 直译模型×thinking 4 组合 A/B 对比")
     parser.add_argument("--judgment-ab", action="store_true",
@@ -383,7 +417,7 @@ def main():
     parser.add_argument("--from-ledger", action="store_true",
                         help="requeue 命令：从 output/rescue/failure_ledger.jsonl 选取仍隔离的 PF 块")
     parser.add_argument("--all", action="store_true",
-                        help="rescue 命令：扫描全书；省略时只处理 --chapter 指定章节")
+                        help="rescue/completed-name-repair 命令：扫描全书；省略时只处理 --chapter 指定章节")
     parser.add_argument("--reset-rescue-budget", action="store_true",
                         help="rescue 命令：仅复位目标章节未完成块的救援/重试预算（算法升级后受控复活）")
     parser.add_argument("--workers", type=int, default=1,
@@ -394,6 +428,8 @@ def main():
                         help="recalibrate-critic 命令：低分报告阈值（默认 7.0）")
     parser.add_argument("--retries", type=int, default=1,
                         help="recalibrate-critic 命令：非校准/瞬时失败重试次数（默认 1）")
+    parser.add_argument("--state-only", action="store_true",
+                        help="name-only-fastpath：允许无文本变化但 pending 已满足的 DIRTY 块，仅以真实重审闭环状态")
 
     args = parser.parse_args()
 
@@ -403,11 +439,70 @@ def main():
         print(f"❌ 非法 chapter_id: '{args.chapter}' (仅允许字母/数字/下划线/连字符，1-32 字符)", file=sys.stderr)
         sys.exit(1)
 
+    # Round 158 Phase 0: every CLI run gets a persisted, timestamped task log.
+    # Write commands fail closed if the log cannot be created; read-only
+    # diagnostics are allowed to continue with a stderr warning.
+    _task_root = Path(__file__).resolve().parent.parent
+    _task_read_only = not _command_needs_lock(args.command, args)
+    try:
+        _task_logger = make_logger(
+            _task_root, args.command, read_only=_task_read_only,
+        )
+        _task_logger.start(chapter=args.chapter)
+        set_active_logger(_task_logger)
+    except TaskLoggingError as _task_log_exc:
+        print(f"❌ [TaskLog] 无法创建本次运行日志，拒绝执行: {_task_log_exc}",
+              file=sys.stderr)
+        sys.exit(1)
+
     # Round 130: 单实例守卫（审计①）——写共享状态的命令必须独占锁；
     # 只读命令（gate/lint/drift-audit 等）不拦截，便于运行中诊断。
     if _command_needs_lock(args.command, args):
         if not acquire_instance_lock():
+            try:
+                _task_logger.finish(1, status="failed", message="lock_busy")
+            except TaskLoggingError:
+                pass
             sys.exit(1)
+
+    _task_logger.event("command_started", stage="RUN", chapter=args.chapter)
+
+    # Round 158 Phase 0: after the flock is held, publish a read-only recovery
+    # report for chunks left in an active stage.  This never resets state and
+    # never deletes final/critic backups; it only makes the interruption
+    # auditable before the stage table resumes it.
+    if args.command in {"pipeline", "rescue"}:
+        _recovery_chapter = None if (args.command == "rescue" and args.all) else args.chapter
+        try:
+            _recovery = audit_and_write(
+                _task_root, chapter_id=_recovery_chapter,
+                run_id=_task_logger.run_id,
+            )
+            _rs = _recovery.get("summary") or {}
+            if int(_rs.get("nonterminal") or 0):
+                print(
+                    f"♻️ [Recovery] 检测到 {_rs.get('nonterminal')} 个上次中断的非终态块；"
+                    f"报告: {_recovery.get('report_path')}（状态与 backup 均未改动）",
+                    file=sys.stderr,
+                )
+            _task_logger.event(
+                "recovery_audit", stage="RECOVERY", status="ok",
+                message="read-only in-flight recovery report",
+                report_path=_recovery.get("report_path"),
+                nonterminal=_rs.get("nonterminal", 0),
+                by_state=_rs.get("by_state", {}),
+            )
+        except Exception as _recovery_exc:
+            print(f"⚠️ [Recovery] 中断恢复审计失败（不阻塞主流程）: {_recovery_exc}",
+                  file=sys.stderr)
+            try:
+                _task_logger.event(
+                    "recovery_audit", stage="RECOVERY", status="failed",
+                    error_class=type(_recovery_exc).__name__,
+                    message=str(_recovery_exc),
+                )
+            except TaskLoggingError:
+                pass
 
     # P4-9: 顶层异常包装（除已规范的 consistency/golden-gate 外，统一捕获并退出）
     try:
@@ -433,8 +528,49 @@ def main():
             if not init_project(chapter_id=args.chapter, force=args.force):
                 sys.exit(1)
         elif args.command == "style-profile":
-            from src.style_profiler import generate_book_profile, summary_line
+            from src.style_profiler import (
+                derive_profile_digests,
+                generate_book_profile,
+                load_profile,
+                save_profile,
+                summary_line,
+            )
             _chapters = [c.strip() for c in args.chapters.split(",") if c.strip()] if args.chapters else None
+            if args.derive_digests:
+                import shutil
+
+                _profile_path = (Path(args.profile_path) if args.profile_path
+                                 else Path.cwd() / "input" / "book_profile.json")
+                _audit_path = Path.cwd() / "output" / "style_profile_audit.json"
+                _prof = load_profile(_profile_path)
+                if not _prof:
+                    print(f"❌ style-profile --derive-digests: 无法读取 {_profile_path}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                try:
+                    _audit = json.loads(_audit_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    print(f"❌ style-profile --derive-digests: 无法读取 {_audit_path}: {exc}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                _derived = derive_profile_digests(Path.cwd(), _prof, _audit)
+                if not _derived.get("ok"):
+                    print(f"❌ style-profile --derive-digests: {_derived.get('error')}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                _backup = _profile_path.with_name(
+                    _profile_path.stem + ".pre_digest_backfill.json")
+                if not _backup.exists():
+                    shutil.copy2(_profile_path, _backup)
+                save_profile(_derived["profile"], _profile_path)
+                _summary = _derived.get("summary") or {}
+                print(f"✅ chapter_digests 已写入 {_profile_path}: "
+                      f"complete={_summary.get('complete')} "
+                      f"chapters={_summary.get('chapters_complete')}/"
+                      f"{_summary.get('chapters_total')} "
+                      f"missing={','.join(_summary.get('missing') or []) or '-'}")
+                print(f"   backup: {_backup}")
+                sys.exit(0)
             res = generate_book_profile(
                 Path.cwd(), chapters=_chapters, force=args.force,
                 deep=args.deep,
@@ -492,8 +628,78 @@ def main():
                 print(f"   uncovered_chapters={','.join(_cov.get('uncovered_chapters') or [])}")
             if args.require_answerable and not _cov.get("answerable"):
                 sys.exit(2)
+        elif args.command == "book-link-audit":
+            from src.book_linker import (
+                DEFAULT_AUDIT_JSON,
+                DEFAULT_AUDIT_MD,
+                DEFAULT_MANIFEST_PATH,
+                audit_book_links,
+                build_manifest,
+                update_manifest_merged,
+                write_book_link_audit,
+                write_manifest,
+            )
+            _root = Path.cwd()
+            _manifest_path = (Path(args.manifest_path) if args.manifest_path
+                              else _root / DEFAULT_MANIFEST_PATH)
+            _merged_path = Path(args.merged_path) if args.merged_path else None
+            if args.write_manifest:
+                if not _merged_path:
+                    print("❌ book-link-audit --write-manifest 需要 --merged-path",
+                          file=sys.stderr)
+                    sys.exit(2)
+                _manifest = build_manifest(
+                    _root, _merged_path,
+                    input_dir=Path(args.input_dir) if args.input_dir else None,
+                    run_id=os.environ.get("SAGATRANS_RUN_ID"))
+                write_manifest(_manifest, _manifest_path)
+                _totals = _manifest.get("totals") or {}
+                print(f"🧾 build manifest: {_manifest_path} "
+                      f"chapters={_totals.get('chapters')} "
+                      f"chunks={_totals.get('db_chunks')} "
+                      f"finals={_totals.get('finals_present')} "
+                      f"missing={_totals.get('finals_missing')} "
+                      f"orphan={_totals.get('orphan_finals')}")
+                print(f"   merged: {(_manifest.get('merged') or {}).get('path')} "
+                      f"{(_manifest.get('merged') or {}).get('sha256', '')[:12]}")
+                sys.exit(0 if (_manifest.get("merged") or {}).get("exists")
+                         and not int(_totals.get("finals_missing") or 0) else 1)
+            if args.update_merged:
+                if not _merged_path:
+                    print("❌ book-link-audit --update-merged 需要 --merged-path",
+                          file=sys.stderr)
+                    sys.exit(2)
+                _upd = update_manifest_merged(
+                    _root, _manifest_path, _merged_path, stage=args.stage)
+                if not _upd.get("ok"):
+                    print(f"❌ book-link-audit --update-merged: {_upd.get('error')} "
+                          f"{(json.dumps(_upd.get('details') or [], ensure_ascii=False)[:300])}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                print(f"🧾 merged 哈希已更新 ({args.stage}): "
+                      f"{_upd.get('sha256', '')[:12]} chars={_upd.get('chars')}")
+                sys.exit(0)
+            _audit = audit_book_links(
+                _root, manifest_path=_manifest_path, merged_path=_merged_path,
+                input_dir=Path(args.input_dir) if args.input_dir else None,
+                require_current=bool(args.require_current),
+                require_sealed=bool(args.require_sealed))
+            _json_path = Path(args.json_out) if args.json_out else _root / DEFAULT_AUDIT_JSON
+            _md_path = _root / DEFAULT_AUDIT_MD
+            write_book_link_audit(_audit, _json_path, _md_path)
+            print(f"🔗 book-link-audit: {_audit.get('status')} "
+                  f"passed={len(_audit.get('passed') or [])} "
+                  f"warn={len(_audit.get('warnings') or [])} "
+                  f"failed={len(_audit.get('failed') or [])}")
+            for _name in (_audit.get("failed") or [])[:12]:
+                print(f"   ❌ {_name}")
+            for _name in (_audit.get("warnings") or [])[:8]:
+                print(f"   ⚠️ {_name}")
+            print(f"   report: {_json_path} / {_md_path}")
+            sys.exit(0 if _audit.get("ok") else 1)
         elif args.command == "story-graph-query":
-            from src.story_graph import load_story_graph
+            from src.artifact_freshness import eval_freshness, load_story_graph_checked
+            from src.style_profiler import load_profile
             from src.story_graph_query import (
                 StoryGraphQueryIndex,
                 default_story_graph_query_generate,
@@ -505,12 +711,31 @@ def main():
             _rel = str((_config.get("story_graph", {}) or {}).get("path")
                        or "input/story_graph.json")
             _path = Path(args.graph_path) if args.graph_path else _root / _rel
-            _graph = load_story_graph(_path)
+            _in_dir = Path(args.input_dir) if args.input_dir else _root / "input"
+            _profile_path = (Path(args.profile_path) if args.profile_path
+                             else _root / "input" / "book_profile.json")
+            _prof = load_profile(_profile_path) if _profile_path.exists() else None
+            _checked = load_story_graph_checked(
+                _root, _path, _prof,
+                require_current=not args.allow_stale,
+                input_dir=_in_dir,
+            )
+            _graph = _checked.get("graph")
             if not _graph:
                 print(f"❌ story-graph-query: 无法读取图 artifact: {_path}",
                       file=sys.stderr)
                 sys.exit(1)
-            _in_dir = Path(args.input_dir) if args.input_dir else _root / "input"
+            if not _checked.get("ok"):
+                print(f"❌ story-graph-query: 图已陈旧或缺少血缘 ({_checked.get('status')}): "
+                      f"{', '.join(_checked.get('reasons') or [])}",
+                      file=sys.stderr)
+                print("   重建: python3 -m src.translator_agent story-graph；"
+                      "仅作研究可显式加 --allow-stale", file=sys.stderr)
+                sys.exit(1)
+            if _checked.get("status") != "fresh":
+                print(f"⚠️ story-graph-query: 使用非新鲜图（{_checked.get('status')}）: "
+                      f"{', '.join(_checked.get('reasons') or [])}",
+                      file=sys.stderr)
             _index = StoryGraphQueryIndex(_graph, input_dir=_in_dir)
             _gen = default_story_graph_query_generate if args.llm_judge else None
             if args.eval_cases:
@@ -519,6 +744,16 @@ def main():
                     _payload = json.loads(_cases_path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError) as exc:
                     print(f"❌ story-graph-query eval: 读取失败 {_cases_path}: {exc}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                _eval_check = eval_freshness(
+                    _payload, _root, _prof, graph=_graph, input_dir=_in_dir)
+                if not _eval_check.get("ok"):
+                    _det = _eval_check.get("details") or {}
+                    print(f"❌ story-graph-query eval: 评测制品无效/过期，拒绝计算指标 "
+                          f"(reasons={','.join(_eval_check.get('reasons') or [])}; "
+                          f"invalid_cases={_det.get('invalid_cases', 0)}; "
+                          f"stale_notes={_det.get('stale_notes', 0)})",
                           file=sys.stderr)
                     sys.exit(1)
                 _cases = _payload.get("cases") if isinstance(_payload, dict) else _payload
@@ -533,6 +768,12 @@ def main():
                       f"R@5={_m.get('R@5', 0):.1%} R@10={_m.get('R@10', 0):.1%} "
                       f"AE@5={_m.get('AE@5', 0):.1%} AE@10={_m.get('AE@10', 0):.1%} "
                       f"anchor_precision@1={_m.get('anchor_precision@1', 0):.1%}")
+                print(f"   evidence: gold_cases={_m.get('gold_cases', 0)} "
+                      f"any@10={_m.get('any_evidence_R@10', 0):.1%} "
+                      f"all@10={_m.get('all_evidence_R@10', 0):.1%} "
+                      f"precision@2={_m.get('evidence_precision@2', 0):.1%} "
+                      f"no_seed={_m.get('no_seed_rate', 0):.1%} "
+                      f"negative_empty={_m.get('negative_empty_rate', 0):.1%}")
                 if _m.get("note_evidence_cases"):
                     print(f"   note_evidence: n={_m.get('note_evidence_cases')} "
                           f"R@5={_m.get('note_evidence_R@5', 0):.1%} "
@@ -580,11 +821,8 @@ def main():
                 select_setup_payoff_candidates,
                 verify_setup_payoff_selections,
             )
-            from src.story_graph import (
-                build_story_graph,
-                load_story_graph,
-                save_story_graph,
-            )
+            from src.artifact_freshness import load_story_graph_checked
+            from src.story_graph import build_story_graph, save_story_graph
             from src.story_graph_query import StoryGraphQueryIndex
             from src.style_profiler import load_profile, save_profile
 
@@ -599,12 +837,28 @@ def main():
             _rel = str((_config.get("story_graph", {}) or {}).get("path")
                        or "input/story_graph.json")
             _graph_path = Path(args.graph_path) if args.graph_path else _root / _rel
-            _graph = load_story_graph(_graph_path)
+            _input_dir = Path(args.input_dir) if args.input_dir else _root / "input"
+            _checked = load_story_graph_checked(
+                _root, _graph_path, _profile,
+                require_current=(not args.allow_stale) or bool(args.apply),
+                input_dir=_input_dir,
+            )
+            _graph = _checked.get("graph")
             if not _graph:
                 print(f"❌ setup-payoff-audit: 无法读取图 artifact {_graph_path}",
                       file=sys.stderr)
                 sys.exit(1)
-            _input_dir = Path(args.input_dir) if args.input_dir else _root / "input"
+            if not _checked.get("ok"):
+                print(f"❌ setup-payoff-audit: 图已陈旧或缺少血缘 ({_checked.get('status')}): "
+                      f"{', '.join(_checked.get('reasons') or [])}",
+                      file=sys.stderr)
+                print("   先运行 story-graph；research-only 可使用 --allow-stale，"
+                      "--apply 永远要求 fresh", file=sys.stderr)
+                sys.exit(1)
+            if _checked.get("status") != "fresh":
+                print(f"⚠️ setup-payoff-audit: 使用非新鲜图（{_checked.get('status')}）: "
+                      f"{', '.join(_checked.get('reasons') or [])}",
+                      file=sys.stderr)
             _index = StoryGraphQueryIndex(_graph, input_dir=_input_dir)
             if args.audit_in:
                 try:
@@ -754,6 +1008,427 @@ def main():
         elif args.command == "consistency":
             n_issues = run_consistency_check(dry_run=not args.apply)
             sys.exit(0 if n_issues == 0 else 2)
+        elif args.command == "pending-reconcile":
+            from src.pending_backtrack_reconcile import (
+                apply_pending_backtrack_reconcile,
+                audit_pending_backtracks,
+            )
+            _pr_root = Path(__file__).resolve().parent.parent
+            if args.apply:
+                _pr_res = apply_pending_backtrack_reconcile(
+                    _pr_root, apply=True, safe_only=args.safe_only,
+                    locked_target_only=args.locked_target_only)
+            else:
+                _pr_res = audit_pending_backtracks(_pr_root)
+            _pr_counts = _pr_res.get("counts") or {}
+            _pr_mode = "apply" if args.apply else "read-only"
+            print("🧾 pending-reconcile(%s): total=%s, %s" % (
+                _pr_mode,
+                _pr_res.get("total", 0),
+                ", ".join(f"{k}={v}" for k, v in _pr_counts.items())))
+            if args.apply:
+                print(f"   consumed={_pr_res.get('consumed', 0)} "
+                      f"triggered_dirty={_pr_res.get('triggered_dirty', 0)}")
+            if not _pr_res.get("ok"):
+                print("   ⛔ 仍有 outstanding/blocked/orphan；详见 "
+                      f"{_pr_res.get('md_path')}", file=sys.stderr)
+            sys.exit(0 if _pr_res.get("ok") else 2)
+        elif args.command == "term-form-audit":
+            from src.term_form_audit import audit_term_forms
+            _tfa_root = Path(__file__).resolve().parent.parent
+            _tfa_res = audit_term_forms(
+                _tfa_root,
+                json_out=(Path(args.json_out) if args.json_out else None),
+            )
+            _tfa_counts = _tfa_res.get("counts") or {}
+            print("🔎 term-form-audit(read-only): " + (
+                ", ".join(f"{key}={value}"
+                          for key, value in _tfa_counts.items()) or "clean"))
+            for _tfa_group in (_tfa_res.get("groups") or [])[:12]:
+                print(f"   group: #{_tfa_group.get('decision_id')} "
+                      f"{_tfa_group.get('source_key')} → "
+                      f"{_tfa_group.get('target')} / "
+                      f"{_tfa_group.get('classification')} / "
+                      f"pending={len(_tfa_group.get('pending_chunks') or [])}")
+            print(f"   报告: {_tfa_res.get('md_path')}")
+            for _tfa_err in (_tfa_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_tfa_err}", file=sys.stderr)
+            sys.exit(0 if _tfa_res.get("ok") else 2)
+        elif args.command == "locked-target-authority-audit":
+            from src.locked_target_authority_audit import (
+                audit_locked_target_authorities,
+            )
+            _lta_root = Path(__file__).resolve().parent.parent
+            _lta_res = audit_locked_target_authorities(
+                _lta_root,
+                json_out=(Path(args.json_out) if args.json_out else None),
+            )
+            _lta_counts = _lta_res.get("counts") or {}
+            print("🔒 locked-target-authority-audit(read-only): " + (
+                ", ".join(f"{key}={value}"
+                          for key, value in _lta_counts.items()) or "clean"))
+            for _lta_group in (_lta_res.get("groups") or [])[:12]:
+                print(f"   group: #{_lta_group.get('decision_id')} "
+                      f"{_lta_group.get('source_key')} → "
+                      f"{_lta_group.get('target')} / "
+                      f"{_lta_group.get('classification')} / "
+                      f"hits={_lta_group.get('target_hits')}/"
+                      f"{_lta_group.get('authority_chunks')}")
+            print(f"   报告: {_lta_res.get('md_path')}")
+            for _lta_err in (_lta_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_lta_err}", file=sys.stderr)
+            sys.exit(0 if _lta_res.get("ok") else 2)
+        elif args.command == "locked-target-authority-repair":
+            from src.decision_authority_align import (
+                apply_locked_target_authority_repairs,
+                audit_locked_target_authority_repairs,
+            )
+            _ltr_root = Path(__file__).resolve().parent.parent
+            if args.apply:
+                _ltr_res = apply_locked_target_authority_repairs(
+                    _ltr_root, apply=True, run_id=_task_logger.run_id)
+            else:
+                _ltr_res = audit_locked_target_authority_repairs(_ltr_root)
+            _ltr_counts = (_ltr_res.get("counts")
+                           or _ltr_res.get("plan_counts") or {})
+            _ltr_mode = "apply" if args.apply else "read-only"
+            print(f"🔧 locked-target-authority-repair({_ltr_mode}): " + (
+                ", ".join(f"{key}={value}"
+                          for key, value in _ltr_counts.items()) or "clean"))
+            for _ltr_cand in (_ltr_res.get("candidates") or [])[:12]:
+                print(f"   candidate: Decision #{_ltr_cand.get('decision_id')} "
+                      f"{_ltr_cand.get('source_key')} "
+                      f"{_ltr_cand.get('old_translation')} → "
+                      f"{_ltr_cand.get('new_translation')} "
+                      f"pending={len(_ltr_cand.get('pending_chunks') or [])}")
+            for _ltr_blocked in (_ltr_res.get("blocked_candidates") or [])[:8]:
+                print(f"   blocked: Decision #{_ltr_blocked.get('decision_id')} "
+                      f"{_ltr_blocked.get('reason')}")
+            print(f"   报告: {_ltr_res.get('md_path')}")
+            for _ltr_err in (_ltr_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_ltr_err}", file=sys.stderr)
+            sys.exit(0 if _ltr_res.get("ok") else 2)
+        elif args.command == "term-form-contract":
+            from src.term_form_contracts import (
+                apply_term_form_contracts,
+                build_term_form_contracts,
+            )
+            _tfc_root = Path(__file__).resolve().parent.parent
+            _tfc_path = (Path(args.contracts_path) if args.contracts_path
+                         else None)
+            if args.apply:
+                _tfc_res = apply_term_form_contracts(
+                    _tfc_root, contracts_path=_tfc_path,
+                    run_id=_task_logger.run_id,
+                )
+            else:
+                _tfc_res = build_term_form_contracts(
+                    _tfc_root, contracts_path=_tfc_path,
+                    report_json=(Path(args.json_out) if args.json_out else None),
+                )
+            _tfc_mode = "apply" if args.apply else "read-only"
+            print("🧩 term-form-contract(%s): " % _tfc_mode + (
+                ", ".join(f"{key}={value}"
+                          for key, value in (_tfc_res.get("counts") or {}).items())
+                or "no contracts"))
+            for _tfc_contract in (_tfc_res.get("contracts") or [])[:12]:
+                print(f"   contract: #{_tfc_contract.get('decision_id')} "
+                      f"{_tfc_contract.get('source_key')} / "
+                      f"{_tfc_contract.get('status')} / "
+                      f"forms=" + ",".join(
+                          form.get("form", "")
+                          for form in _tfc_contract.get("forms") or []))
+            if _tfc_res.get("artifact_path"):
+                print(f"   artifact: {_tfc_res.get('artifact_path')}")
+            print(f"   报告: {_tfc_res.get('md_path')}")
+            for _tfc_err in (_tfc_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_tfc_err}", file=sys.stderr)
+            sys.exit(0 if _tfc_res.get("ok") else 2)
+        elif args.command == "name-authority-audit":
+            from src.name_authority_audit import audit_name_authorities
+            _na_root = Path(__file__).resolve().parent.parent
+            _na_res = audit_name_authorities(_na_root)
+            _na_counts = _na_res.get("counts") or {}
+            print("🧭 name-authority-audit(read-only): " + (
+                ", ".join(f"{k}={v}" for k, v in _na_counts.items()) or "clean"))
+            print(f"   multi_form_groups={_na_res.get('multi_form_count', 0)} "
+                  f"needs_form_contract={_na_res.get('multi_form_needing_contract', 0)}")
+            print(f"   报告: {_na_res.get('md_path')}")
+            if not _na_res.get("ok"):
+                print("   ⛔ 权威分歧尚未对齐；name-only 写闭环不得启用。",
+                      file=sys.stderr)
+            for _na_err in (_na_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_na_err}", file=sys.stderr)
+            sys.exit(0 if _na_res.get("ok") else 2)
+        elif args.command == "name-authority-align":
+            from src.name_authority_align import align_name_authorities
+            _nal_root = Path(__file__).resolve().parent.parent
+            _nal_res = align_name_authorities(
+                _nal_root,
+                apply=args.apply,
+                json_out=(Path(args.json_out) if args.json_out else None),
+                run_id=_task_logger.run_id,
+            )
+            _nal_mode = "apply" if args.apply else "read-only"
+            _nal_counts = (_nal_res.get("counts")
+                           or _nal_res.get("plan_counts") or {})
+            print(f"🧭 name-authority-align({_nal_mode}): " + (
+                ", ".join(f"{k}={v}" for k, v in _nal_counts.items()) or "clean"))
+            _nal_after = _nal_res.get("audit_after") or {}
+            if _nal_after:
+                print(f"   audit_after: ok={_nal_after.get('ok')} "
+                      f"blocking={_nal_after.get('blocking_count', 0)} "
+                      f"status={_nal_after.get('status')}")
+            print(f"   write_attempted={_nal_res.get('write_attempted')} "
+                  f"applied={_nal_res.get('applied_count', 0)}")
+            for _nal_act in (_nal_res.get("actions") or [])[:12]:
+                print(f"   action: id={_nal_act.get('registry_id')} "
+                      f"{_nal_act.get('action')} {_nal_act.get('status', 'planned')}")
+            for _nal_manual in (_nal_res.get("manual_review") or [])[:8]:
+                print("   manual: " + json.dumps(_nal_manual, ensure_ascii=False))
+            print(f"   报告: {_nal_res.get('md_path')}")
+            for _nal_err in (_nal_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_nal_err}", file=sys.stderr)
+            sys.exit(0 if _nal_res.get("ok") else 2)
+        elif args.command == "decision-authority-align":
+            from src.decision_authority_align import (
+                apply_decision_authority_alignment,
+                audit_decision_authorities,
+            )
+            _dac_root = Path(__file__).resolve().parent.parent
+            if args.apply:
+                _dac_res = apply_decision_authority_alignment(
+                    _dac_root, apply=True, run_id=_task_logger.run_id)
+            else:
+                _dac_res = audit_decision_authorities(_dac_root)
+            _dac_counts = _dac_res.get("counts") or _dac_res.get("plan_counts") or {}
+            _dac_mode = "apply" if args.apply else "read-only"
+            print(f"⚖️ decision-authority-align({_dac_mode}): " + (
+                ", ".join(f"{key}={value}"
+                          for key, value in _dac_counts.items()) or "clean"))
+            for _dac_cand in (_dac_res.get("candidates")
+                              or _dac_res.get("planned") or [])[:12]:
+                print(f"   candidate: Decision #{_dac_cand.get('decision_id')} "
+                      f"{_dac_cand.get('source_key')} "
+                      f"{_dac_cand.get('old_translation')} → "
+                      f"{_dac_cand.get('new_translation')} "
+                      f"repair_chunks={len(_dac_cand.get('repair_chunks') or [])}")
+            for _dac_act in (_dac_res.get("actions") or [])[:12]:
+                print(f"   action: Decision #{_dac_act.get('decision_id')} "
+                      f"{_dac_act.get('status')} "
+                      f"queued={len(_dac_act.get('queued_chunks') or [])}")
+            for _dac_blocked in (_dac_res.get("blocked_candidates") or [])[:8]:
+                print("   manual: " + json.dumps(
+                    {"decision_id": _dac_blocked.get("decision_id"),
+                     "source_key": _dac_blocked.get("source_key"),
+                     "reason": _dac_blocked.get("reason")},
+                    ensure_ascii=False))
+            print(f"   报告: {_dac_res.get('md_path')}")
+            for _dac_err in (_dac_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_dac_err}", file=sys.stderr)
+            sys.exit(0 if _dac_res.get("ok") else 2)
+        elif args.command == "decision-target-authority-repair":
+            from src.decision_target_authority_repair import (
+                apply_decision_target_repairs,
+                audit_decision_target_repairs,
+            )
+            _dtar_root = Path(__file__).resolve().parent.parent
+            if args.apply:
+                _dtar_res = apply_decision_target_repairs(
+                    _dtar_root, apply=True, run_id=_task_logger.run_id)
+            else:
+                _dtar_res = audit_decision_target_repairs(_dtar_root)
+            _dtar_counts = (_dtar_res.get("plan_counts")
+                            or _dtar_res.get("counts") or {})
+            _dtar_mode = "apply" if args.apply else "read-only"
+            print(f"🎯 decision-target-authority-repair({_dtar_mode}): " + (
+                ", ".join(f"{key}={value}"
+                          for key, value in _dtar_counts.items()) or "clean"))
+            for _dtar_act in (_dtar_res.get("actions")
+                              or _dtar_res.get("candidates") or [])[:12]:
+                _dtar_queued = len(
+                    _dtar_act.get("queued_chunks")
+                    or _dtar_act.get("stale_chunks") or [])
+                print(f"   action: Decision #{_dtar_act.get('decision_id')} "
+                      f"{_dtar_act.get('source_key')} "
+                      f"{_dtar_act.get('old_translation')} → "
+                      f"{_dtar_act.get('new_translation')} "
+                      f"pending={len(_dtar_act.get('pending_chunks') or [])} "
+                      f"queued={_dtar_queued}")
+            for _dtar_blocked in (_dtar_res.get("blocked_groups") or [])[:12]:
+                print(f"   blocked: {_dtar_blocked.get('source_key')} / "
+                      f"{_dtar_blocked.get('reason')}")
+            print(f"   报告: {_dtar_res.get('md_path')}")
+            for _dtar_err in (_dtar_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_dtar_err}", file=sys.stderr)
+            sys.exit(0 if _dtar_res.get("ok") else 2)
+        elif args.command == "query-gold-set":
+            from src.artifact_freshness import load_story_graph_checked
+            from src.query_gold_set import build_query_gold_set
+            from src.style_profiler import load_profile
+
+            _qg_root = Path(__file__).resolve().parent.parent
+            _qg_in = (Path(args.input_dir) if args.input_dir
+                      else _qg_root / "input")
+            if not _qg_in.is_absolute():
+                _qg_in = _qg_root / _qg_in
+            _qg_profile_path = (Path(args.profile_path) if args.profile_path
+                                else _qg_in / "book_profile.json")
+            if not _qg_profile_path.is_absolute():
+                _qg_profile_path = _qg_root / _qg_profile_path
+            _qg_profile = load_profile(_qg_profile_path)
+            if not _qg_profile:
+                print(f"❌ query-gold-set: 无法读取剖面 {_qg_profile_path}",
+                      file=sys.stderr)
+                sys.exit(1)
+            _qg_rel = str((_config.get("story_graph", {}) or {}).get("path")
+                          or "input/story_graph.json")
+            _qg_graph_path = (Path(args.graph_path) if args.graph_path
+                              else _qg_root / _qg_rel)
+            if not _qg_graph_path.is_absolute():
+                _qg_graph_path = _qg_root / _qg_graph_path
+            _qg_checked = load_story_graph_checked(
+                _qg_root, _qg_graph_path, _qg_profile,
+                require_current=True, input_dir=_qg_in,
+            )
+            if not _qg_checked.get("ok") or not _qg_checked.get("graph"):
+                print("❌ query-gold-set: 图不是 fresh artifact "
+                      f"({_qg_checked.get('status')}): "
+                      f"{', '.join(_qg_checked.get('reasons') or [])}",
+                      file=sys.stderr)
+                sys.exit(1)
+            _qg_res = build_query_gold_set(
+                _qg_root,
+                profile=_qg_profile,
+                graph=_qg_checked.get("graph"),
+                profile_path=_qg_profile_path,
+                graph_path=_qg_graph_path,
+                input_dir=_qg_in,
+                output_path=(Path(args.json_out) if args.json_out else None),
+            )
+            print("🧪 query-gold-set: " + (
+                ", ".join(f"{key}={value}"
+                          for key, value in (_qg_res.get("counts") or {}).items())
+                or "no cases"))
+            print(f"   status={_qg_res.get('status')} "
+                  f"eval_written={_qg_res.get('eval_written')} "
+                  f"case_count={_qg_res.get('case_count', 0)}")
+            if _qg_res.get("gaps"):
+                print("   gaps: " + ", ".join(
+                    f"{key}={value}" for key, value in _qg_res["gaps"].items()),
+                    file=sys.stderr)
+            for _qg_err in (_qg_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_qg_err}", file=sys.stderr)
+            print(f"   报告: {_qg_res.get('report_path')}")
+            sys.exit(0 if _qg_res.get("ok") else 2)
+        elif args.command == "name-only-fastpath":
+            from src.name_only_fastpath import (
+                apply_name_only_fastpath,
+                audit_name_only_fastpath,
+            )
+            _nf_root = Path(__file__).resolve().parent.parent
+            if args.apply:
+                _nf_res = apply_name_only_fastpath(
+                    _nf_root, chapter_id=args.chapter, apply=True,
+                    run_id=_task_logger.run_id, limit=args.limit,
+                    allow_state_only=args.state_only,
+                )
+            else:
+                _nf_res = audit_name_only_fastpath(
+                    _nf_root, chapter_id=args.chapter,
+                    allow_state_only=args.state_only)
+            _nf_counts = _nf_res.get("counts") or {}
+            _nf_mode = "apply" if args.apply else "read-only"
+            print(f"🧪 name-only-fastpath({_nf_mode}): " + ", ".join(
+                f"{k}={v}" for k, v in _nf_counts.items()))
+            print(f"   报告: {_nf_res.get('md_path')}")
+            if _nf_res.get("authority_blocked"):
+                print("   ⛔ 名称权威审计未清零；写闭环已拒绝执行。",
+                      file=sys.stderr)
+            for _nf_rec in (_nf_res.get("candidates") or [])[:12]:
+                print(f"   candidate: {_nf_rec.get('chunk_id')} "
+                      f"mode={_nf_rec.get('change_mode', 'name_only')} "
+                      f"before={str(_nf_rec.get('final_sha256_before'))[:12]} "
+                      f"after={str(_nf_rec.get('final_sha256_after'))[:12]}")
+            for _nf_act in (_nf_res.get("actions") or [])[:12]:
+                print(f"   action: {_nf_act.get('chunk_id')} "
+                      f"{_nf_act.get('status')} / {_nf_act.get('reason')}")
+            if _nf_res.get("failed"):
+                for _nf_err in _nf_res["failed"][:8]:
+                    print(f"   ❌ {_nf_err}", file=sys.stderr)
+            sys.exit(0 if _nf_res.get("ok") else 1)
+        elif args.command == "completed-name-repair":
+            from src.name_only_fastpath import (
+                apply_completed_name_repair,
+                audit_completed_name_repair,
+            )
+            _cn_root = Path(__file__).resolve().parent.parent
+            _cn_chapter = None if getattr(args, "all", False) else args.chapter
+            if args.apply:
+                _cn_res = apply_completed_name_repair(
+                    _cn_root, chapter_id=_cn_chapter, apply=True,
+                    run_id=_task_logger.run_id, limit=args.limit,
+                )
+            else:
+                _cn_res = audit_completed_name_repair(
+                    _cn_root, chapter_id=_cn_chapter)
+            _cn_counts = _cn_res.get("counts") or {}
+            _cn_mode = "apply" if args.apply else "read-only"
+            print(f"🧹 completed-name-repair({_cn_mode}): " + ", ".join(
+                f"{k}={v}" for k, v in _cn_counts.items()))
+            print(f"   报告: {_cn_res.get('md_path')}")
+            if _cn_res.get("authority_blocked"):
+                print("   ⛔ 名称权威审计未清零；COMPLETED 修复已拒绝执行。",
+                      file=sys.stderr)
+            for _cn_rec in (_cn_res.get("candidates") or [])[:12]:
+                print(f"   candidate: {_cn_rec.get('chunk_id')} "
+                      f"{_cn_rec.get('source_key')} → "
+                      f"{_cn_rec.get('canonical_name')} "
+                      f"({len(_cn_rec.get('changed_spans') or [])} 处)")
+            for _cn_act in (_cn_res.get("actions") or [])[:12]:
+                print(f"   action: {_cn_act.get('chunk_id')} "
+                      f"{_cn_act.get('status')} / {_cn_act.get('reason')}")
+            if _cn_res.get("after_counts"):
+                print("   pending_after: " + ", ".join(
+                    f"{k}={v}" for k, v in _cn_res["after_counts"].items()))
+            sys.exit(0 if _cn_res.get("ok") else 1)
+        elif args.command == "confirmed-term-drift-repair":
+            from src.name_only_fastpath import (
+                apply_confirmed_term_drift_repair,
+                audit_confirmed_term_drift_repair,
+            )
+            _ct_root = Path(__file__).resolve().parent.parent
+            _ct_chapter = None if getattr(args, "all", False) else args.chapter
+            if args.apply:
+                _ct_res = apply_confirmed_term_drift_repair(
+                    _ct_root, chapter_id=_ct_chapter, apply=True,
+                    run_id=_task_logger.run_id, limit=args.limit,
+                )
+            else:
+                _ct_res = audit_confirmed_term_drift_repair(
+                    _ct_root, chapter_id=_ct_chapter)
+            _ct_counts = _ct_res.get("counts") or {}
+            _ct_mode = "apply" if args.apply else "read-only"
+            print(f"🧭 confirmed-term-drift-repair({_ct_mode}): " + ", ".join(
+                f"{k}={v}" for k, v in _ct_counts.items()))
+            print(f"   报告: {_ct_res.get('md_path')}")
+            for _ct_rec in (_ct_res.get("candidates") or [])[:12]:
+                print(f"   candidate: Decision #{_ct_rec.get('decision_id')} "
+                      f"{_ct_rec.get('source_key')} / "
+                      f"{_ct_rec.get('wrong_form')} → "
+                      f"{_ct_rec.get('canonical_name')} / chunks="
+                      f"{len(_ct_rec.get('chunks') or [])}")
+            for _ct_act in (_ct_res.get("actions") or [])[:12]:
+                print(f"   action: Decision #{_ct_act.get('decision_id')} "
+                      f"{_ct_act.get('status')} / {_ct_act.get('reason')} / "
+                      f"chunks={len(_ct_act.get('chunks') or [])}")
+            for _ct_blocked in (_ct_res.get("blocked") or [])[:8]:
+                print(f"   blocked: Decision #{_ct_blocked.get('decision_id')} "
+                      f"{_ct_blocked.get('source_key')} / "
+                      f"{_ct_blocked.get('reason')}", file=sys.stderr)
+            for _ct_err in (_ct_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_ct_err}", file=sys.stderr)
+            sys.exit(0 if _ct_res.get("ok") else 1)
         elif args.command == "consolidate":
             from src.pipeline import consolidate_dirty_chapters
             _cons_res = consolidate_dirty_chapters(max_rounds=args.max_rounds)
@@ -894,6 +1569,15 @@ def main():
         elif args.command == "gate":
             from src.pipeline import run_final_gate
             _gate_res = run_final_gate()
+            if not _gate_res.get("ok"):
+                try:
+                    _task_logger.event(
+                        "gate_failed", stage="GATE", status="failed",
+                        message="final gate rejected the delivery",
+                        failures=(_gate_res.get("failures") or [])[:20],
+                    )
+                except TaskLoggingError:
+                    pass
             sys.exit(0 if _gate_res.get("ok") else 1)
         elif args.command == "finalize":
             from src.book_lint import finalize_outputs
@@ -973,15 +1657,48 @@ def main():
     except KeyboardInterrupt:
         print("⛔ 已确认中止（Ctrl+C x2）。进度已保存；重新运行命令会从数据库断点续跑。",
               file=sys.stderr, flush=True)
+        try:
+            _task_logger.event("run_interrupted", stage="RUN", status="interrupted")
+            _task_logger.finish(130, status="interrupted")
+        except TaskLoggingError:
+            pass
         sys.exit(130)
-    except SystemExit:
+    except SystemExit as _task_exit:
+        _task_code = getattr(_task_exit, "code", 1)
+        if _task_code is None:
+            _task_code = 0
+        if not isinstance(_task_code, int):
+            _task_code = 1
+        try:
+            if _task_code != 0:
+                _task_logger.event(
+                    "command_failed", stage="RUN", status="failed",
+                    exit_code=_task_code,
+                    message="command exited non-zero",
+                )
+            _task_logger.finish(_task_code)
+        except TaskLoggingError:
+            pass
         raise
     except Exception as e:
         # P4-9: 顶层异常统一退出（保留 KeyboardInterrupt/SystemExit 上抛）
         print(f"❌ 命令 {args.command} 异常终止: {e}", file=sys.stderr)
         import traceback as _tb_p49
         _tb_p49.print_exc()
+        try:
+            _task_logger.event(
+                "command_failed", stage="RUN", status="failed",
+                error_class=type(e).__name__, message=str(e),
+            )
+            _task_logger.finish(1, status="failed")
+        except TaskLoggingError:
+            pass
         sys.exit(1)
+    else:
+        try:
+            _task_logger.finish(0)
+        except TaskLoggingError:
+            pass
 
 
 # ────────────────────────────────────────────────────────────────────

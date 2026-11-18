@@ -72,14 +72,15 @@ def test_migration_adds_locked_column(engine_mod):
     assert "locked" in cols
 
 
-def test_unlocked_flip_updates_and_backtracks(engine_mod):
+def test_explicit_revision_updates_and_backtracks(engine_mod):
     mod, db_path = engine_mod
     sched = _FakeScheduler()
     engine = mod.DecisionEngine(db_path=str(db_path), scheduler_factory=lambda: sched)
     engine.add_decision(mod.DecisionLevel.REFERENCE, "Mock Turtle", "假海龟",
                         "r1", affected_chunks=["ch10_c000"])
     engine.add_decision(mod.DecisionLevel.REFERENCE, "Mock Turtle", "素甲鱼",
-                        "r2", affected_chunks=["ch10_c000"])
+                        "r2", affected_chunks=["ch10_c000"],
+                        allow_revision=True)
     assert _translation(engine, "Mock Turtle") == "素甲鱼"
     assert sched.calls == [["ch10_c000"], ["ch10_c000"]]
 

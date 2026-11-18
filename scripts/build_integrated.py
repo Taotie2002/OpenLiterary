@@ -102,7 +102,8 @@ import sqlite3
 import psutil
 import requests
 import threading
-from collections import Counter, OrderedDict
+import shutil
+from collections import Counter, OrderedDict, defaultdict
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Callable
@@ -513,10 +514,12 @@ def build_section_2() -> str:
     cache = extract_constant(src, "_client_instances")
     # 然后是 class 和 helper 函数（Round 129: 增加配额降级包装器与拆分后的构建函数）
     classes = [extract_class(src, c) for c in [
-        "QuotaExhaustedError", "ContentSensitiveError", "LLMAdapter", "MockLLMAdapter",
+        "QuotaExhaustedError", "UpstreamUnavailableError",
+        "ContentSensitiveError", "LLMAdapter", "MockLLMAdapter",
         "OpenAICompatibleAdapter", "FallbackRoleAdapter",
     ]]
     helpers = [extract_function(src, f) for f in [
+        "_is_upstream_unavailable_error",
         "_map_effort_for_fallback", "_fallback_levels_for",
         "_build_single_client", "_build_role_client",
         "get_llm_client", "get_llm_client_for_task", "get_role_model_name", "get_task_extra_body",
@@ -694,7 +697,8 @@ def build_section_11() -> str:
 def build_section_11_5() -> str:
     """consistency.py：run_consistency_check + 依赖 helper（docstring 与 imports 已剥离）"""
     src = load_module("consistency.py")
-    fns = ["_load_glossary", "_load_decisions", "_scan_finals", "_find_slash_aliases",
+    fns = ["_load_glossary", "_load_decisions", "_scan_finals",
+           "_chunk_id_from_final", "_load_dirty_chunk_ids", "_find_slash_aliases",
            "_in_quote_or_note", "_detect_issues", "_generate_report", "_apply_issues",
            # Round 134: 名称统一 pass（同人归一 + 别名白名单 + 音译漂移全文统一）
            "_load_name_unification_cfg", "_vet_name_drift_candidates",
@@ -839,11 +843,20 @@ def build_section_11_6() -> str:
 # Round 102 P1: compute_cjk_ratio 按 id(text) 缓存. 与散装 src/utils/text_match.py 同步.
 # 简化版: cache 直接持有 str 强引用 (key=id(text)). 见散装版注释了解 id 复用 trade-off.
 _cjk_ratio_cache: "dict[int, float]" = {}
+_cjk_ratio_cache_refs: "dict[int, str]" = {}
 _CJK_RATIO_CACHE_MAX = 512
 
 
 def _cjk_ratio_cache_get(text):
-    return _cjk_ratio_cache.get(id(text))
+    ratio = _cjk_ratio_cache.get(id(text))
+    if ratio is None:
+        return None
+    cached_text = _cjk_ratio_cache_refs.get(id(text))
+    if cached_text is not text:
+        _cjk_ratio_cache.pop(id(text), None)
+        _cjk_ratio_cache_refs.pop(id(text), None)
+        return None
+    return ratio
 
 
 def _cjk_ratio_cache_put(text, ratio):
@@ -851,14 +864,17 @@ def _cjk_ratio_cache_put(text, ratio):
         try:
             oldest_key = next(iter(_cjk_ratio_cache))
             _cjk_ratio_cache.pop(oldest_key, None)
+            _cjk_ratio_cache_refs.pop(oldest_key, None)
         except StopIteration:
             pass
     _cjk_ratio_cache[id(text)] = ratio
+    _cjk_ratio_cache_refs[id(text)] = text
 
 
 def reset_cjk_ratio_cache() -> None:
     """Chapter 切换时清空 cjk_ratio 缓存 (整合模式 shim 入口)."""
     _cjk_ratio_cache.clear()
+    _cjk_ratio_cache_refs.clear()
 
 
 def compute_cjk_ratio(text: str) -> float:
@@ -1044,7 +1060,16 @@ for _sub in ("src.utils", "src.config", "src.agents", "src.core", "src.consisten
              # Round 131: prefer the real modules in repo mode.  A pre-created
              # fake module otherwise hides private helpers (e.g. pun_audit's
              # _split_anchors) from later imports in the same interpreter.
-             "src.judgment_layer", "src.rescue", "src.story_graph", "src.story_graph_query",
+             "src.judgment_layer", "src.artifact_freshness",
+             "src.rescue", "src.story_graph", "src.story_graph_query",
+             "src.book_linker",
+             "src.pending_backtrack_reconcile", "src.name_only_fastpath",
+             "src.name_authority_audit", "src.name_authority_align",
+             "src.decision_authority_align",
+             "src.term_form_audit",
+             "src.locked_target_authority_audit",
+             "src.term_form_contracts",
+             "src.query_gold_set",
              "src.setup_payoff_audit",
              "src.style_profiler", "src.recalibrate", "src.proofread",
              "src.book_repair"):
@@ -1107,7 +1132,8 @@ _SRC_SUBMODULES = {
     "src.utils.llm_adapter": [
         "get_llm_client", "get_llm_client_for_task", "get_role_model_name", "get_task_extra_body",
         "robust_json_loads", "_build_role_client", "_client_instances",
-        "ContentSensitiveError",
+        "ContentSensitiveError", "UpstreamUnavailableError",
+        "_is_upstream_unavailable_error",
     ],
     # Round 96: 加 text_match shim 让 CJK 比例原语可在整合模式下访问
     # Round 102 P1: 增加 cjk_ratio 缓存相关符号, 让整合模式下也可访问.
@@ -1157,6 +1183,16 @@ _SRC_SUBMODULES = {
     "src.agents.critic_agent": ["CriticAgent"],
     "src.agents.judge_agent": ["JudgeAgent"],
     "src.pipeline": ["TranslationPipeline", "consolidate_dirty_chapters", "run_final_gate"],
+    "src.task_logging": [
+        "CST", "RUN_ID_ENV", "LOG_ENABLED_ENV", "LOG_DIR_ENV", "DEFAULT_LOG_DIR",
+        "TaskLoggingError", "TaskLogger", "now_iso", "new_run_id", "sha256_file",
+        "make_logger", "set_active_logger", "get_active_logger", "log_event",
+        "log_artifact", "validate_jsonl", "prune_runs",
+    ],
+    "src.inflight_recovery": [
+        "RECOVERY_DIR", "NONTERMINAL_STATES", "RESUME_STAGE",
+        "scan_inflight", "write_recovery_report", "audit_and_write",
+    ],
     # Round 119 (T5): 成书样式/lint 单源（散装 src/book_lint.py）
     "src.book_lint": ["normalize_final_style", "finalize_outputs", "lint_texts",
                       "lint_book", "postprocess_chunk_text", "chapter_heading",
@@ -1171,7 +1207,8 @@ _SRC_SUBMODULES = {
                       "_note_key_parts", "_note_mentions_alias",
                       "_note_keys_compatible"],
     "src.consistency": ["run_consistency_check", "_load_glossary", "_load_decisions",
-                        "_scan_finals", "_find_slash_aliases", "_in_quote_or_note",
+                        "_scan_finals", "_chunk_id_from_final", "_load_dirty_chunk_ids",
+                        "_find_slash_aliases", "_in_quote_or_note",
                         "_NOTE_MARKER_RE",
                         "_detect_issues", "_generate_report", "_apply_issues",
                         "run_consistency_check_for_chapter",
@@ -1242,11 +1279,67 @@ _SRC_SUBMODULES = {
         "save_story_graph", "load_story_graph", "build_and_save_story_graph",
         "story_graph_context_for_chapter",
     ],
+    "src.artifact_freshness": [
+        "EVAL_SCHEMA_VERSION", "chapter_manifest", "chapter_hash_map",
+        "profile_notes_hash", "profile_fingerprint", "registry_rows",
+        "rows_fingerprint", "decision_db_fingerprint",
+        "profile_source_freshness", "graph_freshness", "eval_freshness",
+        "load_story_graph_checked",
+    ],
     "src.story_graph_query": [
         "QUERY_VERSION", "DEFAULT_TOP_K", "DEFAULT_MAX_HOPS",
         "StoryGraphQueryIndex", "query_story_graph",
         "default_story_graph_query_generate", "evaluate_story_graph_query",
         "format_query_result",
+    ],
+    "src.book_linker": [
+        "MANIFEST_SCHEMA_VERSION", "DEFAULT_MANIFEST_PATH",
+        "DEFAULT_AUDIT_JSON", "DEFAULT_AUDIT_MD", "build_manifest",
+        "write_manifest", "update_manifest_run_evidence",
+        "update_manifest_merged", "audit_book_links",
+        "format_book_link_audit_md", "write_book_link_audit",
+    ],
+    "src.pending_backtrack_reconcile": [
+        "load_pending_context", "classify_pending_row",
+        "classify_pending_snapshot", "pending_report_markdown",
+        "audit_pending_backtracks", "apply_pending_backtrack_reconcile",
+    ],
+    "src.name_only_fastpath": [
+        "audit_name_only_fastpath", "apply_name_only_fastpath",
+        "audit_completed_name_repair", "apply_completed_name_repair",
+        "audit_confirmed_term_drift_repair",
+        "apply_confirmed_term_drift_repair",
+    ],
+    "src.name_authority_audit": [
+        "audit_name_authorities",
+    ],
+    "src.name_authority_align": [
+        "ALIGNMENT_SCHEMA_VERSION", "build_name_authority_alignment",
+        "align_name_authorities",
+    ],
+    "src.decision_authority_align": [
+        "AUTHORITY_ALIGN_SCHEMA_VERSION", "audit_decision_authorities",
+        "apply_decision_authority_alignment",
+        "audit_article_shadow_decisions",
+        "apply_article_shadow_alias_repairs",
+        "audit_locked_target_authority_repairs",
+        "apply_locked_target_authority_repairs",
+    ],
+    "src.term_form_audit": [
+        "TERM_FORM_AUDIT_SCHEMA_VERSION", "audit_term_forms",
+    ],
+    "src.locked_target_authority_audit": [
+        "LOCKED_TARGET_AUDIT_SCHEMA_VERSION",
+        "audit_locked_target_authorities",
+    ],
+    "src.term_form_contracts": [
+        "TERM_CONTRACT_SCHEMA_VERSION", "DEFAULT_CONTRACT_PATH",
+        "build_term_form_contracts", "apply_term_form_contracts",
+    ],
+    "src.query_gold_set": [
+        "BUILDER_VERSION", "DEFAULT_OUTPUT_PATH", "DEFAULT_REPORT_PATH",
+        "DEFAULT_MIN_SETUP", "DEFAULT_MIN_ARC", "DEFAULT_MIN_VOICE",
+        "DEFAULT_MIN_NEGATIVE", "DEFAULT_MAX_CASES", "build_query_gold_set",
     ],
     "src.setup_payoff_audit": [
         "AUDIT_VERSION", "DEFAULT_TOP_N", "DEFAULT_SELECTION_BATCH",
@@ -1265,6 +1358,7 @@ _SRC_SUBMODULES = {
         "load_chapter_documents", "segment_chapter_text",
         "build_deep_extract_prompt", "parse_deep_extract_response",
         "build_deep_merge_prompt", "parse_deep_merge_response",
+        "build_chapter_digests", "derive_profile_digests",
         "build_deep_profile", "profile_to_style_guide", "save_profile",
         "load_profile", "profile_is_deep", "summary_line", "generate_book_profile",
     ],
@@ -1352,6 +1446,12 @@ def build_section_13() -> str:
         ]),
         ("core/decision_engine.py", [
             "SEED_ENTITY_VARIANTS", "_CONF_ORDER", "load_entity_variant_seeds", "unify_entity_registry",
+            # Round 158: article-led exact-key alias guard (DecisionEngine).
+            "_ARTICLE_PREFIX_RE",
+            # Round 158: term-phrase alias guard / authority-aware unify winner
+            "_EN_GROUP_TERM_WORDS", "_term_compare_key",
+            "_decision_translation_authority_keys",
+            "_decision_term_phrase_translation_pairs",
             # Round 149: 修复历史 unify 跨人物误合并（清洗脚本复用）
             "_repair_names_related", "repair_false_unify_merges",
             # Round 144: entity alias hygiene（query/reference/pipeline 共用）
@@ -1462,8 +1562,17 @@ def build_section_13() -> str:
     # by load_module); runtime cross-module imports are satisfied by the shim
     # below.  Keeping whole modules avoids another hand-maintained symbol list.
     out += section_comment("13.6", "Round 131 全书判断层 / 故事图 / 深读剖面")
-    for rel in ("judgment_layer.py", "story_graph.py", "story_graph_query.py",
-                "setup_payoff_audit.py", "style_profiler.py", "recalibrate.py",
+    for rel in ("task_logging.py", "inflight_recovery.py", "judgment_layer.py",
+                "artifact_freshness.py", "story_graph.py", "story_graph_query.py",
+                "book_linker.py", "pending_backtrack_reconcile.py",
+                "name_only_fastpath.py", "name_authority_audit.py",
+                "name_authority_align.py",
+                "decision_authority_align.py",
+                "term_form_audit.py",
+                "locked_target_authority_audit.py",
+                "term_form_contracts.py",
+                "setup_payoff_audit.py",
+                "style_profiler.py", "query_gold_set.py", "recalibrate.py",
                 "proofread.py", "book_repair.py"):
         body = load_module(rel).strip("\n")
         if not body:

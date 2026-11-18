@@ -113,8 +113,8 @@ _BR_GOM_WRONG_MARKERS = (
 # list deliberately small: ambiguous person names belong in a separate,
 # evidence-mapped review rather than a generic find/replace pass.
 _BR_CANONICAL_ALIAS_RULES: Tuple[Tuple[str, str, str, str], ...] = (
-    ("厄拉科斯", "阿拉基斯", "Arrakis",
-     "profile: Arrakis=阿拉基斯; registry: Arrakis id=5"),
+    ("阿拉基斯", "厄拉科斯", "Arrakis",
+     "decision id=5 translation=厄拉科斯; registry id=6 canonical=厄拉科斯"),
     ("贝尼杰瑟里特", "贝尼·杰瑟里特", "Bene Gesserit",
      "profile: Bene Gesserit=贝尼·杰瑟里特; registry variant"),
     ("沙杜特梅普斯", "沙杜特·梅普斯", "Shadout Mapes",
@@ -129,7 +129,104 @@ _BR_CANONICAL_ALIAS_RULES: Tuple[Tuple[str, str, str, str], ...] = (
      "first-use ch01_chunk021; Feyd-Rautha; variants 费德-劳萨/菲德-劳萨/费德-？劳萨"),
     ("费德-？劳萨", "菲德-罗萨", "Feyd",
      "first-use ch01_chunk021; Feyd-Rautha; EPUB extraction artifact"),
+    # The corpus contains the isolated vocative "图菲尔" in 16 completed
+    # chunks, while the active registry owner and Decision 236 use
+    # "杜菲·哈瓦特".  Every affected chunk's source contains "Thufir", so the
+    # short-form repair remains source-gated and never applies to free prose.
+    ("图菲尔", "杜菲", "Thufir",
+     "registry id=31 canonical=杜菲·哈瓦特; decision id=236; source-gated Thufir"),
+    # Two legacy Decisions disagree on the Landsraad rendering.  The active
+    # registry owner and the book-wide Decisions use 兰兹拉德; the older
+    # 兰萨德 form survives in completed prose.  The source gate prevents this
+    # rule from touching unrelated CJK prose.
+    ("兰萨德", "兰兹拉德", "Landsraad",
+     "registry id=266 canonical=兰兹拉德; decision id=22/3442; source-gated Landsraad"),
 )
+
+# English glosses in parentheses and footnotes are evidence, not prose.  A
+# model can transcribe one letter incorrectly (``stiltent`` for ``stilltent``)
+# while the surrounding Chinese sentence remains correct.  Repair only when
+# the gloss is absent from this chunk's source and exactly one source token is
+# a close spelling variant; ambiguous candidates remain untouched.
+_BR_GLOSS_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9’'\-?]{4,}")
+_BR_GLOSS_PAREN_RE = re.compile(
+    r"[（(]\s*([A-Za-z][A-Za-z0-9’'\-?]{4,})\s*[）)]")
+_BR_GLOSS_QUOTE_RE = re.compile(
+    r"原文(?:作|为)\s*[“\"]([A-Za-z][A-Za-z0-9’'\-?]{4,})[”\"]")
+
+
+def _br_normalize_gloss_token(token: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", token.casefold())
+
+
+def _br_plan_source_gloss_spelling(
+    text: str, source: str,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Restore a single-letter source-term typo inside an explicit gloss.
+
+    The pass is deliberately narrow: it considers only ASCII tokens enclosed
+    in parentheses or quoted by ``原文作/原文为``.  It never rewrites the
+    translated prose around the gloss and never guesses when more than one
+    source spelling is close enough.
+    """
+    if not text or not source:
+        return text, []
+    source_tokens = _BR_GLOSS_TOKEN_RE.findall(source)
+    source_norm = {_br_normalize_gloss_token(token): token
+                   for token in source_tokens}
+    candidates = set(_BR_GLOSS_PAREN_RE.findall(text))
+    candidates.update(_BR_GLOSS_QUOTE_RE.findall(text))
+    working = text
+    changes: List[Dict[str, Any]] = []
+    for candidate in sorted(candidates):
+        norm = _br_normalize_gloss_token(candidate)
+        if not norm or norm in source_norm:
+            continue
+        scored = sorted(
+            ((difflib.SequenceMatcher(None, norm, source_norm_key).ratio(),
+              source_token)
+             for source_norm_key, source_token in source_norm.items()),
+            reverse=True,
+        )
+        if not scored:
+            continue
+        best_ratio, best_token = scored[0]
+        second_ratio = scored[1][0] if len(scored) > 1 else 0.0
+        best_norm = _br_normalize_gloss_token(best_token)
+        if (best_ratio < 0.90
+                or best_ratio - second_ratio < 0.12
+                or abs(len(norm) - len(best_norm)) > 2):
+            continue
+        # A singular gloss such as Messiah versus source messiahs is a valid
+        # lexical form, not a transcription typo.  Prefix-only differences are
+        # therefore left untouched; the stiltent/stilltent case is a true
+        # internal substitution and still passes this guard.
+        if norm.startswith(best_norm) or best_norm.startswith(norm):
+            continue
+        before = working.count(candidate)
+        if not before:
+            continue
+        # Restrict the substitution to the two recognised gloss contexts.
+        working = _BR_GLOSS_PAREN_RE.sub(
+            lambda match: match.group(0).replace(candidate, best_token), working)
+        working = _BR_GLOSS_QUOTE_RE.sub(
+            lambda match: match.group(0).replace(candidate, best_token), working)
+        count = before - working.count(candidate)
+        if count <= 0:
+            continue
+        changes.append({
+            "rule": "source_gloss_typo_restore",
+            "from": candidate,
+            "to": best_token,
+            "count": count,
+            "context": "source_term_gloss",
+            "evidence": {
+                "source_term": best_token,
+                "similarity": round(best_ratio, 3),
+                "runner_up_similarity": round(second_ratio, 3),
+            },
+        })
+    return working, changes
 
 _BR_MD_DEF_RE = re.compile(r"^\s*\[\^([^\]]+)\]:\s?")
 _BR_MALFORMED_MD_DEF_RE = re.compile(
@@ -1054,6 +1151,10 @@ def _br_plan_text(
 
     working, footnote_changes = _br_plan_malformed_footnotes(working)
     changes.extend(footnote_changes)
+
+    working, gloss_changes = _br_plan_source_gloss_spelling(
+        working, source=source)
+    changes.extend(gloss_changes)
 
     working, omission_changes, omission_blocking = _br_plan_omissions(
         working, raw=raw, source=source, literary=literary)

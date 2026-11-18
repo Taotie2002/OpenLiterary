@@ -58,10 +58,20 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-log_info() { echo -e "${BLUE}[INFO]${NC} $*" >&2; }
-log_ok()   { echo -e "${GREEN}[OK]${NC} $*" >&2; }
-log_warn() { echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
-log_err()  { echo -e "${RED}[ERR]${NC} $*" >&2; }
+_task_log_write() {
+    # Shell messages are not children of run_cmd; append them directly so the
+    # run .log has one timestamped line for every human-facing message.
+    if [[ -n "${SAGATRANS_RUN_LOG:-}" ]]; then
+        local ts
+        ts=$(TZ=Asia/Shanghai date '+%Y-%m-%dT%H:%M:%S.%3N+08:00')
+        printf '[%s] %s\n' "$ts" "$*" >> "$SAGATRANS_RUN_LOG"
+    fi
+}
+
+log_info() { _task_log_write "[INFO] $*"; echo -e "${BLUE}[INFO]${NC} $*" >&2; }
+log_ok()   { _task_log_write "[OK] $*"; echo -e "${GREEN}[OK]${NC} $*" >&2; }
+log_warn() { _task_log_write "[WARN] $*"; echo -e "${YELLOW}[WARN]${NC} $*" >&2; }
+log_err()  { _task_log_write "[ERR] $*"; echo -e "${RED}[ERR]${NC} $*" >&2; }
 
 # ===========================
 # Ctrl+C 防误触（Round 141）
@@ -90,8 +100,21 @@ run_cmd() {
     # 必须立即终止整个批次，不能把该章当普通失败后继续下一章。
     PY_CHILD_ACTIVE=1
     set +e
-    "$@"
-    local rc=$?
+    local rc=0
+    if [[ -n "${SAGATRANS_RUN_LOG:-}" && -f "$PROJECT_ROOT/scripts/task_log_tee.py" ]]; then
+        # Preserve the child's exit code; tee is only an audit side channel.
+        "$@" 2>&1 | "${PYTHON:-python3}" "$PROJECT_ROOT/scripts/task_log_tee.py" "$SAGATRANS_RUN_LOG"
+        local -a _pipe_status=("${PIPESTATUS[@]}")
+        rc="${_pipe_status[0]:-1}"
+        local tee_rc="${_pipe_status[1]:-1}"
+        if [[ "$tee_rc" -ne 0 && "$rc" -eq 0 ]]; then
+            log_err "任务日志 tee 失败（rc=$tee_rc）；按写命令日志失败处理"
+            rc=1
+        fi
+    else
+        "$@"
+        rc=$?
+    fi
     set -e
     PY_CHILD_ACTIVE=0
     if [[ $rc -eq 130 ]]; then
@@ -102,6 +125,20 @@ run_cmd() {
 }
 
 trap 'handle_sigint' INT
+
+finalize_task_log() {
+    # The shell tee appends console lines after each Python child seals its own
+    # view.  Recompute the seal once at shell exit so its hash covers the final
+    # text log rather than an intermediate snapshot.
+    if [[ -n "${SAGATRANS_RUN_ID:-}" && -f "$PROJECT_ROOT/scripts/task_log_finalize.py" ]]; then
+        "${PYTHON:-python3}" "$PROJECT_ROOT/scripts/task_log_finalize.py" \
+            --run-id "$SAGATRANS_RUN_ID" \
+            --log-dir "${SAGATRANS_TASK_LOG_DIR:-$PROJECT_ROOT/output/logs/runs}" \
+            >/dev/null 2>&1 || true
+    fi
+}
+
+trap 'finalize_task_log' EXIT
 
 # ===========================
 # 帮助信息
@@ -521,6 +558,25 @@ except Exception:
 ' "$1"
 }
 
+profile_source_status() {
+# Round 158: a deep profile must name the chapter bytes it actually read.
+# Missing lineage is "untracked" (legacy), changed bytes are "stale"; both
+# request a fresh deep read unless the operator explicitly passed
+# --skip-deep-profile.
+    "$PYTHON" -c '
+import sys
+from pathlib import Path
+from src.artifact_freshness import profile_source_freshness
+from src.style_profiler import load_profile
+try:
+    prof = load_profile(Path(sys.argv[1]))
+    res = profile_source_freshness(prof, Path.cwd())
+    print(res.get("status") or "unknown")
+except Exception:
+    print("unknown")
+' "$1" 2>/dev/null || echo "unknown"
+}
+
 ensure_book_profile() {
     local profile_file="$PROJECT_ROOT/input/book_profile.json"
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -531,8 +587,10 @@ ensure_book_profile() {
 
     local schema=0
     local deep=false
+    local source_status="missing"
     [[ -f "$profile_file" ]] && schema=$(profile_schema_version "$profile_file" 2>/dev/null || echo 0)
     [[ -f "$profile_file" ]] && deep=$(profile_is_deep "$profile_file" 2>/dev/null || echo false)
+    [[ -f "$profile_file" ]] && source_status=$(profile_source_status "$profile_file" 2>/dev/null || echo "unknown")
     if [[ "$SKIP_DEEP_PROFILE" == "true" ]]; then
         if [[ -f "$profile_file" ]]; then
             log_info "跳过全书深读剖面（--skip-deep-profile），沿用现有 input/book_profile.json"
@@ -545,9 +603,12 @@ ensure_book_profile() {
         return 0
     fi
 
-    if [[ -f "$profile_file" && "$schema" -ge 2 && "$deep" == "true" ]]; then
-        log_info "检测到已完成深读的 v${schema} 剖面 input/book_profile.json；跳过深读（重建图谱仍会执行）"
+    if [[ -f "$profile_file" && "$schema" -ge 2 && "$deep" == "true" && "$source_status" == "fresh" ]]; then
+        log_info "检测到已完成深读且与章源一致的 v${schema} 剖面；跳过深读（重建图谱仍会执行）"
         return 0
+    fi
+    if [[ -f "$profile_file" && "$deep" == "true" && "$source_status" != "fresh" ]]; then
+        log_warn "剖面章源血缘=${source_status}：按 Round 158 规则默认重新深读（--skip-deep-profile 可显式沿用旧剖面）"
     fi
     if [[ -f "$profile_file" ]]; then
         log_info "检测到 v${schema} 剖面（deep_read=${deep}）；升级为全书深读 v2（L1/L2 校验，失败则保留旧剖面）..."
@@ -813,6 +874,18 @@ main() {
     # Round 130: 单实例守卫（先于任何破坏性操作；审计①）
     acquire_instance_lock "$@"
 
+    # Round 158 Phase 0: one run_id for the whole one-click flow.  Every
+    # child `src.translator_agent` process inherits it, so their JSONL events
+    # form one monotonic, cross-process audit stream.
+    if [[ -z "${SAGATRANS_RUN_ID:-}" ]]; then
+        SAGATRANS_RUN_ID="$(TZ=Asia/Shanghai date '+%Y%m%dT%H%M%S')-$$"
+        export SAGATRANS_RUN_ID
+    fi
+    mkdir -p "$PROJECT_ROOT/output/logs/runs"
+    export SAGATRANS_TASK_LOG_DIR="$PROJECT_ROOT/output/logs/runs"
+    export SAGATRANS_RUN_LOG="$SAGATRANS_TASK_LOG_DIR/$SAGATRANS_RUN_ID.log"
+    log_info "运行 ID: $SAGATRANS_RUN_ID"
+
     # --clean-only 独立模式：清理中间产物后退出
     if [[ "$CLEAN_ONLY" == "true" ]]; then
         cd "$PROJECT_ROOT"
@@ -967,6 +1040,19 @@ except Exception:
         log_err "翻译产出残缺，流程中止（见上方缺失章节提示）。"
         exit 1
     fi
+    local merged_file
+    merged_file=$(book_output_path) || {
+        log_err "无法解析成品译稿路径，无法建立 build manifest"
+        exit 1
+    }
+    log_info "记录 build manifest（source → chunk → final → merged 交付链接）..."
+    if run_cmd "$PYTHON" -m src.translator_agent book-link-audit \
+        --write-manifest --merged-path "$merged_file"; then
+        log_ok "build manifest 已写入 output/build_manifest.json"
+    else
+        log_err "build manifest 写入失败（交付证据不完整）"
+        exit 1
+    fi
 
     # 3.2 Round 121 L5: 章级注释统一（去重/孤儿改锚/顺编号；无 LLM 调用）
     log_info "运行章级注释统一 (notes-normalize)..."
@@ -976,6 +1062,15 @@ except Exception:
         log_err "注释统一失败"
         exit 1
     fi
+    if [[ "$DRY_RUN" != "true" ]]; then
+        if run_cmd "$PYTHON" -m src.translator_agent book-link-audit \
+            --update-merged --merged-path "$merged_file" --stage notes-normalize; then
+            log_info "manifest merged 哈希已记录 notes-normalize 后版本"
+        else
+            log_err "manifest merged 哈希更新失败（notes-normalize 后）"
+            exit 1
+        fi
+    fi
 
     # 3.3 Round 155: 成书机械排错。只删除可证明非正文的拼接残留标题和
     # 不可见字符；重复标点/括号/章节壳等问题只报告，由 gate ⑩ 硬拦截。
@@ -984,6 +1079,15 @@ except Exception:
         log_ok "机械排错全绿（详见 output/proofread_report.md）"
     else
         log_warn "机械排错仍有阻断项；继续重建 QA/lint 报告，gate ⑩ 将硬拦截（详见 output/proofread_report.md）"
+    fi
+    if [[ "$DRY_RUN" != "true" ]]; then
+        if run_cmd "$PYTHON" -m src.translator_agent book-link-audit \
+            --update-merged --merged-path "$merged_file" --stage proofread; then
+            log_info "manifest merged 哈希已记录 proofread 后版本"
+        else
+            log_err "manifest merged 哈希更新失败（proofread 后）"
+            exit 1
+        fi
     fi
 
     # QA 必须在 final 集合稳定后重建。notes-normalize / proofread 只改

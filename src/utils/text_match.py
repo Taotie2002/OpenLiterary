@@ -37,12 +37,27 @@ _CATEGORY_SYNONYMS: dict = {
 #     用户可显式调用 reset_cjk_ratio_cache() 在 chapter 切换时清空.
 #   - FIFO 上限 _CJK_RATIO_CACHE_MAX=512 防止极端 literal 调用下无界增长.
 _cjk_ratio_cache: "dict[int, float]" = {}
+_cjk_ratio_cache_refs: "dict[int, str]" = {}
 _CJK_RATIO_CACHE_MAX = 512  # 经验值: 一章几十个 chunk, 每 chunk ~10 个不同 str, 留 ~10x 余量
 
 
 def _cjk_ratio_cache_get(text: str):
-    """查 cache. 返回 cached float 或 None. 不做 id 碰撞检测 — 见上方注释."""
-    return _cjk_ratio_cache.get(id(text))
+    """查 cache. 返回 cached float 或 None.
+
+    The tuple keeps a strong reference to the exact string whose id is used as
+    the key.  Without that reference CPython may recycle an id for a different
+    string and return a stale ratio (reproduced under Python 3.13 in the full
+    test suite).  A stale entry is evicted on mismatch.
+    """
+    ratio = _cjk_ratio_cache.get(id(text))
+    if ratio is None:
+        return None
+    cached_text = _cjk_ratio_cache_refs.get(id(text))
+    if cached_text is not text:
+        _cjk_ratio_cache.pop(id(text), None)
+        _cjk_ratio_cache_refs.pop(id(text), None)
+        return None
+    return ratio
 
 
 def _cjk_ratio_cache_put(text: str, ratio: float) -> None:
@@ -52,14 +67,17 @@ def _cjk_ratio_cache_put(text: str, ratio: float) -> None:
         try:
             oldest_key = next(iter(_cjk_ratio_cache))
             _cjk_ratio_cache.pop(oldest_key, None)
+            _cjk_ratio_cache_refs.pop(oldest_key, None)
         except StopIteration:
             pass
     _cjk_ratio_cache[id(text)] = ratio
+    _cjk_ratio_cache_refs[id(text)] = text
 
 
 def reset_cjk_ratio_cache() -> None:
     """Chapter 切换时清空 cjk_ratio 缓存. 由 TranslationPipeline._reset_per_run_cache 调用."""
     _cjk_ratio_cache.clear()
+    _cjk_ratio_cache_refs.clear()
 
 
 def _normalize_category(category: str) -> str:

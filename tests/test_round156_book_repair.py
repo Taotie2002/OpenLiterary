@@ -304,7 +304,7 @@ class TestParagraphCoverageRepair:
 class TestCanonicalSurfaceRepair:
     def test_restores_profile_backed_aliases(self):
         text = (
-            "他们抵达厄拉科斯，看到厄拉科斯的风暴。"
+            "他们抵达阿拉基斯，看到阿拉基斯的风暴。"
             "贝尼杰瑟里特姐妹会派出使者，贝尼杰瑟里特体系继续运转。"
             "沙杜特梅普斯前来报告。"
             "费德-劳萨、菲德-劳萨和费德-？劳萨都在场。"
@@ -317,13 +317,13 @@ class TestCanonicalSurfaceRepair:
 
         repaired, changes = _br_plan_canonical_aliases(text, source=source)
 
-        assert "厄拉科斯" not in repaired
+        assert "阿拉基斯" not in repaired
         assert "贝尼杰瑟里特" not in repaired
         assert "沙杜特梅普斯" not in repaired
         assert "费德-劳萨" not in repaired
         assert "菲德-劳萨" not in repaired
         assert "费德-？劳萨" not in repaired
-        assert repaired.count("阿拉基斯") == 2
+        assert repaired.count("厄拉科斯") == 2
         assert repaired.count("贝尼·杰瑟里特") == 2
         assert repaired.count("沙杜特·梅普斯") == 1
         assert repaired.count("菲德-罗萨") == 3
@@ -334,7 +334,7 @@ class TestCanonicalSurfaceRepair:
         assert all(change["evidence"]["source_supported"] for change in changes)
 
     def test_skips_alias_without_source_term_evidence(self):
-        text = "他们抵达厄拉科斯。贝尼杰瑟里特姐妹会派出使者。"
+        text = "他们抵达阿拉基斯。贝尼杰瑟里特姐妹会派出使者。"
         source = "An unrelated English paragraph mentions no proper nouns."
 
         repaired, changes = _br_plan_canonical_aliases(text, source=source)
@@ -343,21 +343,21 @@ class TestCanonicalSurfaceRepair:
         assert changes == []
 
     def test_source_gate_is_evaluated_per_alias(self):
-        text = "他们抵达厄拉科斯。贝尼杰瑟里特姐妹会派出使者。"
+        text = "他们抵达阿拉基斯。贝尼杰瑟里特姐妹会派出使者。"
         source = "They reached Arrakis after a long journey."
 
         repaired, changes = _br_plan_canonical_aliases(text, source=source)
 
-        assert "阿拉基斯" in repaired
+        assert "厄拉科斯" in repaired
         assert "贝尼杰瑟里特" in repaired
         assert "贝尼·杰瑟里特" not in repaired
         assert len(changes) == 1
-        assert changes[0]["from"] == "厄拉科斯"
+        assert changes[0]["from"] == "阿拉基斯"
         assert changes[0]["evidence"]["source_supported"] is True
 
     def test_canonical_alias_restore_is_idempotent(self):
         repaired, _changes = _br_plan_canonical_aliases(
-            "厄拉科斯与贝尼杰瑟里特", source="Arrakis and Bene Gesserit")
+            "阿拉基斯与贝尼杰瑟里特", source="Arrakis and Bene Gesserit")
         again, changes = _br_plan_canonical_aliases(
             repaired, source="Arrakis and Bene Gesserit")
         assert again == repaired

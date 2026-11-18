@@ -6,6 +6,7 @@ SagaTrans 任务状态机（TaskState + TaskScheduler）
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 import threading
@@ -574,6 +575,140 @@ class TaskScheduler:
         return {"dirty": dirty + pf_requeued, "over_cap": over_cap,
                 "skipped_state": skipped_state, "pf_requeued": pf_requeued,
                 "pf_over_cap": pf_over_cap}
+
+    def complete_name_only(
+        self,
+        chunk_id: str,
+        *,
+        final_path: str | Path,
+        critic_report_path: str | Path,
+        evidence_path: str | Path,
+        final_sha256: Optional[str] = None,
+    ) -> Dict[str, bool | str]:
+        """Controlled ``DIRTY -> COMPLETED`` for a verified name-only repair.
+
+        This deliberately does not add ``DIRTY -> COMPLETED`` to the global
+        transition table.  The caller must provide all three persisted pieces
+        of evidence, and this method CAS-checks the task state while preserving
+        ``backtrack_rounds`` (a deterministic repair is not another retry).
+        """
+        final_p = Path(final_path)
+        report_p = Path(critic_report_path)
+        evidence_p = Path(evidence_path)
+
+        def _read(path: Path) -> Optional[Dict]:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return None
+            return data if isinstance(data, dict) else None
+
+        def _sha_text(text: str) -> str:
+            return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+        def _sha_file(path: Path) -> str:
+            h = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for block in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(block)
+            return h.hexdigest()
+
+        final = _read(final_p)
+        report = _read(report_p)
+        evidence = _read(evidence_p)
+        if not final or not isinstance(final.get("text"), str):
+            return {"ok": False, "reason": "final_missing_or_unreadable"}
+        current_final_sha = _sha_text(final["text"])
+        if final_sha256 and str(final_sha256) != current_final_sha:
+            return {"ok": False, "reason": "final_sha256_mismatch"}
+        if not report:
+            return {"ok": False, "reason": "critic_report_missing_or_unreadable"}
+        if not evidence:
+            return {"ok": False, "reason": "name_only_evidence_missing_or_unreadable"}
+
+        expected = {
+            "schema_version": 1,
+            "chunk_id": str(chunk_id),
+            "status": "verified_for_completion",
+            "final_sha256_after": current_final_sha,
+            "critic_final_sha256": current_final_sha,
+            "critic_report_sha256": _sha_file(report_p),
+            "pending_checked": True,
+        }
+        for key, value in expected.items():
+            if evidence.get(key) != value:
+                return {"ok": False, "reason": f"evidence_mismatch:{key}"}
+
+        try:
+            from src.recalibrate import critic_evidence_state
+            proof = critic_evidence_state(
+                report, final_p, project_root=final_p.parent.parent.parent)
+        except Exception as exc:  # noqa: BLE001 - fail closed on verifier failure
+            return {"ok": False, "reason": f"critic_binding_check_failed:{exc}"}
+        if proof.get("status") != "exact":
+            return {"ok": False, "reason": "critic_binding_" + str(proof.get("status"))}
+
+        gate_cfg = getattr(_config, "pipeline", {}) or {}
+        gate_cfg = gate_cfg.get("final_gate", {}) or {}
+        calibrated = gate_cfg.get("calibrated_backends") or ["jev"]
+        if isinstance(calibrated, str):
+            calibrated = [calibrated]
+        backend = str(report.get("_backend_path") or "")
+        if backend not in {str(x) for x in calibrated}:
+            return {"ok": False, "reason": f"critic_backend_uncalibrated:{backend}"}
+        if not isinstance(report.get("scores"), dict) or not report.get("scores"):
+            return {"ok": False, "reason": "critic_scores_missing"}
+
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT state, rescue_stage FROM chunk_tasks WHERE chunk_id = ?",
+            (chunk_id,))
+        row = cursor.fetchone()
+        if not row:
+            return {"ok": False, "reason": "chunk_missing"}
+        if row[0] != TaskState.DIRTY.value:
+            return {"ok": False, "reason": f"state_not_dirty:{row[0]}"}
+        if row[1]:
+            return {"ok": False, "reason": "rescue_stage_present"}
+        cursor.execute(
+            "UPDATE chunk_tasks SET state = ?, last_error = NULL, "
+            "updated_at = CURRENT_TIMESTAMP "
+            "WHERE chunk_id = ? AND state = ? AND rescue_stage IS NULL",
+            (TaskState.COMPLETED.value, chunk_id, TaskState.DIRTY.value))
+        if cursor.rowcount != 1:
+            self.conn.rollback()
+            return {"ok": False, "reason": "state_cas_failed"}
+        self.conn.commit()
+        return {"ok": True, "reason": "completed_name_only",
+                "final_sha256": current_final_sha}
+
+    def reopen_name_only(self, chunk_id: str) -> Dict[str, bool | str]:
+        """Compensate a name-only completion after a cross-DB commit failure.
+
+        This is not a general ``COMPLETED -> DIRTY`` transition.  It exists only
+        to undo ``complete_name_only`` when the Decision DB side could not be
+        committed, and it deliberately does not consume backtrack budget.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT state, rescue_stage FROM chunk_tasks WHERE chunk_id = ?",
+            (chunk_id,))
+        row = cursor.fetchone()
+        if not row:
+            return {"ok": False, "reason": "chunk_missing"}
+        if row[0] != TaskState.COMPLETED.value:
+            return {"ok": False, "reason": f"state_not_completed:{row[0]}"}
+        if row[1]:
+            return {"ok": False, "reason": "rescue_stage_present"}
+        cursor.execute(
+            "UPDATE chunk_tasks SET state = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE chunk_id = ? AND state = ? AND rescue_stage IS NULL",
+            (TaskState.DIRTY.value, chunk_id, TaskState.COMPLETED.value))
+        if cursor.rowcount != 1:
+            self.conn.rollback()
+            return {"ok": False, "reason": "state_cas_failed"}
+        self.conn.commit()
+        return {"ok": True, "reason": "reopened_after_decision_commit_failure"}
 
     def requeue_permanently_failed(self, chapter_id: str,
                                    chunk_ids: Optional[List[str]] = None,

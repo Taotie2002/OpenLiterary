@@ -23,7 +23,6 @@ from bisect import bisect_right
 import hashlib
 import json
 import re
-import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -34,6 +33,11 @@ from src.judgment_layer import (
     atomic_write_json,
     chapter_ids_between,
     sha256_text,
+)
+from src.artifact_freshness import (
+    profile_notes_hash,
+    registry_rows,
+    rows_fingerprint,
 )
 
 GRAPH_VERSION = 5
@@ -90,38 +94,8 @@ def _load_json_list(raw: Any) -> List[str]:
     return [s]
 
 
-def _rows_fingerprint(rows: Sequence[Dict[str, Any]]) -> str:
-    """Content hash of the rows the graph actually consumed.
-
-    The database path alone is not a version: new entities can be added to the
-    same file, and a rebuilt graph must change its fingerprint when that
-    happens.  Hashing the selected registry rows keeps the check stable across
-    unrelated SQLite metadata/page changes.
-    """
-    canonical = json.dumps(list(rows or []), ensure_ascii=False,
-                           sort_keys=True, default=str, separators=(",", ":"))
-    return sha256_text(canonical)
-
-
-def _registry_rows(db_path: Path) -> List[Dict[str, Any]]:
-    if not Path(db_path).exists():
-        return []
-    con = sqlite3.connect(str(db_path))
-    con.row_factory = sqlite3.Row
-    try:
-        cols = {r[1] for r in con.execute("PRAGMA table_info(entity_registry)")}
-        if not cols:
-            return []
-        wanted = ["id", "canonical_name", "source_names", "variant_names", "entity_type",
-                  "pronoun_gender", "confidence", "pending_review", "translation_strategy",
-                  "first_seen_chunk", "quarantined_names"]
-        select = ", ".join(c for c in wanted if c in cols)
-        rows = con.execute(f"SELECT {select} FROM entity_registry ORDER BY id").fetchall()
-        return [dict(r) for r in rows]
-    except sqlite3.Error:
-        return []
-    finally:
-        con.close()
+_rows_fingerprint = rows_fingerprint
+_registry_rows = registry_rows
 
 
 def _entity_aliases(row: Dict[str, Any], canonical_names=(),
@@ -1024,11 +998,9 @@ def build_story_graph(
     ]
     fingerprint_inputs = {
         "chapters": {cid: sha256_text(t) for cid, t in sorted(texts.items())},
-        "decision_db": str(dbp),
         "decision_db_hash": _rows_fingerprint(rows),
         "entity_registry_rows": len(rows),
-        "profile_notes_hash": sha256_text(json.dumps(profile_notes, ensure_ascii=False,
-                                                     sort_keys=True)),
+        "profile_notes_hash": profile_notes_hash(profile),
     }
     fingerprint_params = {
         "cooccur_window": cooccur_window,

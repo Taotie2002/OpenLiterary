@@ -18,6 +18,10 @@ from src.config import config as _config
 from src.utils.llm_adapter import robust_json_loads
 
 
+_ARTICLE_PREFIX_RE = re.compile(
+    r"^(?:the|a|an)\s+(?P<rest>\S.*)$", re.IGNORECASE)
+
+
 class DecisionLevel(IntEnum):
     """决策等级"""
     TERMINOLOGY = 1  # 术语级，全局必须一致
@@ -32,6 +36,119 @@ class DecisionLevel(IntEnum):
 # ────────────────────────────────────────────────────────────────────
 
 class DecisionEngine:
+    _EN_SOURCE_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+    _EN_SOURCE_JOINER_RE = re.compile(r"[\s'’‘\-‐‑‒–—]+")
+
+    @classmethod
+    def _decision_source_case_sensitive(cls, source: str) -> bool:
+        """True for article-led titles with a capitalised content token."""
+        raw_tokens = cls._EN_SOURCE_TOKEN_RE.findall(source)
+        return bool(
+            len(raw_tokens) > 1
+            and raw_tokens[0].casefold() in {"the", "a", "an"}
+            and any(any(ch.isupper() for ch in token)
+                    for token in raw_tokens[1:])
+        )
+
+    @classmethod
+    def _decision_source_hit(cls, source: str, text: str) -> bool:
+        """Return whether a Decision source key is present in a chunk.
+
+        Article-led titles with a capitalised content token (``the One``,
+        ``the Voice``) are case-sensitive.  Otherwise the ordinary lowercase
+        phrase ``the one to tell you`` would receive the messianic Decision
+        target and corrupt otherwise-unrelated prose.  Such case-sensitive
+        keys are also excluded from the non-hit filler pool below.  Generic
+        source keys retain the legacy case-insensitive/loose matching.
+        """
+        if not source or not text:
+            return False
+        raw_tokens = cls._EN_SOURCE_TOKEN_RE.findall(source)
+        if cls._decision_source_case_sensitive(source):
+            # The article itself is normally lower-case in the stored key
+            # (``the Duke``), but at the start of an English sentence it is
+            # capitalised (``The Duke must know...``).  Only the content
+            # token is case-significant; requiring a lower-case ``the`` made
+            # every legitimate sentence-initial use look like a false
+            # positive.  This was especially damaging to version merit: a
+            # correct draft could accrue a bogus authority violation merely
+            # because a title began a sentence.
+            first = raw_tokens[0]
+            first_pattern = re.escape(first)
+            if len(first) > 1 and first[0].isalpha():
+                first_pattern = f"[{first[0].upper()}{first[0].lower()}]{re.escape(first[1:])}"
+            body = cls._EN_SOURCE_JOINER_RE.pattern.join(
+                [first_pattern] + [re.escape(token) for token in raw_tokens[1:]])
+            return re.search(
+                r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])",
+                text,
+            ) is not None
+        if len(raw_tokens) > 1:
+            # Source keys are stored from a normalised extraction pass, but
+            # the original chapter files contain hard line wraps inside
+            # phrases such as ``Judge of the\\nChange``.  A literal substring
+            # check misses those legal wraps, which in turn hides a locked
+            # Decision from the prompt and from version-merit authority checks.
+            body = cls._EN_SOURCE_JOINER_RE.pattern.join(
+                re.escape(token) for token in raw_tokens)
+            if re.search(
+                    r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])",
+                    text, re.IGNORECASE):
+                return True
+        return bool(
+            source in text
+            or (len(source) >= 3 and source.lower() in text.lower()))
+
+    @classmethod
+    def _soft_reference_source(cls, source: str, reason: str = "") -> bool:
+        """Return True for lower-case generic literary references.
+
+        A lower-case common phrase such as ``shadows`` or ``cells`` can carry
+        useful imagery, but it is not a book-wide term with one mandatory
+        surface form.  Treating it as a hard Decision made every completed
+        chunk containing the word DIRTY solely because it used a natural
+        synonym (``阴影`` instead of ``暗影``).  Quoted allusions and proper /
+        capitalised titles remain hard references.  A literal translation and
+        a culturally equivalent metaphor (``clods`` -> ``泥腿子`` vs a
+        contextually natural ``土疙瘩``) are both advisory when no explicit
+        term authority exists.
+        """
+        raw = str(source or "").strip()
+        if not raw:
+            return False
+        # Only an explicitly generic extraction may be soft.
+        # Programmatic authority repairs without a strategy annotation keep
+        # the legacy hard behaviour (and terminology strategies such as
+        # RETAIN_AND_ANNOTATE always do).
+        reason_text = str(reason or "")
+        if "【策略】" not in reason_text:
+            return False
+        if any(tag in reason_text.upper() for tag in
+               ("RETAIN_AND_ANNOTATE", "TRANSLITERATION", "TERMINOLOGY")):
+            return False
+        strategy = reason_text.upper()
+        if not any(tag in strategy for tag in
+                   ("LITERAL_TRANSLATION", "CULTURAL_EQUIVALENT")):
+            return False
+        if re.search(r"[“”\"‘’]", raw):
+            return False
+        tokens = cls._EN_SOURCE_TOKEN_RE.findall(raw)
+        if not tokens:
+            return False
+        return not any(token and token[0].isupper() for token in tokens)
+
+    @staticmethod
+    def _decision_target_core(value: str) -> str:
+        """Return the executable name/phrase from a Decision translation."""
+        raw = str(value or "").strip()
+        instructed = re.findall(
+            r"(?:首次写作|此后统一|统一为|统一)[^“]*“([^”]+)”", raw)
+        if instructed:
+            raw = instructed[-1].strip()
+        raw = raw.strip("《》“”\"'‘’「」『』").strip()
+        core = re.sub(r"[（(][^（()）]*[）)]", "", raw).strip()
+        return core or raw
+
     def __init__(self, db_path="db/decision_db.sqlite", scheduler_factory: Optional[Callable] = None):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -171,10 +288,22 @@ class DecisionEngine:
         except Exception as e:
             print(f"  ⚠️ 登记实体异体失败 ({canonical}<-{variant}): {e}", file=sys.stderr)
 
-    def add_decision(self, level: DecisionLevel, source: str, translation: str, reason: str, affected_chunks: List[str] = None):
+    def add_decision(
+        self,
+        level: DecisionLevel,
+        source: str,
+        translation: str,
+        reason: str,
+        affected_chunks: List[str] = None,
+        *,
+        allow_revision: bool = False,
+    ):
         """插入或更新决策，并记录影响的 chunk。
 
         幂等：同一 source_key 且 translation 未变时不触发 backtrack。
+        稳定：既有非空译文默认拒绝被覆盖。Reference Agent 等 chunk-local
+        提议只能新增 Decision，不能静默改写全书权威；真正的权威修正须由
+        显式审计路径传 allow_revision=True（或直接走 CAS 修复工具）。
         STYLE 默认不回溯（见 style_triggers_backtrack）；即使开启也不得依赖「当前 JUDGING chunk」。
 
         Round 130: backtrack_mode=deferred（默认）时，变更不再即时标记 DIRTY，
@@ -188,8 +317,48 @@ class DecisionEngine:
                 (source,),
             )
             existing = cursor.fetchone()
+
+            # Round 158: ``the Lady Jessica`` must not become a second authority
+            # alongside ``Lady Jessica``.  Only an exact, case-sensitive match
+            # after removing the leading article qualifies; ``the one`` and
+            # ``the One`` therefore remain distinct.
+            article_alias = None
+            article_match = _ARTICLE_PREFIX_RE.match(str(source))
+            if not existing and article_match:
+                cursor.execute(
+                    'SELECT id, translation, locked FROM decision_db '
+                    'WHERE source_key = ?',
+                    (article_match.group("rest"),),
+                )
+                article_alias = cursor.fetchone()
+
+            if article_alias:
+                alias_id = int(article_alias[0])
+                alias_translation = str(article_alias[1] or "")
+                if affected_chunks:
+                    cursor.executemany(
+                        'INSERT OR IGNORE INTO decision_impact '
+                        '(decision_id, chunk_id) VALUES (?, ?)',
+                        [(alias_id, cid) for cid in affected_chunks],
+                    )
+                    self.conn.commit()
+                accepted = alias_translation == translation
+                if accepted:
+                    print(
+                        f"🔗 [Decision Alias] {source}: 归并到既有 "
+                        f"source_key={article_match.group('rest')!r}"
+                    )
+                else:
+                    print(
+                        f"🛡️ [Decision Alias] {source}: 保留既有 "
+                        f"source_key={article_match.group('rest')!r} 译文"
+                        f"「{alias_translation}」，忽略新提议「{translation}」"
+                    )
+                return accepted
+
+            existing_translation = str(existing[1] or "") if existing else ""
             translation_unchanged = bool(
-                existing and existing[1] == translation
+                existing and existing_translation == translation
             )
 
             # Round 121 锁定决策：拒绝覆盖性变更，保住跨章一致译名
@@ -199,7 +368,20 @@ class DecisionEngine:
                     f"🔒 [Decision Lock] {source}: 保留锁定译文「{existing[1]}」，"
                     f"忽略新译文「{translation}」（不触发回溯）"
                 )
-                return
+                return False
+
+            # Round 158: a per-chunk proposal is not a book-wide authority.
+            # Without an explicit revision contract, preserve the first
+            # established translation so one chunk cannot oscillate a
+            # Decision and repeatedly requeue completed chunks.
+            if (existing and existing_translation and not translation_unchanged
+                    and not allow_revision):
+                print(
+                    f"🛡️ [Decision Stability] {source}: 保留既有译文"
+                    f"「{existing_translation}」，忽略块内新提议「{translation}」"
+                    "（未显式授权修订，不触发回溯）"
+                )
+                return False
 
             # 原子化 UPSERT：INSERT ... ON CONFLICT DO UPDATE
             cursor.execute('''
@@ -233,7 +415,7 @@ class DecisionEngine:
 
             if translation_unchanged:
                 print(f"  ℹ️ 决策未变更 (source_key={source})，跳过回溯")
-                return
+                return True
 
             # 触发回溯：必须在 commit 之后调用，避免跨库事务不一致
             de_cfg = _config.decision_engine
@@ -246,6 +428,31 @@ class DecisionEngine:
                 # 默认 False：风格规则只累积进后续 prompt，不重跑已完成 chunk
                 should_backtrack = True
 
+            # Round 158: 语境称谓不是全书唯一译名。``Sire/my Lord`` 在不同句式里
+            # 合法对应「陛下/大人/老爷」等多种形态；把其中一次抽取当成硬决策
+            # 会让几十个已完成块无差别回溯（Dune ch03 实锤 32 块）。这类决策
+            # 仍写入 Decision DB 供后续 prompt 继承，但默认不触发历史块重译。
+            if should_backtrack and not bool(
+                    de_cfg.get("contextual_terms_trigger_backtrack", False)):
+                source_class = classify_entity_source_name(source)
+                if source_class in {"title", "relation"} or canonical_is_title_only(translation):
+                    should_backtrack = False
+                    print(
+                        f"  ℹ️ 语境称谓 (source_class={source_class})："
+                        f"{source} -> {translation} 仅记录，不触发历史块回溯"
+                    )
+
+            # Round 158: lower-case generic metaphors are advisory, not hard
+            # terminology.  Keep them in Decision DB for context, but never
+            # requeue completed prose just because it used a natural synonym.
+            if (should_backtrack and level == DecisionLevel.REFERENCE
+                    and self._soft_reference_source(source, reason)):
+                should_backtrack = False
+                print(
+                    f"  ℹ️ 软典故 (generic reference)：{source} -> {translation} "
+                    "仅记录语义倾向，不触发历史块回溯"
+                )
+
             if should_backtrack and affected_chunks and decision_id:
                 # 截断受影响 chunk 数量，避免单次决策雪崩式重译
                 max_affected = int(de_cfg.get("max_affected_chunks_per_decision", 50) or 50)
@@ -256,14 +463,72 @@ class DecisionEngine:
                         f"截断为 max_affected_chunks_per_decision={max_affected}"
                     )
                     chunks_to_dirty = sorted(chunks_to_dirty)[:max_affected]
+                # Round 158: a Decision is an authority statement, not an
+                # instruction to re-translate chunks that already obey it.
+                # Newly extracted terms such as ``the Imperium -> 帝国`` used
+                # to enqueue every chunk containing the source word even when
+                # every final already said 帝国.  Filter on the actual final
+                # prose before touching workflow state.
+                satisfied = [cid for cid in chunks_to_dirty
+                             if self._chunk_final_satisfies(chunk_id=cid,
+                                                            translation=translation)]
+                if satisfied:
+                    satisfied_set = set(satisfied)
+                    chunks_to_dirty = [cid for cid in chunks_to_dirty
+                                       if cid not in satisfied_set]
+                    print(
+                        f"  🧾 回溯核销 {len(satisfied)} 个已满足块"
+                        f"（{source} -> {translation}）"
+                    )
+                if not chunks_to_dirty:
+                    return True
                 backtrack_mode = str(de_cfg.get("backtrack_mode", "deferred") or "deferred").lower()
                 if backtrack_mode == "immediate":
                     self._trigger_backtrack(chunks_to_dirty)
                 else:
                     self._queue_backtrack(chunks_to_dirty, decision_id, source)
+            return True
         except Exception as e:
             print(f"❌ 决策写入失败: {e}")
             raise
+
+    def _chunk_final_satisfies(self, chunk_id: str, translation: str) -> bool:
+        """Return whether a completed chunk's prose already contains the target.
+
+        Missing / malformed final files deliberately return False: an
+        incomplete artifact still needs the normal pipeline, while a valid
+        final that already uses the authorised target must not be dirtied.
+        Footnote definitions are ignored so an explanatory note cannot stand
+        in for the translated prose itself.
+        """
+        target = self._decision_target_core(translation)
+        if not target:
+            return False
+        chunk_id = str(chunk_id or "")
+        if "_chunk" not in chunk_id:
+            return False
+        chapter = chunk_id.split("_chunk", 1)[0]
+        path = (self.db_path.parent.parent / "output" / chapter /
+                f"{chunk_id}_final.json")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        body = str(payload.get("text") or "")
+        cuts = []
+        for pattern in (
+            re.compile(r"(?m)^\[\^[^\]]+\]:"),
+            re.compile(r"(?ms)^[ \t]*---[ \t]*\r?\n(?:[ \t]*\r?\n)*"
+                       r"[ \t]*\[\d+\][ \t]+"),
+        ):
+            match = pattern.search(body)
+            if match:
+                cuts.append(match.start())
+        if cuts:
+            body = body[:min(cuts)]
+        return bool(target and target in body)
 
     def _trigger_backtrack(self, chunk_ids: List[str]):
         """触发回溯：通过工厂函数获取 scheduler 并标记 DIRTY"""
@@ -365,7 +630,10 @@ class DecisionEngine:
         src_lower = src.lower()
 
         cursor = self.conn.cursor()
-        cursor.execute("SELECT level, source_key, translation FROM decision_db ORDER BY level ASC, id DESC")
+        cursor.execute(
+            "SELECT level, source_key, translation, COALESCE(reason, '') "
+            "FROM decision_db ORDER BY level ASC, id DESC"
+        )
         rows = cursor.fetchall()
 
         terms: List[str] = []
@@ -376,11 +644,26 @@ class DecisionEngine:
         ref_hits, ref_rest = [], []
         style_all = []
 
-        for level, source, trans in rows:
+        for level, source, trans, reason in rows:
             line_t = f"- 术语: '{source}' -> 必须译为 '{trans}'"
             line_r = f"- 典故: '{source}' -> 必须译为 '{trans}' (若策略为保留并加注，请生成脚注)"
             line_s = f"- 风格: {trans}"
-            hit = bool(source) and (source in src or (len(source) >= 3 and source.lower() in src_lower))
+            source_text_key = str(source or "")
+            hit = self._decision_source_hit(source_text_key, src)
+            if self._decision_source_case_sensitive(source_text_key) and not hit:
+                continue
+            # A lower-case generic metaphor is context, not a mandatory
+            # surface form.  Keep it out of the hard "must translate as"
+            # section; otherwise future chunks are instructed to replace
+            # natural synonyms with the same noun everywhere.
+            if (level == DecisionLevel.REFERENCE.value
+                    and self._soft_reference_source(source_text_key, reason)):
+                if hit:
+                    style_all.append(
+                        f"- 风格: 原文“{source}”可带隐喻色彩；仅在语境确实作隐喻时"
+                        f"自然体现“{trans}”的意象，普通用法按语境处理，不得机械替换"
+                    )
+                continue
             if level == DecisionLevel.TERMINOLOGY.value:
                 (term_hits if hit else term_rest).append(line_t)
             elif level == DecisionLevel.REFERENCE.value:
@@ -953,7 +1236,10 @@ def apply_name_unification(text: str, maps: Dict[str, Any]) -> Tuple[str, Dict[s
 
     返回 (new_text, stats)。stats 含各规则替换计数 + 示例，供报告/审计。
     """
-    stats: Dict[str, Any] = {"sep_restore": 0, "forms": 0, "tokens": 0, "examples": []}
+    stats: Dict[str, Any] = {
+        "sep_restore": 0, "forms": 0, "tokens": 0,
+        "examples": [], "targets": [],
+    }
     if not text or not maps:
         return text, stats
 
@@ -961,6 +1247,8 @@ def apply_name_unification(text: str, maps: Dict[str, Any]) -> Tuple[str, Dict[s
         if n <= 0:
             return
         stats[rule] += n
+        if after and after not in stats["targets"]:
+            stats["targets"].append(after)
         if len(stats["examples"]) < 12:
             stats["examples"].append(f"{before}→{after}" + (f"×{n}" if n > 1 else ""))
 
@@ -1075,6 +1363,20 @@ _EN_ROLE_WORDS = frozenset({
     "governor", "president", "minister", "chancellor", "ambassador",
     "consul", "senator", "steward", "warden", "champion", "knight",
     "judge", "justice", "truthsayer",
+})
+
+# English group/category terms that make a source phrase a distinct term rather
+# than an alias of the shorter entity name.  ``Bene Gesserit school`` and
+# ``Bene Gesserit Plan`` are different referents from ``Bene Gesserit``; a
+# surname appended to a personal name (``Feyd-Rautha Harkonnen``) is not.
+_EN_GROUP_TERM_WORDS = frozenset({
+    "army", "bank", "book", "books", "bureau", "church", "company", "corps",
+    "corporation", "council", "court", "department", "duchy", "empire",
+    "family", "fleet", "force", "forces", "genetic", "guard", "guild",
+    "house", "household", "houses", "imperial", "kingdom", "law", "legion",
+    "manual", "marker", "mercenaries", "mercenary", "ministry", "order",
+    "plan", "power", "prophecy", "school", "saying", "sayings", "song",
+    "songs", "suit", "totality", "troop", "troops", "way",
 })
 
 # Round 144: 普通/描述性词汇。即使首字母大写，也不应当作硬专名证据。
@@ -2466,6 +2768,71 @@ def sanitize_entity_registry_variants(conn, dry_run: bool = True) -> Dict[str, A
     }
 
 
+def _term_compare_key(name) -> str:
+    raw = str(name or "").casefold().replace("’", "'").replace("‘", "'")
+    return re.sub(r"[\s" + re.escape(_NAME_SEP_CHARS) + r"]+", "", raw).strip()
+
+
+def _decision_translation_authority_keys(conn) -> set:
+    """Return folded Decision DB translations for deterministic winner choice."""
+    try:
+        rows = conn.execute(
+            "SELECT translation FROM decision_db "
+            "WHERE translation IS NOT NULL AND translation != ''")
+    except Exception:
+        return set()
+    return {
+        key for (translation,) in rows
+        for key in (_term_compare_key(translation),)
+        if key
+    }
+
+
+def _decision_term_phrase_translation_pairs(conn) -> List[Tuple[str, str]]:
+    """Return (base translation key, term translation key) pairs from decisions.
+
+    The Decision DB is the hard terminology source.  If a source phrase is a
+    strict extension of a shorter source with a generic group term
+    (``school``/``plan``/``way`` …), its translation denotes a different term,
+    not an alias spelling of the shorter entity.  These pairs tell the registry
+    merger not to collapse the two canonicals and re-create a dangerous
+    replace mapping that deletes the category word.
+    """
+    try:
+        if not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='decision_db'").fetchone():
+            return []
+        rows = [
+            (str(source or ""), str(translation or ""))
+            for source, translation in conn.execute(
+                "SELECT source_key, translation FROM decision_db "
+                "WHERE source_key IS NOT NULL AND source_key != '' "
+                "AND translation IS NOT NULL AND translation != ''")
+        ]
+    except Exception:
+        return []
+
+    parsed = []
+    for source, translation in rows:
+        normalized = source_name_normalized(source)
+        key = _term_compare_key(translation)
+        if normalized and key:
+            parsed.append((normalized, set(normalized.split()), key, translation))
+
+    pairs = set()
+    for term_norm, term_tokens, term_key, _term_translation in parsed:
+        for base_norm, base_tokens, base_key, _base_translation in parsed:
+            if base_norm == term_norm or base_norm not in term_norm:
+                continue
+            extra = term_tokens - base_tokens
+            if not extra.intersection(_EN_GROUP_TERM_WORDS):
+                continue
+            if base_key and term_key and base_key != term_key:
+                pairs.add((base_key, term_key))
+    return sorted(pairs)
+
+
 def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
     """Round 134: 同人多规范名归一（通用版，取代 Round 105 原型）。
 
@@ -2541,6 +2908,8 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
         }
         order.append(canon)
 
+    term_pairs = _decision_term_phrase_translation_pairs(conn)
+    authority_keys = _decision_translation_authority_keys(conn)
     parent = {c: c for c in order}
 
     def find(x):
@@ -2557,6 +2926,19 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
     def _type_conflict(a, b):
         ta, tb = meta[a]["etype"], meta[b]["etype"]
         return bool(ta and tb and ta != tb)
+
+    def _term_phrase_conflict(a, b):
+        ka, kb = _term_compare_key(a), _term_compare_key(b)
+        if not ka or not kb:
+            return False
+        for base_key, term_key in term_pairs:
+            if ka == base_key:
+                if kb == term_key or name_char_similarity(kb, term_key) >= 0.78:
+                    return True
+            if kb == base_key:
+                if ka == term_key or name_char_similarity(ka, term_key) >= 0.78:
+                    return True
+        return False
 
     def _drift_equivalent(a, b):
         ma, mb = meta[a], meta[b]
@@ -2577,7 +2959,8 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
     for i in range(len(order)):
         for j in range(i + 1, len(order)):
             a, b = order[i], order[j]
-            if find(a) == find(b) or _type_conflict(a, b):
+            if (find(a) == find(b) or _type_conflict(a, b)
+                    or _term_phrase_conflict(a, b)):
                 continue
             # Round 144: 共享一个 source_name 不再足以证明同人。必须先过
             # canonical 身份 token 交集（去掉头衔后的名字部分），防止
@@ -2629,6 +3012,7 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
             # 污染出来的“高别名数 hub”会比干净 canonical 更容易当 winner。
             return (
                 1 if m["title_only"] else 0,
+                0 if _term_compare_key(c) in authority_keys else 1,
                 _CONF_ORDER.get(m["confidence"], 3),
                 -len(m["proper_src"]),
                 0 if "·" in c else 1,

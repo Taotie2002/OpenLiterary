@@ -51,7 +51,8 @@ import sqlite3
 import psutil
 import requests
 import threading
-from collections import Counter, OrderedDict
+import shutil
+from collections import Counter, OrderedDict, defaultdict
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Callable
@@ -422,6 +423,17 @@ class QuotaExhaustedError(RuntimeError):
 
 
 
+class UpstreamUnavailableError(RuntimeError):
+    """A provider repeatedly returned 5xx or could not be reached.
+
+    Unlike a content-specific client error, this says nothing about the prompt's
+    quality.  The role-level fallback wrapper may therefore move subsequent
+    calls to a configured backup provider instead of burning the whole chapter
+    on the same broken upstream route.
+    """
+
+
+
 class ContentSensitiveError(RuntimeError):
     """Round 148: 上游内容审核拒绝（HTTP 422，典型为 input new_sensitive）。
 
@@ -714,6 +726,7 @@ class OpenAICompatibleAdapter(LLMAdapter):
                 time.sleep(limiter["interval"] - elapsed)
             limiter["last"] = time.time()
         last_error = None
+        upstream_unavailable = False
         for attempt in range(self.max_retries):
             try:
                 response = self._requests.post(
@@ -812,11 +825,15 @@ class OpenAICompatibleAdapter(LLMAdapter):
                 raise
             except Exception as e:
                 last_error = e
+                upstream_unavailable = _is_upstream_unavailable_error(e)
                 if attempt < self.max_retries - 1:
                     wait_time = self.retry_delay * (2 ** attempt) + random.uniform(0, 1)
                     print(f"⚠️ API 调用失败 (尝试 {attempt + 1}/{self.max_retries}): {e}, {wait_time:.1f}s 后重试...")
                     time.sleep(wait_time)
 
+        if upstream_unavailable:
+            raise UpstreamUnavailableError(
+                f"上游服务连续不可用，已重试 {self.max_retries} 次: {last_error}")
         raise RuntimeError(f"API 调用失败，已重试 {self.max_retries} 次: {last_error}")
 
     def unload_model(self):
@@ -873,12 +890,15 @@ class FallbackRoleAdapter(LLMAdapter):
                 )
                 self._sync_audit(self._primary)
                 return out
-            except QuotaExhaustedError as e:
+            except (QuotaExhaustedError, UpstreamUnavailableError) as e:
                 self._degraded = True
+                reason = ("配额/限流耗尽"
+                          if isinstance(e, QuotaExhaustedError)
+                          else "上游服务持续不可用")
                 print(
-                    f"⛔ [Quota Fallback] {self._primary_model_name} 配额/限流耗尽 → "
+                    f"⛔ [Role Fallback] {self._primary_model_name} {reason} → "
                     f"永久降级到 {self._fallback_model_name}（role={self._fallback_role}；"
-                    f"配额重置后重启进程恢复主力） | {e}",
+                    f"恢复后重启进程回到主力） | {e}",
                     file=sys.stderr, flush=True,
                 )
         kwargs = dict(kwargs)
@@ -905,6 +925,20 @@ class FallbackRoleAdapter(LLMAdapter):
         finally:
             self._fallback.unload_model()
 
+
+
+def _is_upstream_unavailable_error(exc: BaseException) -> bool:
+    """Return True only for transport failures and persistent 5xx responses."""
+    if not isinstance(exc, requests.RequestException):
+        return False
+    response = getattr(exc, "response", None)
+    if response is None:
+        return True
+    try:
+        status = int(response.status_code)
+    except (TypeError, ValueError):
+        return True
+    return status >= 500 or status in (408, 425)
 
 
 def _map_effort_for_fallback(effort: str, levels: tuple) -> Optional[str]:
@@ -1527,6 +1561,140 @@ class TaskScheduler:
                 "skipped_state": skipped_state, "pf_requeued": pf_requeued,
                 "pf_over_cap": pf_over_cap}
 
+    def complete_name_only(
+        self,
+        chunk_id: str,
+        *,
+        final_path: str | Path,
+        critic_report_path: str | Path,
+        evidence_path: str | Path,
+        final_sha256: Optional[str] = None,
+    ) -> Dict[str, bool | str]:
+        """Controlled ``DIRTY -> COMPLETED`` for a verified name-only repair.
+
+        This deliberately does not add ``DIRTY -> COMPLETED`` to the global
+        transition table.  The caller must provide all three persisted pieces
+        of evidence, and this method CAS-checks the task state while preserving
+        ``backtrack_rounds`` (a deterministic repair is not another retry).
+        """
+        final_p = Path(final_path)
+        report_p = Path(critic_report_path)
+        evidence_p = Path(evidence_path)
+
+        def _read(path: Path) -> Optional[Dict]:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return None
+            return data if isinstance(data, dict) else None
+
+        def _sha_text(text: str) -> str:
+            return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+        def _sha_file(path: Path) -> str:
+            h = hashlib.sha256()
+            with open(path, "rb") as fh:
+                for block in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(block)
+            return h.hexdigest()
+
+        final = _read(final_p)
+        report = _read(report_p)
+        evidence = _read(evidence_p)
+        if not final or not isinstance(final.get("text"), str):
+            return {"ok": False, "reason": "final_missing_or_unreadable"}
+        current_final_sha = _sha_text(final["text"])
+        if final_sha256 and str(final_sha256) != current_final_sha:
+            return {"ok": False, "reason": "final_sha256_mismatch"}
+        if not report:
+            return {"ok": False, "reason": "critic_report_missing_or_unreadable"}
+        if not evidence:
+            return {"ok": False, "reason": "name_only_evidence_missing_or_unreadable"}
+
+        expected = {
+            "schema_version": 1,
+            "chunk_id": str(chunk_id),
+            "status": "verified_for_completion",
+            "final_sha256_after": current_final_sha,
+            "critic_final_sha256": current_final_sha,
+            "critic_report_sha256": _sha_file(report_p),
+            "pending_checked": True,
+        }
+        for key, value in expected.items():
+            if evidence.get(key) != value:
+                return {"ok": False, "reason": f"evidence_mismatch:{key}"}
+
+        try:
+            from src.recalibrate import critic_evidence_state
+            proof = critic_evidence_state(
+                report, final_p, project_root=final_p.parent.parent.parent)
+        except Exception as exc:  # noqa: BLE001 - fail closed on verifier failure
+            return {"ok": False, "reason": f"critic_binding_check_failed:{exc}"}
+        if proof.get("status") != "exact":
+            return {"ok": False, "reason": "critic_binding_" + str(proof.get("status"))}
+
+        gate_cfg = getattr(_config, "pipeline", {}) or {}
+        gate_cfg = gate_cfg.get("final_gate", {}) or {}
+        calibrated = gate_cfg.get("calibrated_backends") or ["jev"]
+        if isinstance(calibrated, str):
+            calibrated = [calibrated]
+        backend = str(report.get("_backend_path") or "")
+        if backend not in {str(x) for x in calibrated}:
+            return {"ok": False, "reason": f"critic_backend_uncalibrated:{backend}"}
+        if not isinstance(report.get("scores"), dict) or not report.get("scores"):
+            return {"ok": False, "reason": "critic_scores_missing"}
+
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT state, rescue_stage FROM chunk_tasks WHERE chunk_id = ?",
+            (chunk_id,))
+        row = cursor.fetchone()
+        if not row:
+            return {"ok": False, "reason": "chunk_missing"}
+        if row[0] != TaskState.DIRTY.value:
+            return {"ok": False, "reason": f"state_not_dirty:{row[0]}"}
+        if row[1]:
+            return {"ok": False, "reason": "rescue_stage_present"}
+        cursor.execute(
+            "UPDATE chunk_tasks SET state = ?, last_error = NULL, "
+            "updated_at = CURRENT_TIMESTAMP "
+            "WHERE chunk_id = ? AND state = ? AND rescue_stage IS NULL",
+            (TaskState.COMPLETED.value, chunk_id, TaskState.DIRTY.value))
+        if cursor.rowcount != 1:
+            self.conn.rollback()
+            return {"ok": False, "reason": "state_cas_failed"}
+        self.conn.commit()
+        return {"ok": True, "reason": "completed_name_only",
+                "final_sha256": current_final_sha}
+
+    def reopen_name_only(self, chunk_id: str) -> Dict[str, bool | str]:
+        """Compensate a name-only completion after a cross-DB commit failure.
+
+        This is not a general ``COMPLETED -> DIRTY`` transition.  It exists only
+        to undo ``complete_name_only`` when the Decision DB side could not be
+        committed, and it deliberately does not consume backtrack budget.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT state, rescue_stage FROM chunk_tasks WHERE chunk_id = ?",
+            (chunk_id,))
+        row = cursor.fetchone()
+        if not row:
+            return {"ok": False, "reason": "chunk_missing"}
+        if row[0] != TaskState.COMPLETED.value:
+            return {"ok": False, "reason": f"state_not_completed:{row[0]}"}
+        if row[1]:
+            return {"ok": False, "reason": "rescue_stage_present"}
+        cursor.execute(
+            "UPDATE chunk_tasks SET state = ?, updated_at = CURRENT_TIMESTAMP "
+            "WHERE chunk_id = ? AND state = ? AND rescue_stage IS NULL",
+            (TaskState.DIRTY.value, chunk_id, TaskState.COMPLETED.value))
+        if cursor.rowcount != 1:
+            self.conn.rollback()
+            return {"ok": False, "reason": "state_cas_failed"}
+        self.conn.commit()
+        return {"ok": True, "reason": "reopened_after_decision_commit_failure"}
+
     def requeue_permanently_failed(self, chapter_id: str,
                                    chunk_ids: Optional[List[str]] = None,
                                    force: bool = False) -> Dict[str, List[str]]:
@@ -1728,6 +1896,119 @@ class TaskScheduler:
 
 
 class DecisionEngine:
+    _EN_SOURCE_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+    _EN_SOURCE_JOINER_RE = re.compile(r"[\s'’‘\-‐‑‒–—]+")
+
+    @classmethod
+    def _decision_source_case_sensitive(cls, source: str) -> bool:
+        """True for article-led titles with a capitalised content token."""
+        raw_tokens = cls._EN_SOURCE_TOKEN_RE.findall(source)
+        return bool(
+            len(raw_tokens) > 1
+            and raw_tokens[0].casefold() in {"the", "a", "an"}
+            and any(any(ch.isupper() for ch in token)
+                    for token in raw_tokens[1:])
+        )
+
+    @classmethod
+    def _decision_source_hit(cls, source: str, text: str) -> bool:
+        """Return whether a Decision source key is present in a chunk.
+
+        Article-led titles with a capitalised content token (``the One``,
+        ``the Voice``) are case-sensitive.  Otherwise the ordinary lowercase
+        phrase ``the one to tell you`` would receive the messianic Decision
+        target and corrupt otherwise-unrelated prose.  Such case-sensitive
+        keys are also excluded from the non-hit filler pool below.  Generic
+        source keys retain the legacy case-insensitive/loose matching.
+        """
+        if not source or not text:
+            return False
+        raw_tokens = cls._EN_SOURCE_TOKEN_RE.findall(source)
+        if cls._decision_source_case_sensitive(source):
+            # The article itself is normally lower-case in the stored key
+            # (``the Duke``), but at the start of an English sentence it is
+            # capitalised (``The Duke must know...``).  Only the content
+            # token is case-significant; requiring a lower-case ``the`` made
+            # every legitimate sentence-initial use look like a false
+            # positive.  This was especially damaging to version merit: a
+            # correct draft could accrue a bogus authority violation merely
+            # because a title began a sentence.
+            first = raw_tokens[0]
+            first_pattern = re.escape(first)
+            if len(first) > 1 and first[0].isalpha():
+                first_pattern = f"[{first[0].upper()}{first[0].lower()}]{re.escape(first[1:])}"
+            body = cls._EN_SOURCE_JOINER_RE.pattern.join(
+                [first_pattern] + [re.escape(token) for token in raw_tokens[1:]])
+            return re.search(
+                r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])",
+                text,
+            ) is not None
+        if len(raw_tokens) > 1:
+            # Source keys are stored from a normalised extraction pass, but
+            # the original chapter files contain hard line wraps inside
+            # phrases such as ``Judge of the\\nChange``.  A literal substring
+            # check misses those legal wraps, which in turn hides a locked
+            # Decision from the prompt and from version-merit authority checks.
+            body = cls._EN_SOURCE_JOINER_RE.pattern.join(
+                re.escape(token) for token in raw_tokens)
+            if re.search(
+                    r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])",
+                    text, re.IGNORECASE):
+                return True
+        return bool(
+            source in text
+            or (len(source) >= 3 and source.lower() in text.lower()))
+
+    @classmethod
+    def _soft_reference_source(cls, source: str, reason: str = "") -> bool:
+        """Return True for lower-case generic literary references.
+
+        A lower-case common phrase such as ``shadows`` or ``cells`` can carry
+        useful imagery, but it is not a book-wide term with one mandatory
+        surface form.  Treating it as a hard Decision made every completed
+        chunk containing the word DIRTY solely because it used a natural
+        synonym (``阴影`` instead of ``暗影``).  Quoted allusions and proper /
+        capitalised titles remain hard references.  A literal translation and
+        a culturally equivalent metaphor (``clods`` -> ``泥腿子`` vs a
+        contextually natural ``土疙瘩``) are both advisory when no explicit
+        term authority exists.
+        """
+        raw = str(source or "").strip()
+        if not raw:
+            return False
+        # Only an explicitly generic extraction may be soft.
+        # Programmatic authority repairs without a strategy annotation keep
+        # the legacy hard behaviour (and terminology strategies such as
+        # RETAIN_AND_ANNOTATE always do).
+        reason_text = str(reason or "")
+        if "【策略】" not in reason_text:
+            return False
+        if any(tag in reason_text.upper() for tag in
+               ("RETAIN_AND_ANNOTATE", "TRANSLITERATION", "TERMINOLOGY")):
+            return False
+        strategy = reason_text.upper()
+        if not any(tag in strategy for tag in
+                   ("LITERAL_TRANSLATION", "CULTURAL_EQUIVALENT")):
+            return False
+        if re.search(r"[“”\"‘’]", raw):
+            return False
+        tokens = cls._EN_SOURCE_TOKEN_RE.findall(raw)
+        if not tokens:
+            return False
+        return not any(token and token[0].isupper() for token in tokens)
+
+    @staticmethod
+    def _decision_target_core(value: str) -> str:
+        """Return the executable name/phrase from a Decision translation."""
+        raw = str(value or "").strip()
+        instructed = re.findall(
+            r"(?:首次写作|此后统一|统一为|统一)[^“]*“([^”]+)”", raw)
+        if instructed:
+            raw = instructed[-1].strip()
+        raw = raw.strip("《》“”\"'‘’「」『』").strip()
+        core = re.sub(r"[（(][^（()）]*[）)]", "", raw).strip()
+        return core or raw
+
     def __init__(self, db_path="db/decision_db.sqlite", scheduler_factory: Optional[Callable] = None):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1867,10 +2148,22 @@ class DecisionEngine:
         except Exception as e:
             print(f"  ⚠️ 登记实体异体失败 ({canonical}<-{variant}): {e}", file=sys.stderr)
 
-    def add_decision(self, level: DecisionLevel, source: str, translation: str, reason: str, affected_chunks: List[str] = None):
+    def add_decision(
+        self,
+        level: DecisionLevel,
+        source: str,
+        translation: str,
+        reason: str,
+        affected_chunks: List[str] = None,
+        *,
+        allow_revision: bool = False,
+    ):
         """插入或更新决策，并记录影响的 chunk。
 
         幂等：同一 source_key 且 translation 未变时不触发 backtrack。
+        稳定：既有非空译文默认拒绝被覆盖。Reference Agent 等 chunk-local
+        提议只能新增 Decision，不能静默改写全书权威；真正的权威修正须由
+        显式审计路径传 allow_revision=True（或直接走 CAS 修复工具）。
         STYLE 默认不回溯（见 style_triggers_backtrack）；即使开启也不得依赖「当前 JUDGING chunk」。
 
         Round 130: backtrack_mode=deferred（默认）时，变更不再即时标记 DIRTY，
@@ -1884,8 +2177,48 @@ class DecisionEngine:
                 (source,),
             )
             existing = cursor.fetchone()
+
+            # Round 158: ``the Lady Jessica`` must not become a second authority
+            # alongside ``Lady Jessica``.  Only an exact, case-sensitive match
+            # after removing the leading article qualifies; ``the one`` and
+            # ``the One`` therefore remain distinct.
+            article_alias = None
+            article_match = _ARTICLE_PREFIX_RE.match(str(source))
+            if not existing and article_match:
+                cursor.execute(
+                    'SELECT id, translation, locked FROM decision_db '
+                    'WHERE source_key = ?',
+                    (article_match.group("rest"),),
+                )
+                article_alias = cursor.fetchone()
+
+            if article_alias:
+                alias_id = int(article_alias[0])
+                alias_translation = str(article_alias[1] or "")
+                if affected_chunks:
+                    cursor.executemany(
+                        'INSERT OR IGNORE INTO decision_impact '
+                        '(decision_id, chunk_id) VALUES (?, ?)',
+                        [(alias_id, cid) for cid in affected_chunks],
+                    )
+                    self.conn.commit()
+                accepted = alias_translation == translation
+                if accepted:
+                    print(
+                        f"🔗 [Decision Alias] {source}: 归并到既有 "
+                        f"source_key={article_match.group('rest')!r}"
+                    )
+                else:
+                    print(
+                        f"🛡️ [Decision Alias] {source}: 保留既有 "
+                        f"source_key={article_match.group('rest')!r} 译文"
+                        f"「{alias_translation}」，忽略新提议「{translation}」"
+                    )
+                return accepted
+
+            existing_translation = str(existing[1] or "") if existing else ""
             translation_unchanged = bool(
-                existing and existing[1] == translation
+                existing and existing_translation == translation
             )
 
             # Round 121 锁定决策：拒绝覆盖性变更，保住跨章一致译名
@@ -1895,7 +2228,20 @@ class DecisionEngine:
                     f"🔒 [Decision Lock] {source}: 保留锁定译文「{existing[1]}」，"
                     f"忽略新译文「{translation}」（不触发回溯）"
                 )
-                return
+                return False
+
+            # Round 158: a per-chunk proposal is not a book-wide authority.
+            # Without an explicit revision contract, preserve the first
+            # established translation so one chunk cannot oscillate a
+            # Decision and repeatedly requeue completed chunks.
+            if (existing and existing_translation and not translation_unchanged
+                    and not allow_revision):
+                print(
+                    f"🛡️ [Decision Stability] {source}: 保留既有译文"
+                    f"「{existing_translation}」，忽略块内新提议「{translation}」"
+                    "（未显式授权修订，不触发回溯）"
+                )
+                return False
 
             # 原子化 UPSERT：INSERT ... ON CONFLICT DO UPDATE
             cursor.execute('''
@@ -1929,7 +2275,7 @@ class DecisionEngine:
 
             if translation_unchanged:
                 print(f"  ℹ️ 决策未变更 (source_key={source})，跳过回溯")
-                return
+                return True
 
             # 触发回溯：必须在 commit 之后调用，避免跨库事务不一致
             de_cfg = _config.decision_engine
@@ -1942,6 +2288,31 @@ class DecisionEngine:
                 # 默认 False：风格规则只累积进后续 prompt，不重跑已完成 chunk
                 should_backtrack = True
 
+            # Round 158: 语境称谓不是全书唯一译名。``Sire/my Lord`` 在不同句式里
+            # 合法对应「陛下/大人/老爷」等多种形态；把其中一次抽取当成硬决策
+            # 会让几十个已完成块无差别回溯（Dune ch03 实锤 32 块）。这类决策
+            # 仍写入 Decision DB 供后续 prompt 继承，但默认不触发历史块重译。
+            if should_backtrack and not bool(
+                    de_cfg.get("contextual_terms_trigger_backtrack", False)):
+                source_class = classify_entity_source_name(source)
+                if source_class in {"title", "relation"} or canonical_is_title_only(translation):
+                    should_backtrack = False
+                    print(
+                        f"  ℹ️ 语境称谓 (source_class={source_class})："
+                        f"{source} -> {translation} 仅记录，不触发历史块回溯"
+                    )
+
+            # Round 158: lower-case generic metaphors are advisory, not hard
+            # terminology.  Keep them in Decision DB for context, but never
+            # requeue completed prose just because it used a natural synonym.
+            if (should_backtrack and level == DecisionLevel.REFERENCE
+                    and self._soft_reference_source(source, reason)):
+                should_backtrack = False
+                print(
+                    f"  ℹ️ 软典故 (generic reference)：{source} -> {translation} "
+                    "仅记录语义倾向，不触发历史块回溯"
+                )
+
             if should_backtrack and affected_chunks and decision_id:
                 # 截断受影响 chunk 数量，避免单次决策雪崩式重译
                 max_affected = int(de_cfg.get("max_affected_chunks_per_decision", 50) or 50)
@@ -1952,14 +2323,72 @@ class DecisionEngine:
                         f"截断为 max_affected_chunks_per_decision={max_affected}"
                     )
                     chunks_to_dirty = sorted(chunks_to_dirty)[:max_affected]
+                # Round 158: a Decision is an authority statement, not an
+                # instruction to re-translate chunks that already obey it.
+                # Newly extracted terms such as ``the Imperium -> 帝国`` used
+                # to enqueue every chunk containing the source word even when
+                # every final already said 帝国.  Filter on the actual final
+                # prose before touching workflow state.
+                satisfied = [cid for cid in chunks_to_dirty
+                             if self._chunk_final_satisfies(chunk_id=cid,
+                                                            translation=translation)]
+                if satisfied:
+                    satisfied_set = set(satisfied)
+                    chunks_to_dirty = [cid for cid in chunks_to_dirty
+                                       if cid not in satisfied_set]
+                    print(
+                        f"  🧾 回溯核销 {len(satisfied)} 个已满足块"
+                        f"（{source} -> {translation}）"
+                    )
+                if not chunks_to_dirty:
+                    return True
                 backtrack_mode = str(de_cfg.get("backtrack_mode", "deferred") or "deferred").lower()
                 if backtrack_mode == "immediate":
                     self._trigger_backtrack(chunks_to_dirty)
                 else:
                     self._queue_backtrack(chunks_to_dirty, decision_id, source)
+            return True
         except Exception as e:
             print(f"❌ 决策写入失败: {e}")
             raise
+
+    def _chunk_final_satisfies(self, chunk_id: str, translation: str) -> bool:
+        """Return whether a completed chunk's prose already contains the target.
+
+        Missing / malformed final files deliberately return False: an
+        incomplete artifact still needs the normal pipeline, while a valid
+        final that already uses the authorised target must not be dirtied.
+        Footnote definitions are ignored so an explanatory note cannot stand
+        in for the translated prose itself.
+        """
+        target = self._decision_target_core(translation)
+        if not target:
+            return False
+        chunk_id = str(chunk_id or "")
+        if "_chunk" not in chunk_id:
+            return False
+        chapter = chunk_id.split("_chunk", 1)[0]
+        path = (self.db_path.parent.parent / "output" / chapter /
+                f"{chunk_id}_final.json")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        body = str(payload.get("text") or "")
+        cuts = []
+        for pattern in (
+            re.compile(r"(?m)^\[\^[^\]]+\]:"),
+            re.compile(r"(?ms)^[ \t]*---[ \t]*\r?\n(?:[ \t]*\r?\n)*"
+                       r"[ \t]*\[\d+\][ \t]+"),
+        ):
+            match = pattern.search(body)
+            if match:
+                cuts.append(match.start())
+        if cuts:
+            body = body[:min(cuts)]
+        return bool(target and target in body)
 
     def _trigger_backtrack(self, chunk_ids: List[str]):
         """触发回溯：通过工厂函数获取 scheduler 并标记 DIRTY"""
@@ -2061,7 +2490,10 @@ class DecisionEngine:
         src_lower = src.lower()
 
         cursor = self.conn.cursor()
-        cursor.execute("SELECT level, source_key, translation FROM decision_db ORDER BY level ASC, id DESC")
+        cursor.execute(
+            "SELECT level, source_key, translation, COALESCE(reason, '') "
+            "FROM decision_db ORDER BY level ASC, id DESC"
+        )
         rows = cursor.fetchall()
 
         terms: List[str] = []
@@ -2072,11 +2504,26 @@ class DecisionEngine:
         ref_hits, ref_rest = [], []
         style_all = []
 
-        for level, source, trans in rows:
+        for level, source, trans, reason in rows:
             line_t = f"- 术语: '{source}' -> 必须译为 '{trans}'"
             line_r = f"- 典故: '{source}' -> 必须译为 '{trans}' (若策略为保留并加注，请生成脚注)"
             line_s = f"- 风格: {trans}"
-            hit = bool(source) and (source in src or (len(source) >= 3 and source.lower() in src_lower))
+            source_text_key = str(source or "")
+            hit = self._decision_source_hit(source_text_key, src)
+            if self._decision_source_case_sensitive(source_text_key) and not hit:
+                continue
+            # A lower-case generic metaphor is context, not a mandatory
+            # surface form.  Keep it out of the hard "must translate as"
+            # section; otherwise future chunks are instructed to replace
+            # natural synonyms with the same noun everywhere.
+            if (level == DecisionLevel.REFERENCE.value
+                    and self._soft_reference_source(source_text_key, reason)):
+                if hit:
+                    style_all.append(
+                        f"- 风格: 原文“{source}”可带隐喻色彩；仅在语境确实作隐喻时"
+                        f"自然体现“{trans}”的意象，普通用法按语境处理，不得机械替换"
+                    )
+                continue
             if level == DecisionLevel.TERMINOLOGY.value:
                 (term_hits if hit else term_rest).append(line_t)
             elif level == DecisionLevel.REFERENCE.value:
@@ -2468,6 +2915,26 @@ class ReferenceAgent:
         # 获取 scheduler 用于全库扫描
         self._scheduler = decision_engine._scheduler_factory() if decision_engine._scheduler_factory else None
 
+    @staticmethod
+    def _reference_decision_level(ref: Dict[str, Any]) -> DecisionLevel:
+        """Classify an extracted reference by how hard its surface form is.
+
+        ``RETAIN_AND_ANNOTATE`` / transliteration entries and capitalised
+        proper titles are terminology: future chunks should inherit the exact
+        form.  Generic lower-case literary phrases (``shadows``, ``cells``)
+        stay references, whose prompt treatment is advisory and never forces a
+        historical chunk to re-translate on a synonym.
+        """
+        source = str(ref.get("source_text") or "").strip()
+        strategy = str(ref.get("strategy") or "").strip().upper()
+        if strategy in {"RETAIN_AND_ANNOTATE", "TRANSLITERATION", "TERMINOLOGY"}:
+            return DecisionLevel.TERMINOLOGY
+        if source and not re.search(r"[“”\"‘’]", source):
+            tokens = re.findall(r"[A-Za-z0-9]+", source)
+            if tokens and any(token and token[0].isupper() for token in tokens):
+                return DecisionLevel.TERMINOLOGY
+        return DecisionLevel.REFERENCE
+
     def _find_chunks_containing(self, source_text: str) -> List[str]:
         """从 workflow DB 全文搜索包含 source_text 的 chunk_id。
 
@@ -2703,13 +3170,19 @@ Schema 如下：
                 all_affected = self._find_chunks_containing(source)
                 if affected_chunks:
                     all_affected = list(set(all_affected) | set(affected_chunks))
+                # The current chunk is still at EXTRACTING_TERMS and will use
+                # this Decision in its own translation later in the same run.
+                # Queueing it now guarantees a redundant DIRTY rerun after it
+                # completes.  Only *other* completed chunks need backtracking.
+                all_affected = [cid for cid in all_affected
+                                if str(cid) != str(chunk_id)]
 
                 self.db.add_decision(
-                    level=DecisionLevel.REFERENCE,
+                    level=self._reference_decision_level(ref),
                     source=source,
                     translation=translation,
                     reason=reason,
-                    affected_chunks=all_affected or [chunk_id]
+                    affected_chunks=all_affected,
                 )
 
         # 4. 登记实体到 entity_registry (增量构建全书实体知识库)
@@ -2835,8 +3308,34 @@ Schema 如下：
             proper_candidates = [s for s in aliases if classify_entity_source_name(s) == "proper"]
             context_candidates = [s for s in aliases if classify_entity_source_name(s) != "proper"]
 
+            # Round 158: a locked Decision is already the authority for a
+            # title-like alias.  If the extractor proposes a rejected title
+            # form (Judge of the Change -> "变更裁决官"), do not create a new
+            # entity alongside the locked "变革仲裁官".  Remapping here is
+            # limited to title aliases; personal names keep their full/short
+            # form distinction.
+            if not proper_candidates and canonical_is_title_only(canonical):
+                for alias in context_candidates:
+                    if classify_entity_source_name(alias) != "title":
+                        continue
+                    locked_targets = decision_targets.get(_norm(alias)) or set()
+                    if len(locked_targets) == 1:
+                        authorised = next(iter(locked_targets))
+                        if authorised and authorised != canonical:
+                            print(f"  🔒 实体主名服从既有决策: {canonical} -> {authorised} ({alias})")
+                            canonical = authorised
+                        break
+
             existing = registry.get(canonical)
             existing_qt = {_norm(x) for x in (existing or {}).get("quarantine", [])}
+
+            # A context-only alias has no executable source form.  Creating a
+            # fresh canonical row from it merely pollutes the registry (Dune
+            # accumulated several "变更/更替法官" rows this way).  Merge into
+            # an already established canonical, but never mint a new one.
+            if existing is None and not proper_candidates:
+                print(f"  ℹ️ 上下文指称不新建实体: {canonical} <- {context_candidates[:2]}")
+                continue
 
             accepted: List[str] = []
             quarantined: List[str] = []
@@ -2925,6 +3424,11 @@ Schema 如下：
                     ]
                 accepted.append(sn)
                 owners.setdefault(key, set()).add(canonical)
+
+            if existing is None and not accepted:
+                print(f"  ℹ️ 无可执行专名不新建实体: {canonical} "
+                      f"(候选={proper_candidates[:2]}, 上下文={context_candidates[:2]})")
+                continue
 
             if existing is not None:
                 existing["source"] = _dedupe(existing["source"] + accepted)
@@ -4941,21 +5445,33 @@ class TranslationPipeline:
         self.book_profile = None
         self.judgment_cfg = dict(_config.get("judgment_injection", {}) or {})
         try:
+            from src.artifact_freshness import profile_source_freshness
             from src.style_profiler import load_profile, profile_to_style_guide
             _prof_path = self._root_dir / "input" / "book_profile.json"
             _prof = load_profile(_prof_path)
             if _prof:
-                self.book_profile = _prof
-                _config.set_runtime_style_guide(profile_to_style_guide(_prof, chapter_id=chapter_id))
-                print(f"🎨 [StyleProfiler] 已加载作品风格剖面 ← {_prof_path.name} "
-                      f"(source={_prof.get('source')}, confidence={_prof.get('confidence')})")
-                try:
-                    from src.judgment_layer import active_notes
-                    _active = active_notes(_prof, float(self.judgment_cfg.get("min_confidence", 0.55)))
-                    if _active:
-                        print(f"🧭 [Judgment] 已加载 {len(_active)} 条 active 注记（L1∧L2 通过）")
-                except Exception:
-                    pass
+                _fresh = profile_source_freshness(
+                    _prof, self._root_dir, chapters=[chapter_id])
+                if _fresh.get("status") == "stale":
+                    print(f"⚠️ [StyleProfiler] 剖面与 {chapter_id} 章源不匹配"
+                          f"（{', '.join(_fresh.get('reasons') or [])}）；"
+                          "本次回退中性基线，不注入作品特定注记。", file=sys.stderr)
+                else:
+                    if _fresh.get("status") != "fresh":
+                        print(f"⚠️ [StyleProfiler] 剖面缺少章源血缘"
+                              f"（{_fresh.get('status')}）；按 legacy 语义读取，"
+                              "但不能作为当前源文已理解的证据。", file=sys.stderr)
+                    self.book_profile = _prof
+                    _config.set_runtime_style_guide(profile_to_style_guide(_prof, chapter_id=chapter_id))
+                    print(f"🎨 [StyleProfiler] 已加载作品风格剖面 ← {_prof_path.name} "
+                          f"(source={_prof.get('source')}, confidence={_prof.get('confidence')})")
+                    try:
+                        from src.judgment_layer import active_notes
+                        _active = active_notes(_prof, float(self.judgment_cfg.get("min_confidence", 0.55)))
+                        if _active:
+                            print(f"🧭 [Judgment] 已加载 {len(_active)} 条 active 注记（L1∧L2 通过）")
+                    except Exception:
+                        pass
         except Exception as _prof_err:
             print(f"⚠️ [StyleProfiler] 剖面加载失败，忽略: {_prof_err}", file=sys.stderr)
 
@@ -5347,6 +5863,11 @@ class TranslationPipeline:
         # Invalidate 缓存 — 下次加载走文件, 反映最新内容
         if hasattr(self, "_intermediate_cache") and self._intermediate_cache is not None:
             self._intermediate_cache.pop((chunk_id, step), None)
+        try:
+            log_artifact(file_path, stage=step, chunk_id=chunk_id, kind="intermediate")
+        except Exception as _log_exc:
+            print(f"⚠️ [TaskLog] 制品日志写入失败（不阻塞主流程）: {_log_exc}",
+                  file=sys.stderr)
 
     def _load_intermediate(self, chunk_id: str, step: str):
         """加载 chunk intermediate 文件 (raw / literary / critic_report 等).
@@ -6380,6 +6901,10 @@ class TranslationPipeline:
 
     def run(self) -> bool:
         print(f"🚀 [Pipeline] 启动批处理模式处理章节: {self.chapter_id}")
+        try:
+            log_event("pipeline_started", stage="PIPELINE", chapter=self.chapter_id)
+        except Exception as _log_exc:
+            print(f"⚠️ [TaskLog] pipeline_started 写入失败: {_log_exc}", file=sys.stderr)
         self._run_started_at = time.monotonic()
         self._rescue_started_at = None
 
@@ -6435,7 +6960,19 @@ class TranslationPipeline:
                     continue
 
                 print(f"📦 [Batch] {stage_name} 阶段: 处理 {len(tasks)} 个任务")
+                try:
+                    log_event("stage_started", stage=state.value,
+                              chapter=self.chapter_id, batch=len(tasks))
+                except Exception as _log_exc:
+                    print(f"⚠️ [TaskLog] stage_started 写入失败: {_log_exc}",
+                          file=sys.stderr)
                 handler(tasks)
+                try:
+                    log_event("stage_finished", stage=state.value,
+                              chapter=self.chapter_id, batch=len(tasks))
+                except Exception as _log_exc:
+                    print(f"⚠️ [TaskLog] stage_finished 写入失败: {_log_exc}",
+                          file=sys.stderr)
                 any_progress = True
 
             if not any_progress:
@@ -6548,7 +7085,14 @@ class TranslationPipeline:
             print(f"⚠️ [Rescue] 账本收尾异常（不影响主流程）: {e}")
 
         # 完成后交叉验证：final.json 落盘数应与任务数一致，否则视为假阳性完成
-        return self._verify_final_outputs(len(existing_tasks))
+        _verify_ok = self._verify_final_outputs(len(existing_tasks))
+        try:
+            log_event("pipeline_finished", stage="PIPELINE",
+                      status="ok" if _verify_ok else "failed",
+                      chapter=self.chapter_id, task_count=len(existing_tasks))
+        except Exception as _log_exc:
+            print(f"⚠️ [TaskLog] pipeline_finished 写入失败: {_log_exc}", file=sys.stderr)
+        return _verify_ok
 
     def _run_post_consistency(self, chapter_scoped: bool = True) -> None:
         """Round 7: 章节完成后自动跑 consistency（章节级 scope）
@@ -7641,11 +8185,37 @@ class TranslationPipeline:
         new_score = self._critic_avg_from_file(critic_new)
         if old_score <= 0 or new_score <= 0:
             return False
+
+        # Round 158: critic mean must not overrule a locked terminology
+        # authority.  An old draft can score higher while still carrying the
+        # wrong locked name (or a false-positive target that the source never
+        # licensed).  Compare deterministic authority violations first and let
+        # the cleaner draft win; score only breaks authority ties.
+        old_text = self._final_text_from_path(backup)
+        new_text = self._final_text_from_path(final_path)
+        old_violations, old_reasons = self._decision_authority_violations(
+            chunk_id, old_text)
+        new_violations, new_reasons = self._decision_authority_violations(
+            chunk_id, new_text)
         try:
             tolerance = float(vm_cfg.get("tolerance", 0.0) or 0.0)
         except (TypeError, ValueError):
             tolerance = 0.0
-        if new_score >= old_score - tolerance:
+        keep_new = new_score >= old_score - tolerance
+        if old_violations > new_violations:
+            keep_new = True
+            print(
+                f"🛡️ [Version Merit] {chunk_id} 旧版违反锁定决策 "
+                f"{old_violations} 项 > 新版 {new_violations} 项，"
+                f"保留新版（旧分 {old_score:.2f} / 新分 {new_score:.2f}）"
+            )
+        elif new_violations > old_violations:
+            keep_new = False
+            print(
+                f"🛡️ [Version Merit] {chunk_id} 新版违反锁定决策 "
+                f"{new_violations} 项 > 旧版 {old_violations} 项，回退旧版"
+            )
+        if keep_new:
             return False
         try:
             final_path.write_text(backup.read_text(encoding="utf-8"), encoding="utf-8")
@@ -7657,6 +8227,128 @@ class TranslationPipeline:
             return False
         print(f"🛡️ [Version Merit] {chunk_id} 新版均分 {new_score:.2f} < 旧版 {old_score:.2f}，保留旧版")
         return True
+
+    @staticmethod
+    def _decision_text_body(text: str) -> str:
+        """Strip translator-note definitions before authority presence checks."""
+        raw = str(text or "")
+        patterns = (
+            re.compile(r"(?m)^\[\^[^\]]+\]:"),
+            re.compile(
+                r"(?ms)^[ \t]*---[ \t]*\r?\n(?:[ \t]*\r?\n)*"
+                r"[ \t]*\[\d+\][ \t]+"),
+        )
+        cuts = [match.start() for pattern in patterns
+                for match in [pattern.search(raw)] if match]
+        return raw[:min(cuts)] if cuts else raw
+
+    @staticmethod
+    def _decision_target_core(value: str) -> str:
+        """Extract the executable CJK/name portion of a Decision target."""
+        raw = str(value or "").strip()
+        instructed = re.findall(
+            r"(?:首次写作|此后统一|统一为|统一)[^“]*“([^”]+)”", raw)
+        if instructed:
+            raw = instructed[-1].strip()
+        raw = raw.strip("《》“”\"'‘’「」『』").strip()
+        core = re.sub(r"[（(][^（()）]*[）)]", "", raw).strip()
+        return core or raw
+
+    def _decision_target_entity_forms(self, source: str) -> List[str]:
+        """Trusted registry forms for a Decision source, full names included.
+
+        A locked Decision can deliberately store the short form (``Piter`` ->
+        ``皮特``) while the prose uses the established full canonical
+        (``彼得·德弗里斯``).  The short form is not a literal substring of the
+        full name, so a raw ``in`` check wrongly marks a correct draft as an
+        authority violation.  Only high-confidence, reviewed registry rows
+        may satisfy this bridge; pending/legacy rows cannot erase a real
+        mismatch.
+        """
+        engine = getattr(self, "decision_engine", None)
+        if engine is None or not source:
+            return []
+        try:
+            rows = engine.conn.execute(
+                "SELECT canonical_name, source_names, variant_names, confidence, "
+                "COALESCE(pending_review, 0) FROM entity_registry"
+            ).fetchall()
+        except Exception:
+            return []
+
+        def norm(value: str) -> str:
+            return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+        wanted = norm(source)
+        forms: List[str] = []
+        for canonical, sources_json, variants_json, confidence, pending in rows:
+            if str(confidence or "") != "high" or int(pending or 0):
+                continue
+            sources = robust_json_loads(sources_json, expected_type=list) or []
+            if not any(norm(item) == wanted for item in sources if isinstance(item, str)):
+                continue
+            if isinstance(canonical, str) and canonical.strip():
+                forms.append(canonical.strip())
+            variants = robust_json_loads(variants_json, expected_type=list) or []
+            forms.extend(str(item).strip() for item in variants
+                         if isinstance(item, str) and item.strip())
+        return list(dict.fromkeys(forms))
+
+    def _decision_authority_violations(
+        self,
+        chunk_id: str,
+        text: str,
+    ) -> Tuple[int, List[str]]:
+        """Count deterministic locked-Decision violations in one final text.
+
+        Two directions matter for version merit:
+        * the source contains the locked key but the prose omits its target;
+        * an article-led capitalised title target appears even though the
+          source does not contain that exact-case key (false positive from
+          the old case-insensitive prompt fill).
+        """
+        engine = getattr(self, "decision_engine", None)
+        scheduler = getattr(self, "scheduler", None)
+        if engine is None or scheduler is None:
+            return 0, []
+        try:
+            task = scheduler.get_task(chunk_id)
+        except Exception:
+            task = None
+        if not isinstance(task, dict):
+            return 0, []
+        source_text = str(task.get("text_content") or "")
+        if not source_text:
+            return 0, []
+        body = self._decision_text_body(text)
+        try:
+            rows = engine.conn.execute(
+                "SELECT source_key, translation FROM decision_db "
+                "WHERE locked=1 ORDER BY id"
+            ).fetchall()
+        except Exception:
+            return 0, []
+        count = 0
+        reasons: List[str] = []
+        for source, translation in rows:
+            source = str(source or "")
+            core = self._decision_target_core(str(translation or ""))
+            if not source or not core:
+                continue
+            source_hit = DecisionEngine._decision_source_hit(source, source_text)
+            target_present = core in body
+            if source_hit and not target_present:
+                target_present = any(
+                    form in body for form in self._decision_target_entity_forms(source))
+            if source_hit and not target_present:
+                count += 1
+                reasons.append(f"missing:{source}->{core}")
+            elif (not source_hit
+                  and DecisionEngine._decision_source_case_sensitive(source)
+                  and target_present):
+                count += 1
+                reasons.append(f"false_positive:{source}->{core}")
+        return count, reasons[:8]
 
     def _critic_avg_from_file(self, path: Path) -> float:
         """读取 critic_report json 的数值维度均分; 缺失/损坏返回 0.0。"""
@@ -7877,6 +8569,14 @@ class TranslationPipeline:
                 print(f"🧊 [Backtrack] 本章合并预算已用尽（{max_sweeps} 轮），"
                       f"冻结 {pending} 项待回溯登记（保留至下次运行）")
             return False
+
+        # Round 158: deferred 回溯不是"所有登记都必须重跑"。新 decision 登记后，
+        # 很多已完成的 final 可能已经满足目标（例如同一术语早已采用该译名），
+        # 或者已被更具体 decision 完全覆盖。先做一次机械核销，避免章末把
+        # 满足项也打成 DIRTY，造成整章复译。这里只消费 satisfied；covered
+        # 仍交给真实状态机处理，blocked/orphan 保留给 gate。
+        self._consume_satisfied_pending_backtracks(task_ids)
+
         entries = self.decision_engine.take_pending_backtracks(task_ids)
         if not entries:
             return False
@@ -7894,6 +8594,71 @@ class TranslationPipeline:
         if over_cap:
             self._write_backtrack_frozen_report(over_cap, entries)
         return bool(dirty)
+
+    def _consume_satisfied_pending_backtracks(self, task_ids: List[str]) -> int:
+        """Consume only evidence-backed satisfied outbox rows before a sweep.
+
+        The deferred queue is an intent log, not a retranslation order.  A row
+        whose current final already satisfies the latest decision must not be
+        turned into DIRTY merely because it was registered before the final was
+        audited.  Deletion uses the snapshot CAS from the global reconciler; a
+        changed row is retained, and any classification failure is fail-open so
+        the normal deferred path still runs.
+        """
+        if not task_ids or not getattr(self, "decision_engine", None):
+            return 0
+        try:
+            from src.pending_backtrack_reconcile import (
+                _delete_pending_row_if_unchanged,
+                classify_pending_snapshot,
+                load_pending_context,
+            )
+
+            root = getattr(self, "_root_dir", None)
+            if root is None:
+                root = getattr(self, "output_dir", None)
+            if root is None:
+                return 0
+            context = load_pending_context(
+                Path(root),
+                decision_db=Path(self.decision_engine.db_path),
+                workflow_db=Path(getattr(self.scheduler, "db_path",
+                                        Path(root) / "db" / "workflow.db")),
+                output_dir=Path(root) / "output",
+            )
+            snapshot = classify_pending_snapshot(context)
+            wanted = set(str(cid) for cid in task_ids)
+            satisfied = {
+                str(entry.get("chunk_id") or "")
+                for entry in (snapshot.get("entries") or [])
+                if str(entry.get("chunk_id") or "") in wanted
+                and str(entry.get("status") or "") == "satisfied"
+            }
+            if not satisfied:
+                return 0
+            outbox = {
+                str(row.get("chunk_id") or ""): row
+                for row in (context.get("pending") or [])
+            }
+            con = self.decision_engine.conn
+            consumed = 0
+            con.execute("BEGIN IMMEDIATE")
+            for chunk_id in sorted(satisfied):
+                row = outbox.get(chunk_id)
+                if row and _delete_pending_row_if_unchanged(con, row):
+                    consumed += 1
+            con.commit()
+            if consumed:
+                print(f"🧾 [Backtrack] 章末核销 {consumed} 条已满足登记；"
+                      f"不触发复译")
+            return consumed
+        except Exception as exc:  # noqa: BLE001 - fail-open, queue remains auditable
+            try:
+                self.decision_engine.conn.rollback()
+            except Exception:
+                pass
+            print(f"⚠️ [Backtrack] 章末满足项核销失败（保留登记）: {exc}")
+            return 0
 
     def _write_backtrack_frozen_report(self, frozen_ids: List[str], entries: List[Dict]) -> None:
         """把治理冻结的 chunk 写入 output/<chapter>/backtrack_frozen.md（诊断用）。"""
@@ -9547,6 +10312,59 @@ class TranslationPipeline:
                 effective.append(sn)
         return effective, swallowed
 
+    def _entity_source_name_residue_forms(
+        self,
+        lit_text: str,
+        source_name: str,
+        canonical: str,
+    ) -> List[str]:
+        """Return source-name residues that are not legitimate translator glosses.
+
+        Reference Agent footnotes commonly preserve the English term, and the
+        literary body may legitimately write ``厄拉科斯（Arrakis）`` once to
+        introduce it.  Treating either as an untranslated entity residue makes
+        a perfectly valid final impossible to pass: the Jev entity score falls
+        below 6 while the local checker simultaneously reports
+        ``variant_instead_of_canonical``.  This helper removes only those two
+        evidence-backed cases; an English name elsewhere in the prose remains a
+        violation.
+        """
+        text = str(lit_text or "")
+        source_name = str(source_name or "").strip()
+        canonical = str(canonical or "").strip()
+        if not text or not source_name:
+            return []
+        footnote = re.search(r"(?m)^\[\^[^\]]+\]:", text)
+        body = text[:footnote.start()] if footnote else text
+        base = self._strip_parenthetical(canonical) if canonical else ""
+        quote_chars = r"['\"“”‘’《》〈〉『』]*"
+        gloss_spans: List[Tuple[int, int]] = []
+        if base:
+            patterns = (
+                re.escape(base) + r"\s*[（(]\s*" + quote_chars
+                + r"\s*" + re.escape(source_name) + r"\s*" + quote_chars
+                + r"\s*[）)]",
+                re.escape(source_name) + r"\s*[（(]\s*" + quote_chars
+                + r"\s*" + re.escape(base) + r"\s*" + quote_chars
+                + r"\s*[）)]",
+            )
+            for pattern in patterns:
+                gloss_spans.extend(
+                    match.span()
+                    for match in re.finditer(pattern, body, re.IGNORECASE)
+                )
+        name_pattern = re.compile(
+            r"(?<![^\W\d_])" + re.escape(source_name) + r"(?![^\W\d_])",
+            re.IGNORECASE,
+        )
+        residues: List[str] = []
+        for match in name_pattern.finditer(body):
+            if any(start <= match.start() and match.end() <= end
+                   for start, end in gloss_spans):
+                continue
+            residues.append(match.group(0))
+        return residues
+
     def _check_entity_consistency(self, chunk_id: str, lit_text: str, source_text: str) -> List[Dict]:
         """实体一致性核查：检查译文中实体译名是否与 entity_registry 一致
 
@@ -9618,9 +10436,9 @@ class TranslationPipeline:
             # Round 21: 收集所有出现在 lit_text 中的 source_name
             matched_source_names = []
             for sn in source_names:
-                found_form = self._case_insensitive_find(sn, lit_text)
-                if found_form:
-                    matched_source_names.append(found_form)
+                matched_source_names.extend(
+                    self._entity_source_name_residue_forms(
+                        lit_text, sn, canonical))
 
             # 去重：source_name 命中后也算 variant_instead_of_canonical（英文残留）
             all_violations = list(matched_variants)
@@ -11558,8 +12376,8 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description="SagaTrans — AI 文学语义编译系统")
     parser.add_argument("command", nargs="?", default="pipeline",
-                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "story-graph", "story-graph-query", "setup-payoff-audit", "drift-audit", "notes-normalize", "proofread", "book-repair", "requeue", "rescue", "qa-report", "recalibrate-critic"],
-                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, story-graph, story-graph-query, setup-payoff-audit, drift-audit, notes-normalize, proofread, book-repair, requeue, rescue, qa-report, recalibrate-critic")
+                        choices=["pipeline", "init", "golden", "golden-gate", "memory", "debug", "split", "consistency", "consolidate", "finalize", "lint", "gate", "style-profile", "story-graph", "story-graph-query", "setup-payoff-audit", "drift-audit", "notes-normalize", "proofread", "book-repair", "book-link-audit", "pending-reconcile", "name-only-fastpath", "completed-name-repair", "confirmed-term-drift-repair", "name-authority-audit", "name-authority-align", "decision-authority-align", "decision-target-authority-repair", "locked-target-authority-repair", "term-form-audit", "locked-target-authority-audit", "term-form-contract", "query-gold-set", "requeue", "rescue", "qa-report", "recalibrate-critic"],
+                        help="执行命令: pipeline (默认), init, golden, golden-gate, memory, debug, split, consistency, consolidate, finalize, lint, gate, style-profile, story-graph, story-graph-query, setup-payoff-audit, drift-audit, notes-normalize, proofread, book-repair, book-link-audit, pending-reconcile, name-only-fastpath, completed-name-repair, confirmed-term-drift-repair, name-authority-audit, name-authority-align, decision-authority-align, decision-target-authority-repair, locked-target-authority-repair, term-form-audit, locked-target-authority-audit, term-form-contract, query-gold-set, requeue, rescue, qa-report, recalibrate-critic")
     parser.add_argument("--chapter", default="ch01", help="章节 ID (默认: ch01)")
     parser.add_argument("--chapters", default=None,
                         help="style-profile 命令：抽样章节，逗号分隔（默认均匀抽 5 章）")
@@ -11569,8 +12387,12 @@ def main():
                         help="style-profile --deep：单段原文字符上限（默认 60000）")
     parser.add_argument("--deep-overlap-chars", type=int, default=2000,
                         help="style-profile --deep：相邻分段重叠字符数（默认 2000）")
+    parser.add_argument("--derive-digests", action="store_true",
+                        help="style-profile：不调用 LLM，从 style_profile_audit.json 确定性回填章源哈希与 chapter_digests")
     parser.add_argument("--graph-path", default=None,
                         help="story-graph / story-graph-query 命令：图路径（默认读取 config.story_graph.path）")
+    parser.add_argument("--allow-stale", action="store_true",
+                        help="story-graph-query / setup-payoff-audit：允许读取 stale 图作研究用途（不能用于交付或 --apply）")
     parser.add_argument("--require-answerable", action="store_true",
                         help="story-graph 命令：实体覆盖率不可答时返回 2")
     parser.add_argument("--query", "--question", "--claim", dest="query", default=None,
@@ -11589,6 +12411,22 @@ def main():
                         help="story-graph-query 命令：关闭问题→已验证注记的相似度种子（严格别名模式）")
     parser.add_argument("--eval-cases", default=None,
                         help="story-graph-query 命令：运行 gold-span 评测 JSON")
+    parser.add_argument("--manifest-path", default=None,
+                        help="book-link-audit：build manifest 路径（默认 output/build_manifest.json）")
+    parser.add_argument("--merged-path", default=None,
+                        help="book-link-audit：merged 成书路径（--write-manifest 时必需）")
+    parser.add_argument("--write-manifest", action="store_true",
+                        help="book-link-audit：merge 后写 output/build_manifest.json")
+    parser.add_argument("--update-merged", action="store_true",
+                        help="book-link-audit：仅更新 manifest 的 merged 哈希（notes-normalize/proofread 后）")
+    parser.add_argument("--contracts-path", default=None,
+                        help="term-form-contract：合同制品路径（默认 input/term_form_contracts.json）")
+    parser.add_argument("--stage", default="postprocess",
+                        help="book-link-audit --update-merged：合并后处理阶段标签")
+    parser.add_argument("--require-sealed", action="store_true",
+                        help="book-link-audit：要求任务日志已封存且哈希一致")
+    parser.add_argument("--require-current", action="store_true",
+                        help="book-link-audit：profile/story graph stale 也判失败")
     parser.add_argument("--profile-path", default=None,
                         help="setup-payoff-audit 命令：book_profile.json 路径（默认 input/book_profile.json）")
     parser.add_argument("--top-n", type=int, default=5,
@@ -11618,6 +12456,10 @@ def main():
                         help="split 命令：短于此字数的章节会被合并到下一章（默认 1000）")
     parser.add_argument("--apply", action="store_true",
                         help="consistency / notes-normalize / proofread / book-repair：执行自动修正；book-repair 只做有 source/raw/literary 证据的确定性修复")
+    parser.add_argument("--safe-only", action="store_true",
+                        help="pending-reconcile --apply：只消费 satisfied / 已 DIRTY 的 covered，outstanding 一律保留且不触发 DIRTY")
+    parser.add_argument("--locked-target-only", action="store_true",
+                        help="pending-reconcile --apply：只把 locked_decision_target_missing 行转 DIRTY，其余行全部保留")
     parser.add_argument("--verify", action="store_true",
                         help="book-repair：只复核当前 final 与修复 manifest，不写正文")
     parser.add_argument("--window", type=int, default=None,
@@ -11625,7 +12467,7 @@ def main():
     parser.add_argument("--jev", action="store_true",
                         help="drift-audit 命令：附加 Jev 窗口配对检查（需要 Jev 可用）")
     parser.add_argument("--json-out", default=None,
-                        help="drift-audit / golden --judgment-ab / proofread / book-repair：报告 JSON 输出路径")
+                        help="drift-audit / golden --judgment-ab / proofread / book-repair / query-gold-set：报告 JSON 输出路径")
     parser.add_argument("--ab", action="store_true",
                         help="golden/golden-gate 命令：运行 直译模型×thinking 4 组合 A/B 对比")
     parser.add_argument("--judgment-ab", action="store_true",
@@ -11637,7 +12479,7 @@ def main():
     parser.add_argument("--from-ledger", action="store_true",
                         help="requeue 命令：从 output/rescue/failure_ledger.jsonl 选取仍隔离的 PF 块")
     parser.add_argument("--all", action="store_true",
-                        help="rescue 命令：扫描全书；省略时只处理 --chapter 指定章节")
+                        help="rescue/completed-name-repair 命令：扫描全书；省略时只处理 --chapter 指定章节")
     parser.add_argument("--reset-rescue-budget", action="store_true",
                         help="rescue 命令：仅复位目标章节未完成块的救援/重试预算（算法升级后受控复活）")
     parser.add_argument("--workers", type=int, default=1,
@@ -11648,6 +12490,8 @@ def main():
                         help="recalibrate-critic 命令：低分报告阈值（默认 7.0）")
     parser.add_argument("--retries", type=int, default=1,
                         help="recalibrate-critic 命令：非校准/瞬时失败重试次数（默认 1）")
+    parser.add_argument("--state-only", action="store_true",
+                        help="name-only-fastpath：允许无文本变化但 pending 已满足的 DIRTY 块，仅以真实重审闭环状态")
 
     args = parser.parse_args()
 
@@ -11657,11 +12501,70 @@ def main():
         print(f"❌ 非法 chapter_id: '{args.chapter}' (仅允许字母/数字/下划线/连字符，1-32 字符)", file=sys.stderr)
         sys.exit(1)
 
+    # Round 158 Phase 0: every CLI run gets a persisted, timestamped task log.
+    # Write commands fail closed if the log cannot be created; read-only
+    # diagnostics are allowed to continue with a stderr warning.
+    _task_root = Path(__file__).resolve().parent.parent
+    _task_read_only = not _command_needs_lock(args.command, args)
+    try:
+        _task_logger = make_logger(
+            _task_root, args.command, read_only=_task_read_only,
+        )
+        _task_logger.start(chapter=args.chapter)
+        set_active_logger(_task_logger)
+    except TaskLoggingError as _task_log_exc:
+        print(f"❌ [TaskLog] 无法创建本次运行日志，拒绝执行: {_task_log_exc}",
+              file=sys.stderr)
+        sys.exit(1)
+
     # Round 130: 单实例守卫（审计①）——写共享状态的命令必须独占锁；
     # 只读命令（gate/lint/drift-audit 等）不拦截，便于运行中诊断。
     if _command_needs_lock(args.command, args):
         if not acquire_instance_lock():
+            try:
+                _task_logger.finish(1, status="failed", message="lock_busy")
+            except TaskLoggingError:
+                pass
             sys.exit(1)
+
+    _task_logger.event("command_started", stage="RUN", chapter=args.chapter)
+
+    # Round 158 Phase 0: after the flock is held, publish a read-only recovery
+    # report for chunks left in an active stage.  This never resets state and
+    # never deletes final/critic backups; it only makes the interruption
+    # auditable before the stage table resumes it.
+    if args.command in {"pipeline", "rescue"}:
+        _recovery_chapter = None if (args.command == "rescue" and args.all) else args.chapter
+        try:
+            _recovery = audit_and_write(
+                _task_root, chapter_id=_recovery_chapter,
+                run_id=_task_logger.run_id,
+            )
+            _rs = _recovery.get("summary") or {}
+            if int(_rs.get("nonterminal") or 0):
+                print(
+                    f"♻️ [Recovery] 检测到 {_rs.get('nonterminal')} 个上次中断的非终态块；"
+                    f"报告: {_recovery.get('report_path')}（状态与 backup 均未改动）",
+                    file=sys.stderr,
+                )
+            _task_logger.event(
+                "recovery_audit", stage="RECOVERY", status="ok",
+                message="read-only in-flight recovery report",
+                report_path=_recovery.get("report_path"),
+                nonterminal=_rs.get("nonterminal", 0),
+                by_state=_rs.get("by_state", {}),
+            )
+        except Exception as _recovery_exc:
+            print(f"⚠️ [Recovery] 中断恢复审计失败（不阻塞主流程）: {_recovery_exc}",
+                  file=sys.stderr)
+            try:
+                _task_logger.event(
+                    "recovery_audit", stage="RECOVERY", status="failed",
+                    error_class=type(_recovery_exc).__name__,
+                    message=str(_recovery_exc),
+                )
+            except TaskLoggingError:
+                pass
 
     # P4-9: 顶层异常包装（除已规范的 consistency/golden-gate 外，统一捕获并退出）
     try:
@@ -11687,8 +12590,49 @@ def main():
             if not init_project(chapter_id=args.chapter, force=args.force):
                 sys.exit(1)
         elif args.command == "style-profile":
-            from src.style_profiler import generate_book_profile, summary_line
+            from src.style_profiler import (
+                derive_profile_digests,
+                generate_book_profile,
+                load_profile,
+                save_profile,
+                summary_line,
+            )
             _chapters = [c.strip() for c in args.chapters.split(",") if c.strip()] if args.chapters else None
+            if args.derive_digests:
+                import shutil
+
+                _profile_path = (Path(args.profile_path) if args.profile_path
+                                 else Path.cwd() / "input" / "book_profile.json")
+                _audit_path = Path.cwd() / "output" / "style_profile_audit.json"
+                _prof = load_profile(_profile_path)
+                if not _prof:
+                    print(f"❌ style-profile --derive-digests: 无法读取 {_profile_path}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                try:
+                    _audit = json.loads(_audit_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    print(f"❌ style-profile --derive-digests: 无法读取 {_audit_path}: {exc}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                _derived = derive_profile_digests(Path.cwd(), _prof, _audit)
+                if not _derived.get("ok"):
+                    print(f"❌ style-profile --derive-digests: {_derived.get('error')}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                _backup = _profile_path.with_name(
+                    _profile_path.stem + ".pre_digest_backfill.json")
+                if not _backup.exists():
+                    shutil.copy2(_profile_path, _backup)
+                save_profile(_derived["profile"], _profile_path)
+                _summary = _derived.get("summary") or {}
+                print(f"✅ chapter_digests 已写入 {_profile_path}: "
+                      f"complete={_summary.get('complete')} "
+                      f"chapters={_summary.get('chapters_complete')}/"
+                      f"{_summary.get('chapters_total')} "
+                      f"missing={','.join(_summary.get('missing') or []) or '-'}")
+                print(f"   backup: {_backup}")
+                sys.exit(0)
             res = generate_book_profile(
                 Path.cwd(), chapters=_chapters, force=args.force,
                 deep=args.deep,
@@ -11746,8 +12690,78 @@ def main():
                 print(f"   uncovered_chapters={','.join(_cov.get('uncovered_chapters') or [])}")
             if args.require_answerable and not _cov.get("answerable"):
                 sys.exit(2)
+        elif args.command == "book-link-audit":
+            from src.book_linker import (
+                DEFAULT_AUDIT_JSON,
+                DEFAULT_AUDIT_MD,
+                DEFAULT_MANIFEST_PATH,
+                audit_book_links,
+                build_manifest,
+                update_manifest_merged,
+                write_book_link_audit,
+                write_manifest,
+            )
+            _root = Path.cwd()
+            _manifest_path = (Path(args.manifest_path) if args.manifest_path
+                              else _root / DEFAULT_MANIFEST_PATH)
+            _merged_path = Path(args.merged_path) if args.merged_path else None
+            if args.write_manifest:
+                if not _merged_path:
+                    print("❌ book-link-audit --write-manifest 需要 --merged-path",
+                          file=sys.stderr)
+                    sys.exit(2)
+                _manifest = build_manifest(
+                    _root, _merged_path,
+                    input_dir=Path(args.input_dir) if args.input_dir else None,
+                    run_id=os.environ.get("SAGATRANS_RUN_ID"))
+                write_manifest(_manifest, _manifest_path)
+                _totals = _manifest.get("totals") or {}
+                print(f"🧾 build manifest: {_manifest_path} "
+                      f"chapters={_totals.get('chapters')} "
+                      f"chunks={_totals.get('db_chunks')} "
+                      f"finals={_totals.get('finals_present')} "
+                      f"missing={_totals.get('finals_missing')} "
+                      f"orphan={_totals.get('orphan_finals')}")
+                print(f"   merged: {(_manifest.get('merged') or {}).get('path')} "
+                      f"{(_manifest.get('merged') or {}).get('sha256', '')[:12]}")
+                sys.exit(0 if (_manifest.get("merged") or {}).get("exists")
+                         and not int(_totals.get("finals_missing") or 0) else 1)
+            if args.update_merged:
+                if not _merged_path:
+                    print("❌ book-link-audit --update-merged 需要 --merged-path",
+                          file=sys.stderr)
+                    sys.exit(2)
+                _upd = update_manifest_merged(
+                    _root, _manifest_path, _merged_path, stage=args.stage)
+                if not _upd.get("ok"):
+                    print(f"❌ book-link-audit --update-merged: {_upd.get('error')} "
+                          f"{(json.dumps(_upd.get('details') or [], ensure_ascii=False)[:300])}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                print(f"🧾 merged 哈希已更新 ({args.stage}): "
+                      f"{_upd.get('sha256', '')[:12]} chars={_upd.get('chars')}")
+                sys.exit(0)
+            _audit = audit_book_links(
+                _root, manifest_path=_manifest_path, merged_path=_merged_path,
+                input_dir=Path(args.input_dir) if args.input_dir else None,
+                require_current=bool(args.require_current),
+                require_sealed=bool(args.require_sealed))
+            _json_path = Path(args.json_out) if args.json_out else _root / DEFAULT_AUDIT_JSON
+            _md_path = _root / DEFAULT_AUDIT_MD
+            write_book_link_audit(_audit, _json_path, _md_path)
+            print(f"🔗 book-link-audit: {_audit.get('status')} "
+                  f"passed={len(_audit.get('passed') or [])} "
+                  f"warn={len(_audit.get('warnings') or [])} "
+                  f"failed={len(_audit.get('failed') or [])}")
+            for _name in (_audit.get("failed") or [])[:12]:
+                print(f"   ❌ {_name}")
+            for _name in (_audit.get("warnings") or [])[:8]:
+                print(f"   ⚠️ {_name}")
+            print(f"   report: {_json_path} / {_md_path}")
+            sys.exit(0 if _audit.get("ok") else 1)
         elif args.command == "story-graph-query":
-            from src.story_graph import load_story_graph
+            from src.artifact_freshness import eval_freshness, load_story_graph_checked
+            from src.style_profiler import load_profile
             from src.story_graph_query import (
                 StoryGraphQueryIndex,
                 default_story_graph_query_generate,
@@ -11759,12 +12773,31 @@ def main():
             _rel = str((_config.get("story_graph", {}) or {}).get("path")
                        or "input/story_graph.json")
             _path = Path(args.graph_path) if args.graph_path else _root / _rel
-            _graph = load_story_graph(_path)
+            _in_dir = Path(args.input_dir) if args.input_dir else _root / "input"
+            _profile_path = (Path(args.profile_path) if args.profile_path
+                             else _root / "input" / "book_profile.json")
+            _prof = load_profile(_profile_path) if _profile_path.exists() else None
+            _checked = load_story_graph_checked(
+                _root, _path, _prof,
+                require_current=not args.allow_stale,
+                input_dir=_in_dir,
+            )
+            _graph = _checked.get("graph")
             if not _graph:
                 print(f"❌ story-graph-query: 无法读取图 artifact: {_path}",
                       file=sys.stderr)
                 sys.exit(1)
-            _in_dir = Path(args.input_dir) if args.input_dir else _root / "input"
+            if not _checked.get("ok"):
+                print(f"❌ story-graph-query: 图已陈旧或缺少血缘 ({_checked.get('status')}): "
+                      f"{', '.join(_checked.get('reasons') or [])}",
+                      file=sys.stderr)
+                print("   重建: python3 -m src.translator_agent story-graph；"
+                      "仅作研究可显式加 --allow-stale", file=sys.stderr)
+                sys.exit(1)
+            if _checked.get("status") != "fresh":
+                print(f"⚠️ story-graph-query: 使用非新鲜图（{_checked.get('status')}）: "
+                      f"{', '.join(_checked.get('reasons') or [])}",
+                      file=sys.stderr)
             _index = StoryGraphQueryIndex(_graph, input_dir=_in_dir)
             _gen = default_story_graph_query_generate if args.llm_judge else None
             if args.eval_cases:
@@ -11773,6 +12806,16 @@ def main():
                     _payload = json.loads(_cases_path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError) as exc:
                     print(f"❌ story-graph-query eval: 读取失败 {_cases_path}: {exc}",
+                          file=sys.stderr)
+                    sys.exit(1)
+                _eval_check = eval_freshness(
+                    _payload, _root, _prof, graph=_graph, input_dir=_in_dir)
+                if not _eval_check.get("ok"):
+                    _det = _eval_check.get("details") or {}
+                    print(f"❌ story-graph-query eval: 评测制品无效/过期，拒绝计算指标 "
+                          f"(reasons={','.join(_eval_check.get('reasons') or [])}; "
+                          f"invalid_cases={_det.get('invalid_cases', 0)}; "
+                          f"stale_notes={_det.get('stale_notes', 0)})",
                           file=sys.stderr)
                     sys.exit(1)
                 _cases = _payload.get("cases") if isinstance(_payload, dict) else _payload
@@ -11787,6 +12830,12 @@ def main():
                       f"R@5={_m.get('R@5', 0):.1%} R@10={_m.get('R@10', 0):.1%} "
                       f"AE@5={_m.get('AE@5', 0):.1%} AE@10={_m.get('AE@10', 0):.1%} "
                       f"anchor_precision@1={_m.get('anchor_precision@1', 0):.1%}")
+                print(f"   evidence: gold_cases={_m.get('gold_cases', 0)} "
+                      f"any@10={_m.get('any_evidence_R@10', 0):.1%} "
+                      f"all@10={_m.get('all_evidence_R@10', 0):.1%} "
+                      f"precision@2={_m.get('evidence_precision@2', 0):.1%} "
+                      f"no_seed={_m.get('no_seed_rate', 0):.1%} "
+                      f"negative_empty={_m.get('negative_empty_rate', 0):.1%}")
                 if _m.get("note_evidence_cases"):
                     print(f"   note_evidence: n={_m.get('note_evidence_cases')} "
                           f"R@5={_m.get('note_evidence_R@5', 0):.1%} "
@@ -11834,11 +12883,8 @@ def main():
                 select_setup_payoff_candidates,
                 verify_setup_payoff_selections,
             )
-            from src.story_graph import (
-                build_story_graph,
-                load_story_graph,
-                save_story_graph,
-            )
+            from src.artifact_freshness import load_story_graph_checked
+            from src.story_graph import build_story_graph, save_story_graph
             from src.story_graph_query import StoryGraphQueryIndex
             from src.style_profiler import load_profile, save_profile
 
@@ -11853,12 +12899,28 @@ def main():
             _rel = str((_config.get("story_graph", {}) or {}).get("path")
                        or "input/story_graph.json")
             _graph_path = Path(args.graph_path) if args.graph_path else _root / _rel
-            _graph = load_story_graph(_graph_path)
+            _input_dir = Path(args.input_dir) if args.input_dir else _root / "input"
+            _checked = load_story_graph_checked(
+                _root, _graph_path, _profile,
+                require_current=(not args.allow_stale) or bool(args.apply),
+                input_dir=_input_dir,
+            )
+            _graph = _checked.get("graph")
             if not _graph:
                 print(f"❌ setup-payoff-audit: 无法读取图 artifact {_graph_path}",
                       file=sys.stderr)
                 sys.exit(1)
-            _input_dir = Path(args.input_dir) if args.input_dir else _root / "input"
+            if not _checked.get("ok"):
+                print(f"❌ setup-payoff-audit: 图已陈旧或缺少血缘 ({_checked.get('status')}): "
+                      f"{', '.join(_checked.get('reasons') or [])}",
+                      file=sys.stderr)
+                print("   先运行 story-graph；research-only 可使用 --allow-stale，"
+                      "--apply 永远要求 fresh", file=sys.stderr)
+                sys.exit(1)
+            if _checked.get("status") != "fresh":
+                print(f"⚠️ setup-payoff-audit: 使用非新鲜图（{_checked.get('status')}）: "
+                      f"{', '.join(_checked.get('reasons') or [])}",
+                      file=sys.stderr)
             _index = StoryGraphQueryIndex(_graph, input_dir=_input_dir)
             if args.audit_in:
                 try:
@@ -12008,6 +13070,427 @@ def main():
         elif args.command == "consistency":
             n_issues = run_consistency_check(dry_run=not args.apply)
             sys.exit(0 if n_issues == 0 else 2)
+        elif args.command == "pending-reconcile":
+            from src.pending_backtrack_reconcile import (
+                apply_pending_backtrack_reconcile,
+                audit_pending_backtracks,
+            )
+            _pr_root = Path(__file__).resolve().parent.parent
+            if args.apply:
+                _pr_res = apply_pending_backtrack_reconcile(
+                    _pr_root, apply=True, safe_only=args.safe_only,
+                    locked_target_only=args.locked_target_only)
+            else:
+                _pr_res = audit_pending_backtracks(_pr_root)
+            _pr_counts = _pr_res.get("counts") or {}
+            _pr_mode = "apply" if args.apply else "read-only"
+            print("🧾 pending-reconcile(%s): total=%s, %s" % (
+                _pr_mode,
+                _pr_res.get("total", 0),
+                ", ".join(f"{k}={v}" for k, v in _pr_counts.items())))
+            if args.apply:
+                print(f"   consumed={_pr_res.get('consumed', 0)} "
+                      f"triggered_dirty={_pr_res.get('triggered_dirty', 0)}")
+            if not _pr_res.get("ok"):
+                print("   ⛔ 仍有 outstanding/blocked/orphan；详见 "
+                      f"{_pr_res.get('md_path')}", file=sys.stderr)
+            sys.exit(0 if _pr_res.get("ok") else 2)
+        elif args.command == "term-form-audit":
+            from src.term_form_audit import audit_term_forms
+            _tfa_root = Path(__file__).resolve().parent.parent
+            _tfa_res = audit_term_forms(
+                _tfa_root,
+                json_out=(Path(args.json_out) if args.json_out else None),
+            )
+            _tfa_counts = _tfa_res.get("counts") or {}
+            print("🔎 term-form-audit(read-only): " + (
+                ", ".join(f"{key}={value}"
+                          for key, value in _tfa_counts.items()) or "clean"))
+            for _tfa_group in (_tfa_res.get("groups") or [])[:12]:
+                print(f"   group: #{_tfa_group.get('decision_id')} "
+                      f"{_tfa_group.get('source_key')} → "
+                      f"{_tfa_group.get('target')} / "
+                      f"{_tfa_group.get('classification')} / "
+                      f"pending={len(_tfa_group.get('pending_chunks') or [])}")
+            print(f"   报告: {_tfa_res.get('md_path')}")
+            for _tfa_err in (_tfa_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_tfa_err}", file=sys.stderr)
+            sys.exit(0 if _tfa_res.get("ok") else 2)
+        elif args.command == "locked-target-authority-audit":
+            from src.locked_target_authority_audit import (
+                audit_locked_target_authorities,
+            )
+            _lta_root = Path(__file__).resolve().parent.parent
+            _lta_res = audit_locked_target_authorities(
+                _lta_root,
+                json_out=(Path(args.json_out) if args.json_out else None),
+            )
+            _lta_counts = _lta_res.get("counts") or {}
+            print("🔒 locked-target-authority-audit(read-only): " + (
+                ", ".join(f"{key}={value}"
+                          for key, value in _lta_counts.items()) or "clean"))
+            for _lta_group in (_lta_res.get("groups") or [])[:12]:
+                print(f"   group: #{_lta_group.get('decision_id')} "
+                      f"{_lta_group.get('source_key')} → "
+                      f"{_lta_group.get('target')} / "
+                      f"{_lta_group.get('classification')} / "
+                      f"hits={_lta_group.get('target_hits')}/"
+                      f"{_lta_group.get('authority_chunks')}")
+            print(f"   报告: {_lta_res.get('md_path')}")
+            for _lta_err in (_lta_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_lta_err}", file=sys.stderr)
+            sys.exit(0 if _lta_res.get("ok") else 2)
+        elif args.command == "locked-target-authority-repair":
+            from src.decision_authority_align import (
+                apply_locked_target_authority_repairs,
+                audit_locked_target_authority_repairs,
+            )
+            _ltr_root = Path(__file__).resolve().parent.parent
+            if args.apply:
+                _ltr_res = apply_locked_target_authority_repairs(
+                    _ltr_root, apply=True, run_id=_task_logger.run_id)
+            else:
+                _ltr_res = audit_locked_target_authority_repairs(_ltr_root)
+            _ltr_counts = (_ltr_res.get("counts")
+                           or _ltr_res.get("plan_counts") or {})
+            _ltr_mode = "apply" if args.apply else "read-only"
+            print(f"🔧 locked-target-authority-repair({_ltr_mode}): " + (
+                ", ".join(f"{key}={value}"
+                          for key, value in _ltr_counts.items()) or "clean"))
+            for _ltr_cand in (_ltr_res.get("candidates") or [])[:12]:
+                print(f"   candidate: Decision #{_ltr_cand.get('decision_id')} "
+                      f"{_ltr_cand.get('source_key')} "
+                      f"{_ltr_cand.get('old_translation')} → "
+                      f"{_ltr_cand.get('new_translation')} "
+                      f"pending={len(_ltr_cand.get('pending_chunks') or [])}")
+            for _ltr_blocked in (_ltr_res.get("blocked_candidates") or [])[:8]:
+                print(f"   blocked: Decision #{_ltr_blocked.get('decision_id')} "
+                      f"{_ltr_blocked.get('reason')}")
+            print(f"   报告: {_ltr_res.get('md_path')}")
+            for _ltr_err in (_ltr_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_ltr_err}", file=sys.stderr)
+            sys.exit(0 if _ltr_res.get("ok") else 2)
+        elif args.command == "term-form-contract":
+            from src.term_form_contracts import (
+                apply_term_form_contracts,
+                build_term_form_contracts,
+            )
+            _tfc_root = Path(__file__).resolve().parent.parent
+            _tfc_path = (Path(args.contracts_path) if args.contracts_path
+                         else None)
+            if args.apply:
+                _tfc_res = apply_term_form_contracts(
+                    _tfc_root, contracts_path=_tfc_path,
+                    run_id=_task_logger.run_id,
+                )
+            else:
+                _tfc_res = build_term_form_contracts(
+                    _tfc_root, contracts_path=_tfc_path,
+                    report_json=(Path(args.json_out) if args.json_out else None),
+                )
+            _tfc_mode = "apply" if args.apply else "read-only"
+            print("🧩 term-form-contract(%s): " % _tfc_mode + (
+                ", ".join(f"{key}={value}"
+                          for key, value in (_tfc_res.get("counts") or {}).items())
+                or "no contracts"))
+            for _tfc_contract in (_tfc_res.get("contracts") or [])[:12]:
+                print(f"   contract: #{_tfc_contract.get('decision_id')} "
+                      f"{_tfc_contract.get('source_key')} / "
+                      f"{_tfc_contract.get('status')} / "
+                      f"forms=" + ",".join(
+                          form.get("form", "")
+                          for form in _tfc_contract.get("forms") or []))
+            if _tfc_res.get("artifact_path"):
+                print(f"   artifact: {_tfc_res.get('artifact_path')}")
+            print(f"   报告: {_tfc_res.get('md_path')}")
+            for _tfc_err in (_tfc_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_tfc_err}", file=sys.stderr)
+            sys.exit(0 if _tfc_res.get("ok") else 2)
+        elif args.command == "name-authority-audit":
+            from src.name_authority_audit import audit_name_authorities
+            _na_root = Path(__file__).resolve().parent.parent
+            _na_res = audit_name_authorities(_na_root)
+            _na_counts = _na_res.get("counts") or {}
+            print("🧭 name-authority-audit(read-only): " + (
+                ", ".join(f"{k}={v}" for k, v in _na_counts.items()) or "clean"))
+            print(f"   multi_form_groups={_na_res.get('multi_form_count', 0)} "
+                  f"needs_form_contract={_na_res.get('multi_form_needing_contract', 0)}")
+            print(f"   报告: {_na_res.get('md_path')}")
+            if not _na_res.get("ok"):
+                print("   ⛔ 权威分歧尚未对齐；name-only 写闭环不得启用。",
+                      file=sys.stderr)
+            for _na_err in (_na_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_na_err}", file=sys.stderr)
+            sys.exit(0 if _na_res.get("ok") else 2)
+        elif args.command == "name-authority-align":
+            from src.name_authority_align import align_name_authorities
+            _nal_root = Path(__file__).resolve().parent.parent
+            _nal_res = align_name_authorities(
+                _nal_root,
+                apply=args.apply,
+                json_out=(Path(args.json_out) if args.json_out else None),
+                run_id=_task_logger.run_id,
+            )
+            _nal_mode = "apply" if args.apply else "read-only"
+            _nal_counts = (_nal_res.get("counts")
+                           or _nal_res.get("plan_counts") or {})
+            print(f"🧭 name-authority-align({_nal_mode}): " + (
+                ", ".join(f"{k}={v}" for k, v in _nal_counts.items()) or "clean"))
+            _nal_after = _nal_res.get("audit_after") or {}
+            if _nal_after:
+                print(f"   audit_after: ok={_nal_after.get('ok')} "
+                      f"blocking={_nal_after.get('blocking_count', 0)} "
+                      f"status={_nal_after.get('status')}")
+            print(f"   write_attempted={_nal_res.get('write_attempted')} "
+                  f"applied={_nal_res.get('applied_count', 0)}")
+            for _nal_act in (_nal_res.get("actions") or [])[:12]:
+                print(f"   action: id={_nal_act.get('registry_id')} "
+                      f"{_nal_act.get('action')} {_nal_act.get('status', 'planned')}")
+            for _nal_manual in (_nal_res.get("manual_review") or [])[:8]:
+                print("   manual: " + json.dumps(_nal_manual, ensure_ascii=False))
+            print(f"   报告: {_nal_res.get('md_path')}")
+            for _nal_err in (_nal_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_nal_err}", file=sys.stderr)
+            sys.exit(0 if _nal_res.get("ok") else 2)
+        elif args.command == "decision-authority-align":
+            from src.decision_authority_align import (
+                apply_decision_authority_alignment,
+                audit_decision_authorities,
+            )
+            _dac_root = Path(__file__).resolve().parent.parent
+            if args.apply:
+                _dac_res = apply_decision_authority_alignment(
+                    _dac_root, apply=True, run_id=_task_logger.run_id)
+            else:
+                _dac_res = audit_decision_authorities(_dac_root)
+            _dac_counts = _dac_res.get("counts") or _dac_res.get("plan_counts") or {}
+            _dac_mode = "apply" if args.apply else "read-only"
+            print(f"⚖️ decision-authority-align({_dac_mode}): " + (
+                ", ".join(f"{key}={value}"
+                          for key, value in _dac_counts.items()) or "clean"))
+            for _dac_cand in (_dac_res.get("candidates")
+                              or _dac_res.get("planned") or [])[:12]:
+                print(f"   candidate: Decision #{_dac_cand.get('decision_id')} "
+                      f"{_dac_cand.get('source_key')} "
+                      f"{_dac_cand.get('old_translation')} → "
+                      f"{_dac_cand.get('new_translation')} "
+                      f"repair_chunks={len(_dac_cand.get('repair_chunks') or [])}")
+            for _dac_act in (_dac_res.get("actions") or [])[:12]:
+                print(f"   action: Decision #{_dac_act.get('decision_id')} "
+                      f"{_dac_act.get('status')} "
+                      f"queued={len(_dac_act.get('queued_chunks') or [])}")
+            for _dac_blocked in (_dac_res.get("blocked_candidates") or [])[:8]:
+                print("   manual: " + json.dumps(
+                    {"decision_id": _dac_blocked.get("decision_id"),
+                     "source_key": _dac_blocked.get("source_key"),
+                     "reason": _dac_blocked.get("reason")},
+                    ensure_ascii=False))
+            print(f"   报告: {_dac_res.get('md_path')}")
+            for _dac_err in (_dac_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_dac_err}", file=sys.stderr)
+            sys.exit(0 if _dac_res.get("ok") else 2)
+        elif args.command == "decision-target-authority-repair":
+            from src.decision_target_authority_repair import (
+                apply_decision_target_repairs,
+                audit_decision_target_repairs,
+            )
+            _dtar_root = Path(__file__).resolve().parent.parent
+            if args.apply:
+                _dtar_res = apply_decision_target_repairs(
+                    _dtar_root, apply=True, run_id=_task_logger.run_id)
+            else:
+                _dtar_res = audit_decision_target_repairs(_dtar_root)
+            _dtar_counts = (_dtar_res.get("plan_counts")
+                            or _dtar_res.get("counts") or {})
+            _dtar_mode = "apply" if args.apply else "read-only"
+            print(f"🎯 decision-target-authority-repair({_dtar_mode}): " + (
+                ", ".join(f"{key}={value}"
+                          for key, value in _dtar_counts.items()) or "clean"))
+            for _dtar_act in (_dtar_res.get("actions")
+                              or _dtar_res.get("candidates") or [])[:12]:
+                _dtar_queued = len(
+                    _dtar_act.get("queued_chunks")
+                    or _dtar_act.get("stale_chunks") or [])
+                print(f"   action: Decision #{_dtar_act.get('decision_id')} "
+                      f"{_dtar_act.get('source_key')} "
+                      f"{_dtar_act.get('old_translation')} → "
+                      f"{_dtar_act.get('new_translation')} "
+                      f"pending={len(_dtar_act.get('pending_chunks') or [])} "
+                      f"queued={_dtar_queued}")
+            for _dtar_blocked in (_dtar_res.get("blocked_groups") or [])[:12]:
+                print(f"   blocked: {_dtar_blocked.get('source_key')} / "
+                      f"{_dtar_blocked.get('reason')}")
+            print(f"   报告: {_dtar_res.get('md_path')}")
+            for _dtar_err in (_dtar_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_dtar_err}", file=sys.stderr)
+            sys.exit(0 if _dtar_res.get("ok") else 2)
+        elif args.command == "query-gold-set":
+            from src.artifact_freshness import load_story_graph_checked
+            from src.query_gold_set import build_query_gold_set
+            from src.style_profiler import load_profile
+
+            _qg_root = Path(__file__).resolve().parent.parent
+            _qg_in = (Path(args.input_dir) if args.input_dir
+                      else _qg_root / "input")
+            if not _qg_in.is_absolute():
+                _qg_in = _qg_root / _qg_in
+            _qg_profile_path = (Path(args.profile_path) if args.profile_path
+                                else _qg_in / "book_profile.json")
+            if not _qg_profile_path.is_absolute():
+                _qg_profile_path = _qg_root / _qg_profile_path
+            _qg_profile = load_profile(_qg_profile_path)
+            if not _qg_profile:
+                print(f"❌ query-gold-set: 无法读取剖面 {_qg_profile_path}",
+                      file=sys.stderr)
+                sys.exit(1)
+            _qg_rel = str((_config.get("story_graph", {}) or {}).get("path")
+                          or "input/story_graph.json")
+            _qg_graph_path = (Path(args.graph_path) if args.graph_path
+                              else _qg_root / _qg_rel)
+            if not _qg_graph_path.is_absolute():
+                _qg_graph_path = _qg_root / _qg_graph_path
+            _qg_checked = load_story_graph_checked(
+                _qg_root, _qg_graph_path, _qg_profile,
+                require_current=True, input_dir=_qg_in,
+            )
+            if not _qg_checked.get("ok") or not _qg_checked.get("graph"):
+                print("❌ query-gold-set: 图不是 fresh artifact "
+                      f"({_qg_checked.get('status')}): "
+                      f"{', '.join(_qg_checked.get('reasons') or [])}",
+                      file=sys.stderr)
+                sys.exit(1)
+            _qg_res = build_query_gold_set(
+                _qg_root,
+                profile=_qg_profile,
+                graph=_qg_checked.get("graph"),
+                profile_path=_qg_profile_path,
+                graph_path=_qg_graph_path,
+                input_dir=_qg_in,
+                output_path=(Path(args.json_out) if args.json_out else None),
+            )
+            print("🧪 query-gold-set: " + (
+                ", ".join(f"{key}={value}"
+                          for key, value in (_qg_res.get("counts") or {}).items())
+                or "no cases"))
+            print(f"   status={_qg_res.get('status')} "
+                  f"eval_written={_qg_res.get('eval_written')} "
+                  f"case_count={_qg_res.get('case_count', 0)}")
+            if _qg_res.get("gaps"):
+                print("   gaps: " + ", ".join(
+                    f"{key}={value}" for key, value in _qg_res["gaps"].items()),
+                    file=sys.stderr)
+            for _qg_err in (_qg_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_qg_err}", file=sys.stderr)
+            print(f"   报告: {_qg_res.get('report_path')}")
+            sys.exit(0 if _qg_res.get("ok") else 2)
+        elif args.command == "name-only-fastpath":
+            from src.name_only_fastpath import (
+                apply_name_only_fastpath,
+                audit_name_only_fastpath,
+            )
+            _nf_root = Path(__file__).resolve().parent.parent
+            if args.apply:
+                _nf_res = apply_name_only_fastpath(
+                    _nf_root, chapter_id=args.chapter, apply=True,
+                    run_id=_task_logger.run_id, limit=args.limit,
+                    allow_state_only=args.state_only,
+                )
+            else:
+                _nf_res = audit_name_only_fastpath(
+                    _nf_root, chapter_id=args.chapter,
+                    allow_state_only=args.state_only)
+            _nf_counts = _nf_res.get("counts") or {}
+            _nf_mode = "apply" if args.apply else "read-only"
+            print(f"🧪 name-only-fastpath({_nf_mode}): " + ", ".join(
+                f"{k}={v}" for k, v in _nf_counts.items()))
+            print(f"   报告: {_nf_res.get('md_path')}")
+            if _nf_res.get("authority_blocked"):
+                print("   ⛔ 名称权威审计未清零；写闭环已拒绝执行。",
+                      file=sys.stderr)
+            for _nf_rec in (_nf_res.get("candidates") or [])[:12]:
+                print(f"   candidate: {_nf_rec.get('chunk_id')} "
+                      f"mode={_nf_rec.get('change_mode', 'name_only')} "
+                      f"before={str(_nf_rec.get('final_sha256_before'))[:12]} "
+                      f"after={str(_nf_rec.get('final_sha256_after'))[:12]}")
+            for _nf_act in (_nf_res.get("actions") or [])[:12]:
+                print(f"   action: {_nf_act.get('chunk_id')} "
+                      f"{_nf_act.get('status')} / {_nf_act.get('reason')}")
+            if _nf_res.get("failed"):
+                for _nf_err in _nf_res["failed"][:8]:
+                    print(f"   ❌ {_nf_err}", file=sys.stderr)
+            sys.exit(0 if _nf_res.get("ok") else 1)
+        elif args.command == "completed-name-repair":
+            from src.name_only_fastpath import (
+                apply_completed_name_repair,
+                audit_completed_name_repair,
+            )
+            _cn_root = Path(__file__).resolve().parent.parent
+            _cn_chapter = None if getattr(args, "all", False) else args.chapter
+            if args.apply:
+                _cn_res = apply_completed_name_repair(
+                    _cn_root, chapter_id=_cn_chapter, apply=True,
+                    run_id=_task_logger.run_id, limit=args.limit,
+                )
+            else:
+                _cn_res = audit_completed_name_repair(
+                    _cn_root, chapter_id=_cn_chapter)
+            _cn_counts = _cn_res.get("counts") or {}
+            _cn_mode = "apply" if args.apply else "read-only"
+            print(f"🧹 completed-name-repair({_cn_mode}): " + ", ".join(
+                f"{k}={v}" for k, v in _cn_counts.items()))
+            print(f"   报告: {_cn_res.get('md_path')}")
+            if _cn_res.get("authority_blocked"):
+                print("   ⛔ 名称权威审计未清零；COMPLETED 修复已拒绝执行。",
+                      file=sys.stderr)
+            for _cn_rec in (_cn_res.get("candidates") or [])[:12]:
+                print(f"   candidate: {_cn_rec.get('chunk_id')} "
+                      f"{_cn_rec.get('source_key')} → "
+                      f"{_cn_rec.get('canonical_name')} "
+                      f"({len(_cn_rec.get('changed_spans') or [])} 处)")
+            for _cn_act in (_cn_res.get("actions") or [])[:12]:
+                print(f"   action: {_cn_act.get('chunk_id')} "
+                      f"{_cn_act.get('status')} / {_cn_act.get('reason')}")
+            if _cn_res.get("after_counts"):
+                print("   pending_after: " + ", ".join(
+                    f"{k}={v}" for k, v in _cn_res["after_counts"].items()))
+            sys.exit(0 if _cn_res.get("ok") else 1)
+        elif args.command == "confirmed-term-drift-repair":
+            from src.name_only_fastpath import (
+                apply_confirmed_term_drift_repair,
+                audit_confirmed_term_drift_repair,
+            )
+            _ct_root = Path(__file__).resolve().parent.parent
+            _ct_chapter = None if getattr(args, "all", False) else args.chapter
+            if args.apply:
+                _ct_res = apply_confirmed_term_drift_repair(
+                    _ct_root, chapter_id=_ct_chapter, apply=True,
+                    run_id=_task_logger.run_id, limit=args.limit,
+                )
+            else:
+                _ct_res = audit_confirmed_term_drift_repair(
+                    _ct_root, chapter_id=_ct_chapter)
+            _ct_counts = _ct_res.get("counts") or {}
+            _ct_mode = "apply" if args.apply else "read-only"
+            print(f"🧭 confirmed-term-drift-repair({_ct_mode}): " + ", ".join(
+                f"{k}={v}" for k, v in _ct_counts.items()))
+            print(f"   报告: {_ct_res.get('md_path')}")
+            for _ct_rec in (_ct_res.get("candidates") or [])[:12]:
+                print(f"   candidate: Decision #{_ct_rec.get('decision_id')} "
+                      f"{_ct_rec.get('source_key')} / "
+                      f"{_ct_rec.get('wrong_form')} → "
+                      f"{_ct_rec.get('canonical_name')} / chunks="
+                      f"{len(_ct_rec.get('chunks') or [])}")
+            for _ct_act in (_ct_res.get("actions") or [])[:12]:
+                print(f"   action: Decision #{_ct_act.get('decision_id')} "
+                      f"{_ct_act.get('status')} / {_ct_act.get('reason')} / "
+                      f"chunks={len(_ct_act.get('chunks') or [])}")
+            for _ct_blocked in (_ct_res.get("blocked") or [])[:8]:
+                print(f"   blocked: Decision #{_ct_blocked.get('decision_id')} "
+                      f"{_ct_blocked.get('source_key')} / "
+                      f"{_ct_blocked.get('reason')}", file=sys.stderr)
+            for _ct_err in (_ct_res.get("errors") or [])[:8]:
+                print(f"   ❌ {_ct_err}", file=sys.stderr)
+            sys.exit(0 if _ct_res.get("ok") else 1)
         elif args.command == "consolidate":
             from src.pipeline import consolidate_dirty_chapters
             _cons_res = consolidate_dirty_chapters(max_rounds=args.max_rounds)
@@ -12148,6 +13631,15 @@ def main():
         elif args.command == "gate":
             from src.pipeline import run_final_gate
             _gate_res = run_final_gate()
+            if not _gate_res.get("ok"):
+                try:
+                    _task_logger.event(
+                        "gate_failed", stage="GATE", status="failed",
+                        message="final gate rejected the delivery",
+                        failures=(_gate_res.get("failures") or [])[:20],
+                    )
+                except TaskLoggingError:
+                    pass
             sys.exit(0 if _gate_res.get("ok") else 1)
         elif args.command == "finalize":
             from src.book_lint import finalize_outputs
@@ -12227,15 +13719,48 @@ def main():
     except KeyboardInterrupt:
         print("⛔ 已确认中止（Ctrl+C x2）。进度已保存；重新运行命令会从数据库断点续跑。",
               file=sys.stderr, flush=True)
+        try:
+            _task_logger.event("run_interrupted", stage="RUN", status="interrupted")
+            _task_logger.finish(130, status="interrupted")
+        except TaskLoggingError:
+            pass
         sys.exit(130)
-    except SystemExit:
+    except SystemExit as _task_exit:
+        _task_code = getattr(_task_exit, "code", 1)
+        if _task_code is None:
+            _task_code = 0
+        if not isinstance(_task_code, int):
+            _task_code = 1
+        try:
+            if _task_code != 0:
+                _task_logger.event(
+                    "command_failed", stage="RUN", status="failed",
+                    exit_code=_task_code,
+                    message="command exited non-zero",
+                )
+            _task_logger.finish(_task_code)
+        except TaskLoggingError:
+            pass
         raise
     except Exception as e:
         # P4-9: 顶层异常统一退出（保留 KeyboardInterrupt/SystemExit 上抛）
         print(f"❌ 命令 {args.command} 异常终止: {e}", file=sys.stderr)
         import traceback as _tb_p49
         _tb_p49.print_exc()
+        try:
+            _task_logger.event(
+                "command_failed", stage="RUN", status="failed",
+                error_class=type(e).__name__, message=str(e),
+            )
+            _task_logger.finish(1, status="failed")
+        except TaskLoggingError:
+            pass
         sys.exit(1)
+    else:
+        try:
+            _task_logger.finish(0)
+        except TaskLoggingError:
+            pass
 
 
 # Section 11 — 输入格式适配器 (EpubSplitter / TextSplitter / MdSplitter)
@@ -13149,6 +14674,33 @@ def _scan_finals(output_dir: str, flat: bool = False) -> list:
     return finals
 
 
+def _chunk_id_from_final(item: dict) -> str:
+    name = Path(str(item.get("path") or item.get("file") or "")).name
+    return name[:-len("_final.json")] if name.endswith("_final.json") else ""
+
+
+def _load_dirty_chunk_ids(workflow_db: Path) -> Optional[set]:
+    """Read-only DIRTY set; absent/legacy DB means no chunks are exempt."""
+    path = Path(workflow_db)
+    if not path.exists():
+        return set()
+    try:
+        con = sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True)
+        try:
+            return {
+                str(row[0]) for row in con.execute(
+                    "SELECT chunk_id FROM chunk_tasks WHERE state='DIRTY'")
+            }
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        if "no such table" in str(exc).lower():
+            return set()
+        print(f"  ⚠️ [Consistency] 无法读取 DIRTY 状态，暂缓所有正文写入: {exc}",
+              file=sys.stderr)
+        return None
+
+
 def _find_slash_aliases(canonical: str) -> list:
     """'省长/地方市长' → ['省长', '地方市长']"""
     parts = [p.strip() for p in canonical.split("/")]
@@ -13310,7 +14862,8 @@ def _generate_report(finals: list, issues: list, dry_run: bool) -> str:
     return "\n".join(lines)
 
 
-def _apply_issues(finals: list, issues: list) -> int:
+def _apply_issues(finals: list, issues: list,
+                  skip_paths: Optional[set] = None) -> int:
     """应用修正到 final.json，返回实际修改的文件数"""
     by_file: dict = {}
     for iss in issues:
@@ -13319,6 +14872,9 @@ def _apply_issues(finals: list, issues: list) -> int:
 
     patched_files = 0
     for filepath, reps in by_file.items():
+        if skip_paths and str(filepath) in skip_paths:
+            print(f"  ⏭️ {Path(filepath).name}: DIRTY，名称修正留给 consolidate 重审闭环")
+            continue
         p = Path(filepath)
         # P2-1: 统一走 robust_json_loads 抗损坏 final.json
         data = robust_json_loads(p.read_text(encoding="utf-8"), expected_type=dict)
@@ -13470,6 +15026,7 @@ def _apply_name_unification_pass(
     cache_path: Path,
     scope_label: str = "",
     dry_run: bool = False,
+    skip_chunk_ids: Optional[set] = None,
 ) -> dict:
     """Round 134: 章节/全书级名称统一（登记表归一 + 别名整形 + 漂移 token 统一）。
 
@@ -13488,7 +15045,8 @@ def _apply_name_unification_pass(
                 "dry_run": bool(dry_run), "skipped": True}
     out = {"files": 0, "files_pending": 0, "sep_restore": 0, "forms": 0, "tokens": 0,
            "approved": [], "rejected": [], "pending": [], "clusters": 0,
-           "dry_run": bool(dry_run)}
+           "dry_run": bool(dry_run), "skipped_dirty": 0,
+           "skipped_dirty_chunks": []}
     tmp_path = None
     conn = None
     try:
@@ -13546,6 +15104,12 @@ def _apply_name_unification_pass(
             out["rejected"] = sorted(f"{c}→{i.get('to')}" for c, i in cands.items()
                                      if c not in approved)
         for fin in finals:
+            chunk_id = _chunk_id_from_final(fin)
+            if (not dry_run and skip_chunk_ids
+                    and chunk_id in skip_chunk_ids):
+                out["skipped_dirty"] += 1
+                out["skipped_dirty_chunks"].append(chunk_id)
+                continue
             new_text, st = apply_name_unification(fin.get("text", ""), maps)
             if new_text and new_text != fin.get("text", ""):
                 if dry_run:
@@ -13589,6 +15153,9 @@ def _apply_name_unification_pass(
                 lines.append(f"- 待写入文件: {out['files_pending']} / {len(finals)}")
             else:
                 lines.append(f"- 受影响文件: {out['files']} / {len(finals)}")
+                if out["skipped_dirty"]:
+                    lines.append(
+                        f"- DIRTY 暂缓写入: {out['skipped_dirty']} 个（等待 consolidate 重审闭环）")
             lines.append("")
             lines.append("## 统一映射（音译漂移 → 规范形）")
             for v, t, w in maps.get("forms", [])[:40]:
@@ -13674,6 +15241,13 @@ def run_consistency_check(dry_run: bool = True, check_only: bool = False,
     print("\n🔎 检测名称不一致...")
     issues = _detect_issues(finals, entities, decisions)
     print(f"    发现 {len(issues)} 处")
+    dirty_ids = _load_dirty_chunk_ids(Path(db_path).with_name("workflow.db"))
+    if dirty_ids is None:
+        dirty_ids = {_chunk_id_from_final(item) for item in finals}
+    skip_paths = {
+        str(item["path"]) for item in finals
+        if _chunk_id_from_final(item) in dirty_ids
+    }
 
     if check_only:
         return len(issues)
@@ -13686,7 +15260,7 @@ def run_consistency_check(dry_run: bool = True, check_only: bool = False,
 
     if not dry_run and issues:
         print("\n✏️ 执行修正...")
-        patched = _apply_issues(finals, issues)
+        patched = _apply_issues(finals, issues, skip_paths=skip_paths)
         print(f"    修改了 {patched} 个文件")
     elif dry_run and issues:
         print("\n⏸️  DRY RUN 模式：未修改任何文件（--apply 以执行修正）")
@@ -13699,6 +15273,7 @@ def run_consistency_check(dry_run: bool = True, check_only: bool = False,
             cache_path=Path(output_dir) / "_name_drift_vetting.json",
             scope_label="(global)",
             dry_run=dry_run,
+            skip_chunk_ids=dirty_ids,
         )
         if not nu.get("skipped"):
             n_repl = nu["sep_restore"] + nu["forms"] + nu["tokens"]
@@ -13758,6 +15333,13 @@ def run_consistency_check_for_chapter(
 
     issues = _detect_issues(finals, entities, decisions)
     print(f"    发现 {len(issues)} 处不一致")
+    dirty_ids = _load_dirty_chunk_ids(Path(db_path).with_name("workflow.db"))
+    if dirty_ids is None:
+        dirty_ids = {_chunk_id_from_final(item) for item in finals}
+    skip_paths = {
+        str(item["path"]) for item in finals
+        if _chunk_id_from_final(item) in dirty_ids
+    }
 
     # 报告写到 chapter 目录内（避免污染全局报告）
     report = _generate_report(finals, issues, dry_run=dry_run)
@@ -13766,7 +15348,7 @@ def run_consistency_check_for_chapter(
     print(f"    → 报告: {report_path}")
 
     if not dry_run and issues:
-        patched = _apply_issues(finals, issues)
+        patched = _apply_issues(finals, issues, skip_paths=skip_paths)
         print(f"    ✏️ 已修正 {patched} 个文件")
     elif dry_run and issues:
         print(f"    ⏸️ DRY RUN：未修改文件")
@@ -13782,6 +15364,7 @@ def run_consistency_check_for_chapter(
             cache_path=Path(output_root) / "_name_drift_vetting.json",
             scope_label=f"{chapter_id} → 全文 output/**",
             dry_run=False,
+            skip_chunk_ids=dirty_ids,
         )
         if not nu.get("skipped"):
             n_repl = nu["sep_restore"] + nu["forms"] + nu["tokens"]
@@ -13992,6 +15575,8 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
         }
         order.append(canon)
 
+    term_pairs = _decision_term_phrase_translation_pairs(conn)
+    authority_keys = _decision_translation_authority_keys(conn)
     parent = {c: c for c in order}
 
     def find(x):
@@ -14008,6 +15593,19 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
     def _type_conflict(a, b):
         ta, tb = meta[a]["etype"], meta[b]["etype"]
         return bool(ta and tb and ta != tb)
+
+    def _term_phrase_conflict(a, b):
+        ka, kb = _term_compare_key(a), _term_compare_key(b)
+        if not ka or not kb:
+            return False
+        for base_key, term_key in term_pairs:
+            if ka == base_key:
+                if kb == term_key or name_char_similarity(kb, term_key) >= 0.78:
+                    return True
+            if kb == base_key:
+                if ka == term_key or name_char_similarity(ka, term_key) >= 0.78:
+                    return True
+        return False
 
     def _drift_equivalent(a, b):
         ma, mb = meta[a], meta[b]
@@ -14028,7 +15626,8 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
     for i in range(len(order)):
         for j in range(i + 1, len(order)):
             a, b = order[i], order[j]
-            if find(a) == find(b) or _type_conflict(a, b):
+            if (find(a) == find(b) or _type_conflict(a, b)
+                    or _term_phrase_conflict(a, b)):
                 continue
             # Round 144: 共享一个 source_name 不再足以证明同人。必须先过
             # canonical 身份 token 交集（去掉头衔后的名字部分），防止
@@ -14080,6 +15679,7 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
             # 污染出来的“高别名数 hub”会比干净 canonical 更容易当 winner。
             return (
                 1 if m["title_only"] else 0,
+                0 if _term_compare_key(c) in authority_keys else 1,
                 _CONF_ORDER.get(m["confidence"], 3),
                 -len(m["proper_src"]),
                 0 if "·" in c else 1,
@@ -14170,6 +15770,86 @@ def unify_entity_registry(conn, dry_run: bool = True) -> Dict[str, Dict]:
     if not dry_run:
         conn.commit()
     return plan
+
+
+_ARTICLE_PREFIX_RE = re.compile(
+    r"^(?:the|a|an)\s+(?P<rest>\S.*)$", re.IGNORECASE)
+
+
+_EN_GROUP_TERM_WORDS = frozenset({
+    "army", "bank", "book", "books", "bureau", "church", "company", "corps",
+    "corporation", "council", "court", "department", "duchy", "empire",
+    "family", "fleet", "force", "forces", "genetic", "guard", "guild",
+    "house", "household", "houses", "imperial", "kingdom", "law", "legion",
+    "manual", "marker", "mercenaries", "mercenary", "ministry", "order",
+    "plan", "power", "prophecy", "school", "saying", "sayings", "song",
+    "songs", "suit", "totality", "troop", "troops", "way",
+})
+
+
+def _term_compare_key(name) -> str:
+    raw = str(name or "").casefold().replace("’", "'").replace("‘", "'")
+    return re.sub(r"[\s" + re.escape(_NAME_SEP_CHARS) + r"]+", "", raw).strip()
+
+
+def _decision_translation_authority_keys(conn) -> set:
+    """Return folded Decision DB translations for deterministic winner choice."""
+    try:
+        rows = conn.execute(
+            "SELECT translation FROM decision_db "
+            "WHERE translation IS NOT NULL AND translation != ''")
+    except Exception:
+        return set()
+    return {
+        key for (translation,) in rows
+        for key in (_term_compare_key(translation),)
+        if key
+    }
+
+
+def _decision_term_phrase_translation_pairs(conn) -> List[Tuple[str, str]]:
+    """Return (base translation key, term translation key) pairs from decisions.
+
+    The Decision DB is the hard terminology source.  If a source phrase is a
+    strict extension of a shorter source with a generic group term
+    (``school``/``plan``/``way`` …), its translation denotes a different term,
+    not an alias spelling of the shorter entity.  These pairs tell the registry
+    merger not to collapse the two canonicals and re-create a dangerous
+    replace mapping that deletes the category word.
+    """
+    try:
+        if not conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='decision_db'").fetchone():
+            return []
+        rows = [
+            (str(source or ""), str(translation or ""))
+            for source, translation in conn.execute(
+                "SELECT source_key, translation FROM decision_db "
+                "WHERE source_key IS NOT NULL AND source_key != '' "
+                "AND translation IS NOT NULL AND translation != ''")
+        ]
+    except Exception:
+        return []
+
+    parsed = []
+    for source, translation in rows:
+        normalized = source_name_normalized(source)
+        key = _term_compare_key(translation)
+        if normalized and key:
+            parsed.append((normalized, set(normalized.split()), key, translation))
+
+    pairs = set()
+    for term_norm, term_tokens, term_key, _term_translation in parsed:
+        for base_norm, base_tokens, base_key, _base_translation in parsed:
+            if base_norm == term_norm or base_norm not in term_norm:
+                continue
+            extra = term_tokens - base_tokens
+            if not extra.intersection(_EN_GROUP_TERM_WORDS):
+                continue
+            if base_key and term_key and base_key != term_key:
+                pairs.add((base_key, term_key))
+    return sorted(pairs)
 
 
 def _repair_names_related(a: str, b: str) -> bool:
@@ -15613,7 +17293,10 @@ def apply_name_unification(text: str, maps: Dict[str, Any]) -> Tuple[str, Dict[s
 
     返回 (new_text, stats)。stats 含各规则替换计数 + 示例，供报告/审计。
     """
-    stats: Dict[str, Any] = {"sep_restore": 0, "forms": 0, "tokens": 0, "examples": []}
+    stats: Dict[str, Any] = {
+        "sep_restore": 0, "forms": 0, "tokens": 0,
+        "examples": [], "targets": [],
+    }
     if not text or not maps:
         return text, stats
 
@@ -15621,6 +17304,8 @@ def apply_name_unification(text: str, maps: Dict[str, Any]) -> Tuple[str, Dict[s
         if n <= 0:
             return
         stats[rule] += n
+        if after and after not in stats["targets"]:
+            stats["targets"].append(after)
         if len(stats["examples"]) < 12:
             stats["examples"].append(f"{before}→{after}" + (f"×{n}" if n > 1 else ""))
 
@@ -16049,6 +17734,20 @@ def consolidate_dirty_chapters(
     pipeline_factory=None,
     db_path=None,
     output_dir=None,
+    pending_applier=None,
+    name_only_applier=None,
+    run_pending_reconcile: bool = True,
+    run_name_only: bool = True,
+    run_confirmed_term_repair: bool = True,
+    confirmed_term_applier=None,
+    run_completed_name_repair: bool = True,
+    completed_name_applier=None,
+    run_term_contracts: bool = True,
+    term_contract_applier=None,
+    run_article_alias_repair: bool = True,
+    article_alias_applier=None,
+    run_name_authority_align: bool = True,
+    name_authority_applier=None,
 ) -> dict:
     """T2: 全书决策收敛闭环 — 重跑所有含 DIRTY chunk 的章节直到收敛。
 
@@ -16076,7 +17775,22 @@ def consolidate_dirty_chapters(
     db_file = Path(db_path) if db_path else root / "db" / "workflow.db"
     out_root = Path(output_dir) if output_dir else root / "output"
 
-    result = {"converged": True, "rounds": 0, "rerun": [], "remaining": {}, "diff_path": None}
+    result = {
+        "converged": True,
+        "rounds": 0,
+        "rerun": [],
+        "remaining": {},
+        "diff_path": None,
+        "pending_reconcile": [],
+        "name_only_fastpath": None,
+        "confirmed_term_drift_repair": None,
+        "completed_name_repair": None,
+        "term_form_contracts": None,
+        "article_alias_repair": None,
+        "article_alias_requeue": None,
+        "article_alias_repair_after_rerun": None,
+        "name_authority_align": None,
+    }
     if not db_file.exists():
         print(f"⚠️ [Consolidate] workflow.db 不存在（{db_file}），跳过收敛检查")
         return result
@@ -16085,12 +17799,229 @@ def consolidate_dirty_chapters(
         pipeline_factory = lambda ch: TranslationPipeline(chapter_id=ch)
 
     scheduler = TaskScheduler(db_path=str(db_file))
+    decision_file = root / "db" / "decision_db.sqlite"
 
-    def _dirty_rows():
+    # Article-led aliases such as ``the Lady Jessica`` must be folded back into
+    # their exact-key Decision before pending reconciliation runs.  This is a
+    # no-prose repair: it deletes only a shadow row whose completed evidence
+    # already uses the canonical target.
+    if run_article_alias_repair and decision_file.exists():
+        if article_alias_applier is None:
+            from src.decision_authority_align import (
+                apply_article_shadow_alias_repairs,
+            )
+            article_alias_applier = lambda: apply_article_shadow_alias_repairs(
+                root, apply=True)
+        try:
+            article_alias_result = article_alias_applier()
+        except Exception as exc:  # noqa: BLE001
+            article_alias_result = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "counts": {},
+            }
+        result["article_alias_repair"] = article_alias_result
+        print(
+            "🧷 [Consolidate] article-alias repair: "
+            f"ok={article_alias_result.get('ok')} "
+            f"counts={article_alias_result.get('counts') or {}}")
+
+        # An article-led alias can be blocked by a COMPLETED chunk that is
+        # source-positive but absent from ``pending_backtrack`` (for example
+        # ``the Lady Jessica`` in ch04_chunk054).  Such a chunk must enter the
+        # same DIRTY repair path as an outbox row; otherwise the alias audit
+        # remains blocked forever and the wrong variant survives to delivery.
+        # Queue only the exact chunk named by an ``alias_target_still_present``
+        # blocker after re-verifying its source phrase and COMPLETED state.
+        blocked_alias_chunks = []
+        for blocked in (article_alias_result.get("blocked_candidates") or []):
+            reason = str(blocked.get("reason") or "")
+            named_chunks = [
+                str(value).strip()
+                for value in (blocked.get("blocked_chunks") or [])
+                if str(value).strip()
+            ]
+            if not named_chunks and reason.startswith(
+                    "alias_target_still_present:"):
+                named_chunks = [reason.split(":", 1)[1].strip()]
+            source_key = str(blocked.get("source_key") or "").strip()
+            if not source_key:
+                continue
+            from src.pending_backtrack_reconcile import _source_phrase_spans
+            for chunk_id in named_chunks:
+                task = scheduler.get_task(chunk_id)
+                if not task:
+                    continue
+                if str(task.get("state") or "") != TaskState.COMPLETED.value:
+                    continue
+                if not _source_phrase_spans(
+                        str(task.get("text_content") or ""), source_key):
+                    continue
+                alias_target_present = str(
+                    blocked.get("alias_translation") or "")
+                if alias_target_present:
+                    final_path = (
+                        out_root / str(task.get("chapter_id") or chunk_id[:4]) /
+                        f"{chunk_id}_final.json")
+                    try:
+                        final_payload = json.loads(
+                            final_path.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if alias_target_present not in str(
+                            final_payload.get("text") or ""):
+                        continue
+                blocked_alias_chunks.append(chunk_id)
+        blocked_alias_chunks = sorted(set(blocked_alias_chunks))
+        if blocked_alias_chunks:
+            transition = scheduler.trigger_backtrack(blocked_alias_chunks)
+            requeue = {
+                "chunk_ids": blocked_alias_chunks,
+                "transition": transition,
+                "ok": all(cid in set(transition.get("dirty") or [])
+                          for cid in blocked_alias_chunks),
+            }
+            result["article_alias_requeue"] = requeue
+            print(
+                "🔁 [Consolidate] article-alias blocked chunks: "
+                f"queued={requeue['chunk_ids']} ok={requeue['ok']}")
+
+    # Registry aliases are a derived index, so conflicting aliases must be
+    # quarantined before name-only and completed-name repair consume them.
+    if run_name_authority_align and decision_file.exists():
+        if name_authority_applier is None:
+            from src.name_authority_align import align_name_authorities
+            name_authority_applier = lambda: align_name_authorities(
+                root, apply=True)
+        try:
+            name_authority_result = name_authority_applier()
+        except Exception as exc:  # noqa: BLE001
+            name_authority_result = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "counts": {},
+            }
+        result["name_authority_align"] = name_authority_result
+        print(
+            "🧭 [Consolidate] name-authority align: "
+            f"ok={name_authority_result.get('ok')} "
+            f"counts={name_authority_result.get('counts') or {}}")
+
+    # Confirmed specific-term drift (Shield Wall→屏蔽墙) and completed-name
+    # drift must both run before the outbox consumer.  Otherwise a COMPLETED
+    # chunk whose only defect is a name spelling would be marked DIRTY and
+    # re-translated instead of being repaired under a calibrated re-audit.
+    if run_confirmed_term_repair and decision_file.exists():
+        if confirmed_term_applier is None:
+            from src.name_only_fastpath import apply_confirmed_term_drift_repair
+            confirmed_term_applier = lambda: apply_confirmed_term_drift_repair(
+                root, apply=True)
+        try:
+            confirmed_term_result = confirmed_term_applier()
+        except Exception as exc:  # noqa: BLE001
+            confirmed_term_result = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "counts": {},
+            }
+        result["confirmed_term_drift_repair"] = confirmed_term_result
+        print(
+            "🧭 [Consolidate] confirmed-term drift repair: "
+            f"ok={confirmed_term_result.get('ok')} "
+            f"counts={confirmed_term_result.get('counts') or {}}")
+
+    # Completed-name drift must run before the outbox consumer: otherwise a
+    # COMPLETED chunk whose only defect is one CJK character in a canonical
+    # name would be marked DIRTY and re-translated instead of being repaired.
+    if run_completed_name_repair and decision_file.exists():
+        if completed_name_applier is None:
+            from src.name_only_fastpath import apply_completed_name_repair
+            completed_name_applier = lambda: apply_completed_name_repair(
+                root, apply=True)
+        try:
+            completed_result = completed_name_applier()
+        except Exception as exc:  # noqa: BLE001
+            completed_result = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "counts": {},
+            }
+        result["completed_name_repair"] = completed_result
+        print(
+            "🧹 [Consolidate] completed-name repair: "
+            f"ok={completed_result.get('ok')} "
+            f"counts={completed_result.get('counts') or {}}")
+
+    # Term/form contracts are evidence-bound exemptions for legitimate short
+    # forms and explicit source glosses.  Build/apply them only after all
+    # completed-text repairs, and before the outbox consumer, so the pending
+    # classifier sees the same artifact that a standalone command would write.
+    if run_term_contracts and decision_file.exists():
+        if term_contract_applier is None:
+            from src.term_form_contracts import apply_term_form_contracts
+            term_contract_applier = lambda: apply_term_form_contracts(root)
+        try:
+            term_contract_result = term_contract_applier()
+        except Exception as exc:  # noqa: BLE001
+            term_contract_result = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "counts": {},
+            }
+        result["term_form_contracts"] = term_contract_result
+        print(
+            "🧩 [Consolidate] term/form contracts: "
+            f"ok={term_contract_result.get('ok')} "
+            f"counts={term_contract_result.get('counts') or {}}")
+
+    if run_pending_reconcile and decision_file.exists():
+        if pending_applier is None:
+            from src.pending_backtrack_reconcile import (
+                apply_pending_backtrack_reconcile,
+            )
+            pending_applier = lambda: apply_pending_backtrack_reconcile(
+                root, workflow_db=db_file, output_dir=out_root,
+                scheduler=scheduler, apply=True)
+        for stage in ("before_name_only",):
+            try:
+                pending_result = pending_applier()
+            except Exception as exc:  # noqa: BLE001
+                pending_result = {
+                    "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                    "after_counts": {}, "actions": [],
+                }
+            pending_result["stage"] = stage
+            result["pending_reconcile"].append(pending_result)
+            print(
+                f"🧾 [Consolidate] pending reconcile({stage}): "
+                f"ok={pending_result.get('ok')} "
+                f"after={pending_result.get('after_counts') or {}}")
+
+    if run_name_only and decision_file.exists():
+        if name_only_applier is None:
+            from src.name_only_fastpath import apply_name_only_fastpath
+            name_only_applier = lambda: apply_name_only_fastpath(
+                root, apply=True, scheduler=scheduler)
+        try:
+            name_only_result = name_only_applier()
+        except Exception as exc:  # noqa: BLE001
+            name_only_result = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "counts": {},
+            }
+        result["name_only_fastpath"] = name_only_result
+        print(
+            "🧪 [Consolidate] name-only fastpath: "
+            f"ok={name_only_result.get('ok')} "
+            f"counts={name_only_result.get('counts') or {}}")
+
+    def _work_rows():
+        # Round 158: an interrupted run can leave chunks in an active stage
+        # (TRANSLATING_RAW / REWRITING_LITERARY / ...), not only DIRTY.  The
+        # old DIRTY-only scan declared "converged" while those chunks were
+        # still unfinished and then merged stale/missing finals.  Consolidate
+        # must own every resumable state; PERMANENTLY_FAILED stays isolated
+        # for the explicit rescue channel.
         cursor = scheduler.conn.execute(
-            "SELECT chapter_id, chunk_id FROM chunk_tasks WHERE state = ? "
+            "SELECT chapter_id, chunk_id FROM chunk_tasks "
+            "WHERE state NOT IN (?, ?) "
             "ORDER BY chapter_id ASC, chunk_id ASC",
-            (TaskState.DIRTY.value,),
+            (TaskState.COMPLETED.value, TaskState.PERMANENTLY_FAILED.value),
         )
         return [tuple(row) for row in cursor.fetchall()]
 
@@ -16106,7 +18037,7 @@ def consolidate_dirty_chapters(
 
     diff_records = []
     while result["rounds"] < rounds_cap:
-        rows = _dirty_rows()
+        rows = _work_rows()
         if not rows:
             break
         result["rounds"] += 1
@@ -16115,7 +18046,7 @@ def consolidate_dirty_chapters(
         for chapter_id, chunk_id in rows:
             by_chapter.setdefault(chapter_id, []).append(chunk_id)
         print(f"🔁 [Consolidate] 第 {round_no}/{rounds_cap} 轮: "
-              f"{len(rows)} 个 DIRTY chunk, {len(by_chapter)} 章待收敛")
+              f"{len(rows)} 个待续跑 chunk, {len(by_chapter)} 章待收敛")
         for chapter_id in sorted(by_chapter):
             chunk_ids = by_chapter[chapter_id]
             pre_texts = {cid: _read_final_text(chapter_id, cid) for cid in chunk_ids}
@@ -16136,8 +18067,59 @@ def consolidate_dirty_chapters(
                 })
                 result["rerun"].append(cid)
 
-    remaining_rows = _dirty_rows()
-    result["converged"] = len(remaining_rows) == 0
+    # The first alias pass can be blocked by exactly one still-wrong COMPLETED
+    # final.  Pending reconciliation turns that row into DIRTY and the rerun
+    # above repairs it; retry the no-prose shadow merge before the final
+    # outbox scan so the shadow Decision cannot survive into delivery.
+    if run_article_alias_repair and decision_file.exists():
+        if article_alias_applier is None:
+            from src.decision_authority_align import (
+                apply_article_shadow_alias_repairs,
+            )
+            article_alias_applier = lambda: apply_article_shadow_alias_repairs(
+                root, apply=True)
+        try:
+            article_alias_after = article_alias_applier()
+        except Exception as exc:  # noqa: BLE001
+            article_alias_after = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "counts": {},
+            }
+        result["article_alias_repair_after_rerun"] = article_alias_after
+        print(
+            "🧷 [Consolidate] article-alias repair(after_rerun): "
+            f"ok={article_alias_after.get('ok')} "
+            f"counts={article_alias_after.get('counts') or {}}")
+
+    remaining_rows = _work_rows()
+    pending_final = None
+    if run_pending_reconcile and decision_file.exists():
+        if pending_applier is None:
+            from src.pending_backtrack_reconcile import (
+                apply_pending_backtrack_reconcile,
+            )
+            pending_applier = lambda: apply_pending_backtrack_reconcile(
+                root, workflow_db=db_file, output_dir=out_root,
+                scheduler=scheduler, apply=True)
+        try:
+            pending_final = pending_applier()
+        except Exception as exc:  # noqa: BLE001
+            pending_final = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "after_counts": {}, "actions": [],
+            }
+        pending_final["stage"] = "after_rerun"
+        result["pending_reconcile"].append(pending_final)
+        print(
+            "🧾 [Consolidate] pending reconcile(after_rerun): "
+            f"ok={pending_final.get('ok')} "
+            f"after={pending_final.get('after_counts') or {}}")
+    pending_ok = True if pending_final is None else bool(pending_final.get("ok"))
+    article_alias_ok = not bool(
+        (result.get("article_alias_repair_after_rerun") or {}).get(
+            "blocked_candidates") or [])
+    result["converged"] = (
+        len(remaining_rows) == 0 and pending_ok and article_alias_ok)
     for chapter_id, chunk_id in remaining_rows:
         result["remaining"].setdefault(chapter_id, []).append(chunk_id)
 
@@ -16147,7 +18129,7 @@ def consolidate_dirty_chapters(
         f"- 生成时间: {datetime.now().isoformat(timespec='seconds')}",
         f"- 轮次: {result['rounds']} / max_rounds={rounds_cap}",
         f"- 重跑 chunk: {len(result['rerun'])} 个",
-        f"- 最终状态: {'✅ 收敛 (DIRTY=0)' if result['converged'] else '❌ 未收敛'}",
+        f"- 最终状态: {'✅ 收敛 (待处理=0)' if result['converged'] else '❌ 未收敛'}",
         "",
     ]
     if result["remaining"]:
@@ -16157,7 +18139,7 @@ def consolidate_dirty_chapters(
             lines.append(f"- {chapter_id}: {', '.join(result['remaining'][chapter_id])}")
         lines.append("")
     if not diff_records:
-        lines.append("（本次扫描 DIRTY=0，无重跑）")
+        lines.append("（本次扫描待处理=0，无重跑）")
         lines.append("")
     else:
         lines.append("## 重跑明细")
@@ -16207,11 +18189,11 @@ def consolidate_dirty_chapters(
         print(f"⚠️ [Consolidate] 报告写入失败: {exc}")
 
     if result["converged"]:
-        print(f"✅ [Consolidate] 收敛完成: DIRTY=0 "
+        print(f"✅ [Consolidate] 收敛完成: 待处理=0 "
               f"(重跑 {len(result['rerun'])} chunk, {result['rounds']} 轮)")
     else:
         total_left = sum(len(v) for v in result["remaining"].values())
-        print(f"❌ [Consolidate] 未收敛: 仍余 {total_left} 个 DIRTY chunk"
+        print(f"❌ [Consolidate] 未收敛: 仍余 {total_left} 个待处理 chunk"
               f"（max_rounds={rounds_cap} 已用尽）")
         for chapter_id in sorted(result["remaining"]):
             print(f"   {chapter_id}: {', '.join(result['remaining'][chapter_id])}")
@@ -16241,6 +18223,8 @@ def run_final_gate(
     ⑪ 全书修复闭环：每个 final 都有源文证据且可解析；当前 final 不再有
        待修项、未决高危姓名错位或正文段漏译/插入歧义；若存在 book_repair
        manifest，其 final 哈希必须与当前文件一致
+    ⑫ 全书交付链接：build manifest 的章序、DB chunk、final/merged 哈希、
+       运行日志封存证据均可从当前磁盘复算一致
     任一为红 → ok=False（translate_book.sh 以非零退出中止 / ⛔）。
     """
     root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
@@ -16651,10 +18635,112 @@ def run_final_gate(
         stats["book_repair"] = {"error": str(_br_exc)}
         failures.append(f"⑪ 全书修复复核异常: {_br_exc}")
 
+    # ⑫ 全书交付链接：source → DB chunk → final → merged → 运行日志。
+    # manifest 缺失时默认 advisory；一旦存在，任何哈希/顺序/日志不一致都判红。
+    try:
+        from src.book_linker import audit_book_links
+        _manifest_path = out_root / "build_manifest.json"
+        _required = False
+        _cfg_path = root / "config.yaml"
+        if _cfg_path.exists():
+            try:
+                import yaml as _yaml_gate
+                _gate_cfg = _yaml_gate.safe_load(
+                    _cfg_path.read_text(encoding="utf-8")) or {}
+                _required = bool(((_gate_cfg.get("gate") or {}).get(
+                    "book_link_required")))
+            except Exception:
+                _required = False
+        if not _manifest_path.exists():
+            stats["book_link"] = {"status": "missing", "required": _required}
+            if _required:
+                failures.append(
+                    "⑫ 缺少 output/build_manifest.json（交付链接证据缺失）")
+            else:
+                warnings.append(
+                    "⑫ 缺少 output/build_manifest.json（advisory；"
+                    "生产已要求 merge 后写 manifest）")
+        else:
+            _bla = audit_book_links(
+                root, manifest_path=_manifest_path,
+                require_current=False, require_sealed=False)
+            stats["book_link"] = {
+                "status": _bla.get("status"),
+                "passed": len(_bla.get("passed") or []),
+                "warnings": len(_bla.get("warnings") or []),
+                "failed": len(_bla.get("failed") or []),
+            }
+            if _bla.get("failed"):
+                failures.append(
+                    f"⑫ book-link-audit 失败 {len(_bla.get('failed') or [])} 项: "
+                    f"{(_bla.get('failed') or [])[:8]}")
+            elif _bla.get("warnings"):
+                warnings.append(
+                    f"⑫ book-link-audit 警告 {len(_bla.get('warnings') or [])} 项: "
+                    f"{(_bla.get('warnings') or [])[:8]}")
+    except Exception as _bl_exc:
+        stats["book_link"] = {"error": str(_bl_exc)}
+        failures.append(f"⑫ 全书链接审计异常: {_bl_exc}")
+
+    # ⑬ 全书 pending_backtrack 不变量：队列中不得存在未解释的
+    # outstanding/blocked/orphan。satisfied 与 covered 是可解释项，但仍应由
+    # Phase 1.5 的受控 apply 路径在状态迁移成功后消费，不能由 gate 直接删除。
+    try:
+        from src.pending_backtrack_reconcile import (
+            classify_pending_snapshot,
+            load_pending_context,
+        )
+        _pb_context = load_pending_context(
+            root,
+            decision_db=root / "db" / "decision_db.sqlite",
+            workflow_db=db_file,
+            output_dir=out_root,
+        )
+        _pb = classify_pending_snapshot(_pb_context)
+        stats["pending_backtrack"] = {
+            "available": bool(_pb.get("available")),
+            "reason": _pb.get("reason"),
+            "total": int(_pb.get("total") or 0),
+            "pending_rows": int(_pb.get("pending_rows") or 0),
+            "counts": _pb.get("counts") or {},
+            "by_chapter": _pb.get("by_chapter") or {},
+            "blocking": len(_pb.get("blocking") or []),
+        }
+        if not _pb.get("available"):
+            _pending_rows = int(_pb.get("pending_rows") or 0)
+            _msg = (f"⑬ pending_backtrack 审计不可用: "
+                    f"{_pb.get('reason') or 'unknown'}")
+            if _pending_rows:
+                failures.append(_msg + f"（仍有 {_pending_rows} 行队列无法核对）")
+            else:
+                warnings.append(_msg + "（空队列）")
+        elif _pb.get("blocking"):
+            _samples = [
+                f"{e.get('chunk_id')}:{e.get('status')}/{e.get('reason')}"
+                for e in (_pb.get("blocking") or [])[:8]
+            ]
+            failures.append(
+                f"⑬ pending_backtrack 未决 {len(_pb.get('blocking') or [])} 条: "
+                f"{_samples}")
+    except Exception as _pb_exc:
+        stats["pending_backtrack"] = {"error": str(_pb_exc)}
+        failures.append(f"⑬ pending_backtrack 审计异常: {_pb_exc}")
+
     if stats["tasks"] == 0 and db_file.exists():
         failures.append("① workflow.db 无任务行（未 init？）")
 
     result = {"ok": not failures, "failures": failures, "warnings": warnings, "stats": stats}
+    try:
+        log_event(
+            "gate_passed" if not failures else "gate_failed",
+            stage="GATE", status="ok" if not failures else "failed",
+            message=("delivery gate passed" if not failures
+                     else "delivery gate rejected"),
+            failures=failures[:20], warnings=warnings[:20],
+            task_count=stats.get("tasks", 0),
+        )
+    except Exception as _gate_log_exc:
+        print(f"⚠️ [TaskLog] gate 事件写入失败: {_gate_log_exc}", file=sys.stderr)
     print("🎯 [Gate] 交付门禁检查：")
     print(f"  ① 状态机: {stats['tasks']} 个任务, states={by_state}")
     print(f"  ② 产物: {stats['chapters']} 章, final_backup={len(backups)}")
@@ -16693,6 +18779,24 @@ def run_final_gate(
         print(f"  ⑪ 全书修复: pending={_br_stats.get('pending_chunks', 0)}, "
               f"blocking={_br_stats.get('blocking_issues', 0)}, "
               f"manifest={_br_stats.get('manifest_current', False)}")
+    _bl_stats = stats.get("book_link") or {}
+    if _bl_stats.get("error"):
+        print(f"  ⑫ 全书链接: 异常 {_bl_stats['error']}")
+    else:
+        print(f"  ⑫ 全书链接: status={_bl_stats.get('status')}, "
+              f"passed={_bl_stats.get('passed', 0)}, "
+              f"warn={_bl_stats.get('warnings', 0)}, "
+              f"failed={_bl_stats.get('failed', 0)}, "
+              f"required={_bl_stats.get('required', False)}")
+    _pb_stats = stats.get("pending_backtrack") or {}
+    if _pb_stats.get("error"):
+        print(f"  ⑬ 回溯队列: 异常 {_pb_stats['error']}")
+    elif _pb_stats.get("available"):
+        print(f"  ⑬ 回溯队列: total={_pb_stats.get('total', 0)}, "
+              f"counts={_pb_stats.get('counts')}, "
+              f"blocking={_pb_stats.get('blocking', 0)}")
+    else:
+        print(f"  ⑬ 回溯队列: 不可用 ({_pb_stats.get('reason') or 'unknown'})")
     for f in failures:
         print(f"  ❌ {f}")
     if result["ok"]:
@@ -16706,7 +18810,11 @@ _INSTANCE_LOCK_FD: Optional[int] = None
 _MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile", "story-graph",
                       "consolidate", "finalize", "notes-normalize", "requeue",
                       "rescue", "qa-report", "recalibrate-critic", "proofread",
-                      "book-repair"}
+                      "book-repair", "book-link-audit", "name-authority-align",
+                      "decision-authority-align",
+                      "decision-target-authority-repair", "term-form-contract",
+                      "query-gold-set", "locked-target-authority-repair",
+                      "confirmed-term-drift-repair"}
 
 
 _SIGINT_WARNED = False
@@ -16806,6 +18914,10 @@ def _command_needs_lock(command: str, args: object) -> bool:
     if command == "setup-payoff-audit" and getattr(args, "apply", False):
         return True
     if command == "book-repair" and getattr(args, "apply", False):
+        return True
+    if command in {"pending-reconcile", "name-only-fastpath",
+                   "completed-name-repair"} and getattr(
+            args, "apply", False):
         return True
     return False
 
@@ -19078,6 +21190,684 @@ def sup_run_to_int(run: str) -> int:
 # Section 13.6 — Round 131 全书判断层 / 故事图 / 深读剖面
 # ────────────────────────────────────────────────────────────────────
 
+RUN_ID_ENV = "SAGATRANS_RUN_ID"
+LOG_ENABLED_ENV = "SAGATRANS_TASK_LOG_ENABLED"
+LOG_DIR_ENV = "SAGATRANS_TASK_LOG_DIR"
+DEFAULT_LOG_DIR = Path("output") / "logs" / "runs"
+CST = _dt.timezone(_dt.timedelta(hours=8), name="Asia/Shanghai")
+
+_MANDATORY_FIELDS = ("ts", "seq", "run_id", "command", "stage", "event", "status")
+_TEXT_CONTENT_KEYS = {
+    "text", "source_text", "target_text", "translated_text", "raw_text",
+    "prompt", "response", "content", "body", "literary", "final_text",
+}
+_SECRET_KEY_RE = re.compile(
+    r"(?i)(api[_-]?key|authorization|auth[_-]?token|access[_-]?token|"
+    r"secret|password|passwd|moark[_-]?key|deepseek[_-]?key|minimax[_-]?key)"
+)
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?[^\s,;]+"),
+    re.compile(r"(?i)((?:api[_-]?key|access[_-]?token|secret|password)\s*[:=]\s*)[^\s,;]+"),
+    re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
+)
+
+
+class TaskLoggingError(RuntimeError):
+    """Raised when a required task log cannot be created or written."""
+
+
+def now_iso() -> str:
+    """Return a millisecond ISO-8601 timestamp in Asia/Shanghai time."""
+    return _dt.datetime.now(CST).isoformat(timespec="milliseconds")
+
+
+def new_run_id() -> str:
+    """Create a sortable, process-unique run id."""
+    stamp = _dt.datetime.now(CST).strftime("%Y%m%dT%H%M%S")
+    suffix = int(time.time_ns() % 100000)
+    return f"{stamp}-{os.getpid()}-{suffix:05d}"
+
+
+def sha256_file(path: Path) -> str:
+    """Return the lowercase SHA-256 hex digest of a file."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _redact_text(value: str, limit: int = 2000) -> str:
+    text = str(value)
+    for pattern in _SECRET_PATTERNS:
+        def _replace(match: re.Match) -> str:
+            if match.lastindex:
+                return str(match.group(1)) + "[REDACTED]"
+            return "[REDACTED]"
+        text = pattern.sub(_replace, text)
+    if len(text) > limit:
+        text = text[:limit] + "...[truncated]"
+    return text
+
+
+def _sanitize(value: Any, key: str = "") -> Any:
+    """Redact secrets and never persist complete source/translation bodies."""
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for item_key, item_value in value.items():
+            out[str(item_key)] = _sanitize(item_value, str(item_key))
+        return out
+    if isinstance(value, (list, tuple)):
+        return [_sanitize(item, key) for item in value]
+    if isinstance(value, str):
+        text = _redact_text(value)
+        if key.lower() in _TEXT_CONTENT_KEYS and len(text) > 240:
+            return text[:240] + "...[content truncated]"
+        return text
+    return value
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+class TaskLogger:
+    """Append-only task log with cross-process sequence allocation.
+
+    A single ``run_id`` may be shared by a shell parent and several Python
+    children.  The sequence counter is protected by ``fcntl.flock`` so events
+    from all processes form one monotonic stream.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        command: str,
+        run_id: Optional[str] = None,
+        read_only: bool = False,
+        enabled: bool = True,
+        log_dir: Optional[Path] = None,
+    ) -> None:
+        self.root = Path(root).resolve()
+        self.command = str(command or "unknown")
+        self.run_id = str(run_id or os.environ.get(RUN_ID_ENV) or new_run_id())
+        os.environ[RUN_ID_ENV] = self.run_id
+        self.read_only = bool(read_only)
+        self.enabled = bool(enabled)
+        self._explicit_log_dir = Path(log_dir) if log_dir else None
+        self.log_dir = (self._explicit_log_dir if self._explicit_log_dir
+                        else self.root / DEFAULT_LOG_DIR)
+        self.jsonl_path = self.log_dir / f"{self.run_id}.jsonl"
+        self.text_path = self.log_dir / f"{self.run_id}.log"
+        self.seal_path = self.log_dir / f"{self.run_id}.sha256"
+        self._seq_path = self.log_dir / f"{self.run_id}.seq"
+        self._lock_path = self.log_dir / f"{self.run_id}.lock"
+        self._jsonl = None
+        self._text = None
+        self._seq: Optional[int] = None
+        self._started = False
+        self._closed = False
+        self._last_status = "running"
+        self._started_monotonic: Optional[float] = None
+        self._last_ts = ""
+        if self.enabled:
+            self._open()
+
+    def _open(self) -> None:
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            self._jsonl = open(self.jsonl_path, "a", encoding="utf-8", buffering=1)
+            self._text = open(self.text_path, "a", encoding="utf-8", buffering=1)
+        except OSError as exc:
+            raise TaskLoggingError(f"无法创建任务日志: {exc}") from exc
+
+    def _next_seq(self) -> int:
+        # Re-read the sidecar on every event: several Python children may share
+        # one run_id, and an in-process cached counter would otherwise reuse
+        # sequence numbers after another process has advanced the stream.
+        disk_seq = 0
+        try:
+            disk_seq = int(self._seq_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            disk_seq = 0
+        self._seq = max(self._seq or 0, disk_seq)
+        self._seq += 1
+        try:
+            _atomic_write_text(self._seq_path, str(self._seq))
+        except OSError:
+            pass
+        return self._seq
+
+    def _format_text(self, payload: Dict[str, Any]) -> str:
+        parts = [
+            f"[{payload.get('ts', '')}]",
+            str(payload.get("event") or ""),
+            f"stage={payload.get('stage') or '-'}",
+            f"status={payload.get('status') or '-'}",
+        ]
+        for key in ("chapter", "chunk_id", "attempt", "artifact", "error_class"):
+            value = payload.get(key)
+            if value not in (None, ""):
+                parts.append(f"{key}={value}")
+        message = str(payload.get("message") or "")
+        if message:
+            parts.append(message)
+        return " ".join(parts).replace("\n", " ").replace("\r", " ")
+
+    def event(self, event: str, *, stage: str = "", status: str = "ok",
+              message: str = "", **fields: Any) -> Optional[Dict[str, Any]]:
+        """Append one event.  Returns the emitted payload, or None if disabled."""
+        if not self.enabled:
+            return None
+        if self._closed:
+            raise TaskLoggingError("任务日志已关闭，不能再写入事件")
+        payload: Dict[str, Any] = dict(fields)
+        payload.update({
+            "ts": now_iso(),
+            "run_id": self.run_id,
+            "command": self.command,
+            "stage": str(stage or ""),
+            "event": str(event or ""),
+            "status": str(status or ""),
+            "message": str(message or ""),
+        })
+        payload = _sanitize(payload)
+        # Reserved fields are always present even if a caller supplied them.
+        for key in _MANDATORY_FIELDS:
+            payload.setdefault(key, "")
+        try:
+            import fcntl
+            with open(self._lock_path, "a+", encoding="utf-8") as lock_handle:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    payload["seq"] = self._next_seq()
+                    line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                    assert self._jsonl is not None and self._text is not None
+                    self._jsonl.write(line + "\n")
+                    self._jsonl.flush()
+                    self._text.write(self._format_text(payload) + "\n")
+                    self._text.flush()
+                    self._last_ts = str(payload["ts"])
+                    self._last_status = str(payload.get("status") or "")
+                finally:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        except Exception as exc:
+            if self.read_only:
+                print(f"⚠️ [TaskLog] 写日志失败（只读命令继续）: {exc}", file=sys.stderr)
+                return payload
+            raise TaskLoggingError(f"写任务日志失败: {exc}") from exc
+        return payload
+
+    def start(self, **fields: Any) -> Optional[Dict[str, Any]]:
+        if self._started:
+            return None
+        self._started = True
+        self._started_monotonic = time.monotonic()
+        fields.setdefault("argv", [str(item) for item in sys.argv])
+        fields.setdefault("pid", os.getpid())
+        fields.setdefault("cwd", str(Path.cwd()))
+        fields.setdefault("python", sys.executable)
+        fields.setdefault("jsonl_path", str(self.jsonl_path))
+        fields.setdefault("log_path", str(self.text_path))
+        return self.event("run_start", stage="RUN", status="running", **fields)
+
+    def __enter__(self) -> "TaskLogger":
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc_type is None:
+            self.finish(0)
+        elif issubclass(exc_type, KeyboardInterrupt):
+            self.finish(130, status="interrupted")
+        elif issubclass(exc_type, SystemExit):
+            code = getattr(exc, "code", 1)
+            if code in (None, 0):
+                self.finish(0)
+            elif code == 130:
+                self.finish(130, status="interrupted")
+            else:
+                self.finish(int(code) if isinstance(code, int) else 1)
+        else:
+            self.finish(1, status="failed", error_class=type(exc).__name__)
+        return False
+
+    def finish(self, exit_code: int = 0, status: Optional[str] = None,
+               **fields: Any) -> Optional[Dict[str, Any]]:
+        if self._closed:
+            return None
+        if status is None:
+            if exit_code == 0:
+                status = "ok"
+            elif exit_code == 130:
+                status = "interrupted"
+            else:
+                status = "failed"
+        duration_ms = 0
+        if self._started_monotonic is not None:
+            duration_ms = int((time.monotonic() - self._started_monotonic) * 1000)
+        payload = self.event(
+            "run_end", stage="RUN", status=str(status),
+            exit_code=int(exit_code), duration_ms=duration_ms, **fields)
+        try:
+            if self._jsonl is not None:
+                self._jsonl.flush()
+                os.fsync(self._jsonl.fileno())
+            if self._text is not None:
+                self._text.flush()
+                os.fsync(self._text.fileno())
+        except (OSError, ValueError):
+            pass
+        self.close(seal=True)
+        return payload
+
+    def close(self, seal: bool = True) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for handle in (self._jsonl, self._text):
+            try:
+                if handle is not None:
+                    handle.close()
+            except OSError:
+                pass
+        self._jsonl = None
+        self._text = None
+        if seal and self.enabled:
+            self.seal()
+
+    def seal(self) -> Optional[Dict[str, Any]]:
+        """Write the post-run hash envelope for both log streams."""
+        if not self.jsonl_path.exists() and not self.text_path.exists():
+            return None
+        payload = {
+            "run_id": self.run_id,
+            "command": self.command,
+            "sealed_at": now_iso(),
+            "status": self._last_status,
+            "jsonl": str(self.jsonl_path.relative_to(self.root))
+            if self.jsonl_path.is_relative_to(self.root) else str(self.jsonl_path),
+            "log": str(self.text_path.relative_to(self.root))
+            if self.text_path.is_relative_to(self.root) else str(self.text_path),
+            "jsonl_sha256": sha256_file(self.jsonl_path) if self.jsonl_path.exists() else "",
+            "log_sha256": sha256_file(self.text_path) if self.text_path.exists() else "",
+            "seq_last": self._seq or 0,
+            "last_ts": self._last_ts,
+        }
+        try:
+            _atomic_write_text(
+                self.seal_path,
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
+        except OSError as exc:
+            if not self.read_only:
+                raise TaskLoggingError(f"无法封存任务日志哈希: {exc}") from exc
+            print(f"⚠️ [TaskLog] 封存失败（只读命令继续）: {exc}", file=sys.stderr)
+            return None
+        return payload
+
+
+def make_logger(root: Path, command: str, read_only: bool = False,
+                enabled: Optional[bool] = None,
+                run_id: Optional[str] = None,
+                log_dir: Optional[Path] = None) -> TaskLogger:
+    """Create a logger according to the command's failure policy.
+
+    Write commands fail closed when the primary log cannot be created.  Read-only
+    diagnostics keep running but report the degradation on stderr.
+    """
+    if enabled is None:
+        env_value = os.environ.get(LOG_ENABLED_ENV, "").strip().lower()
+        enabled = env_value not in {"0", "false", "off", "no"}
+    try:
+        return TaskLogger(root=root, command=command, run_id=run_id,
+                          read_only=read_only, enabled=bool(enabled),
+                          log_dir=log_dir)
+    except TaskLoggingError:
+        if read_only:
+            print("⚠️ [TaskLog] 任务日志不可写；只读命令继续运行", file=sys.stderr)
+            return TaskLogger(root=root, command=command, run_id=run_id,
+                              read_only=True, enabled=False, log_dir=log_dir)
+        raise
+
+
+_ACTIVE_LOGGER: Optional[TaskLogger] = None
+
+
+def set_active_logger(logger: Optional[TaskLogger]) -> None:
+    global _ACTIVE_LOGGER
+    _ACTIVE_LOGGER = logger
+
+
+def get_active_logger() -> Optional[TaskLogger]:
+    return _ACTIVE_LOGGER
+
+
+def log_event(event: str, *, stage: str = "", status: str = "ok",
+              message: str = "", **fields: Any) -> Optional[Dict[str, Any]]:
+    logger = _ACTIVE_LOGGER
+    if logger is None or not logger.enabled:
+        return None
+    return logger.event(event, stage=stage, status=status, message=message, **fields)
+
+
+def log_artifact(path: Path, *, stage: str = "", chunk_id: str = "",
+                 kind: str = "", status: str = "ok") -> Optional[Dict[str, Any]]:
+    """Record an artifact write when a task logger is active."""
+    logger = _ACTIVE_LOGGER
+    if logger is None or not logger.enabled:
+        return None
+    artifact_path = Path(path)
+    digest = ""
+    try:
+        if artifact_path.exists() and artifact_path.is_file():
+            digest = "sha256:" + sha256_file(artifact_path)
+    except OSError:
+        digest = ""
+    return logger.event(
+        "artifact_written", stage=stage, status=status,
+        chunk_id=chunk_id or "", artifact=str(artifact_path),
+        artifact_sha256=digest, artifact_kind=kind or "",
+    )
+
+
+def validate_jsonl(path: Path, expected_run_id: Optional[str] = None,
+                   require_run_start: bool = True,
+                   require_run_end: bool = True) -> Dict[str, Any]:
+    """Validate ordering, timestamps and mandatory fields in a run JSONL file."""
+    errors: List[str] = []
+    seqs: List[int] = []
+    run_ids = set()
+    events: List[str] = []
+    path = Path(path)
+    if not path.exists():
+        return {"ok": False, "errors": ["missing_jsonl"], "events": []}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        return {"ok": False, "errors": [f"read_error:{exc}"], "events": []}
+    for line_no, raw in enumerate(lines, 1):
+        if not raw.strip():
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            errors.append(f"line{line_no}:json_error:{exc.msg}")
+            continue
+        if not isinstance(payload, dict):
+            errors.append(f"line{line_no}:not_object")
+            continue
+        missing = [key for key in _MANDATORY_FIELDS if key not in payload]
+        if missing:
+            errors.append(f"line{line_no}:missing:{','.join(missing)}")
+        ts = str(payload.get("ts") or "")
+        try:
+            parsed_ts = _dt.datetime.fromisoformat(ts)
+            if parsed_ts.tzinfo is None:
+                errors.append(f"line{line_no}:ts_without_tz")
+        except ValueError:
+            errors.append(f"line{line_no}:bad_ts")
+        try:
+            seqs.append(int(payload.get("seq")))
+        except (TypeError, ValueError):
+            errors.append(f"line{line_no}:bad_seq")
+        if payload.get("run_id"):
+            run_ids.add(str(payload.get("run_id")))
+        if payload.get("event"):
+            events.append(str(payload.get("event")))
+    for index in range(1, len(seqs)):
+        if seqs[index] != seqs[index - 1] + 1:
+            errors.append(f"seq_gap:{seqs[index - 1]}->{seqs[index]}")
+    if expected_run_id and run_ids and run_ids != {expected_run_id}:
+        errors.append("run_id_mismatch")
+    if require_run_start and not any(event == "run_start" for event in events):
+        errors.append("run_start_missing")
+    if require_run_end and not any(event == "run_end" for event in events):
+        errors.append("run_end_missing")
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "events": events,
+        "seq_first": seqs[0] if seqs else 0,
+        "seq_last": seqs[-1] if seqs else 0,
+        "run_ids": sorted(run_ids),
+    }
+
+
+def prune_runs(log_dir: Path, keep_last: int = 30, keep_days: int = 90,
+               current_run_id: str = "") -> List[str]:
+    """Delete old run artifacts while preserving the active run.
+
+    Returns the list of removed run ids.  This function is explicit; callers
+    decide when retention is safe.
+    """
+    directory = Path(log_dir)
+    if not directory.is_dir():
+        return []
+    now = time.time()
+    files = sorted(directory.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    removed: List[str] = []
+    for index, jsonl_path in enumerate(files):
+        run_id = jsonl_path.stem
+        if run_id == current_run_id:
+            continue
+        try:
+            age_days = (now - jsonl_path.stat().st_mtime) / 86400.0
+        except OSError:
+            continue
+        if index < keep_last and age_days <= keep_days:
+            continue
+        for suffix in (".jsonl", ".log", ".sha256", ".seq", ".lock"):
+            target = directory / f"{run_id}{suffix}"
+            try:
+                if target.exists():
+                    target.unlink()
+            except OSError:
+                pass
+        removed.append(run_id)
+    return removed
+
+
+__all__ = [
+    "CST", "RUN_ID_ENV", "LOG_ENABLED_ENV", "LOG_DIR_ENV",
+    "DEFAULT_LOG_DIR", "TaskLoggingError", "TaskLogger",
+    "now_iso", "new_run_id", "sha256_file", "make_logger",
+    "set_active_logger", "get_active_logger", "log_event", "log_artifact",
+    "validate_jsonl", "prune_runs",
+]
+
+
+RECOVERY_DIR = Path("output") / "recovery"
+NONTERMINAL_STATES = (
+    "EXTRACTING_TERMS", "TRANSLATING_RAW", "REWRITING_LITERARY", "AUDITING", "JUDGING",
+)
+RESUME_STAGE = {
+    "EXTRACTING_TERMS": "EXTRACTING_TERMS",
+    "TRANSLATING_RAW": "TRANSLATING_RAW",
+    "REWRITING_LITERARY": "REWRITING_LITERARY",
+    "AUDITING": "AUDITING",
+    "JUDGING": "JUDGING",
+}
+
+
+def _connect_readonly(db_path: Path) -> sqlite3.Connection:
+    uri = "file:" + str(Path(db_path).resolve()) + "?mode=ro"
+    try:
+        return sqlite3.connect(uri, uri=True)
+    except sqlite3.Error:
+        return sqlite3.connect(str(db_path))
+
+
+def _artifact_info(path: Path) -> Dict[str, Any]:
+    info = {"path": str(path), "exists": False, "bytes": 0, "sha256": ""}
+    try:
+        if path.is_file():
+            info["exists"] = True
+            info["bytes"] = path.stat().st_size
+            info["sha256"] = "sha256:" + sha256_file(path)
+    except OSError:
+        pass
+    return info
+
+
+def _pending_counts(root: Path, chunk_ids: List[str]) -> Dict[str, int]:
+    if not chunk_ids:
+        return {}
+    db_path = Path(root) / "db" / "decision_db.sqlite"
+    if not db_path.exists():
+        return {}
+    counts: Dict[str, int] = {}
+    try:
+        conn = _connect_readonly(db_path)
+        try:
+            placeholders = ",".join("?" for _ in chunk_ids)
+            rows = conn.execute(
+                "SELECT chunk_id, COUNT(*) FROM pending_backtrack "
+                f"WHERE chunk_id IN ({placeholders}) GROUP BY chunk_id",
+                chunk_ids,
+            ).fetchall()
+            counts = {str(row[0]): int(row[1]) for row in rows}
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {}
+    return counts
+
+
+def scan_inflight(root: Path, chapter_id: Optional[str] = None,
+                  run_id: Optional[str] = None) -> Dict[str, Any]:
+    """Scan workflow.db without changing any row and return a recovery report."""
+    root = Path(root).resolve()
+    db_path = root / "db" / "workflow.db"
+    report: Dict[str, Any] = {
+        "schema_version": 1,
+        "run_id": str(run_id or os.environ.get("SAGATRANS_RUN_ID") or ""),
+        "generated_at": now_iso(),
+        "chapter": chapter_id or "all",
+        "db_path": str(db_path),
+        "nonterminal_states": list(NONTERMINAL_STATES),
+        "chunks": [],
+        "summary": {"nonterminal": 0, "by_state": {}, "by_chapter": {},
+                    "with_final": 0, "with_final_backup": 0,
+                    "with_critic_report": 0, "with_critic_report_backup": 0},
+        "warnings": [],
+    }
+    if not db_path.exists():
+        report["warnings"].append("workflow_db_missing")
+        return report
+    try:
+        conn = _connect_readonly(db_path)
+    except sqlite3.Error as exc:
+        report["warnings"].append(f"workflow_db_open_failed:{exc}")
+        return report
+
+    rows: List[tuple] = []
+    try:
+        placeholders = ",".join("?" for _ in NONTERMINAL_STATES)
+        sql = (
+            "SELECT chapter_id, chunk_id, state, retries, quality_retries, "
+            "last_error, updated_at, backtrack_rounds, rescue_attempts, rescue_stage "
+            "FROM chunk_tasks WHERE state IN (" + placeholders + ")"
+        )
+        params: List[Any] = list(NONTERMINAL_STATES)
+        if chapter_id:
+            sql += " AND chapter_id = ?"
+            params.append(chapter_id)
+        sql += " ORDER BY chapter_id, chunk_id"
+        rows = conn.execute(sql, params).fetchall()
+    except sqlite3.Error as exc:
+        report["warnings"].append(f"workflow_query_failed:{exc}")
+    finally:
+        conn.close()
+
+    chunk_ids = [str(row[1]) for row in rows]
+    pending = _pending_counts(root, chunk_ids)
+    for row in rows:
+        chapter, chunk_id, state, retries, quality_retries, last_error, updated_at, \
+            backtrack_rounds, rescue_attempts, rescue_stage = row
+        out_dir = root / "output" / str(chapter)
+        final_path = out_dir / f"{chunk_id}_final.json"
+        final_backup = out_dir / f"{chunk_id}_final_backup.json"
+        critic_path = out_dir / f"{chunk_id}_critic_report.json"
+        critic_backup = out_dir / f"{chunk_id}_critic_report_backup.json"
+        final_info = _artifact_info(final_path)
+        backup_info = _artifact_info(final_backup)
+        critic_info = _artifact_info(critic_path)
+        critic_backup_info = _artifact_info(critic_backup)
+        report["chunks"].append({
+            "chapter": str(chapter),
+            "chunk_id": str(chunk_id),
+            "state": str(state),
+            "status": "interrupted_inflight",
+            "resume_stage": RESUME_STAGE.get(str(state), str(state)),
+            "final_exists": bool(final_info["exists"]),
+            "final": final_info,
+            "final_backup_present": bool(backup_info["exists"]),
+            "final_backup": backup_info,
+            "critic_report_exists": bool(critic_info["exists"]),
+            "critic_report": critic_info,
+            "critic_report_backup_present": bool(critic_backup_info["exists"]),
+            "critic_report_backup": critic_backup_info,
+            "pending_backtrack_rows": int(pending.get(str(chunk_id), 0)),
+            "retries": int(retries or 0),
+            "quality_retries": int(quality_retries or 0),
+            "backtrack_rounds": int(backtrack_rounds or 0),
+            "rescue_attempts": int(rescue_attempts or 0),
+            "rescue_stage": str(rescue_stage or ""),
+            "last_error": str(last_error or "")[:500],
+            "updated_at": str(updated_at or ""),
+            "safe_to_skip_stage": False,
+            "backup_preserved": True,
+            "completed": False,
+        })
+        summary = report["summary"]
+        summary["nonterminal"] += 1
+        summary["by_state"][str(state)] = summary["by_state"].get(str(state), 0) + 1
+        summary["by_chapter"][str(chapter)] = summary["by_chapter"].get(str(chapter), 0) + 1
+        if final_info["exists"]:
+            summary["with_final"] += 1
+        if backup_info["exists"]:
+            summary["with_final_backup"] += 1
+        if critic_info["exists"]:
+            summary["with_critic_report"] += 1
+        if critic_backup_info["exists"]:
+            summary["with_critic_report_backup"] += 1
+    return report
+
+
+def write_recovery_report(root: Path, report: Dict[str, Any],
+                          run_id: Optional[str] = None) -> Path:
+    """Atomically publish the recovery report; never touches workflow rows."""
+    root = Path(root).resolve()
+    directory = root / RECOVERY_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    identifier = str(run_id or report.get("run_id") or "manual")
+    path = directory / f"{identifier}.json"
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def audit_and_write(root: Path, chapter_id: Optional[str] = None,
+                    run_id: Optional[str] = None) -> Dict[str, Any]:
+    report = scan_inflight(root, chapter_id=chapter_id, run_id=run_id)
+    path = write_recovery_report(root, report, run_id=run_id)
+    report["report_path"] = str(path)
+    return report
+
+
+__all__ = [
+    "RECOVERY_DIR", "NONTERMINAL_STATES", "RESUME_STAGE",
+    "scan_inflight", "write_recovery_report", "audit_and_write",
+]
+
+
 JUDGMENT_SCHEMA_VERSION = 2
 VALID_NOTE_TYPES = ("voice", "setup_payoff", "arc")
 VALID_NOTE_STATUSES = ("active", "dormant", "dropped")
@@ -20276,6 +23066,531 @@ def judgment_cache_key(profile: Optional[Dict[str, Any]], chapter_id: str,
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
+EVAL_SCHEMA_VERSION = 2
+
+_REGISTRY_COLUMNS = (
+    "id", "canonical_name", "source_names", "variant_names", "entity_type",
+    "pronoun_gender", "confidence", "pending_review", "translation_strategy",
+    "first_seen_chunk", "quarantined_names",
+)
+
+
+def _result(ok: bool, status: str, reasons: Optional[Sequence[str]] = None,
+            expected: Optional[Dict[str, Any]] = None,
+            actual: Optional[Dict[str, Any]] = None,
+            details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {
+        "ok": bool(ok),
+        "status": status,
+        "reasons": list(reasons or []),
+        "expected": expected or {},
+        "actual": actual or {},
+        "details": details or {},
+    }
+
+
+def chapter_manifest(input_dir: Path) -> Dict[str, Dict[str, Any]]:
+    """Return ``chapter_id -> {chars, sha256}`` for ``input/ch*.md``.
+
+    Only the chapter file bytes are hashed.  Paths and mtimes are deliberately
+    excluded so the manifest is stable across checkouts and copies.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for path in sorted(Path(input_dir).glob("ch*.md")):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        out[path.stem] = {"chars": len(text), "sha256": sha256_text(text)}
+    return out
+
+
+def chapter_hash_map(input_dir: Path) -> Dict[str, str]:
+    """Compact ``chapter_id -> sha256`` map used by profile/graph artifacts."""
+    return {cid: rec["sha256"] for cid, rec in chapter_manifest(input_dir).items()}
+
+
+def _canonical_note(note: Dict[str, Any]) -> Dict[str, Any]:
+    evidence: List[Dict[str, Any]] = []
+    for ev in note.get("evidence") or []:
+        if not isinstance(ev, dict):
+            continue
+        evidence.append({
+            "chapter": str(ev.get("chapter") or ""),
+            "quote": str(ev.get("quote") or ""),
+            "offset": ev.get("offset"),
+            "match_kind": str(ev.get("match_kind") or ""),
+        })
+    evidence.sort(key=lambda e: (e["chapter"], str(e["offset"]), e["quote"]))
+    return {
+        "id": str(note.get("id") or ""),
+        "type": str(note.get("type") or ""),
+        "chapters": [str(c) for c in (note.get("chapters") or [])],
+        "claim": str(note.get("claim") or ""),
+        "evidence": evidence,
+        "confidence": note.get("confidence"),
+        "status": str(note.get("status") or ""),
+        "l2_verdict": str(note.get("l2_verdict") or ""),
+    }
+
+
+def profile_notes_hash(profile: Optional[Dict[str, Any]]) -> str:
+    """Hash the semantic identity of the notes the graph consumes.
+
+    Volatile bookkeeping (``created_at`` / ``source_model``) is excluded: a
+    legacy profile loaded twice would otherwise receive a new ``created_at``
+    on each normalization and make an unchanged graph look stale.
+    """
+    notes = [_canonical_note(n) for n in all_notes(profile) if isinstance(n, dict)]
+    notes.sort(key=lambda n: (n["type"], n["id"]))
+    return sha256_text(json.dumps(notes, ensure_ascii=False, sort_keys=True,
+                                  separators=(",", ":")))
+
+
+def profile_fingerprint(profile: Optional[Dict[str, Any]]) -> str:
+    """Content fingerprint of a book profile.
+
+    Excludes ``generated_at``/``time`` and other wall-clock fields; includes the
+    prompt version, generation parameters and canonicalized notes.  Rewriting a
+    profile with the same content therefore yields the same fingerprint.
+    """
+    if not isinstance(profile, dict):
+        return sha256_text("{}")
+    generation = profile.get("generation")
+    if not isinstance(generation, dict):
+        generation = {}
+    notes = [_canonical_note(n) for n in all_notes(profile) if isinstance(n, dict)]
+    notes.sort(key=lambda n: (n["type"], n["id"]))
+    payload = {
+        "schema_version": profile.get("schema_version"),
+        "source": profile.get("source"),
+        "model": generation.get("model"),
+        "merge_model": generation.get("merge_model"),
+        "prompt_version": generation.get("prompt_version"),
+        "params": generation.get("params") or {},
+        "notes": notes,
+        "chapter_digests": [
+            {
+                "chapter_id": d.get("chapter_id"),
+                "source_sha256": d.get("source_sha256"),
+                "source_chars": d.get("source_chars"),
+                "segment_ids": d.get("segment_ids") or [],
+                "digest": d.get("digest"),
+                "complete": bool(d.get("complete")),
+            }
+            for d in profile.get("chapter_digests") or []
+            if isinstance(d, dict)
+        ],
+    }
+    return sha256_text(json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                                  separators=(",", ":"), default=str))
+
+
+def registry_rows(db_path: Path) -> List[Dict[str, Any]]:
+    """Read the exact ``entity_registry`` rows consumed by the story graph."""
+    path = Path(db_path)
+    if not path.exists():
+        return []
+    con = sqlite3.connect(str(path))
+    con.row_factory = sqlite3.Row
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(entity_registry)")}
+        if not cols:
+            return []
+        select = ", ".join(c for c in _REGISTRY_COLUMNS if c in cols)
+        rows = con.execute(f"SELECT {select} FROM entity_registry ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+    except sqlite3.Error:
+        return []
+    finally:
+        con.close()
+
+
+def rows_fingerprint(rows: Sequence[Dict[str, Any]]) -> str:
+    """Content hash of registry rows; stable across SQLite page metadata."""
+    canonical = json.dumps(list(rows or []), ensure_ascii=False,
+                           sort_keys=True, default=str, separators=(",", ":"))
+    return sha256_text(canonical)
+
+
+def decision_db_fingerprint(db_path: Path) -> Dict[str, Any]:
+    """Fingerprint the Decision DB content the graph would read right now."""
+    path = Path(db_path)
+    exists = path.exists()
+    rows = registry_rows(path) if exists else []
+    return {
+        "path_exists": bool(exists),
+        "entity_registry_rows": len(rows),
+        "rows_sha256": rows_fingerprint(rows),
+    }
+
+
+def profile_source_freshness(profile: Optional[Dict[str, Any]], root: Path,
+                             input_dir: Optional[Path] = None,
+                             chapters: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    """Compare ``generation.inputs.chapters`` with the chapter files on disk.
+
+    ``chapters`` may restrict the comparison to the chapters a caller is about
+    to consume.  A missing input block is ``untracked`` (legacy, readable but
+    not evidence of current-source understanding), never ``fresh``.
+    """
+    root = Path(root)
+    in_dir = Path(input_dir) if input_dir else root / "input"
+    current = chapter_manifest(in_dir)
+    if chapters is not None:
+        wanted = [str(c) for c in chapters]
+        current = {cid: current[cid] for cid in wanted if cid in current}
+    if not isinstance(profile, dict):
+        return _result(False, "missing", ["profile_missing"],
+                       expected={"chapters": current},
+                       actual={"chapters": {}})
+    generation = profile.get("generation")
+    if not isinstance(generation, dict):
+        generation = {}
+    inputs = generation.get("inputs")
+    declared = inputs.get("chapters") if isinstance(inputs, dict) else None
+    if not isinstance(declared, dict) or not declared:
+        return _result(False, "untracked", ["profile_chapter_inputs_missing"],
+                       expected={"chapters": current},
+                       actual={"chapters": {}})
+
+    reasons: List[str] = []
+    missing: List[str] = []
+    extra: List[str] = []
+    changed: List[str] = []
+    for cid, rec in current.items():
+        got = declared.get(cid)
+        if not isinstance(got, str) or not got:
+            missing.append(cid)
+        elif got != rec["sha256"]:
+            changed.append(cid)
+    if chapters is None:
+        for cid in declared:
+            if cid not in current:
+                extra.append(str(cid))
+    if missing:
+        reasons.append("profile_chapter_missing")
+    if extra:
+        reasons.append("profile_chapter_unexpected")
+    if changed:
+        reasons.append("chapter_sources_changed")
+    status = "fresh" if not reasons else "stale"
+    return _result(not reasons, status, reasons,
+                   expected={"chapters": current},
+                   actual={"chapters": declared},
+                   details={"missing": missing, "extra": extra, "changed": changed})
+
+
+def _story_graph_params_from_config(root: Path) -> Dict[str, Any]:
+    path = Path(root) / "config.yaml"
+    if not path.exists():
+        return {}
+    try:
+        import yaml
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001 - config is advisory here
+        return {}
+    cfg = data.get("story_graph") if isinstance(data, dict) else None
+    if not isinstance(cfg, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for key, caster in (("cooccur_window", int), ("max_cooccur_edges", int),
+                        ("entity_coverage_min", float), ("scene_chars", int)):
+        if key in cfg:
+            try:
+                out[key] = caster(cfg[key])
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def graph_freshness(graph: Optional[Dict[str, Any]], root: Path,
+                    profile: Optional[Dict[str, Any]],
+                    input_dir: Optional[Path] = None,
+                    db_path: Optional[Path] = None,
+                    expected_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Check that an on-disk story graph matches current sources/DB/profile."""
+    root = Path(root)
+    in_dir = Path(input_dir) if input_dir else root / "input"
+    dbp = Path(db_path) if db_path else root / "db" / "decision_db.sqlite"
+    chapters = chapter_manifest(in_dir)
+    db_fp = decision_db_fingerprint(dbp)
+    notes_hash = profile_notes_hash(profile)
+    params = dict(expected_params or _story_graph_params_from_config(root))
+
+    if not isinstance(graph, dict) or not graph:
+        return _result(False, "missing", ["graph_artifact_missing"],
+                       expected={"chapters": chapters, "decision_db": db_fp,
+                                 "profile_notes_hash": notes_hash},
+                       actual={})
+    generation = graph.get("generation")
+    if not isinstance(generation, dict):
+        generation = {}
+    inputs = generation.get("inputs")
+    if not isinstance(inputs, dict) or not inputs:
+        return _result(False, "untracked", ["graph_generation_inputs_missing"],
+                       expected={"chapters": chapters, "decision_db": db_fp,
+                                 "profile_notes_hash": notes_hash},
+                       actual={})
+
+    reasons: List[str] = []
+    details: Dict[str, Any] = {}
+    actual_chapters = inputs.get("chapters")
+    if not isinstance(actual_chapters, dict) or not actual_chapters:
+        reasons.append("graph_chapter_inputs_missing")
+        actual_chapters = {}
+    else:
+        missing = [cid for cid in chapters if cid not in actual_chapters]
+        extra = [str(cid) for cid in actual_chapters if cid not in chapters]
+        changed = [cid for cid, rec in chapters.items()
+                   if cid in actual_chapters and actual_chapters.get(cid) != rec["sha256"]]
+        if missing or extra or changed:
+            reasons.append("chapter_sources_changed")
+            details["chapters"] = {"missing": missing, "extra": extra,
+                                   "changed": changed}
+    if not db_fp["path_exists"]:
+        reasons.append("decision_db_missing")
+    if inputs.get("decision_db_hash") != db_fp["rows_sha256"]:
+        reasons.append("decision_db_hash_changed")
+    if int(inputs.get("entity_registry_rows") or 0) != int(db_fp["entity_registry_rows"]):
+        reasons.append("decision_db_row_count_changed")
+    if inputs.get("profile_notes_hash") != notes_hash:
+        reasons.append("profile_notes_changed")
+
+    declared_params = generation.get("params") if isinstance(generation.get("params"), dict) else {}
+    param_diffs: Dict[str, Any] = {}
+    for key, expected in params.items():
+        actual = declared_params.get(key)
+        if actual != expected:
+            param_diffs[key] = {"expected": expected, "actual": actual}
+    if param_diffs:
+        reasons.append("graph_params_changed")
+        details["params"] = param_diffs
+
+    stored_fp = str(graph.get("fingerprint") or "")
+    if stored_fp:
+        version = graph.get("schema_version") or generation.get("graph_version")
+        payload = {"graph_version": version,
+                   "inputs": inputs,
+                   "params": declared_params}
+        recomputed = sha256_text(json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+        if stored_fp != recomputed:
+            reasons.append("graph_fingerprint_mismatch")
+
+    status = "fresh" if not reasons else "stale"
+    return _result(not reasons, status, reasons,
+                   expected={"chapters": chapters, "decision_db": db_fp,
+                             "profile_notes_hash": notes_hash, "params": params},
+                   actual={"chapters": actual_chapters,
+                           "decision_db_hash": inputs.get("decision_db_hash"),
+                           "entity_registry_rows": inputs.get("entity_registry_rows"),
+                           "profile_notes_hash": inputs.get("profile_notes_hash"),
+                           "params": declared_params},
+                   details=details)
+
+
+def load_story_graph_checked(root: Path, path: Path,
+                             profile: Optional[Dict[str, Any]],
+                             require_current: bool = True,
+                             input_dir: Optional[Path] = None,
+                             db_path: Optional[Path] = None,
+                             graph: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Load a graph and attach its freshness verdict.
+
+    ``require_current=True`` makes an untracked/stale graph unusable for
+    consumers that would present the result as current evidence.  Research
+    callers may pass ``False`` (CLI ``--allow-stale``).
+    """
+    if graph is None:
+        from src.story_graph import load_story_graph
+        graph = load_story_graph(Path(path))
+    if not graph:
+        return {"ok": False, "status": "missing", "graph": None,
+                "reasons": ["graph_artifact_missing"], "freshness": {}}
+    freshness = graph_freshness(graph, root, profile, input_dir=input_dir,
+                                db_path=db_path)
+    usable = bool(freshness.get("ok")) or not require_current
+    return {
+        "ok": usable,
+        "status": freshness.get("status", "unknown"),
+        "graph": graph,
+        "reasons": list(freshness.get("reasons") or []),
+        "freshness": freshness,
+    }
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _gold_errors(case: Dict[str, Any], chapter_texts: Dict[str, str],
+                 min_similarity: float = 0.9) -> List[str]:
+    gold = _as_list(case.get("gold") or case.get("gold_spans"))
+    if not gold:
+        if case.get("answerable") is False or case.get("negative") is True:
+            return []
+        return ["gold_missing"]
+    errors: List[str] = []
+    for item in gold:
+        if not isinstance(item, dict):
+            errors.append("gold_not_object")
+            continue
+        chapter = str(item.get("chapter") or "")
+        quote = str(item.get("quote") or "")
+        text = chapter_texts.get(chapter)
+        if text is None:
+            errors.append(f"gold_chapter_missing:{chapter}")
+            continue
+        if not quote:
+            errors.append(f"gold_quote_missing:{chapter}")
+            continue
+        hit = match_quote(text, quote, min_similarity=min_similarity,
+                          preferred_offset=item.get("offset"))
+        if not hit.get("ok"):
+            errors.append(f"gold_quote_unmatched:{chapter}")
+    return errors
+
+
+def eval_freshness(payload: Any, root: Path,
+                   profile: Optional[Dict[str, Any]],
+                   graph: Optional[Dict[str, Any]] = None,
+                   input_dir: Optional[Path] = None,
+                   require_active_notes: bool = True,
+                   min_similarity: float = 0.9) -> Dict[str, Any]:
+    """Fail-closed validation for a gold-span evaluation file.
+
+    Legacy list payloads, missing lineage fields, unknown note IDs, inactive
+    notes and unverifiable gold quotes all make the whole evaluation invalid.
+    No metrics may be computed from an invalid file.
+    """
+    root = Path(root)
+    in_dir = Path(input_dir) if input_dir else root / "input"
+    chapters = chapter_manifest(in_dir)
+    notes_hash = profile_notes_hash(profile)
+    graph_fp = str((graph or {}).get("fingerprint") or "")
+    note_status: Dict[str, str] = {}
+    for note in all_notes(profile):
+        nid = str(note.get("id") or "")
+        if nid:
+            note_status[nid] = str(note.get("status") or "")
+
+    if isinstance(payload, list):
+        return _result(False, "invalid", ["eval_payload_legacy_list"],
+                       expected={"schema_version": EVAL_SCHEMA_VERSION,
+                                 "chapter_manifest": chapters,
+                                 "profile_notes_hash": notes_hash,
+                                 "graph_fingerprint": graph_fp},
+                       actual={"schema_version": 0, "cases": len(payload)},
+                       details={"invalid_cases": len(payload)})
+    if not isinstance(payload, dict):
+        return _result(False, "invalid", ["eval_payload_not_object"],
+                       expected={"schema_version": EVAL_SCHEMA_VERSION},
+                       actual={})
+
+    cases = payload.get("cases")
+    if not isinstance(cases, list) or not cases:
+        return _result(False, "invalid", ["eval_cases_empty"],
+                       expected={"schema_version": EVAL_SCHEMA_VERSION},
+                       actual={"cases": len(cases) if isinstance(cases, list) else 0})
+
+    reasons: List[str] = []
+    version = payload.get("schema_version")
+    if version is None:
+        version = payload.get("version")
+    try:
+        version_int = int(version or 0)
+    except (TypeError, ValueError):
+        version_int = 0
+    if version_int < EVAL_SCHEMA_VERSION:
+        reasons.append("eval_schema_legacy")
+
+    required = ("book", "profile_notes_hash", "chapter_manifest", "source",
+                "graph_fingerprint")
+    missing_fields = [key for key in required if not payload.get(key)]
+    if missing_fields:
+        reasons.append("eval_lineage_fields_missing")
+
+    declared_manifest = payload.get("chapter_manifest")
+    if isinstance(declared_manifest, dict) and declared_manifest:
+        normalized: Dict[str, Any] = {}
+        for cid, value in declared_manifest.items():
+            if isinstance(value, dict):
+                normalized[str(cid)] = value
+            else:
+                normalized[str(cid)] = {"sha256": str(value)}
+        if normalized != chapters:
+            reasons.append("eval_chapter_manifest_changed")
+    elif "eval_lineage_fields_missing" not in reasons:
+        reasons.append("eval_chapter_manifest_missing")
+
+    if payload.get("profile_notes_hash") and payload.get("profile_notes_hash") != notes_hash:
+        reasons.append("eval_profile_changed")
+    if graph_fp and payload.get("graph_fingerprint") and \
+            payload.get("graph_fingerprint") != graph_fp:
+        reasons.append("eval_graph_changed")
+
+    chapter_texts: Dict[str, str] = {}
+    for cid in chapters:
+        path = in_dir / f"{cid}.md"
+        try:
+            chapter_texts[cid] = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+    case_errors: List[Dict[str, Any]] = []
+    stale_notes = 0
+    for index, case in enumerate(cases):
+        if not isinstance(case, dict):
+            case_errors.append({"index": index, "errors": ["case_not_object"]})
+            continue
+        errors: List[str] = []
+        note_id = str(case.get("note_id") or "")
+        negative = (case.get("answerable") is False
+                    or case.get("negative") is True)
+        if note_id:
+            status = note_status.get(note_id)
+            if status is None:
+                errors.append("note_id_missing")
+                stale_notes += 1
+            elif require_active_notes and status != "active":
+                errors.append(f"note_not_active:{status or 'unknown'}")
+                stale_notes += 1
+        elif not negative:
+            errors.append("note_id_missing")
+            stale_notes += 1
+        errors.extend(_gold_errors(case, chapter_texts, min_similarity))
+        if errors:
+            case_errors.append({"index": index, "id": str(case.get("id") or ""),
+                                "errors": errors})
+    if stale_notes:
+        reasons.append("eval_stale_notes")
+    if case_errors:
+        reasons.append("eval_cases_invalid")
+
+    status = "fresh" if not reasons else "invalid"
+    return _result(not reasons, status, reasons,
+                   expected={"schema_version": EVAL_SCHEMA_VERSION,
+                             "chapter_manifest": chapters,
+                             "profile_notes_hash": notes_hash,
+                             "graph_fingerprint": graph_fp},
+                   actual={"schema_version": version_int,
+                           "book": payload.get("book"),
+                           "source": payload.get("source"),
+                           "chapter_manifest": declared_manifest or {},
+                           "profile_notes_hash": payload.get("profile_notes_hash"),
+                           "graph_fingerprint": payload.get("graph_fingerprint"),
+                           "cases": len(cases)},
+                   details={"missing_fields": missing_fields,
+                            "stale_notes": stale_notes,
+                            "invalid_cases": len(case_errors),
+                            "case_errors": case_errors[:50]})
+
+
 GRAPH_VERSION = 5
 DEFAULT_GRAPH_PATH = "input/story_graph.json"
 _DEFAULT_SCENE_CHARS = 2200
@@ -20330,38 +23645,8 @@ def _load_json_list(raw: Any) -> List[str]:
     return [s]
 
 
-def _rows_fingerprint(rows: Sequence[Dict[str, Any]]) -> str:
-    """Content hash of the rows the graph actually consumed.
-
-    The database path alone is not a version: new entities can be added to the
-    same file, and a rebuilt graph must change its fingerprint when that
-    happens.  Hashing the selected registry rows keeps the check stable across
-    unrelated SQLite metadata/page changes.
-    """
-    canonical = json.dumps(list(rows or []), ensure_ascii=False,
-                           sort_keys=True, default=str, separators=(",", ":"))
-    return sha256_text(canonical)
-
-
-def _registry_rows(db_path: Path) -> List[Dict[str, Any]]:
-    if not Path(db_path).exists():
-        return []
-    con = sqlite3.connect(str(db_path))
-    con.row_factory = sqlite3.Row
-    try:
-        cols = {r[1] for r in con.execute("PRAGMA table_info(entity_registry)")}
-        if not cols:
-            return []
-        wanted = ["id", "canonical_name", "source_names", "variant_names", "entity_type",
-                  "pronoun_gender", "confidence", "pending_review", "translation_strategy",
-                  "first_seen_chunk", "quarantined_names"]
-        select = ", ".join(c for c in wanted if c in cols)
-        rows = con.execute(f"SELECT {select} FROM entity_registry ORDER BY id").fetchall()
-        return [dict(r) for r in rows]
-    except sqlite3.Error:
-        return []
-    finally:
-        con.close()
+_rows_fingerprint = rows_fingerprint
+_registry_rows = registry_rows
 
 
 def _entity_aliases(row: Dict[str, Any], canonical_names=(),
@@ -21264,11 +24549,9 @@ def build_story_graph(
     ]
     fingerprint_inputs = {
         "chapters": {cid: sha256_text(t) for cid, t in sorted(texts.items())},
-        "decision_db": str(dbp),
         "decision_db_hash": _rows_fingerprint(rows),
         "entity_registry_rows": len(rows),
-        "profile_notes_hash": sha256_text(json.dumps(profile_notes, ensure_ascii=False,
-                                                     sort_keys=True)),
+        "profile_notes_hash": profile_notes_hash(profile),
     }
     fingerprint_params = {
         "cooccur_window": cooccur_window,
@@ -22294,9 +25577,9 @@ class StoryGraphQueryIndex:
                 "hop": float(candidate.get("hop") or 1),
             }
             score = hop_factor * (
-                0.30 * seed_ratio + 0.40 * note_bonus + 0.10 * cert_ratio
-                + 0.06 * density + 0.06 * lexical + 0.05 * proximity
-                + 0.03 * expansion_ratio
+                0.28 * seed_ratio + 0.50 * note_bonus + 0.08 * cert_ratio
+                + 0.05 * density + 0.05 * lexical + 0.03 * proximity
+                + 0.01 * expansion_ratio
             )
             rows.append({
                 "scene_id": sid,
@@ -22715,8 +25998,14 @@ def evaluate_story_graph_query(index: StoryGraphQueryIndex,
                              max_hops=max_hops, use_dpp=use_dpp,
                              use_note_similarity=use_note_similarity,
                              llm_generate=llm_generate)
-        note_matches = (result.get("trace") or {}).get("note_matches") or []
+        trace = result.get("trace") or {}
+        result_metrics = result.get("metrics") or {}
+        note_matches = trace.get("note_matches") or []
         results = result.get("results") or []
+        answerable = (case.get("answerable") is not False
+                      and not bool(case.get("negative")))
+        no_seed = not bool(trace.get("seeds") or [])
+        no_candidate = int(result_metrics.get("candidate_scenes") or 0) <= 0
         result_spans: List[Dict[str, Any]] = []
         for row in results:
             anchor = row.get("anchor") or {}
@@ -22740,6 +26029,14 @@ def evaluate_story_graph_query(index: StoryGraphQueryIndex,
             top = result_spans[:max(0, k)]
             return any(_span_overlap(r["anchor"], gold_span)
                        for r in top for gold_span in gold)
+
+        def evidence_hit_at(k: int, require_all: bool = False) -> bool:
+            if not gold:
+                return False
+            top = result_spans[:max(0, k)]
+            hits = [any(_span_overlap(r["span"], gold_span) for r in top)
+                    for gold_span in gold]
+            return all(hits) if require_all else any(hits)
 
         def precision_at(k: int) -> float:
             top = result_spans[:max(0, k)]
@@ -22766,55 +26063,84 @@ def evaluate_story_graph_query(index: StoryGraphQueryIndex,
             "R@10": round(recall_at(10), 4),
             "AE@5": anchor_hit_at(5),
             "AE@10": anchor_hit_at(10),
+            "any_evidence@5": evidence_hit_at(5),
+            "any_evidence@10": evidence_hit_at(10),
+            "all_evidence@5": evidence_hit_at(5, require_all=True),
+            "all_evidence@10": evidence_hit_at(10, require_all=True),
             "precision@1": round(precision_at(1), 4),
+            "precision@2": round(precision_at(2), 4),
             "precision@3": round(precision_at(3), 4),
             "precision@5": round(precision_at(5), 4),
             "precision@10": round(precision_at(10), 4),
             "matched@10": matched_at_10,
             "returned": len(results),
+            "answerable": bool(answerable),
+            "negative": not bool(answerable),
+            "no_seed": bool(no_seed),
+            "no_candidate": bool(no_candidate),
             "top_scene": str((results[0] if results else {}).get("scene_id") or ""),
-            "reason": str((result.get("trace") or {}).get("reason") or ""),
+            "reason": str(trace.get("reason") or ""),
         })
     if not rows:
         return {"cases": 0, "metrics": {}, "rows": []}
 
-    def mean(key: str) -> float:
-        return round(sum(float(r.get(key) or 0.0) for r in rows) / len(rows), 4)
+    evidence_rows = [r for r in rows if r.get("gold_spans")]
+    answerable_rows = [r for r in rows if r.get("answerable")]
+    negative_rows = [r for r in rows if r.get("negative")]
 
-    def subset_mean(items: Sequence[Dict[str, Any]], key: str) -> float:
+    def mean(items: Sequence[Dict[str, Any]], key: str) -> float:
         if not items:
             return 0.0
         return round(sum(float(r.get(key) or 0.0) for r in items) / len(items), 4)
 
+    def rate(items: Sequence[Dict[str, Any]], key: str) -> float:
+        if not items:
+            return 0.0
+        return round(sum(1 for r in items if r.get(key)) / float(len(items)), 4)
+
     metrics = {
         "cases": len(rows),
-        "R@5": mean("R@5"),
-        "R@10": mean("R@10"),
-        "AE@5": round(sum(1 for r in rows if r["AE@5"]) / float(len(rows)), 4),
-        "AE@10": round(sum(1 for r in rows if r["AE@10"]) / float(len(rows)), 4),
-        "anchor_precision@1": mean("precision@1"),
-        "anchor_precision@3": mean("precision@3"),
-        "anchor_precision@5": mean("precision@5"),
-        "anchor_precision@10": mean("precision@10"),
+        "answerable_cases": len(answerable_rows),
+        "negative_cases": len(negative_rows),
+        "gold_cases": len(evidence_rows),
+        "R@5": mean(evidence_rows, "R@5"),
+        "R@10": mean(evidence_rows, "R@10"),
+        "AE@5": rate(evidence_rows, "AE@5"),
+        "AE@10": rate(evidence_rows, "AE@10"),
+        "any_evidence_R@5": rate(evidence_rows, "any_evidence@5"),
+        "any_evidence_R@10": rate(evidence_rows, "any_evidence@10"),
+        "all_evidence_R@5": rate(evidence_rows, "all_evidence@5"),
+        "all_evidence_R@10": rate(evidence_rows, "all_evidence@10"),
+        "evidence_precision@1": mean(evidence_rows, "precision@1"),
+        "evidence_precision@2": mean(evidence_rows, "precision@2"),
+        "anchor_precision@1": mean(evidence_rows, "precision@1"),
+        "anchor_precision@3": mean(evidence_rows, "precision@3"),
+        "anchor_precision@5": mean(evidence_rows, "precision@5"),
+        "anchor_precision@10": mean(evidence_rows, "precision@10"),
+        "no_seed_rate": rate(answerable_rows, "no_seed"),
+        "no_candidate_rate": rate(answerable_rows, "no_candidate"),
+        "negative_empty_rate": (
+            round(sum(1 for r in negative_rows
+                      if int(r.get("returned") or 0) == 0)
+                  / float(len(negative_rows)), 4)
+            if negative_rows else 0.0),
     }
     # Micro precision across the first ten returned scenes: this is the
     # "anchor precision" audit number, not a relevance judgement for a book.
-    total_returned = sum(min(10, int(r.get("returned") or 0)) for r in rows)
-    total_matched = sum(int(r.get("matched@10") or 0) for r in rows)
+    total_returned = sum(min(10, int(r.get("returned") or 0)) for r in evidence_rows)
+    total_matched = sum(int(r.get("matched@10") or 0) for r in evidence_rows)
     metrics["anchor_precision"] = round(
         total_matched / float(total_returned or 1), 4)
     for mode in ("alias_only", "note_similarity", "note_evidence"):
-        subset = [r for r in rows if r.get("mode") == mode]
+        subset = [r for r in evidence_rows if r.get("mode") == mode]
         if not subset:
             continue
         metrics[mode + "_cases"] = len(subset)
-        metrics[mode + "_R@5"] = subset_mean(subset, "R@5")
-        metrics[mode + "_R@10"] = subset_mean(subset, "R@10")
-        metrics[mode + "_AE@5"] = round(
-            sum(1 for r in subset if r["AE@5"]) / float(len(subset)), 4)
-        metrics[mode + "_AE@10"] = round(
-            sum(1 for r in subset if r["AE@10"]) / float(len(subset)), 4)
-        metrics[mode + "_anchor_precision@1"] = subset_mean(subset, "precision@1")
+        metrics[mode + "_R@5"] = mean(subset, "R@5")
+        metrics[mode + "_R@10"] = mean(subset, "R@10")
+        metrics[mode + "_AE@5"] = rate(subset, "AE@5")
+        metrics[mode + "_AE@10"] = rate(subset, "AE@10")
+        metrics[mode + "_anchor_precision@1"] = mean(subset, "precision@1")
     return {"cases": len(rows), "metrics": metrics, "rows": rows}
 
 
@@ -22851,6 +26177,11392 @@ def format_query_result(result: Dict[str, Any], max_items: int = 5) -> str:
             lines.append("    judge: %s (%.2f) %s" % (
                 verdict, float(row.get("judge_score") or 0.0), row.get("judge_reason") or ""))
     return "\n".join(lines)
+
+
+MANIFEST_SCHEMA_VERSION = 1
+DEFAULT_MANIFEST_PATH = "output/build_manifest.json"
+DEFAULT_AUDIT_JSON = "output/book_link_audit.json"
+DEFAULT_AUDIT_MD = "output/book_link_audit.md"
+
+
+def _natural_key(value: str) -> List[Any]:
+    return [int(part) if part.isdigit() else part.lower()
+            for part in re.split(r"(\d+)", str(value))]
+
+
+def _rel(root: Path, path: Path) -> str:
+    try:
+        return str(Path(path).resolve().relative_to(Path(root).resolve()))
+    except (ValueError, OSError):
+        return str(path)
+
+
+def _read_json(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _load_profile(root: Path):
+    try:
+        from src.style_profiler import load_profile
+        return load_profile(Path(root) / "input" / "book_profile.json")
+    except Exception:  # noqa: BLE001 - audit remains usable without a profile
+        return None
+
+
+def _load_graph(root: Path):
+    try:
+        from src.story_graph import load_story_graph
+        return load_story_graph(Path(root) / "input" / "story_graph.json")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _chapter_heading(root: Path, chapter_id: str) -> str:
+    try:
+        from src.book_lint import chapter_heading
+        value = str(chapter_heading(str(root), chapter_id) or "").strip()
+        if value:
+            return value
+    except Exception:  # noqa: BLE001 - heading check is advisory if lint is absent
+        pass
+    return chapter_id
+
+
+def _load_tasks(db_path: Path) -> Dict[str, Any]:
+    path = Path(db_path)
+    if not path.exists():
+        return {"rows": [], "error": f"workflow.db missing: {path}"}
+    con = sqlite3.connect(str(path))
+    con.row_factory = sqlite3.Row
+    try:
+        rows = con.execute(
+            "SELECT chunk_id, chapter_id, state, text_content, updated_at "
+            "FROM chunk_tasks ORDER BY chapter_id, chunk_id"
+        ).fetchall()
+        return {"rows": [dict(row) for row in rows], "error": ""}
+    except sqlite3.Error as exc:
+        return {"rows": [], "error": f"workflow.db unreadable: {exc}"}
+    finally:
+        con.close()
+
+
+def _json_chars(path: Path) -> int:
+    data = _read_json(path)
+    if not isinstance(data, dict):
+        return 0
+    return len(str(data.get("text") or ""))
+
+
+def _is_fallback(path: Path) -> bool:
+    data = _read_json(path)
+    if not isinstance(data, dict):
+        return False
+    meta = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+    return bool(meta.get("fallback") or meta.get("quality_waived"))
+
+
+def _run_evidence(root: Path, run_id: Optional[str]) -> Dict[str, Any]:
+    log_dir = root / "output" / "logs" / "runs"
+    rid = str(run_id or os.environ.get("SAGATRANS_RUN_ID") or "").strip()
+    jsonl = log_dir / f"{rid}.jsonl" if rid else None
+    text = log_dir / f"{rid}.log" if rid else None
+    seal = log_dir / f"{rid}.sha256" if rid else None
+    sealed = _read_json(seal) if seal and seal.exists() else None
+    payload = {
+        "run_id": rid,
+        "jsonl_path": _rel(root, jsonl) if jsonl else "",
+        "log_path": _rel(root, text) if text else "",
+        "seal_path": _rel(root, seal) if seal else "",
+        "jsonl_sha256": str((sealed or {}).get("jsonl_sha256") or ""),
+        "log_sha256": str((sealed or {}).get("log_sha256") or ""),
+        "sealed": bool(sealed),
+        "sealed_at": str((sealed or {}).get("sealed_at") or ""),
+        "seq_last": int((sealed or {}).get("seq_last") or 0),
+    }
+    return payload
+
+
+def build_manifest(root: Path, merged_path: Path,
+                   input_dir: Optional[Path] = None,
+                   output_dir: Optional[Path] = None,
+                   db_path: Optional[Path] = None,
+                   run_id: Optional[str] = None) -> Dict[str, Any]:
+    """Derive the manifest from the current disk state (no writes)."""
+    root = Path(root)
+    in_dir = Path(input_dir) if input_dir else root / "input"
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    dbp = Path(db_path) if db_path else root / "db" / "workflow.db"
+    merged = Path(merged_path)
+
+    chapter_sources = chapter_manifest(in_dir)
+    chapter_order = sorted(chapter_sources, key=_natural_key)
+    tasks = _load_tasks(dbp)
+    rows_by_chapter: Dict[str, List[Dict[str, Any]]] = {}
+    for row in tasks.get("rows") or []:
+        rows_by_chapter.setdefault(str(row.get("chapter_id") or ""), []).append(row)
+
+    chapters: List[Dict[str, Any]] = []
+    totals = {"chapters": len(chapter_order), "db_chunks": 0,
+              "finals_present": 0, "finals_missing": 0,
+              "fallback_finals": 0, "orphan_finals": 0}
+    for cid in chapter_order:
+        src = chapter_sources[cid]
+        rows = sorted(rows_by_chapter.get(cid, []),
+                      key=lambda r: _natural_key(r.get("chunk_id") or ""))
+        manifest_chunks: List[Dict[str, Any]] = []
+        expected_ids = set()
+        for index, row in enumerate(rows):
+            chunk_id = str(row.get("chunk_id") or "")
+            expected_ids.add(chunk_id)
+            final_path = out_dir / cid / f"{chunk_id}_final.json"
+            present = final_path.exists()
+            manifest_chunks.append({
+                "index": index,
+                "chunk_id": chunk_id,
+                "state": str(row.get("state") or ""),
+                "source_sha256": sha256_text(str(row.get("text_content") or "")),
+                "source_chars": len(str(row.get("text_content") or "")),
+                "final_path": _rel(root, final_path),
+                "final_sha256": sha256_file(final_path) if present else "",
+                "final_chars": _json_chars(final_path) if present else 0,
+                "fallback": _is_fallback(final_path) if present else False,
+                "updated_at": str(row.get("updated_at") or ""),
+            })
+            totals["db_chunks"] += 1
+            if present:
+                totals["finals_present"] += 1
+                if _is_fallback(final_path):
+                    totals["fallback_finals"] += 1
+            else:
+                totals["finals_missing"] += 1
+        orphan_finals = []
+        for final_path in sorted((out_dir / cid).glob("*_final.json"),
+                                 key=lambda p: _natural_key(p.name)):
+            chunk_id = final_path.name[:-len("_final.json")]
+            if chunk_id not in expected_ids:
+                orphan_finals.append({
+                    "chunk_id": chunk_id,
+                    "final_path": _rel(root, final_path),
+                    "final_sha256": sha256_file(final_path),
+                    "final_chars": _json_chars(final_path),
+                })
+        totals["orphan_finals"] += len(orphan_finals)
+        chapters.append({
+            "chapter_id": cid,
+            "source_path": _rel(root, in_dir / f"{cid}.md"),
+            "source_sha256": src["sha256"],
+            "source_chars": src["chars"],
+            "heading": _chapter_heading(root, cid),
+            "chunks": manifest_chunks,
+            "orphan_finals": orphan_finals,
+        })
+
+    merged_exists = merged.exists()
+    merged_info = {
+        "path": _rel(root, merged),
+        "sha256": sha256_file(merged) if merged_exists else "",
+        "chars": len(merged.read_text(encoding="utf-8")) if merged_exists else 0,
+        "exists": merged_exists,
+        "updated_at": now_iso(),
+    }
+    profile = _load_profile(root)
+    graph = _load_graph(root)
+    profile_status = (profile_source_freshness(profile, root, input_dir=in_dir)
+                      if profile else {"status": "missing", "reasons": ["profile_missing"]})
+    graph_status = (graph_freshness(graph, root, profile, input_dir=in_dir, db_path=dbp)
+                    if graph else {"status": "missing", "reasons": ["graph_missing"]})
+    return {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "generated_at": now_iso(),
+        "run_evidence": _run_evidence(root, run_id),
+        "chapter_order": chapter_order,
+        "chapters": chapters,
+        "totals": totals,
+        "merged": merged_info,
+        "merged_history": [{
+            "stage": "merge",
+            "sha256": merged_info["sha256"],
+            "chars": merged_info["chars"],
+            "at": merged_info["updated_at"],
+        }],
+        "artifacts": {
+            "profile_fingerprint": profile_fingerprint(profile) if profile else "",
+            "profile_status": profile_status.get("status"),
+            "profile_reasons": profile_status.get("reasons") or [],
+            "profile_chapter_digests_complete": bool(
+                (profile or {}).get("chapter_digests_complete")),
+            "graph_fingerprint": str((graph or {}).get("fingerprint") or ""),
+            "graph_status": graph_status.get("status"),
+            "graph_reasons": graph_status.get("reasons") or [],
+        },
+        "workflow_db": {"path": _rel(root, dbp), "error": tasks.get("error") or ""},
+    }
+
+
+def write_manifest(manifest: Dict[str, Any], path: Path) -> Path:
+    out = Path(path)
+    atomic_write_json(out, manifest)
+    return out
+
+
+def update_manifest_run_evidence(root: Path, manifest_path: Path,
+                                 run_id: str, seal: Dict[str, Any]) -> bool:
+    """Attach the post-run sealed log hash without touching any final hash."""
+    root = Path(root)
+    manifest_path = Path(manifest_path)
+    manifest = _read_json(manifest_path)
+    if not manifest:
+        return False
+    evidence = manifest.get("run_evidence") if isinstance(manifest.get("run_evidence"), dict) else {}
+    recorded = str(evidence.get("run_id") or "")
+    if recorded and recorded != run_id:
+        return False
+    log_dir = root / "output" / "logs" / "runs"
+    evidence.update({
+        "run_id": run_id,
+        "jsonl_path": _rel(root, log_dir / f"{run_id}.jsonl"),
+        "log_path": _rel(root, log_dir / f"{run_id}.log"),
+        "seal_path": _rel(root, log_dir / f"{run_id}.sha256"),
+        "jsonl_sha256": str(seal.get("jsonl_sha256") or ""),
+        "log_sha256": str(seal.get("log_sha256") or ""),
+        "sealed": True,
+        "sealed_at": str(seal.get("sealed_at") or ""),
+        "seq_last": int(seal.get("seq_last") or 0),
+    })
+    manifest["run_evidence"] = evidence
+    manifest["updated_at"] = now_iso()
+    atomic_write_json(manifest_path, manifest)
+    return True
+
+
+def _verify_final_links(manifest: Dict[str, Any], root: Path) -> List[str]:
+    errors: List[str] = []
+    for chapter in manifest.get("chapters") or []:
+        for chunk in chapter.get("chunks") or []:
+            path = root / str(chunk.get("final_path") or "")
+            if not path.exists():
+                errors.append(f"missing_final:{chunk.get('chunk_id')}")
+            elif sha256_file(path) != chunk.get("final_sha256"):
+                errors.append(f"changed_final:{chunk.get('chunk_id')}")
+    return errors
+
+
+def update_manifest_merged(root: Path, manifest_path: Path, merged_path: Path,
+                           stage: str = "postprocess") -> Dict[str, Any]:
+    """Record a merged-only transform (notes-normalize / proofread)."""
+    root = Path(root)
+    manifest_path = Path(manifest_path)
+    merged = Path(merged_path)
+    manifest = _read_json(manifest_path)
+    if not manifest:
+        return {"ok": False, "error": "manifest_missing"}
+    if not merged.exists():
+        return {"ok": False, "error": f"merged_missing:{merged}"}
+    final_errors = _verify_final_links(manifest, root)
+    if final_errors:
+        return {"ok": False, "error": "final_links_changed",
+                "details": final_errors[:20]}
+    digest = sha256_file(merged)
+    chars = len(merged.read_text(encoding="utf-8"))
+    history = manifest.get("merged_history")
+    if not isinstance(history, list):
+        history = []
+    history.append({"stage": str(stage), "sha256": digest,
+                    "chars": chars, "at": now_iso()})
+    manifest["merged_history"] = history[-20:]
+    manifest["merged"] = {
+        "path": _rel(root, merged),
+        "sha256": digest,
+        "chars": chars,
+        "exists": True,
+        "updated_at": now_iso(),
+    }
+    manifest["updated_at"] = now_iso()
+    atomic_write_json(manifest_path, manifest)
+    return {"ok": True, "sha256": digest, "chars": chars,
+            "stage": str(stage), "manifest_path": str(manifest_path)}
+
+
+def _item(name: str, status: str, message: str = "",
+          **details: Any) -> Dict[str, Any]:
+    return {"name": name, "status": status, "message": message,
+            "details": details}
+
+
+def _check_source_links(root: Path, manifest: Dict[str, Any],
+                       input_dir: Path) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    current = chapter_manifest(input_dir)
+    expected_order = sorted(current, key=_natural_key)
+    declared = [str(c) for c in (manifest.get("chapter_order") or [])]
+    if declared != expected_order:
+        items.append(_item("source.chapter_order", "fail",
+                           "manifest 章序与 input/ch*.md 不一致",
+                           expected=expected_order, actual=declared))
+    else:
+        items.append(_item("source.chapter_order", "pass",
+                           "章序一致", chapters=declared))
+    by_id = {str(c.get("chapter_id")): c for c in manifest.get("chapters") or []}
+    for cid in expected_order:
+        entry = by_id.get(cid)
+        if not entry:
+            items.append(_item(f"source.{cid}", "fail", "manifest 缺章"))
+            continue
+        rec = current[cid]
+        if entry.get("source_sha256") != rec["sha256"] or \
+                int(entry.get("source_chars") or 0) != rec["chars"]:
+            items.append(_item(f"source.{cid}", "fail", "章源哈希/字数已变化",
+                               expected=rec, actual={
+                                   "sha256": entry.get("source_sha256"),
+                                   "chars": entry.get("source_chars")}))
+        else:
+            items.append(_item(f"source.{cid}", "pass", "章源一致"))
+    for cid in declared:
+        if cid not in current:
+            items.append(_item(f"source.{cid}", "fail", "manifest 引用了不存在的章"))
+    return items
+
+
+def _check_chunk_links(root: Path, manifest: Dict[str, Any], db_path: Path,
+                       output_dir: Path) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    tasks = _load_tasks(db_path)
+    if tasks.get("error"):
+        return [_item("chunks.workflow_db", "fail", tasks["error"])]
+    rows_by_chapter: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for row in tasks.get("rows") or []:
+        rows_by_chapter.setdefault(str(row.get("chapter_id") or ""), {})[
+            str(row.get("chunk_id") or "")] = row
+    for chapter in manifest.get("chapters") or []:
+        cid = str(chapter.get("chapter_id") or "")
+        expected_rows = rows_by_chapter.get(cid, {})
+        expected_ids = sorted(expected_rows, key=_natural_key)
+        chunks = chapter.get("chunks") or []
+        actual_ids = [str(c.get("chunk_id") or "") for c in chunks]
+        if actual_ids != expected_ids:
+            items.append(_item(f"chunks.{cid}.set", "fail",
+                               "manifest chunk 集合/顺序与 DB 不一致",
+                               expected=expected_ids, actual=actual_ids))
+        else:
+            items.append(_item(f"chunks.{cid}.set", "pass",
+                               "chunk 集合与顺序一致", chunks=len(actual_ids)))
+        seen = set()
+        for index, chunk in enumerate(chunks):
+            chunk_id = str(chunk.get("chunk_id") or "")
+            if chunk_id in seen:
+                items.append(_item(f"chunks.{cid}.{chunk_id}", "fail", "重复 chunk"))
+                continue
+            seen.add(chunk_id)
+            row = expected_rows.get(chunk_id)
+            if row is None:
+                items.append(_item(f"chunks.{cid}.{chunk_id}", "fail", "DB 无此任务"))
+                continue
+            raw_index = chunk.get("index")
+            try:
+                chunk_index = int(raw_index) if raw_index is not None else -1
+            except (TypeError, ValueError):
+                chunk_index = -1
+            if chunk_index != index:
+                items.append(_item(f"chunks.{cid}.{chunk_id}", "fail",
+                                   "chunk index 不连续"))
+            if str(chunk.get("state") or "") != str(row.get("state") or ""):
+                items.append(_item(f"chunks.{cid}.{chunk_id}", "fail",
+                                   "DB 状态与 manifest 不一致",
+                                   expected=row.get("state"),
+                                   actual=chunk.get("state")))
+            source_hash = sha256_text(str(row.get("text_content") or ""))
+            if chunk.get("source_sha256") != source_hash:
+                items.append(_item(f"chunks.{cid}.{chunk_id}", "fail",
+                                   "DB source 与 manifest 哈希不一致"))
+            final_path = output_dir / cid / f"{chunk_id}_final.json"
+            if not final_path.exists():
+                items.append(_item(f"final.{cid}.{chunk_id}", "fail", "final 缺失"))
+            else:
+                actual = sha256_file(final_path)
+                if actual != chunk.get("final_sha256"):
+                    items.append(_item(f"final.{cid}.{chunk_id}", "fail",
+                                       "final 哈希已变化",
+                                       expected=chunk.get("final_sha256"),
+                                       actual=actual))
+                elif _is_fallback(final_path) != bool(chunk.get("fallback")):
+                    items.append(_item(f"final.{cid}.{chunk_id}", "fail",
+                                       "fallback 标记与 manifest 不一致"))
+        orphan = chapter.get("orphan_finals") or []
+        disk_orphans = []
+        known = set(expected_ids)
+        for path in sorted((output_dir / cid).glob("*_final.json"),
+                           key=lambda p: _natural_key(p.name)):
+            chunk_id = path.name[:-len("_final.json")]
+            if chunk_id not in known:
+                disk_orphans.append(chunk_id)
+        if orphan or disk_orphans:
+            items.append(_item(f"chunks.{cid}.orphan", "fail",
+                               "存在未登记的 final",
+                               manifest=[o.get("chunk_id") for o in orphan],
+                               disk=disk_orphans))
+        else:
+            items.append(_item(f"chunks.{cid}.orphan", "pass", "无孤立 final"))
+    extra_chapters = sorted(set(rows_by_chapter) -
+                            {str(c.get("chapter_id")) for c in manifest.get("chapters") or []},
+                            key=_natural_key)
+    if extra_chapters:
+        items.append(_item("chunks.extra_chapters", "fail",
+                           "DB 有 manifest 未覆盖的章", chapters=extra_chapters))
+    return items
+
+
+def _headings_from_merged(text: str) -> List[str]:
+    out = []
+    for line in text.splitlines():
+        match = re.match(r"^#\s+(.+?)\s*$", line)
+        if match:
+            out.append(match.group(1).strip())
+    return out
+
+
+def _check_merged(root: Path, manifest: Dict[str, Any], merged_path: Path) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    recorded = manifest.get("merged") if isinstance(manifest.get("merged"), dict) else {}
+    if not merged_path.exists():
+        return [_item("merged.exists", "fail", "merged 不存在")]
+    actual_hash = sha256_file(merged_path)
+    if actual_hash != recorded.get("sha256"):
+        items.append(_item("merged.hash", "fail", "merged 哈希与 manifest 不一致",
+                           expected=recorded.get("sha256"), actual=actual_hash))
+    else:
+        items.append(_item("merged.hash", "pass", "merged 哈希一致"))
+    if Path(str(recorded.get("path") or "")) != Path(_rel(root, merged_path)):
+        # The recorded path is intentionally relative; compare its normalized form.
+        recorded_rel = str(recorded.get("path") or "")
+        if recorded_rel and recorded_rel != _rel(root, merged_path):
+            items.append(_item("merged.path", "fail", "merged 路径与 manifest 不一致",
+                               expected=recorded_rel, actual=_rel(root, merged_path)))
+    text = merged_path.read_text(encoding="utf-8")
+    headings = _headings_from_merged(text)
+    expected = [str(c.get("heading") or "") for c in manifest.get("chapters") or []]
+    if expected and headings != expected:
+        items.append(_item("merged.headings", "fail", "merged H1 章序/标题不一致",
+                           expected=expected, actual=headings))
+    else:
+        items.append(_item("merged.headings", "pass", "merged H1 一致",
+                           headings=headings))
+    return items
+
+
+def _check_artifacts(root: Path, manifest: Dict[str, Any],
+                     require_current: bool) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    recorded = manifest.get("artifacts") if isinstance(manifest.get("artifacts"), dict) else {}
+    profile = _load_profile(root)
+    graph = _load_graph(root)
+    profile_fresh = (profile_source_freshness(profile, root) if profile
+                     else {"status": "missing", "reasons": ["profile_missing"]})
+    graph_fresh = (graph_freshness(graph, root, profile) if graph
+                   else {"status": "missing", "reasons": ["graph_missing"]})
+    for name, actual, current, recorded_fp in (
+        ("profile", profile_fresh, profile_fingerprint(profile) if profile else "",
+         recorded.get("profile_fingerprint")),
+        ("graph", graph_fresh, str((graph or {}).get("fingerprint") or ""),
+         recorded.get("graph_fingerprint")),
+    ):
+        if actual.get("status") == "fresh":
+            items.append(_item(f"artifacts.{name}", "pass", "当前制品新鲜"))
+        else:
+            status = "fail" if require_current else "warn"
+            items.append(_item(f"artifacts.{name}", status,
+                               f"制品 {actual.get('status')}",
+                               reasons=actual.get("reasons") or []))
+        if recorded_fp and current and recorded_fp != current:
+            items.append(_item(f"artifacts.{name}.fingerprint", "warn",
+                               "manifest 记录与当前指纹不同",
+                               expected=recorded_fp, actual=current))
+    return items
+
+
+def _check_run_evidence(root: Path, manifest: Dict[str, Any],
+                        require_sealed: bool) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    evidence = manifest.get("run_evidence") if isinstance(manifest.get("run_evidence"), dict) else {}
+    run_id = str(evidence.get("run_id") or "")
+    if not run_id:
+        return [_item("run.id", "fail", "manifest 未记录 run_id")]
+    items.append(_item("run.id", "pass", "run_id 已记录", run_id=run_id))
+    jsonl = root / str(evidence.get("jsonl_path") or "")
+    text = root / str(evidence.get("log_path") or "")
+    seal_path = root / str(evidence.get("seal_path") or "")
+    if not jsonl.exists():
+        items.append(_item("run.jsonl", "fail", "任务 JSONL 缺失", path=str(jsonl)))
+        return items
+    if not text.exists():
+        items.append(_item("run.log", "fail", "任务文本日志缺失", path=str(text)))
+    else:
+        items.append(_item("run.log", "pass", "任务文本日志存在"))
+    sealed = bool(evidence.get("sealed")) and seal_path.exists()
+    validation = validate_jsonl(
+        jsonl, expected_run_id=run_id, require_run_start=True,
+        require_run_end=bool(sealed or require_sealed))
+    if validation.get("ok"):
+        items.append(_item("run.jsonl.events", "pass", "JSONL 事件序列有效",
+                           seq_last=validation.get("seq_last")))
+    else:
+        items.append(_item("run.jsonl.events", "fail", "JSONL 事件序列无效",
+                           errors=validation.get("errors") or []))
+    if sealed:
+        seal = _read_json(seal_path) or {}
+        actual = sha256_file(jsonl)
+        if str(seal.get("jsonl_sha256") or "") != actual:
+            items.append(_item("run.seal", "fail", "封存哈希与 JSONL 不一致",
+                               expected=seal.get("jsonl_sha256"), actual=actual))
+        elif evidence.get("jsonl_sha256") and \
+                evidence.get("jsonl_sha256") != actual:
+            items.append(_item("run.seal", "fail", "manifest 封存哈希已过期",
+                               expected=evidence.get("jsonl_sha256"), actual=actual))
+        else:
+            items.append(_item("run.seal", "pass", "封存哈希一致"))
+    else:
+        status = "fail" if require_sealed else "warn"
+        items.append(_item("run.seal", status,
+                           "运行尚未封存（交付审计需 --require-sealed）"))
+    return items
+
+
+def audit_book_links(root: Path, manifest_path: Optional[Path] = None,
+                     merged_path: Optional[Path] = None,
+                     input_dir: Optional[Path] = None,
+                     output_dir: Optional[Path] = None,
+                     db_path: Optional[Path] = None,
+                     require_current: bool = False,
+                     require_sealed: bool = False) -> Dict[str, Any]:
+    """Re-derive every source -> chunk -> final -> merged link."""
+    root = Path(root)
+    in_dir = Path(input_dir) if input_dir else root / "input"
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    dbp = Path(db_path) if db_path else root / "db" / "workflow.db"
+    mp = Path(manifest_path) if manifest_path else root / DEFAULT_MANIFEST_PATH
+    manifest = _read_json(mp)
+    if not manifest:
+        return {
+            "ok": False, "status": "failed", "manifest_path": _rel(root, mp),
+            "checks": [_item("manifest.read", "fail",
+                             f"无法读取 build manifest: {mp}")],
+            "passed": [], "warnings": [], "failed": ["manifest.read"],
+            "skipped": [],
+        }
+    checks: List[Dict[str, Any]] = []
+    checks.extend(_check_source_links(root, manifest, in_dir))
+    checks.extend(_check_chunk_links(root, manifest, dbp, out_dir))
+    recorded_merged = (manifest.get("merged") or {}).get("path")
+    actual_merged = (Path(merged_path) if merged_path else
+                     (root / str(recorded_merged) if recorded_merged else None))
+    if actual_merged is None:
+        checks.append(_item("merged.path", "fail", "manifest 未记录 merged 路径"))
+    else:
+        checks.extend(_check_merged(root, manifest, actual_merged))
+    checks.extend(_check_artifacts(root, manifest, require_current))
+    checks.extend(_check_run_evidence(root, manifest, require_sealed))
+    passed = [c["name"] for c in checks if c["status"] == "pass"]
+    warnings = [c["name"] for c in checks if c["status"] == "warn"]
+    failed = [c["name"] for c in checks if c["status"] == "fail"]
+    skipped = [c["name"] for c in checks if c["status"] == "skip"]
+    status = "failed" if failed else ("warning" if warnings else "pass")
+    return {
+        "ok": not failed,
+        "status": status,
+        "manifest_path": _rel(root, mp),
+        "manifest_schema_version": manifest.get("schema_version"),
+        "run_id": (manifest.get("run_evidence") or {}).get("run_id"),
+        "checks": checks,
+        "passed": passed,
+        "warnings": warnings,
+        "failed": failed,
+        "skipped": skipped,
+    }
+
+
+def format_book_link_audit_md(result: Dict[str, Any]) -> str:
+    lines = ["# 全书链接审计 (book_link_audit)", "",
+             f"- 状态: {result.get('status')}",
+             f"- manifest: {result.get('manifest_path')}",
+             f"- run_id: {result.get('run_id') or '-'}",
+             f"- passed: {len(result.get('passed') or [])}",
+             f"- warnings: {len(result.get('warnings') or [])}",
+             f"- failed: {len(result.get('failed') or [])}", ""]
+    for check in result.get("checks") or []:
+        icon = {"pass": "✅", "warn": "⚠️", "fail": "❌", "skip": "⏭️"}.get(
+            str(check.get("status")), "•")
+        lines.append(f"- {icon} {check.get('name')}: {check.get('message')}")
+        details = check.get("details") or {}
+        if check.get("status") in {"fail", "warn"} and details:
+            text = json.dumps(details, ensure_ascii=False, sort_keys=True)
+            lines.append(f"  - {text[:500]}")
+    return "\n".join(lines) + "\n"
+
+
+def write_book_link_audit(result: Dict[str, Any], json_path: Optional[Path] = None,
+                          md_path: Optional[Path] = None) -> Tuple[Path, Path]:
+    jp = Path(json_path) if json_path else Path(DEFAULT_AUDIT_JSON)
+    mp = Path(md_path) if md_path else Path(DEFAULT_AUDIT_MD)
+    atomic_write_json(jp, result)
+    mp.parent.mkdir(parents=True, exist_ok=True)
+    tmp = mp.with_name(mp.name + ".tmp")
+    tmp.write_text(format_book_link_audit_md(result), encoding="utf-8")
+    os.replace(tmp, mp)
+    return jp, mp
+
+
+TERMINAL_STATES = {"COMPLETED", "PERMANENTLY_FAILED"}
+NONTERMINAL_STATES = {
+    "PENDING", "EXTRACTING_TERMS", "TRANSLATING_RAW", "REWRITING_LITERARY",
+    "AUDITING", "JUDGING", "DIRTY", "FAILED",
+}
+
+_FOOTNOTE_DEF_PATTERNS = (
+    re.compile(r"(?m)^\[\^[^\]]+\]:"),
+    re.compile(r"(?ms)^[ \t]*---[ \t]*\r?\n(?:[ \t]*\r?\n)*[ \t]*\[\d+\][ \t]+"),
+    re.compile(r"(?m)^[ \t]*\[\d+\][ \t]+[^\n]"),
+)
+
+_SOURCE_GLOSS_RE = re.compile(
+    r"(?P<cjk>[\u4e00-\u9fff·・－\-]{2,40})\s*[（(]\s*"
+    r"(?P<source>[A-Za-z][A-Za-z0-9'’\- .]{1,100})\s*[）)]"
+)
+_ARTICLE_ALIAS_RE = re.compile(
+    r"^(?:the|a|an)\s+(?P<rest>\S.*)$", re.IGNORECASE)
+
+
+def _article_shadow_authority_id(
+    decision: Dict[str, Any], decisions: Dict[int, dict]
+) -> int:
+    """Return an exact-key Decision shadowed by this article-led source."""
+    match = _ARTICLE_ALIAS_RE.match(
+        str(decision.get("source_key") or "").strip())
+    if not match:
+        return 0
+    remainder = match.group("rest")
+    decision_id = int(decision.get("id") or 0)
+    for other_id, other in decisions.items():
+        if int(other_id) == decision_id:
+            continue
+        if str(other.get("source_key") or "") == remainder:
+            return int(other_id)
+    return 0
+
+
+def body_before_footnotes(text: Any) -> str:
+    """Return prose before markdown or numbered translator-note definitions.
+
+    Both ``[^1]: ...`` and the book's current ``---\\n\\n[1] ...`` form are
+    note definitions, not translated prose.  A canonical term that appears only
+    in an explanatory note must not satisfy a pending Decision or authorise a
+    corpus-derived surface form.
+    """
+    raw = str(text or "")
+    cuts = []
+    for pattern in _FOOTNOTE_DEF_PATTERNS:
+        match = pattern.search(raw)
+        if match:
+            cuts.append(match.start())
+    return raw[:min(cuts)] if cuts else raw
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _name_key(text: Any) -> str:
+    """Comparison key for names: width, quote, case, whitespace and separators.
+
+    It keeps phrase boundaries useful (``贝尼杰赛里特`` contains no separator)
+    while making the many legal Dune spellings ``·`` / ``-`` / ``－`` equal for
+    an audit.  This helper is not a translation policy and never rewrites text.
+    """
+    raw = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    raw = (raw.replace("’", "'").replace("‘", "'")
+              .replace("“", '"').replace("”", '"'))
+    raw = re.sub(r"[\s" + re.escape(_NAME_SEP_CHARS) + r"]+", "", raw)
+    return raw.strip()
+
+
+def _phrase_key(text: Any) -> str:
+    raw = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    raw = raw.replace("’", "'").replace("‘", "'")
+    return re.sub(r"\s+", " ", raw).strip()
+
+
+def _contains_name(text: str, name: str) -> bool:
+    key = _name_key(name)
+    return bool(key and key in _name_key(text))
+
+
+def _contains_phrase(text: str, phrase: str) -> bool:
+    key = _phrase_key(phrase)
+    return bool(key and key in _phrase_key(text))
+
+
+def _source_phrase_present(text: str, phrase: str) -> bool:
+    """Treat ASCII source keys as tokens, not unconstrained substrings."""
+    if _source_tokens(phrase):
+        return bool(_source_phrase_spans(text, phrase))
+    return _contains_phrase(text, phrase)
+
+
+_TARGET_ANNOTATION_RE = re.compile(r"[（(][^（()）]*[）)]")
+_TARGET_INSTRUCTION_RE = re.compile(
+    r"(?:首次写作|此后统一|统一为|统一)[^“]*“([^”]+)”")
+_TARGET_SURROUNDING_QUOTES = "《》“”\"'‘’「」『』"
+
+
+def _target_core(value: Any) -> str:
+    """Return the executable part of a Decision target.
+
+    Decisions often record a reader annotation alongside the term itself, for
+    example ``音言（The Voice）``.  The translated prose is expected to contain
+    ``音言``, never the annotation.  Comparing the raw decision string would
+    turn a correct final into an endless outstanding row.  Parenthetical
+    annotations are therefore ignored for presence/form matching only; the
+    Decision DB remains unchanged.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    # A few high-value Decisions store an executable form inside editorial
+    # prose (Kwisatz Haderach: "首次写作...，此后统一‘短距者’").  Treating the
+    # whole sentence as a literal target creates permanent false outstanding
+    # rows.  The last explicit instruction is the post-first-occurrence form.
+    instructed = _TARGET_INSTRUCTION_RE.findall(raw)
+    if instructed:
+        raw = instructed[-1].strip()
+    raw = raw.strip(_TARGET_SURROUNDING_QUOTES).strip()
+    core = _TARGET_ANNOTATION_RE.sub("", raw).strip()
+    return core or raw
+
+
+def _name_compatible(a: str, b: str) -> bool:
+    """True when one name form contains the other after separator folding."""
+    ka, kb = _name_key(a), _name_key(b)
+    if not ka or not kb:
+        return False
+    if ka == kb or ka in kb or kb in ka:
+        return True
+    # A decision may deliberately use a short title form ("雷托公爵") while
+    # the canonical registry name is fuller ("雷托·厄崔迪公爵").  The short
+    # form's characters must appear in order in the fuller target; a one-char
+    # transliteration conflict ("杰赛" vs "杰瑟") still fails this test.
+    pos = 0
+    for ch in kb:
+        pos = ka.find(ch, pos)
+        if pos < 0:
+            return False
+        pos += 1
+    return True
+
+
+def _connect_ro(path: Path) -> sqlite3.Connection:
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+    con = sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _read_json(path: Path) -> Optional[dict]:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _load_term_contracts(
+    root: Path,
+    path: Optional[Path] = None,
+) -> Tuple[Dict[Tuple[int, str, str], dict], str]:
+    """Load the optional Round 158 term/form artifact.
+
+    A malformed artifact is reported but does not change pre-contract pending
+    classification.  This keeps a bad evidence file fail-open for diagnosis and
+    fail-closed for delivery: rows still appear outstanding/blocked and gate ⑬
+    remains red until the artifact is fixed.
+    """
+    cpath = Path(path) if path else Path(root) / "input" / "term_form_contracts.json"
+    if not cpath.exists():
+        return {}, ""
+    payload = _read_json(cpath)
+    if not payload:
+        return {}, "term_contract_artifact_unreadable"
+    if int(payload.get("schema_version") or 0) != 1:
+        return {}, "term_contract_schema_incompatible"
+    out: Dict[Tuple[int, str, str], dict] = {}
+    for contract in payload.get("contracts") or []:
+        if not isinstance(contract, dict):
+            continue
+        try:
+            decision_id = int(contract.get("decision_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        source_key = str(contract.get("source_key") or "")
+        translation = str(contract.get("decision_translation") or "")
+        forms = []
+        for item in contract.get("forms") or []:
+            if isinstance(item, dict):
+                form = str(item.get("form") or "").strip()
+            else:
+                form = str(item or "").strip()
+            if form:
+                forms.append(form)
+        match_mode = str(contract.get("match_mode") or "forms")
+        reference = str(contract.get("reference") or "")
+        if not decision_id or not source_key or not translation:
+            continue
+        if match_mode == "fuzzy_text" and not reference:
+            continue
+        if match_mode != "fuzzy_text" and not forms:
+            continue
+        key = (decision_id, _phrase_key(source_key), _phrase_key(translation))
+        out[key] = dict(contract, forms=forms)
+    return out, ""
+
+
+def _cjk_only(text: Any) -> str:
+    return "".join(re.findall(r"[\u4e00-\u9fff]", str(text or "")))
+
+
+def term_text_similarity(text: str, reference: str) -> float:
+    """Best similarity between a reference passage and a quoted final segment."""
+    ref = _cjk_only(reference)
+    if not ref:
+        return 0.0
+    segments = re.findall(r"[“\"]([^”\"]{10,})[”\"]", str(text or ""))
+    if not segments:
+        segments = [str(text or "")]
+    best = 0.0
+    for segment in segments:
+        probe = _cjk_only(segment)
+        if not probe:
+            continue
+        best = max(best, difflib.SequenceMatcher(
+            None, ref, probe, autojunk=False).ratio())
+    return best
+
+
+def _table_exists(con: sqlite3.Connection, name: str) -> bool:
+    row = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone()
+    return bool(row)
+
+
+def _registry_source_targets(
+    con: sqlite3.Connection,
+) -> Tuple[Dict[str, set], Dict[str, str], Dict[str, set], Dict[str, set]]:
+    """Return source→canonical, source→trusted canonical, target→sources,
+    and source→trusted canonical set."""
+    by_source: Dict[str, set] = {}
+    state: Dict[str, str] = {}
+    sources_by_target: Dict[str, set] = {}
+    trusted_by_source: Dict[str, set] = {}
+    if not _table_exists(con, "entity_registry"):
+        return by_source, state, sources_by_target, trusted_by_source
+    cols = {r[1] for r in con.execute("PRAGMA table_info(entity_registry)")}
+    pending_col = "pending_review" if "pending_review" in cols else "0"
+    for row in con.execute(
+        "SELECT canonical_name, source_names, confidence, "
+        f"{pending_col} AS pending_review FROM entity_registry"
+    ):
+        if str(row["confidence"] or "") != "high":
+            continue
+        canonical = str(row["canonical_name"] or "").strip()
+        if not canonical:
+            continue
+        canonical_key = _name_key(canonical)
+        if canonical_key:
+            sources_by_target.setdefault(canonical_key, set())
+        try:
+            sources = json.loads(row["source_names"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            sources = []
+        if not isinstance(sources, list):
+            continue
+        for source in sources:
+            key = _phrase_key(source)
+            if not key:
+                continue
+            by_source.setdefault(key, set()).add(canonical)
+            if canonical_key:
+                sources_by_target.setdefault(canonical_key, set()).add(key)
+            if not int(row["pending_review"] or 0):
+                state.setdefault(key, canonical)
+                trusted_by_source.setdefault(key, set()).add(canonical)
+    return by_source, state, sources_by_target, trusted_by_source
+
+
+def _registry_form_owners(con: sqlite3.Connection) -> Dict[str, List[dict]]:
+    """Index every registry form (source/variant/quarantined) to its owner.
+
+    A Decision key can be quarantined as an ambiguous alias while one of its
+    translations is still a non-canonical spelling of a different active name
+    (the ``Leto -> 莱托`` vs ``雷托·厄崔迪公爵`` case).  Full-book pending
+    reconciliation needs the quarantined form as evidence *against* enforcing
+    that Decision target, not as proof that the entity is absent.
+    """
+    out: Dict[str, List[dict]] = {}
+    if not _table_exists(con, "entity_registry"):
+        return out
+    cols = {r[1] for r in con.execute("PRAGMA table_info(entity_registry)")}
+    pending_col = "pending_review" if "pending_review" in cols else "0"
+    variant_expr = "variant_names" if "variant_names" in cols else "NULL"
+    quarantined_expr = ("quarantined_names"
+                        if "quarantined_names" in cols else "NULL")
+    for row in con.execute(
+        "SELECT canonical_name, source_names, "
+        f"{variant_expr} AS variant_names, "
+        f"{quarantined_expr} AS quarantined_names, confidence, "
+        f"{pending_col} AS pending_review FROM entity_registry"
+    ):
+        if str(row["confidence"] or "") != "high":
+            continue
+        canonical = str(row["canonical_name"] or "").strip()
+        if not canonical:
+            continue
+        parsed: Dict[str, List[str]] = {}
+        for field in ("source_names", "variant_names", "quarantined_names"):
+            try:
+                values = json.loads(row[field] or "[]")
+            except (TypeError, json.JSONDecodeError):
+                values = []
+            parsed[field] = [str(v).strip() for v in values
+                             if isinstance(v, str) and str(v).strip()]
+        owner = {
+            "canonical": canonical,
+            "variants": parsed["variant_names"],
+            "quarantined": parsed["quarantined_names"],
+            "pending_review": int(row["pending_review"] or 0),
+        }
+        for field in ("source_names", "variant_names", "quarantined_names"):
+            for form in parsed[field]:
+                key = _phrase_key(form)
+                if not key:
+                    continue
+                bucket = out.setdefault(key, [])
+                if not any(item["canonical"] == canonical for item in bucket):
+                    bucket.append(owner)
+    return out
+
+
+def _profile_source_keys(root: Path) -> set:
+    """Return source keys explicitly covered by the profile's term hints."""
+    profile = _read_json(Path(root) / "input" / "book_profile.json") or {}
+    out = set()
+    for hint in profile.get("translation_hints") or []:
+        if not isinstance(hint, str) or "=" not in hint:
+            continue
+        source = hint.split("=", 1)[0].strip()
+        key = _phrase_key(source)
+        if key:
+            out.add(key)
+    return out
+
+
+def _completed_gloss_keys(tasks: Dict[str, dict], out_dir: Path) -> set:
+    """Collect exact ``中文（English source）`` glosses from completed finals.
+
+    This is a read-only term-authority signal.  It deliberately uses only
+    source-positive completed chunks, so an outstanding chunk cannot grant
+    itself an exemption by writing a gloss in its own final.
+    """
+    out = set()
+    for chunk_id, task in (tasks or {}).items():
+        if str(task.get("state") or "") != "COMPLETED":
+            continue
+        final_path = (Path(out_dir) / str(task.get("chapter_id") or chunk_id[:4])
+                      / f"{chunk_id}_final.json")
+        final = _read_json(final_path) or {}
+        text = body_before_footnotes(final.get("text") or "")
+        if not text:
+            continue
+        for match in _SOURCE_GLOSS_RE.finditer(text):
+            key = _phrase_key(match.group("source"))
+            if key:
+                out.add(key)
+    return out
+
+
+def _canonical_present(text: str, canonical: str) -> bool:
+    if not text or not canonical:
+        return False
+    if _contains_name(text, canonical):
+        return True
+    return any(len(token) >= 2 and _contains_name(text, token)
+               for token in canonical_tokens(canonical))
+
+
+def _decision_conflict(
+    source_key: str,
+    translation: str,
+    source_text: str,
+    final_text: str,
+    registry_targets: Dict[str, str],
+    trusted_by_source: Dict[str, set],
+    form_owners: Dict[str, List[dict]],
+) -> str:
+    key = _phrase_key(source_key)
+    if not key or not _source_phrase_present(source_text, source_key):
+        return ""
+    trusted_targets = trusted_by_source.get(key) or set()
+    if len({_name_key(c) for c in trusted_targets}) > 1:
+        return "cross_person_alias_conflict"
+    registry_target = registry_targets.get(key) or ""
+    if registry_target and not _name_compatible(registry_target, translation):
+        return "decision_registry_target_conflict"
+    for owner in form_owners.get(key) or []:
+        canonical = str(owner.get("canonical") or "")
+        if not canonical or _name_compatible(canonical, translation):
+            continue
+        if any(_name_compatible(variant, translation)
+               for variant in owner.get("variants") or []):
+            if _canonical_present(final_text, canonical):
+                return "decision_target_noncanonical_variant"
+    return ""
+
+
+def _proper_core_forms(
+    context: Dict[str, Any],
+    source_key: str,
+) -> List[str]:
+    """Return registry-owned translations for the proper-name part of a phrase.
+
+    ``Bene Gesserit witch`` and ``Harkonnen agents`` are descriptive phrases,
+    not executable jargon.  Their proper-name cores still have to be present,
+    but the common-noun tail may legitimately vary with Chinese syntax.
+    """
+    proper_tokens = set(source_name_proper_tokens(source_key))
+    if not proper_tokens:
+        return []
+    by_source = context.get("registry_by_source") or {}
+    trusted = context.get("registry_trusted_by_source") or {}
+    candidates = []
+    for key, forms in by_source.items():
+        key_tokens = set(_source_tokens(key))
+        if not key_tokens or not key_tokens <= proper_tokens:
+            continue
+        if not _source_phrase_spans(source_key, key):
+            continue
+        trusted_forms = trusted.get(key) or set()
+        use_forms = trusted_forms if trusted_forms else set(forms or ())
+        if len({_name_key(form) for form in use_forms if _name_key(form)}) != 1:
+            continue
+        candidates.append((len(key_tokens), key, tuple(sorted(use_forms))))
+    if not candidates:
+        return []
+    max_tokens = max(item[0] for item in candidates)
+    best = [item for item in candidates if item[0] == max_tokens]
+    if len(best) != 1:
+        return []
+    return list(best[0][2])
+
+
+def _has_hard_term_authority(
+    context: Dict[str, Any],
+    source_key: str,
+    decision: Dict[str, Any],
+) -> bool:
+    """True when a Decision is backed by a hard term/name authority."""
+    key = _phrase_key(source_key)
+    if not key:
+        return True
+    if int(decision.get("locked") or 0):
+        return True
+    if key in (context.get("profile_sources") or set()):
+        return True
+    if key in (context.get("glossed_sources") or set()):
+        return True
+    if (context.get("registry_by_source") or {}).get(key):
+        return True
+    return False
+
+
+def _contextual_reference_kind(source_key: str, target: str) -> str:
+    """Classify a narrow, non-jargon Reference phrase.
+
+    This is intentionally lexical rather than model-based.  Technical nouns
+    such as ``suspensors`` / ``shield`` must never be relaxed just because
+    their source has no explicit gloss.  Eligible shapes are:
+
+    * a proper-name prefix plus a contextual common-noun tail;
+    * a grammatical participle/adjective (``conditioned``);
+    * a coordinated descriptive phrase (``green and black banner``);
+    * a slash-separated editorial target (``妾室/情妇``).
+    """
+    raw = str(source_key or "").strip()
+    if not raw:
+        return ""
+    proper_tokens = set(source_name_proper_tokens(raw))
+    tokens = _source_tokens(raw)
+    if proper_tokens and any(token not in proper_tokens for token in tokens):
+        return "proper_core"
+    if not proper_tokens and re.fullmatch(r"[A-Za-z]+(?:ed|ing)", raw):
+        return "common"
+    if not proper_tokens and re.search(r"\b(?:and|or)\b", raw, re.I):
+        return "common"
+    if "/" in str(target or ""):
+        return "common"
+    return ""
+
+
+def _soft_reference_strategy(source_key: str, decision: Dict[str, Any]) -> str:
+    """Return the generic-reference strategy for a lower-case prose phrase.
+
+    ``shadows -> 暗影`` and ``cells -> 小组`` are useful lexical observations,
+    not mandatory surface forms.  The same applies to a culturally equivalent
+    metaphor such as ``clods -> 泥腿子`` when another context naturally uses
+    ``土疙瘩``.  The Decision reason records the extractor's strategy; only
+    LITERAL_TRANSLATION or CULTURAL_EQUIVALENT without retain/terminology
+    tags, quoted text, or capitalised proper tokens is eligible.  Hard term
+    authorities are checked by the caller and always win.
+    """
+    reason = str(decision.get("reason") or "")
+    if "【策略】" not in reason:
+        return ""
+    strategy = reason.upper()
+    if any(tag in reason.upper() for tag in
+           ("RETAIN_AND_ANNOTATE", "TRANSLITERATION", "TERMINOLOGY")):
+        return ""
+    if "LITERAL_TRANSLATION" in strategy:
+        kind = "literal"
+    elif "CULTURAL_EQUIVALENT" in strategy:
+        kind = "cultural"
+    else:
+        return ""
+    raw = str(source_key or "").strip()
+    if not raw or re.search(r"[“”\"‘’]", raw):
+        return ""
+    tokens = _EN_SOURCE_TOKEN_RE.findall(raw)
+    if not tokens or any(token and token[0].isupper() for token in tokens):
+        return ""
+    return kind
+
+
+def _soft_literal_reference_decision(source_key: str, decision: Dict[str, Any]) -> bool:
+    """Backward-compatible predicate for literal generic references."""
+    return _soft_reference_strategy(source_key, decision) == "literal"
+
+
+_EN_SOURCE_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
+_EN_SOURCE_JOINER = r"[\s'’‘\-‐‑‒–—]+"
+
+
+def _source_tokens(text: Any) -> List[str]:
+    """Tokenize an English source key for strict phrase containment."""
+    return [token.casefold() for token in _EN_SOURCE_TOKEN_RE.findall(str(text or ""))]
+
+
+def _source_phrase_spans(text: str, phrase: str) -> List[Tuple[int, int]]:
+    """Locate an English source phrase without rewriting the source text.
+
+    Decision source keys may use straight/curly apostrophes and different
+    whitespace from the EPUB text.  Only ASCII alphanumeric tokens are matched;
+    Chinese term targets are deliberately outside this helper's scope.
+    """
+    raw_tokens = _EN_SOURCE_TOKEN_RE.findall(str(phrase or ""))
+    tokens = [token.casefold() for token in raw_tokens]
+    if not tokens or not str(text or ""):
+        return []
+    body = _EN_SOURCE_JOINER.join(re.escape(token) for token in raw_tokens)
+    # Article-led names such as ``the Voice`` must not consume the ordinary
+    # lowercase phrase ``the voice``.  The capitalisation is part of the term
+    # identity here; otherwise source-positive audits are inflated by generic
+    # narration and every such chunk becomes a false pending/contract signal.
+    case_sensitive = bool(
+        len(raw_tokens) > 1
+        and raw_tokens[0].casefold() in {"the", "a", "an"}
+        and any(any(ch.isupper() for ch in token) for token in raw_tokens[1:])
+    )
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9])" + body + r"(?![A-Za-z0-9])",
+        0 if case_sensitive else re.IGNORECASE,
+    )
+    spans = []
+    for match in pattern.finditer(str(text)):
+        if case_sensitive and _is_title_head_span(
+                str(text), match.end(), raw_tokens):
+            continue
+        spans.append(match.span())
+    return spans
+
+
+def _is_title_head_span(
+    text: str,
+    end: int,
+    raw_tokens: Sequence[str],
+) -> bool:
+    """Return True when an article-led term heads a longer proper title.
+
+    ``the Voice from the Outer World`` is a title, not the Bene Gesserit
+    ``the Voice``.  A generic Decision must not create a pending row for the
+    longer phrase merely because its first two words match.  The exception is
+    deliberately limited to article-led keys followed by a lowercase
+    preposition and a capitalised title token (optionally after an article).
+    """
+    if not raw_tokens or raw_tokens[0].casefold() not in {"the", "a", "an"}:
+        return False
+    tail = text[end:end + 120]
+    return bool(re.match(
+        r"\s+(?:of|from|for|in|on|at|by|with)\s+"
+        r"(?:(?:the|a|an)\s+)?[A-Z][A-Za-z0-9'’-]*",
+        tail,
+    ))
+
+
+def _strictly_more_specific_source(pending_source: str, candidate_source: str) -> bool:
+    """True when a decision key extends the pending key by whole tokens.
+
+    Case, articles and simple plural forms are *not* more specific: those are
+    competing authorities for the same lexical key and need an explicit form
+    contract.  This helper only accepts a genuine longer phrase such as
+    ``Mapes`` -> ``Shadout Mapes`` or ``flagon`` -> ``water flagon``.
+    """
+    pending = _source_tokens(pending_source)
+    candidate = _source_tokens(candidate_source)
+    if not pending or len(candidate) <= len(pending):
+        return False
+    for start in range(len(candidate) - len(pending) + 1):
+        if candidate[start:start + len(pending)] == pending:
+            return True
+    return False
+
+
+def _specific_decision_coverage(
+    *,
+    pending_source: str,
+    pending_decision_id: int,
+    source_text: str,
+    final_text: str,
+    decisions: Dict[int, dict],
+) -> Dict[str, Any]:
+    """Prove that every generic source occurrence is covered by a specific one.
+
+    A pending row stores only the latest deferred decision for a chunk.  A
+    generic key such as ``Mapes`` or ``flagon`` can be a substring of a more
+    specific decision (``Shadout Mapes`` / ``water flagon``) whose target is
+    already present.  Clearing the generic row is safe only when:
+
+    * every occurrence of the generic key is contained in a specific phrase;
+    * the specific Decision targets are present in the final text; and
+    * all competing targets covering the same occurrence are compatible.
+
+    If any occurrence lacks a specific cover, the row remains outstanding.  A
+    partial hit must never erase a whole-book invariant.
+    """
+    pending_spans = _source_phrase_spans(source_text, pending_source)
+    if not pending_spans:
+        return {"ok": False, "reason": "pending_source_span_missing"}
+
+    per_span: List[List[Dict[str, Any]]] = [[] for _ in pending_spans]
+    for decision_id, decision in (decisions or {}).items():
+        if int(decision_id) == int(pending_decision_id):
+            continue
+        candidate_source = str(decision.get("source_key") or "")
+        candidate_target = _target_core(decision.get("translation"))
+        if not candidate_target:
+            continue
+        if not _strictly_more_specific_source(pending_source, candidate_source):
+            continue
+        candidate_spans = _source_phrase_spans(source_text, candidate_source)
+        if not candidate_spans:
+            continue
+        if not _contains_name(final_text, candidate_target):
+            continue
+        evidence = {
+            "decision_id": int(decision_id),
+            "source_key": candidate_source,
+            "translation": candidate_target,
+        }
+        for index, pending_span in enumerate(pending_spans):
+            if any(start <= pending_span[0] and pending_span[1] <= end
+                   for start, end in candidate_spans):
+                per_span[index].append(evidence)
+
+    if any(not candidates for candidates in per_span):
+        return {"ok": False, "reason": "pending_source_not_fully_covered"}
+
+    for candidates in per_span:
+        targets = [str(item["translation"]) for item in candidates]
+        for left in targets:
+            for right in targets:
+                if not _name_compatible(left, right):
+                    return {"ok": False, "reason": "specific_target_conflict"}
+
+    unique: Dict[int, Dict[str, Any]] = {}
+    for candidates in per_span:
+        for item in candidates:
+            unique[int(item["decision_id"])] = item
+    return {
+        "ok": True,
+        "reason": "specific_decision_covered",
+        "covered_by_decisions": [unique[key] for key in sorted(unique)],
+        "covered_source_occurrences": len(pending_spans),
+    }
+
+
+def _all_source_occurrences_have_more_specific_decision(
+    *,
+    pending_source: str,
+    pending_decision_id: int,
+    source_text: str,
+    decisions: Dict[int, dict],
+) -> bool:
+    """True when every generic source span is inside a longer Decision key.
+
+    This distinguishes a missing *specific* target (``Shield Wall``) from a
+    genuinely missing generic target (``shield``).  The generic locked row must
+    not masquerade as authority over the longer phrase and force a whole-chunk
+    retranslation of the wrong term.
+    """
+    pending_spans = _source_phrase_spans(source_text, pending_source)
+    if not pending_spans:
+        return False
+    candidate_spans: List[Tuple[int, int]] = []
+    for decision_id, decision in (decisions or {}).items():
+        if int(decision_id) == int(pending_decision_id):
+            continue
+        candidate_source = str(decision.get("source_key") or "")
+        if not _strictly_more_specific_source(pending_source, candidate_source):
+            continue
+        candidate_spans.extend(_source_phrase_spans(
+            source_text, candidate_source))
+    if not candidate_spans:
+        return False
+    return all(
+        any(start <= span[0] and span[1] <= end
+            for start, end in candidate_spans)
+        for span in pending_spans
+    )
+
+
+def load_pending_context(
+    project_root: Path,
+    *,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    term_contracts_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Load a coherent read-only snapshot for pending classification."""
+    root = Path(project_root)
+    decision_path = Path(decision_db) if decision_db else root / "db" / "decision_db.sqlite"
+    workflow_path = Path(workflow_db) if workflow_db else root / "db" / "workflow.db"
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    term_contracts, term_contract_error = _load_term_contracts(
+        root, term_contracts_path)
+
+    if not decision_path.exists():
+        return {"available": False, "reason": "decision_db_missing",
+                "pending": [], "pending_rows": 0, "tasks": {}, "decisions": {},
+                "decisions_complete": False, "chapters": {}}
+    if not workflow_path.exists():
+        return {"available": False, "reason": "workflow_db_missing",
+                "pending": [], "pending_rows": 0, "tasks": {}, "decisions": {},
+                "decisions_complete": False, "chapters": {}}
+
+    dcon = _connect_ro(decision_path)
+    wcon = _connect_ro(workflow_path)
+    try:
+        if not _table_exists(dcon, "pending_backtrack"):
+            pending: List[dict] = []
+        else:
+            pending = [dict(r) for r in dcon.execute(
+                "SELECT chunk_id, decision_id, source_key, "
+                "COALESCE(queue_rounds, 0) AS queue_rounds, "
+                "created_at, updated_at FROM pending_backtrack "
+                "ORDER BY chunk_id"
+            )]
+        # A minimal/legacy project may have no decision_db table at all, and old
+        # fixtures declare only source_key/translation/reason.  Pending cleanup
+        # has no rows to reconcile in that case, but name-only auditing still
+        # needs decisions when the authoritative columns exist.  A schema gap is
+        # blocking only when there is a real pending row that cannot be checked.
+        decision_cols = {r[1] for r in dcon.execute("PRAGMA table_info(decision_db)")}
+        required_cols = {"id", "source_key", "translation"}
+        missing_cols = sorted(required_cols - decision_cols)
+        schema_error = ""
+        if missing_cols:
+            decisions: Dict[int, dict] = {}
+            # name-only classification still needs decisions even when the
+            # outbox is empty.  Treat the schema gap as unavailable only when
+            # there is an actual pending row to reconcile.
+            if pending:
+                schema_error = "decision_db_schema_incompatible:" + ",".join(missing_cols)
+        else:
+            locked_expr = ("COALESCE(locked, 0)" if "locked" in decision_cols else "0")
+            updated_expr = ("updated_at" if "updated_at" in decision_cols else "NULL")
+            reason_expr = ("COALESCE(reason, '')" if "reason" in decision_cols else "''")
+            decisions = {
+                int(r["id"]): dict(r)
+                for r in dcon.execute(
+                    "SELECT id, source_key, translation, "
+                    f"{reason_expr} AS reason, "
+                    f"{updated_expr} AS updated_at, "
+                    f"{locked_expr} AS locked FROM decision_db"
+                )
+            }
+        registry_by_source, registry_targets, sources_by_target, trusted_by_source = (
+            _registry_source_targets(dcon))
+        registry_form_owners = _registry_form_owners(dcon)
+    finally:
+        dcon.close()
+
+    try:
+        tasks = {
+            str(r["chunk_id"]): dict(r)
+            for r in wcon.execute(
+                "SELECT chunk_id, chapter_id, text_content, state, last_error, "
+                "COALESCE(backtrack_rounds, 0) AS backtrack_rounds, rescue_stage "
+                "FROM chunk_tasks"
+            )
+        }
+    finally:
+        wcon.close()
+
+    profile_sources = _profile_source_keys(root)
+    glossed_sources = _completed_gloss_keys(tasks, out_dir)
+
+    if schema_error:
+        return {
+            "available": False,
+            "reason": schema_error,
+            "pending": pending,
+            "pending_rows": len(pending),
+            "tasks": tasks,
+            "decisions": {},
+            "decisions_complete": False,
+            "term_contracts": {},
+            "term_contract_error": term_contract_error,
+            "chapters": chapter_hash_map(root / "input"),
+            "pending_table_present": True,
+            "profile_sources": profile_sources,
+            "glossed_sources": glossed_sources,
+        }
+
+    return {
+        "available": True,
+        "reason": "",
+        "root": root,
+        "decision_db": decision_path,
+        "workflow_db": workflow_path,
+        "output_dir": out_dir,
+        "pending": pending,
+        "pending_rows": len(pending),
+        "tasks": tasks,
+        "decisions": decisions,
+        "decisions_complete": not bool(missing_cols),
+        "term_contracts": term_contracts,
+        "term_contract_error": term_contract_error,
+        "registry_targets": registry_targets,
+        "registry_by_source": registry_by_source,
+        "registry_sources_by_target": sources_by_target,
+        "registry_trusted_by_source": trusted_by_source,
+        "registry_form_owners": registry_form_owners,
+        "chapters": chapter_hash_map(root / "input"),
+        "profile_sources": profile_sources,
+        "glossed_sources": glossed_sources,
+    }
+
+
+def classify_pending_row(
+    row: Dict[str, Any],
+    context: Dict[str, Any],
+    *,
+    final_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Classify one outbox row as satisfied/covered/outstanding/orphan/blocked."""
+    chunk_id = str(row.get("chunk_id") or "")
+    decision_id = row.get("decision_id")
+    override_map = final_overrides or {}
+    task = (context.get("tasks") or {}).get(chunk_id)
+    decision = (context.get("decisions") or {}).get(
+        int(decision_id) if decision_id is not None else -1
+    )
+    base = {
+        "chunk_id": chunk_id,
+        "chapter": str((task or {}).get("chapter_id") or chunk_id[:4]),
+        "decision_id": decision_id,
+        "pending_source_key": str(row.get("source_key") or ""),
+        "queue_rounds": int(row.get("queue_rounds") or 0),
+        "updated_at": row.get("updated_at"),
+        "state": str((task or {}).get("state") or "MISSING"),
+        "status": "blocked",
+        "reason": "",
+        "decision_source_key": "",
+        "decision_translation": "",
+        "target_present": False,
+        "source_active": False,
+        "covered_by_decisions": [],
+        "covered_source_occurrences": 0,
+        "term_contract_id": "",
+        "matched_term_form": "",
+    }
+    if task is None:
+        base.update(status="orphan", reason="chunk_missing")
+        return base
+    if decision is None:
+        base.update(status="blocked", reason="decision_missing")
+        return base
+    source_key = str(decision.get("source_key") or "")
+    translation = str(decision.get("translation") or "")
+    pending_source = str(row.get("source_key") or "")
+    base.update(decision_source_key=source_key, decision_translation=translation)
+    if pending_source and _phrase_key(pending_source) != _phrase_key(source_key):
+        base.update(status="blocked", reason="pending_decision_key_mismatch")
+        return base
+    if not source_key.strip() or not translation.strip():
+        base.update(status="blocked", reason="empty_decision")
+        return base
+
+    source_text = str(task.get("text_content") or "")
+    final_path = (context.get("output_dir") or Path(".")) / base["chapter"] / f"{chunk_id}_final.json"
+    final_text = override_map.get(chunk_id)
+    if final_text is None:
+        final = _read_json(final_path)
+        final_text = str(final.get("text") or "") if final else ""
+    final_prose = body_before_footnotes(final_text)
+    translation_core = _target_core(translation)
+    target_present = _contains_name(final_prose, translation_core)
+    source_active = _source_phrase_present(source_text, source_key)
+    shadow_authority_id = _article_shadow_authority_id(
+        decision, context.get("decisions") or {})
+    shadow_decision = ((context.get("decisions") or {}).get(
+        int(shadow_authority_id)) if shadow_authority_id else {}) or {}
+    shadow_target = _target_core(str(shadow_decision.get("translation") or ""))
+    shadow_canonical_present = bool(
+        shadow_target and _contains_name(final_prose, shadow_target))
+    base.update(
+        target_present=target_present,
+        source_active=source_active,
+        article_shadow_authority_id=shadow_authority_id,
+        article_shadow_canonical_id=int(shadow_authority_id or 0),
+        article_shadow_canonical_target=shadow_target,
+        article_shadow_canonical_present=shadow_canonical_present,
+    )
+
+    # Round 158: title/address decisions are advisory because the same English
+    # form legitimately takes different Chinese forms by grammar position
+    # (Sire -> 陛下/大人/老爷).  They must not keep a global outbox row alive.
+    # This is deliberately narrower than "any non-proper source": technical
+    # terms such as ``shield`` remain hard consistency decisions.
+    source_class = classify_entity_source_name(source_key)
+    if source_class in {"title", "relation"} or (
+            source_class != "proper" and canonical_is_title_only(translation)):
+        base.update(
+            status="satisfied",
+            reason="contextual_decision_not_unified",
+        )
+        return base
+
+    if not str(final_text).strip():
+        state = base["state"]
+        if state in NONTERMINAL_STATES:
+            base.update(status="covered", reason="nonterminal_final_pending")
+        else:
+            base.update(status="blocked", reason="final_missing_or_unreadable")
+        return base
+
+    # An article-led Decision (``the Lady Jessica``) is a shadow of the exact
+    # key (``Lady Jessica``).  Its own target may be a bad title variant.  Close
+    # the row when the canonical target is already in prose; if the shadow
+    # target is the only form present, keep one repair signal instead of
+    # treating the wrong variant as satisfaction.
+    if shadow_authority_id and source_active:
+        if shadow_canonical_present:
+            base.update(
+                status="satisfied",
+                reason="article_shadow_canonical_present",
+            )
+            return base
+        state = base["state"]
+        if state in NONTERMINAL_STATES:
+            base.update(
+                status="covered",
+                reason="nonterminal_article_shadow_target_pending",
+            )
+        elif state == "COMPLETED":
+            base.update(
+                status="outstanding",
+                reason="article_shadow_canonical_missing",
+            )
+        elif state == "PERMANENTLY_FAILED":
+            base.update(status="blocked", reason="permanently_failed_task")
+        else:
+            base.update(status="blocked", reason=f"unknown_state:{state}")
+        return base
+
+    # Level-2 Reference rows are not all hard terminology.  A descriptive
+    # lowercase phrase with no profile hint, registry source, explicit gloss,
+    # or lock is context-dependent prose (``conditioned`` / ``concubine``).
+    # Proper-name prefixes still need their registered Chinese core; common
+    # noun tails such as ``witch`` / ``agents`` may follow Chinese syntax.
+    contextual_kind = _contextual_reference_kind(source_key, translation)
+    soft_reference = _soft_reference_strategy(source_key, decision)
+    if (source_class == "description"
+            and not _has_hard_term_authority(context, source_key, decision)
+            and soft_reference):
+        base.update(
+            status="satisfied",
+            reason=("soft_literal_reference_not_unified"
+                    if soft_reference == "literal"
+                    else "soft_cultural_reference_not_unified"),
+        )
+        return base
+    if (contextual_kind and source_class == "description"
+            and not _has_hard_term_authority(context, source_key, decision)):
+        if contextual_kind == "common":
+            base.update(
+                status="satisfied",
+                reason="contextual_reference_not_unified",
+            )
+            return base
+        core_forms = _proper_core_forms(context, source_key)
+        if core_forms and all(
+                _contains_name(final_prose, form) for form in core_forms):
+            base.update(
+                status="satisfied",
+                reason="contextual_reference_proper_core_present",
+                matched_term_form="|".join(core_forms),
+            )
+            return base
+
+    conflict = _decision_conflict(
+        source_key, translation, source_text, final_prose,
+        context.get("registry_targets") or {},
+        context.get("registry_trusted_by_source") or {},
+        context.get("registry_form_owners") or {},
+    )
+    if conflict:
+        base.update(status="blocked", reason=conflict)
+        return base
+    contract = (context.get("term_contracts") or {}).get((
+        int(decision_id or 0), _phrase_key(source_key), _phrase_key(translation)))
+    if shadow_authority_id:
+        contract = None
+    # A locked Decision is an explicit book-wide authority.  A partial contract
+    # may still be useful for normal pending rows, but it must never be enough
+    # to close a locked target by itself: otherwise a partial pending snapshot
+    # would silently downgrade the lock and hide missing prose.
+    contract_can_close = (
+        not int(decision.get("locked") or 0)
+        or str(contract.get("status") or "") == "complete"
+    ) if contract else False
+    if source_active and contract and contract_can_close:
+        if str(contract.get("match_mode") or "forms") == "fuzzy_text":
+            similarity = term_text_similarity(
+                final_prose, str(contract.get("reference") or ""))
+            minimum = float(contract.get("min_similarity") or 0.8)
+            if similarity >= minimum:
+                base.update(
+                    status="satisfied",
+                    reason="term_quote_contract_present",
+                    term_contract_id=str(contract.get("contract_id") or ""),
+                    matched_term_form="fuzzy_text:%.4f" % similarity,
+                )
+                return base
+        for form in contract.get("forms") or []:
+            if _contains_name(final_prose, str(form)):
+                base.update(
+                    status="satisfied",
+                    reason="term_form_contract_present",
+                    term_contract_id=str(contract.get("contract_id") or ""),
+                    matched_term_form=str(form),
+                )
+                return base
+    specific: Optional[Dict[str, Any]] = None
+    if int(decision.get("locked") or 0) and not target_present:
+        specific = _specific_decision_coverage(
+            pending_source=pending_source or source_key,
+            pending_decision_id=int(row.get("decision_id") or 0),
+            source_text=source_text,
+            final_text=final_prose,
+            decisions=context.get("decisions") or {},
+        )
+        if specific.get("ok"):
+            base.update(
+                status="satisfied",
+                reason="specific_decision_covered",
+                covered_by_decisions=specific.get("covered_by_decisions") or [],
+                covered_source_occurrences=int(
+                    specific.get("covered_source_occurrences") or 0),
+            )
+            return base
+        if _all_source_occurrences_have_more_specific_decision(
+                pending_source=pending_source or source_key,
+                pending_decision_id=int(row.get("decision_id") or 0),
+                source_text=source_text,
+                decisions=context.get("decisions") or {}):
+            base.update(
+                status="blocked",
+                reason="specific_decision_target_missing",
+            )
+            return base
+        base.update(status="blocked", reason="locked_decision_target_missing")
+        return base
+    if target_present:
+        base.update(status="satisfied", reason="target_present")
+        return base
+    if not source_active:
+        base.update(status="satisfied", reason="source_absent")
+        return base
+    if specific is None:
+        specific = _specific_decision_coverage(
+            pending_source=pending_source or source_key,
+            pending_decision_id=int(row.get("decision_id") or 0),
+            source_text=source_text,
+            final_text=final_prose,
+            decisions=context.get("decisions") or {},
+        )
+    if specific.get("ok"):
+        base.update(
+            status="satisfied",
+            reason="specific_decision_covered",
+            covered_by_decisions=specific.get("covered_by_decisions") or [],
+            covered_source_occurrences=int(
+                specific.get("covered_source_occurrences") or 0),
+        )
+        return base
+
+    state = base["state"]
+    if state == "FAILED":
+        base.update(status="blocked", reason="failed_task_not_in_backtrack_path")
+    elif state == "PERMANENTLY_FAILED":
+        base.update(status="blocked", reason="permanently_failed_task")
+    elif state in NONTERMINAL_STATES:
+        base.update(status="covered", reason="nonterminal_task_will_consume_decisions")
+    elif state == "COMPLETED":
+        base.update(status="outstanding", reason="completed_final_still_misses_target")
+    else:
+        base.update(status="blocked", reason=f"unknown_state:{state}")
+    return base
+
+
+def classify_pending_snapshot(
+    context: Dict[str, Any],
+    *,
+    final_overrides: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    if not context.get("available"):
+        pending_rows = int(context.get("pending_rows") or
+                           len(context.get("pending") or []))
+        return {
+            "ok": pending_rows == 0,
+            "available": False,
+            "reason": context.get("reason") or "pending_backtrack_unavailable",
+            "total": pending_rows,
+            "pending_rows": pending_rows,
+            "counts": {},
+            "by_chapter": {},
+            "entries": [],
+            "blocking": [],
+        }
+    entries = [classify_pending_row(row, context, final_overrides=final_overrides)
+               for row in (context.get("pending") or [])]
+    counts: Dict[str, int] = {}
+    by_chapter: Dict[str, Dict[str, int]] = {}
+    for entry in entries:
+        status = str(entry["status"])
+        counts[status] = counts.get(status, 0) + 1
+        bucket = by_chapter.setdefault(entry["chapter"], {})
+        bucket[status] = bucket.get(status, 0) + 1
+    blocking = [e for e in entries if e["status"] in {"outstanding", "blocked", "orphan"}]
+    return {
+        "ok": not blocking,
+        "available": True,
+        "reason": "",
+        "counts": dict(sorted(counts.items())),
+        "by_chapter": {k: dict(sorted(v.items())) for k, v in sorted(by_chapter.items())},
+        "entries": entries,
+        "blocking": blocking,
+        "total": len(entries),
+    }
+
+
+def pending_report_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# pending_backtrack 全书核对（只读）", ""]
+    lines.append(f"- 生成时间: {_now_iso()}")
+    lines.append(f"- 队列总数: **{result.get('total', 0)}**")
+    lines.append(f"- 结论: **{'可清账/可收敛' if result.get('ok') else '存在未决项'}**")
+    if result.get("reason"):
+        lines.append(f"- 不可用原因: `{result['reason']}`")
+    counts = result.get("counts") or {}
+    if counts:
+        lines.append("- 分类: " + ", ".join(f"`{k}`={v}" for k, v in counts.items()))
+    by_chapter = result.get("by_chapter") or {}
+    if by_chapter:
+        lines.append("")
+        lines.append("## 按章")
+        for chapter, bucket in by_chapter.items():
+            lines.append(f"- {chapter}: " + ", ".join(
+                f"{k}={v}" for k, v in bucket.items()))
+    blocking = result.get("blocking") or []
+    if blocking:
+        lines.append("")
+        lines.append(f"## 需要处理（仅列前 40 / 共 {len(blocking)}）")
+        for entry in blocking[:40]:
+            lines.append(
+                f"- `{entry['chunk_id']}` {entry['status']} / {entry['reason']} / "
+                f"{entry.get('decision_source_key', '')} → "
+                f"{entry.get('decision_translation', '')}"
+            )
+    else:
+        lines.append("")
+        lines.append("所有队列项均有机械证据解释；仍应由受控 apply 路径在状态迁移成功后消费。")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def audit_pending_backtracks(
+    project_root: Path,
+    *,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Read-only audit; writes reports but never mutates DB/final/pending."""
+    root = Path(project_root)
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    context = load_pending_context(
+        root, decision_db=decision_db, workflow_db=workflow_db,
+        output_dir=out_dir,
+    )
+    result = classify_pending_snapshot(context)
+    result["generated_at"] = _now_iso()
+    result["mode"] = "read_only"
+    json_path = Path(json_out) if json_out else out_dir / "pending_backtrack_reconcile.json"
+    md_path = Path(md_out) if md_out else out_dir / "pending_backtrack_reconcile.md"
+    result["json_path"] = str(json_path)
+    result["md_path"] = str(md_path)
+    _atomic_write(json_path, json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    _atomic_write(md_path, pending_report_markdown(result))
+    return result
+
+
+def _delete_pending_row_if_unchanged(
+    con: sqlite3.Connection,
+    row: Dict[str, Any],
+) -> bool:
+    """CAS-delete one outbox row; a concurrent refresh makes this a no-op."""
+    cursor = con.execute(
+        "DELETE FROM pending_backtrack WHERE chunk_id = ? "
+        "AND decision_id IS ? AND source_key IS ? "
+        "AND COALESCE(queue_rounds, 0) = ? "
+        "AND COALESCE(updated_at, '') = COALESCE(?, '')",
+        (
+            str(row.get("chunk_id") or ""),
+            row.get("decision_id"),
+            row.get("source_key"),
+            int(row.get("queue_rounds") or 0),
+            row.get("updated_at"),
+        ),
+    )
+    return cursor.rowcount == 1
+
+
+def _pending_apply_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# pending_backtrack 全书清账（受控写入）", ""]
+    lines.append(f"- 生成时间: {result.get('generated_at')}")
+    lines.append(f"- 模式: **{result.get('mode')}**")
+    lines.append(f"- 写入尝试: `{result.get('write_attempted')}`")
+    if result.get("safe_only"):
+        lines.append("- 范围: **仅消费机械满足项；outstanding 不触发 DIRTY**")
+    if result.get("locked_target_only"):
+        lines.append("- 范围: **仅处理 locked_decision_target_missing；其余行原样保留**")
+    before = result.get("before_counts") or {}
+    after = result.get("after_counts") or {}
+    lines.append("- 清账前: " + (", ".join(
+        f"`{k}`={v}" for k, v in before.items()) or "无"))
+    lines.append("- 清账后: " + (", ".join(
+        f"`{k}`={v}" for k, v in after.items()) or "无"))
+    actions = result.get("actions") or []
+    consumed = sum(1 for a in actions if a.get("status") == "consumed")
+    triggered = sum(1 for a in actions if a.get("triggered_dirty"))
+    lines.append(f"- 已消费: **{consumed}**；转 DIRTY: **{triggered}**")
+    if actions:
+        lines.append("")
+        lines.append(f"## 动作（仅列前 60 / 共 {len(actions)}）")
+        for action in actions[:60]:
+            lines.append(
+                f"- `{action.get('chunk_id')}` {action.get('before_status')} → "
+                f"{action.get('status')} / {action.get('reason')}"
+                + (" / triggered DIRTY" if action.get("triggered_dirty") else ""))
+    if not result.get("ok"):
+        lines.append("")
+        lines.append("仍有 outstanding/blocked/orphan；gate ⑬ 必须保持红色。")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def apply_pending_backtrack_reconcile(
+    project_root: Path,
+    *,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+    scheduler: Any = None,
+    max_actions: Optional[int] = None,
+    safe_only: bool = False,
+    locked_target_only: bool = False,
+    apply: bool = False,
+) -> Dict[str, Any]:
+    """Reconcile the complete book-wide outbox, optionally consuming safe rows.
+
+    ``satisfied`` rows are removed after an exact snapshot CAS.  A ``covered``
+    row is removed only when the chunk is already DIRTY, because that run will
+    consume the latest decision.  Nonterminal translation states are left alone.
+    An ``outstanding`` row is consumed only after ``COMPLETED -> DIRTY``
+    succeeds.  With ``safe_only=True`` it is retained without a state change.
+    ``blocked`` rows caused by a locked Decision losing its target are
+    actionable: the lock is the authority and the current final is known not to
+    satisfy it.  Other blocked rows and orphan rows always remain visible.
+    ``locked_target_only=True`` narrows a mutating run to exactly that slice;
+    every other row is retained untouched, so the CLI cannot accidentally turn
+    all outstanding rows into DIRTY work.
+    """
+    root = Path(project_root)
+    decision_path = Path(decision_db) if decision_db else root / "db" / "decision_db.sqlite"
+    workflow_path = Path(workflow_db) if workflow_db else root / "db" / "workflow.db"
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "pending_backtrack_reconcile.json"
+    mpath = Path(md_out) if md_out else out_dir / "pending_backtrack_reconcile.md"
+
+    before_context = load_pending_context(
+        root, decision_db=decision_path, workflow_db=workflow_path,
+        output_dir=out_dir,
+    )
+    before = classify_pending_snapshot(before_context)
+    result: Dict[str, Any] = {
+        "schema_version": 1,
+        "mode": "apply" if apply else "read_only",
+        "safe_only": bool(safe_only),
+        "locked_target_only": bool(locked_target_only),
+        "write_attempted": bool(apply),
+        "generated_at": _now_iso(),
+        "before_counts": dict(before.get("counts") or {}),
+        "actions": [],
+        "errors": [],
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+    }
+    if not apply:
+        result.update(before)
+        result["mode"] = "read_only"
+        result["write_attempted"] = False
+        _atomic_write(jpath, json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+        _atomic_write(mpath, pending_report_markdown(result))
+        return result
+
+    if not before.get("available"):
+        result.update(before)
+        result["mode"] = "apply"
+        result["write_attempted"] = True
+        result["errors"].append(str(before.get("reason") or "pending_context_unavailable"))
+        _atomic_write(jpath, json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+        _atomic_write(mpath, _pending_apply_markdown(result))
+        return result
+
+    if scheduler is None:
+        from src.core.scheduler import TaskScheduler
+        scheduler = TaskScheduler(db_path=str(workflow_path))
+
+    try:
+        limit = None if max_actions is None else max(0, int(max_actions))
+    except (TypeError, ValueError):
+        limit = None
+
+    dcon = sqlite3.connect(str(decision_path))
+    dcon.row_factory = sqlite3.Row
+    outbox_by_chunk = {
+        str(row.get("chunk_id") or ""): row
+        for row in (before_context.get("pending") or [])
+    }
+    used = 0
+    try:
+        dcon.execute("BEGIN IMMEDIATE")
+        for entry in before.get("entries") or []:
+            if limit is not None and used >= limit:
+                result["actions"].append({
+                    "chunk_id": entry.get("chunk_id"),
+                    "before_status": entry.get("status"),
+                    "status": "deferred_by_limit",
+                    "reason": entry.get("reason"),
+                    "triggered_dirty": False,
+                })
+                continue
+            before_status = str(entry.get("status") or "")
+            outbox_row = outbox_by_chunk.get(str(entry.get("chunk_id") or ""), {})
+            actionable_blocked = (
+                before_status == "blocked"
+                and entry.get("reason") == "locked_decision_target_missing")
+            action = {
+                "chunk_id": entry.get("chunk_id"),
+                "chapter": entry.get("chapter"),
+                "before_status": before_status,
+                "reason": entry.get("reason"),
+                "status": "kept",
+                "triggered_dirty": False,
+            }
+            if locked_target_only and not actionable_blocked:
+                action.update(
+                    status="deferred_not_locked_target",
+                    reason=entry.get("reason"),
+                )
+                result["actions"].append(action)
+                continue
+            if before_status == "satisfied":
+                action["status"] = (
+                    "consumed" if _delete_pending_row_if_unchanged(dcon, outbox_row)
+                    else "stale_snapshot")
+                if action["status"] == "consumed":
+                    used += 1
+            elif before_status == "covered" and entry.get("state") == "DIRTY":
+                action["status"] = (
+                    "consumed" if _delete_pending_row_if_unchanged(dcon, outbox_row)
+                    else "stale_snapshot")
+                if action["status"] == "consumed":
+                    used += 1
+            elif before_status in {"outstanding", "blocked"}:
+                if before_status == "blocked" and not actionable_blocked:
+                    action["status"] = "blocked_evidence_retained"
+                    result["actions"].append(action)
+                    continue
+                if safe_only:
+                    action.update(
+                        status="retained_safe_only",
+                        reason=(
+                            "outstanding_requires_triage"
+                            if before_status == "outstanding"
+                            else "locked_target_repair_requires_apply"),
+                    )
+                else:
+                    task = scheduler.get_task(
+                        str(entry.get("chunk_id") or "")) or {}
+                    if task.get("state") != "COMPLETED":
+                        action["status"] = "state_changed"
+                    else:
+                        try:
+                            transition = scheduler.trigger_backtrack(
+                                [str(entry.get("chunk_id") or "")])
+                            triggered = str(entry.get("chunk_id") or "") in set(
+                                transition.get("dirty") or [])
+                            action["triggered_dirty"] = triggered
+                            if triggered:
+                                task_after = scheduler.get_task(
+                                    str(entry.get("chunk_id") or "")) or {}
+                                if task_after.get("state") != "DIRTY":
+                                    action["status"] = "transition_unverified"
+                                elif _delete_pending_row_if_unchanged(
+                                        dcon, outbox_row):
+                                    action["status"] = "consumed"
+                                    used += 1
+                                else:
+                                    action["status"] = "dirty_pending_stale"
+                            else:
+                                action["status"] = "blocked_by_backtrack_budget"
+                        except Exception as exc:  # noqa: BLE001
+                            action["status"] = "transition_failed"
+                            action["error"] = f"{type(exc).__name__}: {exc}"
+            elif before_status == "orphan":
+                action["status"] = "orphan_retained"
+            else:
+                action["status"] = "unsupported_status_retained"
+            result["actions"].append(action)
+        dcon.commit()
+    except Exception as exc:  # noqa: BLE001 - a failed apply must not hide evidence
+        try:
+            dcon.rollback()
+        except sqlite3.Error:
+            pass
+        result["errors"].append(f"{type(exc).__name__}: {exc}")
+    finally:
+        dcon.close()
+
+    after_context = load_pending_context(
+        root, decision_db=decision_path, workflow_db=workflow_path,
+        output_dir=out_dir,
+    )
+    after = classify_pending_snapshot(after_context)
+    result.update(after)
+    result["mode"] = "apply"
+    result["safe_only"] = bool(safe_only)
+    result["locked_target_only"] = bool(locked_target_only)
+    result["write_attempted"] = True
+    result["after_counts"] = dict(after.get("counts") or {})
+    result["ok"] = bool(after.get("ok")) and not result["errors"]
+    result["consumed"] = sum(1 for a in result["actions"] if a.get("status") == "consumed")
+    result["triggered_dirty"] = sum(
+        1 for a in result["actions"] if a.get("triggered_dirty"))
+    _atomic_write(jpath, json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+    _atomic_write(mpath, _pending_apply_markdown(result))
+    return result
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _read_json(path: Path) -> Optional[dict]:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _atomic_json(path: Path, payload: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    tmp.replace(path)
+
+
+def _atomic_text(path: Path, text: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _calibrated_backends() -> set:
+    gate_cfg = _config.get("pipeline.final_gate", {}) or {}
+    raw = gate_cfg.get("calibrated_backends") or ["jev"]
+    if isinstance(raw, str):
+        raw = [raw]
+    return {str(x) for x in raw}
+
+
+def _score_floor() -> Dict[str, float]:
+    floors = dict(_config.critic_thresholds or {})
+    floors.setdefault("entity_consistency", 6.0)
+    return {str(k): float(v) for k, v in floors.items()}
+
+
+def _scores_below_floor(report: Dict[str, Any]) -> List[str]:
+    scores = (report or {}).get("scores") or {}
+    out: List[str] = []
+    for dim, floor in _score_floor().items():
+        try:
+            value = float(scores.get(dim))
+        except (TypeError, ValueError):
+            out.append(f"{dim}:missing")
+            continue
+        if value < floor:
+            out.append(f"{dim}:{value:g}<{floor:g}")
+    return out
+
+
+def _residual_authority_forms(text: str, authorities: Iterable[str]) -> List[dict]:
+    """Find registered canonical names with a one-character CJK drift.
+
+    The critic's per-entity check is source-scoped: a translator footnote may
+    mention ``贝尼·杰瑟里特`` even when the source chunk does not, and an LLM
+    score can therefore miss a wrong ``贝尼杰赛里特`` spelled in that note.
+    Name-only completion is a state-changing fast path, so it additionally
+    requires every active canonical form to be free of a mechanically
+    plausible one-character drift.
+
+    Separator folding deliberately matches both ``贝尼·杰瑟里特`` and
+    ``贝尼杰赛里特``.  Only canonicals with at least two canonical tokens and
+    four CJK characters participate; this keeps short CJK words out of the
+    no-space scan, where the false-positive rate would be unacceptable.
+    """
+    text_key = _name_key(text)
+    if not text_key:
+        return []
+    findings: List[dict] = []
+    seen = set()
+    for authority in authorities:
+        canonical = str(authority or "").strip()
+        if not canonical:
+            continue
+        base = re.sub(r"（[^）]*）|\([^)]*\)", "", canonical).strip()
+        if len(canonical_tokens(base)) < 2:
+            continue
+        canonical_key = _name_key(base)
+        if (len(canonical_key) < 4
+                or not re.fullmatch(r"[\u4e00-\u9fff]+", canonical_key)):
+            continue
+        length = len(canonical_key)
+        for start in range(0, max(0, len(text_key) - length + 1)):
+            found_key = text_key[start:start + length]
+            if found_key == canonical_key:
+                continue
+            if not re.fullmatch(r"[\u4e00-\u9fff]+", found_key):
+                continue
+            if sum(a != b for a, b in zip(canonical_key, found_key)) != 1:
+                continue
+            plausible, _reason = is_plausible_name_variant(
+                canonical_key, found_key)
+            if not plausible:
+                continue
+            key = (canonical, found_key)
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append({
+                "canonical": canonical,
+                "found": found_key,
+                "kind": "one_char_cjk_drift",
+            })
+            if len(findings) >= 20:
+                return findings
+    return findings
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _atomic_json_fsync(path: Path, payload: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _open_decision_write_db(path: Path) -> sqlite3.Connection:
+    con = sqlite3.connect(str(path))
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _decision_index(context: Dict[str, Any]) -> Dict[str, List[dict]]:
+    out: Dict[str, List[dict]] = {}
+    for decision in (context.get("decisions") or {}).values():
+        key = _phrase_key(decision.get("source_key") or "")
+        if key:
+            out.setdefault(key, []).append(decision)
+    return out
+
+
+def _active_authority_conflicts(
+    source_text: str,
+    context: Dict[str, Any],
+    decision_index: Dict[str, List[dict]],
+    targets: Optional[Iterable[str]] = None,
+) -> List[Dict[str, str]]:
+    """Find authority conflicts for the names this chunk would actually change.
+
+    A polluted registry row for an unrelated character must not veto a local
+    separator repair.  Scope the check to the target names touched by the
+    deterministic mapping.
+    """
+    conflicts: List[Dict[str, str]] = []
+    sources_by_target = context.get("registry_sources_by_target") or {}
+    wanted = {_name_key(t) for t in (targets or []) if _name_key(t)}
+    if not wanted:
+        return conflicts
+    source_keys = set()
+    for target_key in wanted:
+        source_keys.update(sources_by_target.get(target_key) or set())
+    by_source = context.get("registry_by_source") or {}
+    trusted_by_source = context.get("registry_trusted_by_source") or {}
+    for source_key in sorted(source_keys):
+        canonicals = by_source.get(source_key) or set()
+        if not canonicals:
+            continue
+        trusted = trusted_by_source.get(source_key) or set()
+        trusted_keys = {_name_key(c) for c in trusted if _name_key(c)}
+        if len(trusted_keys) > 1:
+            conflicts.append({
+                "source_key": source_key,
+                "reason": "cross_person_alias_conflict",
+                "registry_targets": " | ".join(sorted(trusted)),
+                "decision_targets": "",
+            })
+            continue
+        trusted_target = next(iter(trusted), "")
+        if not trusted_target and len(
+                {_name_key(c) for c in canonicals if _name_key(c)}) > 1:
+            conflicts.append({
+                "source_key": source_key,
+                "reason": "untrusted_registry_alias_ambiguity",
+                "registry_targets": " | ".join(sorted(canonicals)),
+                "decision_targets": "",
+            })
+            continue
+        decisions = decision_index.get(source_key) or []
+        decision_targets = [str(d.get("translation") or "") for d in decisions]
+        compatible = any(
+            _name_compatible(str(target), d_target)
+            for target in wanted for d_target in decision_targets if d_target)
+        if decision_targets and not compatible:
+            conflicts.append({
+                "source_key": source_key,
+                "reason": "decision_registry_target_conflict",
+                "registry_targets": trusted_target or " | ".join(sorted(canonicals)),
+                "decision_targets": " | ".join(sorted(decision_targets)),
+            })
+    return conflicts
+
+
+def _build_maps(
+    root: Path,
+    decision_db: Path,
+    chunks: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build maps on a disposable Decision DB copy (production DB is read-only)."""
+    fd, tmp_name = tempfile.mkstemp(prefix="sagatrans_r158_nu_", suffix=".sqlite")
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        source_con = sqlite3.connect(str(decision_db))
+        copy_con = sqlite3.connect(str(tmp_path))
+        try:
+            source_con.backup(copy_con)
+            unify_entity_registry(copy_con, dry_run=False)
+            corpus = "\n".join(str(c.get("text") or "") for c in chunks)
+            preferred = (_config.get("pipeline.name_unification.preferred_forms", {})
+                         or {})
+            maps = build_name_unification_maps(
+                copy_con, corpus, preferred_forms=preferred)
+        finally:
+            copy_con.close()
+            source_con.close()
+        return maps
+    finally:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def _changed_spans(before: str, after: str) -> List[Dict[str, Any]]:
+    spans: List[Dict[str, Any]] = []
+    matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        spans.append({
+            "op": tag,
+            "start": i1,
+            "end": i2,
+            "before": before[i1:i2],
+            "after": after[j1:j2],
+        })
+        if len(spans) >= 80:
+            break
+    return spans
+
+
+def _mapping_targets(maps: Dict[str, Any], stats: Dict[str, Any]) -> List[str]:
+    """Targets touched by the actual deterministic changes in this chunk."""
+    targets: List[str] = [str(t) for t in (stats.get("targets") or []) if t]
+    for text in stats.get("examples") or []:
+        if "→" not in str(text):
+            continue
+        target = str(text).split("→", 1)[1].split("×", 1)[0]
+        if target:
+            targets.append(target)
+    return list(dict.fromkeys(targets))
+
+
+def _lockable_decisions(
+    source_text: str,
+    maps: Dict[str, Any],
+    stats: Dict[str, Any],
+    context: Dict[str, Any],
+    decision_index: Dict[str, List[dict]],
+    *,
+    chunk_id: str = "",
+    proposed_text: str = "",
+    authority_corpus: Optional[Dict[str, Dict[str, str]]] = None,
+    authority_gram_cache: Optional[Dict[str, set]] = None,
+) -> List[dict]:
+    """Decisions touched by this name change and supported by chunk/registry evidence."""
+    targets = _mapping_targets(maps, stats)
+    target_keys = {_name_key(t) for t in targets if _name_key(t)}
+    registry_sources = context.get("registry_sources_by_target") or {}
+    evidence_sources = set()
+    for target_key in target_keys:
+        evidence_sources.update(registry_sources.get(target_key) or set())
+    source_key = _phrase_key(source_text)
+    corpus = authority_corpus
+    gram_cache = authority_gram_cache
+    if corpus is None or gram_cache is None:
+        corpus, gram_cache = build_lock_authority_corpus(context)
+    out: List[dict] = []
+    seen = set()
+    for decision in (context.get("decisions") or {}).values():
+        did = int(decision.get("id") or 0)
+        if not did or did in seen:
+            continue
+        translation = str(decision.get("translation") or "")
+        if not translation or not any(
+                _name_compatible(translation, target) for target in targets):
+            continue
+        dec_source = _phrase_key(decision.get("source_key") or "")
+        if dec_source not in evidence_sources and dec_source not in source_key:
+            continue
+        seen.add(did)
+        authority = evaluate_decision_lock_authority(
+            decision_id=did,
+            source_key=str(decision.get("source_key") or ""),
+            target=translation,
+            context=context,
+            corpus=corpus,
+            gram_cache=gram_cache,
+            proposed_chunk_id=chunk_id,
+            proposed_text=proposed_text,
+        )
+        out.append({
+            "id": did,
+            "source_key": str(decision.get("source_key") or ""),
+            "translation": translation,
+            "locked": int(decision.get("locked") or 0),
+            "authority": authority,
+            "lock_allowed": bool(authority.get("lock_allowed")),
+        })
+    return out
+
+
+def _validate_reauthored_report(
+    report: Optional[dict],
+    *,
+    proposed_text: str,
+) -> List[str]:
+    reasons: List[str] = []
+    report = report or {}
+    backend = str(report.get("_backend_path") or "missing")
+    if backend not in _calibrated_backends():
+        reasons.append(f"critic_backend_uncalibrated:{backend}")
+    scores = report.get("scores") or {}
+    if not isinstance(scores, dict) or not scores:
+        reasons.append("critic_scores_missing")
+    low = _scores_below_floor(report)
+    if low:
+        reasons.extend(f"critic_floor:{item}" for item in low)
+    verdict = report.get("_typesafe_verdict") or {}
+    decision = str(verdict.get("decision") or "")
+    if decision and decision != "PASS":
+        reasons.append(f"critic_verdict:{decision}")
+    entity_notes = report.get("entity_consistency_notes") or []
+    unresolved_notes = [
+        note for note in entity_notes
+        if not (isinstance(note, dict)
+                and _entity_note_satisfied(note, proposed_text))
+    ]
+    if unresolved_notes:
+        reasons.append(f"entity_consistency_notes:{len(unresolved_notes)}")
+    if report.get("_entity_check_error"):
+        reasons.append(f"entity_check_error:{report['_entity_check_error']}")
+    if not proposed_text.strip():
+        reasons.append("proposed_text_empty")
+    return reasons
+
+
+def _entity_note_satisfied(note: Dict[str, Any], text: str) -> bool:
+    """Mirror the pipeline's allowed-form tolerance for entity notes.
+
+    A translated chunk may legitimately keep the source name in a parenthetical
+    gloss or translator footnote while using the canonical Chinese form in the
+    prose.  The pipeline already suppresses those notes when the canonical (or
+    a canonical token) is present; the name-only fast path must use the same
+    rule or it would hold otherwise-clean chunks DIRTY forever.
+    """
+    if not isinstance(note, dict) or not text:
+        return False
+    entity = note.get("entity") or note.get("expected") or ""
+    if entity:
+        if entity in text:
+            return True
+        for token in canonical_tokens(entity):
+            if len(token) >= 2 and token in text:
+                return True
+    found = note.get("found")
+    if (isinstance(found, str) and found
+            and re.search(r"[\u4e00-\u9fff]", found) and found in text):
+        return True
+    return False
+
+
+def _pending_rows_for_chunk(context: Dict[str, Any], chunk_id: str,
+                            proposed_text: str) -> List[dict]:
+    classified = classify_pending_snapshot(
+        context, final_overrides={str(chunk_id): proposed_text})
+    return [entry for entry in (classified.get("entries") or [])
+            if str(entry.get("chunk_id") or "") == str(chunk_id)]
+
+
+def _default_critic_fn(
+    record: Dict[str, Any],
+    source_text: str,
+    raw_text: str,
+    proposed_text: str,
+    pipeline: Any,
+) -> Dict[str, Any]:
+    cid = str(record["chunk_id"])
+    from src.splitters import _normalize_scores
+    registry = pipeline._build_entity_registry_for_rewriter(source_text)
+    variants = pipeline._build_entity_variants_for_critic(source_text)
+    report = pipeline.critic_agent.process_chunk(
+        cid,
+        source_text,
+        raw_text,
+        proposed_text,
+        pipeline.style_guide,
+        entity_registry=registry,
+        entity_variants=variants,
+        allow_legacy_fallback=False,
+    )
+    if isinstance(report, dict) and "scores" in report:
+        report["scores"] = _normalize_scores(report.get("scores"))
+    if isinstance(report, dict):
+        try:
+            notes = pipeline._check_entity_consistency(
+                cid, proposed_text, source_text)
+            if notes:
+                report["entity_consistency_notes"] = notes
+        except Exception as exc:  # noqa: BLE001 - fail closed on verifier error
+            report["_entity_check_error"] = f"{type(exc).__name__}: {exc}"
+    return report
+
+
+def _load_dirty_items(
+    workflow_path: Path,
+    out_dir: Path,
+    chapter_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    wcon = sqlite3.connect(f"file:{workflow_path.resolve()}?mode=ro", uri=True)
+    wcon.row_factory = sqlite3.Row
+    try:
+        sql = ("SELECT chunk_id, chapter_id, text_content, state, rescue_stage "
+               "FROM chunk_tasks WHERE state='DIRTY'")
+        params: tuple = ()
+        if chapter_id:
+            sql += " AND chapter_id=?"
+            params = (chapter_id,)
+        tasks = [dict(r) for r in wcon.execute(sql + " ORDER BY chunk_id", params)]
+    finally:
+        wcon.close()
+    loaded: List[Dict[str, Any]] = []
+    for task in tasks:
+        cid = str(task["chunk_id"])
+        ch = str(task["chapter_id"])
+        final_path = out_dir / ch / f"{cid}_final.json"
+        final = _read_json(final_path)
+        loaded.append({
+            "task": task,
+            "final_path": final_path,
+            "final": final,
+            "text": str((final or {}).get("text") or ""),
+            "critic": _read_json(out_dir / ch / f"{cid}_critic_report.json"),
+        })
+    return loaded
+
+
+def _load_completed_items(
+    workflow_path: Path,
+    out_dir: Path,
+    chapter_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Load COMPLETED chunks for the completed-name repair planner.
+
+    This is deliberately separate from ``_load_dirty_items``: the completed
+    repair path must never broaden the DIRTY fast path's state contract.
+    """
+    wcon = sqlite3.connect(f"file:{workflow_path.resolve()}?mode=ro", uri=True)
+    wcon.row_factory = sqlite3.Row
+    try:
+        sql = ("SELECT chunk_id, chapter_id, text_content, state, rescue_stage "
+               "FROM chunk_tasks WHERE state='COMPLETED'")
+        params: tuple = ()
+        if chapter_id:
+            sql += " AND chapter_id=?"
+            params = (chapter_id,)
+        tasks = [dict(r) for r in wcon.execute(sql + " ORDER BY chunk_id", params)]
+    finally:
+        wcon.close()
+    loaded: List[Dict[str, Any]] = []
+    for task in tasks:
+        cid = str(task["chunk_id"])
+        ch = str(task["chapter_id"])
+        final_path = out_dir / ch / f"{cid}_final.json"
+        final = _read_json(final_path)
+        loaded.append({
+            "task": task,
+            "final_path": final_path,
+            "final": final,
+            "text": str((final or {}).get("text") or ""),
+            "critic": _read_json(out_dir / ch / f"{cid}_critic_report.json"),
+        })
+    return loaded
+
+
+def _canonical_name_chars(canonical: str, min_chars: int) -> List[str]:
+    """Return the CJK character sequence for a pure-Chinese canonical name.
+
+    Mixed Latin/Chinese targets are intentionally excluded.  The completed
+    repair path is a deterministic one-character CJK correction, not a general
+    term rewriter.
+    """
+    base = re.sub(r"（[^）]*）|\([^)]*\)", "", str(canonical or "")).strip()
+    tokens = canonical_tokens(base)
+    chars = [ch for token in tokens for ch in token]
+    if len(chars) < max(1, int(min_chars)):
+        return []
+    if any(not re.fullmatch(r"[\u4e00-\u9fff]", ch) for ch in chars):
+        return []
+    if len("".join(tokens)) != len(chars):
+        return []
+    return chars
+
+
+def _one_char_name_drift_matches(
+    text: str,
+    canonical: str,
+    *,
+    min_chars: int = 4,
+) -> List[Dict[str, Any]]:
+    """Find names that differ from ``canonical`` by exactly one CJK character.
+
+    The match keeps the canonical token boundaries but permits the project's
+    legal name separators (``·``, ``-`` etc.) between tokens.  It never matches
+    the canonical form itself, and it requires equal normalized length plus a
+    Hamming distance of exactly one; a broader fuzzy match is not admissible
+    for a text-rewriting operation.
+    """
+    target_chars = _canonical_name_chars(canonical, min_chars)
+    if not target_chars or not text:
+        return []
+    tokens = canonical_tokens(re.sub(
+        r"（[^）]*）|\([^)]*\)", "", str(canonical or "")).strip())
+    sep = r"[\s" + re.escape(_NAME_SEP_CHARS) + r"]*"
+    patterns: List[str] = []
+    for changed in range(len(target_chars)):
+        pieces: List[str] = []
+        char_index = 0
+        for token_index, token in enumerate(tokens):
+            if token_index:
+                pieces.append(sep)
+            for char in token:
+                if char_index == changed:
+                    pieces.append(r"[\u4e00-\u9fff]")
+                else:
+                    pieces.append(re.escape(char))
+                char_index += 1
+        patterns.append("(?:%s)" % "".join(pieces))
+    matcher = re.compile("|".join(patterns))
+    target_key = _name_key(canonical)
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for match in matcher.finditer(text):
+        form = match.group(0)
+        key = _name_key(form)
+        if len(key) != len(target_key) or key == target_key:
+            continue
+        if sum(a != b for a, b in zip(key, target_key)) != 1:
+            continue
+        signature = (match.start(), match.end(), key)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        out.append({
+            "start": match.start(),
+            "end": match.end(),
+            "form": form,
+            "normalized": key,
+        })
+    return out
+
+
+def _replace_name_drift_spans(
+    text: str,
+    matches: Iterable[Dict[str, Any]],
+    canonical: str,
+) -> str:
+    after = str(text)
+    for match in sorted(matches, key=lambda item: int(item["start"]), reverse=True):
+        start = int(match["start"])
+        end = int(match["end"])
+        after = after[:start] + str(canonical) + after[end:]
+    return after
+
+
+def _active_name_owners(context: Dict[str, Any], source_key: str) -> List[Dict[str, Any]]:
+    owners = (context.get("registry_form_owners") or {}).get(
+        _phrase_key(source_key)) or []
+    unique: Dict[str, Dict[str, Any]] = {}
+    for owner in owners:
+        if int(owner.get("pending_review") or 0):
+            continue
+        key = _name_key(owner.get("canonical") or "")
+        if key:
+            unique.setdefault(key, owner)
+    return list(unique.values())
+
+
+def _protected_active_name_keys(
+    context: Dict[str, Any],
+    target_key: str,
+) -> set:
+    """Active canonical/variant keys that may not be overwritten by this repair."""
+    protected = set()
+    for owners in (context.get("registry_form_owners") or {}).values():
+        for owner in owners:
+            if int(owner.get("pending_review") or 0):
+                continue
+            key = _name_key(owner.get("canonical") or "")
+            if not key or key == target_key:
+                continue
+            protected.add(key)
+            for variant in owner.get("variants") or []:
+                variant_key = _name_key(variant)
+                if variant_key:
+                    protected.add(variant_key)
+    return protected
+
+
+def _source_key_occurrence_count(text: str, source_key: str) -> int:
+    """Count a simple ASCII source term without matching inside another word.
+
+    EPUB source paragraphs contain soft line wraps.  The source key is a
+    semantic phrase, not a literal byte string, so internal whitespace is
+    normalised exactly as it is in ``_confirmed_term_source_count``.
+    """
+    key = str(source_key or "").strip()
+    if (len(key) < 2
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9'’ .-]*", key)):
+        return 0
+    parts = [part for part in key.split() if part]
+    if not parts:
+        return 0
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9])" + r"\s+".join(
+            re.escape(part) for part in parts) + r"(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+    return len(pattern.findall(_body_before_footnotes(text)))
+
+
+_TARGET_MIGRATION_MARKERS = (
+    re.compile(
+        r"Round 158 decision target authority repair:\s*([^|]+?)\s*->\s*([^|]+?)(?:\s*\||$)"),
+    re.compile(
+        r"Round 158 corpus lock authority:\s*([^|]+?)\s*->\s*([^|]+?)(?:\s*\||$)"),
+)
+
+
+def _decision_target_migration_matches(
+    item: Dict[str, Any],
+    context: Dict[str, Any],
+    pending_entry: Optional[dict],
+    canonical: str,
+) -> Dict[str, Any]:
+    """Plan a post-authority target migration for a COMPLETED final.
+
+    ``decision-target-authority-repair`` and the locked-target repairer write a
+    machine-readable ``old -> new`` marker into the Decision reason.  A target
+    repair can still leave an already COMPLETED chunk containing the old form;
+    this helper recognises only that audited migration.  It deliberately does
+    not infer an old target from similarity, so ordinary prose cannot opt into
+    the broader rewrite path by accident.
+    """
+    if not pending_entry:
+        return {"status": "unavailable", "reason": "no_pending_backtrack"}
+    decision_id = pending_entry.get("decision_id")
+    try:
+        decision = (context.get("decisions") or {}).get(int(decision_id))
+    except (TypeError, ValueError):
+        decision = None
+    if not decision:
+        return {"status": "unavailable", "reason": "decision_missing"}
+    reason = str(decision.get("reason") or "")
+    migrations: List[Tuple[str, str]] = []
+    for pattern in _TARGET_MIGRATION_MARKERS:
+        migrations.extend(
+            (str(old).strip(), str(new).strip())
+            for old, new in pattern.findall(reason)
+        )
+    if not migrations:
+        return {"status": "unavailable", "reason": "no_authority_migration_marker"}
+    old_raw, new_raw = migrations[-1]
+    old_core = _target_core(old_raw)
+    new_core = _target_core(new_raw)
+    canonical_key = _name_key(canonical)
+    new_key = _name_key(new_core)
+    old_key = _name_key(old_core)
+    if not canonical_key or canonical_key != new_key:
+        return {
+            "status": "unavailable",
+            "reason": "migration_new_target_mismatch",
+            "old_target": old_core,
+            "new_target": new_core,
+        }
+    if (not old_key or old_key == new_key or not old_core
+            or not re.fullmatch(r"[\u4e00-\u9fff·・－\-]+", old_core)):
+        return {
+            "status": "unavailable",
+            "reason": "migration_old_target_not_mechanical",
+            "old_target": old_core,
+            "new_target": new_core,
+        }
+    source_text = str((item.get("task") or {}).get("text_content") or "")
+    source_key = str((item.get("task") or {}).get("source_key") or "")
+    # The pending row carries the authoritative Decision source key; prefer it
+    # over any task-local fixture field.
+    source_key = str(pending_entry.get("decision_source_key") or source_key)
+    source_spans = _source_phrase_spans(source_text, source_key)
+    body = body_before_footnotes(item.get("text") or "")
+    spans = [
+        (match.start(), match.end(), match.group(0))
+        for match in re.finditer(re.escape(old_core), body)
+    ]
+    if not source_spans:
+        return {
+            "status": "unavailable",
+            "reason": "migration_source_absent",
+            "old_target": old_core,
+            "new_target": new_core,
+        }
+    if len(spans) != len(source_spans):
+        return {
+            "status": "unavailable",
+            "reason": "migration_occurrence_mismatch",
+            "source_occurrences": len(source_spans),
+            "old_target_occurrences": len(spans),
+            "old_target": old_core,
+            "new_target": new_core,
+        }
+    protected = _protected_active_name_keys(context, canonical_key)
+    if old_key in protected:
+        return {
+            "status": "unavailable",
+            "reason": "migration_old_form_owned_by_active_name",
+            "old_target": old_core,
+            "new_target": new_core,
+        }
+    return {
+        "status": "eligible",
+        "reason": "round158_authority_migration",
+        "old_target": old_core,
+        "new_target": new_core,
+        "source_occurrences": len(source_spans),
+        "old_target_occurrences": len(spans),
+        "matches": [
+            {"start": start, "end": end, "form": form,
+             "normalized": _name_key(form)}
+            for start, end, form in spans
+        ],
+    }
+
+
+def _best_glossed_term_form(form: str, target_key: str) -> str:
+    """Trim context accidentally welded to an explicit ``term（source）`` gloss.
+
+    A fixed-width scan can include a preceding verb when the Chinese term is
+    shorter than the Decision target (``看见运输机（carryall）``).  The literal
+    gloss is still strong provenance, so choose the suffix that is most similar
+    to the target instead of replacing the verb together with the term.
+    """
+    best = form
+    best_score = (
+        difflib.SequenceMatcher(
+            None, form, target_key, autojunk=False).ratio(),
+        len(form),
+    )
+    for offset in range(1, len(form) - 1):
+        suffix = form[offset:]
+        if is_likely_common_word(suffix):
+            continue
+        score = (
+            difflib.SequenceMatcher(
+                None, suffix, target_key, autojunk=False).ratio(),
+            len(suffix),
+        )
+        if score > best_score:
+            best = suffix
+            best_score = score
+    return best
+
+
+def _pending_source_scoped_term_matches(
+    item: Dict[str, Any],
+    canonical: str,
+    *,
+    source_key: str,
+    context: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Find a repeated final form whose count matches the source term count.
+
+    This is the missing bridge between a one-character typo repair and a full
+    chunk rerun.  A rejected spelling such as ``梅普斯`` may differ from the
+    Decision target by two characters, yet the chunk still gives mechanical
+    provenance: the source contains ``Mapes`` N times and the body contains
+    that one competing CJK form exactly N times.  A second safe form is a
+    translator-glossed term such as ``真实感（truthsense）``: every occurrence
+    of the candidate is directly bound to the literal source key.
+
+    The helper is read-only and intentionally returns at most one form.  The
+    caller still revalidates the proposed bytes with a calibrated critic and
+    only then clears pending/locks the Decision.
+    """
+    source_text = str(item.get("task", {}).get("text_content") or "")
+    final_text = str(item.get("text") or "")
+    target = _term_target_core(canonical)
+    target_key = _name_key(target)
+    evidence: Dict[str, Any] = {
+        "status": "unavailable",
+        "reason": "",
+        "target": target,
+        "source_key": str(source_key or ""),
+        "source_count": 0,
+        "matches": [],
+        "paired_gloss": False,
+    }
+    if not source_text.strip() or not final_text.strip():
+        evidence["reason"] = "source_or_final_missing"
+        return evidence
+    if (not target_key or len(target_key) < 2
+            or not all(re.fullmatch(r"[\u4e00-\u9fff]", ch)
+                       for ch in target_key)):
+        evidence["reason"] = "target_not_pure_cjk_or_too_short"
+        return evidence
+    source_count = _source_key_occurrence_count(source_text, source_key)
+    evidence["source_count"] = source_count
+    if source_count <= 0:
+        evidence["reason"] = "source_term_not_present"
+        return evidence
+    final_body = _body_before_footnotes(final_text)
+    if target_key in _name_key(final_body):
+        evidence["reason"] = "target_already_present"
+        return evidence
+
+    protected = _protected_active_name_keys(context, target_key)
+    candidate_spans: Dict[str, List[Tuple[int, int]]] = {}
+    candidate_meta: Dict[str, Dict[str, Any]] = {}
+    # A same-width CJK token is the only admissible form here.  Allowing a
+    # longer n-gram can include a preceding particle (``的真实感``) and then a
+    # replacement would delete grammatical text instead of just the term.
+    width = len(target_key)
+    for run in re.finditer(r"[\u4e00-\u9fff]+", final_text):
+        chars = run.group(0)
+        if len(chars) < width:
+            continue
+        for offset in range(0, len(chars) - width + 1):
+            form = chars[offset:offset + width]
+            normalized = _name_key(form)
+            if (not normalized or normalized == target_key
+                    or normalized in protected):
+                continue
+            if any(normalized in key or key in normalized
+                   for key in protected if key):
+                continue
+            similarity = difflib.SequenceMatcher(
+                None, normalized, target_key, autojunk=False).ratio()
+            pair_re = re.compile(
+                r"(?P<form>" + re.escape(form) + r")"
+                + r"""["'”’」』]*\s*[（(]\s*"""
+                + re.escape(str(source_key or ""))
+                + r"\s*[）)]",
+                re.IGNORECASE,
+            )
+            paired_in_body = len(pair_re.findall(final_body))
+            pair_matches = list(pair_re.finditer(final_text))
+            total_form = len(re.findall(re.escape(form), final_text))
+            paired_gloss = bool(paired_in_body and len(pair_matches) == total_form)
+            if paired_gloss:
+                trimmed = _best_glossed_term_form(form, target_key)
+                if trimmed != form:
+                    form = trimmed
+                    normalized = _name_key(form)
+                    if (not normalized or normalized == target_key
+                            or normalized in protected):
+                        continue
+                    if any(normalized in key or key in normalized
+                           for key in protected if key):
+                        continue
+                    similarity = difflib.SequenceMatcher(
+                        None, normalized, target_key, autojunk=False).ratio()
+                    pair_re = re.compile(
+                        r"(?P<form>" + re.escape(form) + r")"
+                        + r"""["'”’」』]*\s*[（(]\s*"""
+                        + re.escape(str(source_key or ""))
+                        + r"\s*[）)]",
+                        re.IGNORECASE,
+                    )
+                    paired_in_body = len(pair_re.findall(final_body))
+                    pair_matches = list(pair_re.finditer(final_text))
+                    total_form = len(pair_matches)
+                    paired_gloss = bool(paired_in_body and total_form)
+            if not paired_gloss:
+                positional = sum(
+                    left == right
+                    for left, right in zip(normalized, target_key))
+                if positional < 1:
+                    continue
+                if normalized[-1] != target_key[-1]:
+                    continue
+                if total_form != source_count:
+                    continue
+                # A one-position match (usually the shared final character) is
+                # admissible only when the source term is repeated.  A one-off
+                # common phrase such as ``的能力`` must fall through to the
+                # stricter legacy paths.
+                if positional < 2 and source_count < 2:
+                    continue
+                if is_likely_common_word(form):
+                    continue
+            term_spans: List[Tuple[int, int]] = []
+            if paired_gloss:
+                all_form_matches = list(re.finditer(re.escape(form), final_text))
+                if len(all_form_matches) == source_count:
+                    # The gloss proves the term identity; an exact occurrence
+                    # count matching the English source count safely extends the
+                    # replacement to unglossed repetitions in the same chunk.
+                    term_spans = [match.span() for match in all_form_matches]
+                    total_form = source_count
+                else:
+                    term_spans = [match.span("form") for match in pair_matches]
+                    total_form = len(pair_matches)
+            else:
+                all_form_matches = list(re.finditer(re.escape(form), final_text))
+                term_spans = [match.span() for match in all_form_matches]
+            if normalized not in candidate_meta:
+                candidate_meta[normalized] = {
+                    "form": form,
+                    "similarity": round(similarity, 4),
+                    "total_form": total_form,
+                    "paired_gloss": paired_gloss,
+                }
+            candidate_spans.setdefault(normalized, [])
+            candidate_spans[normalized].extend(term_spans)
+            candidate_spans[normalized] = sorted(
+                set(candidate_spans[normalized]))
+    # A literal ``form（source_key）`` gloss is exact provenance and outranks a
+    # count-only neighbour that merely happens to share the target's last CJK
+    # character.  If several glossed forms remain, the caller still rejects.
+    paired_keys = {
+        normalized for normalized, meta in candidate_meta.items()
+        if meta.get("paired_gloss")
+    }
+    if paired_keys:
+        candidate_meta = {
+            normalized: meta for normalized, meta in candidate_meta.items()
+            if normalized in paired_keys
+        }
+        candidate_spans = {
+            normalized: spans for normalized, spans in candidate_spans.items()
+            if normalized in paired_keys
+        }
+    if not candidate_meta:
+        evidence["reason"] = "no_counted_term_variant"
+        return evidence
+    if len(candidate_meta) != 1:
+        evidence["reason"] = "multiple_counted_term_variants"
+        evidence["candidates"] = sorted(candidate_meta.values(),
+                                        key=lambda row: row["form"])
+        return evidence
+    normalized, meta = next(iter(candidate_meta.items()))
+    spans = candidate_spans.get(normalized) or []
+    evidence.update(
+        status="eligible",
+        reason="",
+        paired_gloss=bool(meta["paired_gloss"]),
+        matches=[{
+            "start": start,
+            "end": end,
+            "form": final_text[start:end],
+            "normalized": normalized,
+            "source_count": source_count,
+            "similarity": meta["similarity"],
+            "paired_gloss": bool(meta["paired_gloss"]),
+        } for start, end in spans],
+    )
+    return evidence
+
+
+def _registered_alias_drift_keys(
+    *,
+    source_key: str,
+    canonical: str,
+    context: Dict[str, Any],
+    min_chars: int = 3,
+) -> set:
+    """Return exact pending registry aliases one CJK character from canonical."""
+    target_key = _name_key(canonical)
+    if not target_key or not _canonical_name_chars(
+            canonical, min(2, max(1, int(min_chars)))):
+        return set()
+    owners = (context.get("registry_form_owners") or {}).get(
+        _phrase_key(source_key)) or []
+    protected = _protected_active_name_keys(context, target_key)
+    wrong_keys = set()
+    for owner in owners:
+        candidates = []
+        if int(owner.get("pending_review") or 0):
+            candidates.append(str(owner.get("canonical") or "").strip())
+        candidates.extend(str(value).strip()
+                          for value in owner.get("quarantined") or [])
+        for candidate in candidates:
+            candidate_key = _name_key(candidate)
+            if not candidate_key or candidate_key in protected:
+                continue
+            if len(candidate_key) != len(target_key) or candidate_key == target_key:
+                continue
+            if sum(a != b for a, b in zip(candidate_key, target_key)) != 1:
+                continue
+            if not all(re.fullmatch(r"[\u4e00-\u9fff]", ch)
+                       for ch in candidate_key):
+                continue
+            wrong_keys.add(candidate_key)
+    return wrong_keys
+
+
+def _registered_alias_drift_matches(
+    text: str,
+    *,
+    source_key: str,
+    canonical: str,
+    context: Dict[str, Any],
+    min_chars: int = 3,
+) -> List[Dict[str, Any]]:
+    """Find exact pending registry aliases that differ from active canonical.
+
+    A 3-character canonical name is too short for unrestricted fuzzy scanning:
+    nearby names such as ``厄拉科斯`` contain many one-character windows.  This
+    helper therefore accepts only an exact alias already attached to the same
+    source key in the registry, owned by a non-active row, and mechanically one
+    CJK character away from the single active canonical.
+    """
+    wrong_keys = _registered_alias_drift_keys(
+        source_key=source_key,
+        canonical=canonical,
+        context=context,
+        min_chars=min_chars,
+    )
+    if not wrong_keys:
+        return []
+    return [
+        match for match in _one_char_name_drift_matches(
+            text, canonical, min_chars=min_chars)
+        if str(match.get("normalized") or "") in wrong_keys
+    ]
+
+
+def _term_target_core(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    core = re.sub(r"（[^）]*）|\([^)]*\)", "", raw).strip()
+    return core or raw
+
+
+def _body_before_footnotes(text: str) -> str:
+    """Drop definition-style footnote lines from provenance checks.
+
+    Raw and final may both contain an exact target only in a translator note.
+    A note is evidence about the term, not evidence that the prose once used
+    the target.  Definition-style notes are therefore outside this repair's
+    witness region.
+    """
+    return body_before_footnotes(text)
+
+
+def _literal_name_spans(text: str, canonical: str) -> List[Tuple[int, int]]:
+    """Locate a Decision target without separator/case normalization drift."""
+    core = _term_target_core(canonical)
+    tokens = canonical_tokens(core)
+    if not core or not tokens:
+        return []
+    sep = r"[\s" + re.escape(_NAME_SEP_CHARS) + r"]*"
+    pattern = re.compile(sep.join(re.escape(token) for token in tokens))
+    target_key = _name_key(core)
+    return [
+        match.span() for match in pattern.finditer(str(text or ""))
+        if _name_key(match.group(0)) == target_key
+    ]
+
+
+def _mapped_range_through_diff(
+    raw_text: str,
+    final_text: str,
+    start: int,
+    end: int,
+) -> Optional[Tuple[int, int, str]]:
+    """Map one raw span to final without accepting an edit outside that span."""
+    matcher = difflib.SequenceMatcher(
+        None, raw_text, final_text, autojunk=False)
+    pieces: List[Tuple[int, int]] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        overlap_start = max(start, i1)
+        overlap_end = min(end, i2)
+        if overlap_start >= overlap_end:
+            # Insertions have zero width in raw; include only an insertion that
+            # is wholly inside the target, never text inserted at its boundary.
+            if tag == "insert" and start < i1 < end:
+                pieces.append((j1, j2))
+            continue
+        if tag == "equal":
+            pieces.append((
+                j1 + (overlap_start - i1),
+                j1 + (overlap_end - i1),
+            ))
+            continue
+        if tag == "replace":
+            # A replacement that also rewrites surrounding prose cannot tell us
+            # which final characters belong to the name.
+            if i1 < start or i2 > end:
+                return None
+            pieces.append((j1, j2))
+            continue
+        if tag == "delete":
+            continue
+        return None
+    if not pieces:
+        return None
+    pieces.sort()
+    final_start = pieces[0][0]
+    final_end = pieces[-1][1]
+    for left, right in zip(pieces, pieces[1:]):
+        if left[1] != right[0]:
+            return None
+    candidate = final_text[final_start:final_end]
+    return final_start, final_end, candidate
+
+
+def _raw_provenance_name_drift_matches(
+    item: Dict[str, Any],
+    canonical: str,
+    *,
+    min_chars: int = 3,
+) -> Dict[str, Any]:
+    """Find a final rewrite drift that raw states to undo.
+
+    This is deliberately narrower than a general name repair.  It requires the
+    same chunk's raw artifact to contain the exact Decision target, the final
+    to have lost it, and a high raw/final similarity so a stale intermediate
+    cannot authorize a rewrite.  The final replacement must be a unique, near
+    target CJK form that maps to the raw target through a bounded diff.
+    """
+    final_text = str(item.get("text") or "")
+    final_path = Path(item.get("final_path") or "")
+    raw_text = ""
+    raw_payload = _read_json(final_path.with_name(
+        "%s_raw.json" % str(item.get("task", {}).get("chunk_id") or "")))
+    if raw_payload:
+        raw_text = str(raw_payload.get("text") or "")
+    target = _term_target_core(canonical)
+    target_chars = _canonical_name_chars(
+        target, min(3, max(1, int(min_chars))))
+    evidence: Dict[str, Any] = {
+        "status": "unavailable",
+        "reason": "",
+        "target": target,
+        "raw_path": str(final_path.with_name(
+            "%s_raw.json" % str(item.get("task", {}).get("chunk_id") or ""))),
+        "raw_final_similarity": None,
+        "matches": [],
+    }
+    if not raw_text.strip():
+        evidence["reason"] = "raw_missing"
+        return evidence
+    if not target_chars or len(target_chars) < 3:
+        evidence["reason"] = "target_not_pure_cjk_or_too_short"
+        return evidence
+    if not final_text.strip():
+        evidence["reason"] = "final_missing"
+        return evidence
+    raw_body = _body_before_footnotes(raw_text)
+    final_body = _body_before_footnotes(final_text)
+    target_key = _name_key(target)
+    if target_key in _name_key(final_body):
+        evidence["reason"] = "target_already_present"
+        return evidence
+    target_spans = _literal_name_spans(raw_body, target)
+    if not target_spans:
+        evidence["reason"] = "target_not_in_raw_body"
+        return evidence
+    raw_final_similarity = difflib.SequenceMatcher(
+        None, raw_text, final_text, autojunk=False).ratio()
+    evidence["raw_final_similarity"] = round(raw_final_similarity, 4)
+    if raw_final_similarity < 0.80:
+        evidence["reason"] = "raw_final_drift_too_large"
+        return evidence
+
+    candidates: List[Dict[str, Any]] = []
+    for start, end in target_spans:
+        mapped = _mapped_range_through_diff(raw_text, final_body, start, end)
+        if mapped is None:
+            continue
+        final_start, final_end, candidate = mapped
+        candidate_key = _name_key(candidate)
+        if not candidate_key or candidate_key == target_key:
+            continue
+        if candidate_key in target_key or target_key in candidate_key:
+            # Suffix-only common nouns ("医生") and target fragments are not
+            # repairs; the candidate must be a substitution of the name form.
+            if candidate_key in target_key:
+                continue
+        if len(candidate_key) > len(target_key) + 2:
+            continue
+        if not all(re.fullmatch(r"[\u4e00-\u9fff]", ch)
+                   for ch in candidate_key):
+            continue
+        if candidate_key in _name_key(raw_body):
+            continue
+        similarity = difflib.SequenceMatcher(
+            None, candidate_key, target_key, autojunk=False).ratio()
+        if similarity < 0.55:
+            continue
+        common = difflib.SequenceMatcher(
+            None, candidate_key, target_key, autojunk=False).find_longest_match(
+                0, len(candidate_key), 0, len(target_key))
+        if common.size < 2:
+            continue
+        if len(_literal_name_spans(final_body, candidate)) != 1:
+            continue
+        candidates.append({
+            "start": final_start,
+            "end": final_end,
+            "form": candidate,
+            "normalized": candidate_key,
+            "similarity": round(similarity, 4),
+            "raw_target": target,
+        })
+    forms = {str(match["normalized"]) for match in candidates}
+    if not candidates:
+        evidence["reason"] = "no_bounded_raw_to_final_name_drift"
+        return evidence
+    if len(forms) != 1:
+        evidence["reason"] = "multiple_raw_provenance_drift_forms"
+        evidence["matches"] = candidates
+        return evidence
+    evidence.update(
+        status="eligible",
+        reason="",
+        matches=candidates,
+        wrong_forms=sorted({str(match["form"]) for match in candidates}),
+    )
+    return evidence
+
+
+def _raw_rewrite_term_drift_matches(
+    item: Dict[str, Any],
+    canonical: str,
+    *,
+    min_chars: int = 3,
+) -> Dict[str, Any]:
+    """Recover a term span that raw had but a later rewrite replaced entirely.
+
+    ``crysknife`` is the motivating case: raw/literary say ``晶牙匕首`` while the
+    final says ``啸刃`` at the same position.  Raw does not contain the Decision
+    target itself, so the exact-witness mode above must decline.  This second
+    mode is limited to one small diff replacement whose raw side is a bounded
+    CJK form near the Decision target and whose final side is another non-
+    dictionary CJK word.  The final is restored to the Decision target only
+    after the normal critic re-audit and pending CAS.
+    """
+    final_text = str(item.get("text") or "")
+    final_path = Path(item.get("final_path") or "")
+    cid = str(item.get("task", {}).get("chunk_id") or "")
+    raw_path = final_path.with_name("%s_raw.json" % cid)
+    raw_payload = _read_json(raw_path)
+    raw_text = str((raw_payload or {}).get("text") or "")
+    target = _term_target_core(canonical)
+    target_key = _name_key(target)
+    evidence: Dict[str, Any] = {
+        "status": "unavailable",
+        "reason": "",
+        "target": target,
+        "raw_path": str(raw_path),
+        "raw_final_similarity": None,
+        "matches": [],
+    }
+    target_chars = _canonical_name_chars(
+        target, min(3, max(1, int(min_chars))))
+    if not raw_text.strip() or not final_text.strip():
+        evidence["reason"] = "raw_or_final_missing"
+        return evidence
+    if not target_chars or len(target_chars) < 3:
+        evidence["reason"] = "target_not_pure_cjk_or_too_short"
+        return evidence
+    raw_body = _body_before_footnotes(raw_text)
+    final_body = _body_before_footnotes(final_text)
+    if target_key in _name_key(final_body):
+        evidence["reason"] = "target_already_present"
+        return evidence
+    similarity = difflib.SequenceMatcher(
+        None, raw_text, final_text, autojunk=False).ratio()
+    evidence["raw_final_similarity"] = round(similarity, 4)
+    if similarity < 0.80:
+        evidence["reason"] = "raw_final_drift_too_large"
+        return evidence
+
+    candidates: List[Dict[str, Any]] = []
+    matcher = difflib.SequenceMatcher(
+        None, raw_text, final_text, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag != "replace" or i2 <= i1 or j2 <= j1:
+            continue
+        if i2 > len(raw_body) or j2 > len(final_body):
+            continue
+        raw_candidate = raw_text[i1:i2].strip()
+        final_candidate = final_text[j1:j2].strip()
+        raw_key = _name_key(raw_candidate)
+        final_key = _name_key(final_candidate)
+        if not raw_key or not final_key:
+            continue
+        if not all(re.fullmatch(r"[\u4e00-\u9fff]", ch) for ch in raw_key):
+            continue
+        if not all(re.fullmatch(r"[\u4e00-\u9fff]", ch) for ch in final_key):
+            continue
+        if len(raw_key) > len(target_key) + 1:
+            continue
+        if len(final_key) < 2 or len(final_key) > len(target_key) + 1:
+            continue
+        if final_key == target_key or final_key in raw_key:
+            continue
+        if final_key in target_key or target_key in final_key:
+            continue
+        if is_likely_common_word(final_key):
+            continue
+        raw_similarity = difflib.SequenceMatcher(
+            None, raw_key, target_key, autojunk=False).ratio()
+        if raw_similarity < 0.55:
+            continue
+        common = difflib.SequenceMatcher(
+            None, raw_key, target_key, autojunk=False).find_longest_match(
+                0, len(raw_key), 0, len(target_key))
+        if common.size < 2:
+            continue
+        if _name_key(final_candidate) in _name_key(raw_body):
+            continue
+        if len(_literal_name_spans(final_body, final_candidate)) != 1:
+            continue
+        candidates.append({
+            "start": j1,
+            "end": j2,
+            "form": final_candidate,
+            "normalized": final_key,
+            "raw_form": raw_candidate,
+            "raw_similarity": round(raw_similarity, 4),
+        })
+    forms = {str(match["normalized"]) for match in candidates}
+    if not candidates:
+        evidence["reason"] = "no_bounded_term_rewrite_span"
+        return evidence
+    if len(candidates) != 1 or len(forms) != 1:
+        evidence["reason"] = "multiple_term_rewrite_spans"
+        evidence["matches"] = candidates
+        return evidence
+    evidence.update(
+        status="eligible",
+        reason="",
+        matches=candidates,
+        wrong_forms=sorted({str(match["form"]) for match in candidates}),
+    )
+    return evidence
+
+
+def _stable_payload_sha256(payload: Any) -> str:
+    """Hash a JSON-like payload without depending on file formatting."""
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        default=str,
+    )
+    return sha256_text(encoded)
+
+
+def _completed_reject_memo_path(root: Path, out_dir: Path) -> Path:
+    cfg = (_config.get("pipeline.completed_name_repair", {}) or {})
+    raw = str(cfg.get("reject_memo_path") or "").strip()
+    if not raw:
+        return Path(out_dir) / "completed_name_repair_rejects.json"
+    path = Path(raw)
+    return path if path.is_absolute() else Path(root) / path
+
+
+def _load_completed_reject_memo(path: Path) -> Dict[str, Any]:
+    payload = _read_json(Path(path)) or {}
+    entries = payload.get("entries") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        entries = []
+    return {
+        "schema_version": 1,
+        "updated_at": str(payload.get("updated_at") or ""),
+        "entries": [entry for entry in entries if isinstance(entry, dict)],
+    }
+
+
+def _completed_repair_policy_fingerprint() -> Dict[str, Any]:
+    return {
+        "critic_score_floor": _score_floor(),
+        "calibrated_backends": sorted(_calibrated_backends()),
+    }
+
+
+def _completed_repair_fingerprint(record: Dict[str, Any]) -> Dict[str, Any]:
+    decisions = record.get("applied_decisions") or []
+    decision = decisions[0] if decisions and isinstance(decisions[0], dict) else {}
+    return {
+        "chunk_id": str(record.get("chunk_id") or ""),
+        "chapter": str(record.get("chapter") or ""),
+        "final_sha256_before": str(record.get("final_sha256_before") or ""),
+        "final_sha256_after": str(record.get("final_sha256_after") or ""),
+        "critic_sha256": str(record.get("critic_sha256") or ""),
+        "decision_id": record.get("decision_id"),
+        "decision_source_key": str(decision.get("source_key") or ""),
+        "decision_translation": str(decision.get("translation") or ""),
+        "decision_locked": int(decision.get("locked") or 0),
+        "policy": _completed_repair_policy_fingerprint(),
+    }
+
+
+def _completed_repair_fingerprint_key(record: Dict[str, Any]) -> str:
+    return _stable_payload_sha256(_completed_repair_fingerprint(record))
+
+
+def _completed_reject_memo_entry(
+    memo: Dict[str, Any],
+    record: Dict[str, Any],
+) -> Optional[dict]:
+    key = _completed_repair_fingerprint_key(record)
+    for entry in memo.get("entries") or []:
+        if str(entry.get("key") or "") == key:
+            return entry
+    return None
+
+
+def _stable_critic_rejection(
+    report: Optional[dict],
+    reasons: Iterable[str],
+) -> bool:
+    """Return True only for a quality rejection that is safe to memoize.
+
+    Missing backends, malformed reports, verifier exceptions and empty text are
+    infrastructure or programming failures.  Caching them would turn a
+    transient outage into a permanent repair veto, so they remain retryable.
+    """
+    report = report or {}
+    if str(report.get("_backend_path") or "") not in _calibrated_backends():
+        return False
+    unstable_prefixes = (
+        "critic_backend_uncalibrated:",
+        "critic_scores_missing",
+        "entity_check_error:",
+        "proposed_text_empty",
+    )
+    return not any(
+        str(reason).startswith(unstable_prefixes)
+        for reason in reasons
+    )
+
+
+def _record_completed_reject(
+    path: Path,
+    memo: Dict[str, Any],
+    record: Dict[str, Any],
+    reasons: Iterable[str],
+    *,
+    run_id: str,
+) -> str:
+    key = _completed_repair_fingerprint_key(record)
+    entries = [
+        entry for entry in (memo.get("entries") or [])
+        if str(entry.get("key") or "") != key
+    ]
+    entries.append({
+        "key": key,
+        "fingerprint": _completed_repair_fingerprint(record),
+        "chunk_id": str(record.get("chunk_id") or ""),
+        "chapter": str(record.get("chapter") or ""),
+        "reasons": sorted({str(reason) for reason in reasons if reason}),
+        "run_id": run_id,
+        "rejected_at": _now_iso(),
+    })
+    payload = {
+        "schema_version": 1,
+        "updated_at": _now_iso(),
+        "entries": entries[-5000:],
+    }
+    _atomic_json_fsync(path, payload)
+    memo.clear()
+    memo.update(payload)
+    return key
+
+
+def _classify_completed_name_candidate(
+    item: Dict[str, Any],
+    *,
+    context: Dict[str, Any],
+    pending_entry: Optional[dict],
+    min_chars: int = 4,
+    authority_corpus: Optional[Dict[str, Dict[str, str]]] = None,
+    authority_gram_cache: Optional[Dict[str, set]] = None,
+) -> Dict[str, Any]:
+    """Build a strict candidate record for one COMPLETED chunk.
+
+    A candidate is not permission to write.  It is a frozen plan that the
+    mutating phase must revalidate against the current files and a fresh
+    calibrated critic report before touching any artifact.
+    """
+    task = item["task"]
+    cid = str(task.get("chunk_id") or "")
+    chapter = str(task.get("chapter_id") or "")
+    before = str(item.get("text") or "")
+    record: Dict[str, Any] = {
+        "chunk_id": cid,
+        "chapter": chapter,
+        "state_before": str(task.get("state") or ""),
+        "final_sha256_before": sha256_text(before),
+        "final_sha256_after": "",
+        "decision_id": None,
+        "source_key": "",
+        "canonical_name": "",
+        "wrong_forms": [],
+        "changed_spans": [],
+        "critic_before": {
+            "backend_path": (item.get("critic") or {}).get("_backend_path"),
+            "scores": (item.get("critic") or {}).get("scores") or {},
+        },
+        "critic_sha256": _stable_payload_sha256(item.get("critic") or {}),
+        "pending_before": [pending_entry] if pending_entry else [],
+        "pending_after": [],
+        "applied_decisions": [],
+        "reaudit_required": True,
+        "status": "kept",
+        "reasons": [],
+    }
+    reasons = record["reasons"]
+
+    if not pending_entry:
+        reasons.append("no_pending_backtrack")
+        return record
+    record["decision_id"] = pending_entry.get("decision_id")
+    record["source_key"] = str(pending_entry.get("decision_source_key") or "")
+    canonical = str(pending_entry.get("decision_translation") or "")
+    record["canonical_name"] = canonical
+    pending_status = str(pending_entry.get("status") or "")
+    pending_reason = str(pending_entry.get("reason") or "")
+    # A locked decision turns every other same-name outstanding row into
+    # ``locked_decision_target_missing``.  That is not a separate blocker: it is
+    # the same deterministic one-character drift, now protected by the lock.
+    if pending_status == "outstanding":
+        if pending_reason != "completed_final_still_misses_target":
+            reasons.append("pending_reason:%s" % pending_reason)
+            return record
+    elif (pending_status == "satisfied"
+          and pending_reason == "target_present"):
+        # A chunk may contain the canonical form and a registered rejected
+        # variant at the same time.  Presence of the canonical form satisfies
+        # the outbox check, but the rejected form still needs the strict
+        # one-character drift repair below.
+        pass
+    elif (pending_status == "blocked"
+          and pending_reason == "locked_decision_target_missing"):
+        # eligible: the lock is the reason the target is a hard invariant.
+        pass
+    else:
+        reasons.append("pending_not_outstanding:%s" % pending_status)
+        return record
+    if not bool(pending_entry.get("source_active")):
+        reasons.append("source_not_active")
+        return record
+    if str(task.get("state") or "") != "COMPLETED":
+        reasons.append("state_not_completed:%s" % task.get("state"))
+    if task.get("rescue_stage"):
+        reasons.append("rescue_stage_present")
+    if not before.strip():
+        reasons.append("final_missing_or_unreadable")
+        return record
+    final = item.get("final") or {}
+    metadata = final.get("metadata") if isinstance(final.get("metadata"), dict) else {}
+    if metadata.get("fallback") or metadata.get("fallback_used"):
+        reasons.append("final_fallback")
+    if metadata.get("quality_waived"):
+        reasons.append("final_quality_waived")
+
+    report = item.get("critic") or {}
+    backend = str(report.get("_backend_path") or "missing")
+    if not report:
+        reasons.append("critic_report_missing")
+    elif backend not in _calibrated_backends():
+        reasons.append("critic_backend_uncalibrated:%s" % backend)
+    low = _scores_below_floor(report) if report else ["critic_scores_missing"]
+    entity_only_low = bool(low) and all(
+        str(item).startswith("entity_consistency:") for item in low)
+    if low and not entity_only_low:
+        reasons.append("critic_scores_below_floor")
+        record["critic_before"]["low_scores"] = low
+    elif low:
+        record["critic_before"]["low_scores"] = low
+
+    source_key = record["source_key"]
+    if not source_key or not canonical:
+        reasons.append("empty_decision")
+        return record
+    target_key = _name_key(canonical)
+    raw_provenance = _raw_provenance_name_drift_matches(
+        item, canonical, min_chars=min_chars)
+    record["raw_provenance"] = raw_provenance
+    target_migration = _decision_target_migration_matches(
+        item, context, pending_entry, canonical)
+    record["target_migration"] = target_migration
+    raw_rewrite: Dict[str, Any] = {}
+    if raw_provenance.get("status") != "eligible":
+        raw_rewrite = _raw_rewrite_term_drift_matches(
+            item, canonical, min_chars=min_chars)
+        record["raw_rewrite"] = raw_rewrite
+    drifts: List[Dict[str, Any]] = []
+    drift_mode = ""
+    alias_min_chars = min(2, max(1, int(min_chars)))
+    raw_mode = ""
+    raw_evidence: Dict[str, Any] = {}
+    if target_migration.get("status") == "eligible":
+        # A target change can be a complete spelling change (Carthag:
+        # 迦太基 -> 卡萨格), so the one-character-drift helpers do not apply.
+        # The Decision reason marker plus an exact source/old-target occurrence
+        # count is the authority boundary for this mode.
+        drift_mode = "decision_target_migration"
+        drifts = list(target_migration.get("matches") or [])
+    elif raw_provenance.get("status") == "eligible":
+        raw_mode = "raw_provenance"
+        raw_evidence = raw_provenance
+    elif raw_rewrite.get("status") == "eligible":
+        raw_mode = "raw_rewrite"
+        raw_evidence = raw_rewrite
+    if raw_mode:
+        # ``registry_trusted_by_source`` contains only non-pending hard source
+        # aliases.  A source form present only in ``quarantined_names`` is an
+        # explicit non-authority and must not veto a Decision-backed raw
+        # witness.  This is the Yueh/威灵顿·岳 pollution case.
+        trusted_owners = set(
+            (context.get("registry_trusted_by_source") or {}).get(
+                _phrase_key(source_key)) or set())
+        if len(trusted_owners) > 1:
+            reasons.append("registry_active_owner_count:%d" % len(trusted_owners))
+            return record
+        if len(trusted_owners) == 1:
+            owner = next(iter(trusted_owners))
+            if not _name_compatible(canonical, owner):
+                reasons.append("registry_target_mismatch")
+                return record
+        drift_mode = raw_mode
+        drifts = list(raw_evidence.get("matches") or [])
+    elif target_migration.get("status") != "eligible":
+        active_owners = _active_name_owners(context, source_key)
+        if len(active_owners) > 1:
+            reasons.append("registry_active_owner_count:%d" % len(active_owners))
+            return record
+        if len(active_owners) == 1:
+            owner_key = _name_key(active_owners[0].get("canonical") or "")
+        else:
+            owner_key = ""
+        if owner_key and not _name_compatible(canonical, owner_key):
+            reasons.append("registry_target_mismatch")
+            return record
+        # Preserve the existing one-character / registered-alias behaviour
+        # first.  The source-counted mode is a fallback for a term whose
+        # registry owner is still pending review (Mapes) or absent
+        # (truthsense), not a replacement for an exact narrow alias repair.
+        if len(active_owners) == 1:
+            registered = {
+                _name_key(value)
+                for value in ((context.get("registry_by_source") or {}).get(
+                    _phrase_key(source_key)) or set())
+                if _name_key(value)
+            }
+            allowed_alias_keys = _registered_alias_drift_keys(
+                source_key=source_key,
+                canonical=canonical,
+                context=context,
+                min_chars=min(3, max(1, int(min_chars))),
+            )
+            if registered and (registered - {target_key} - allowed_alias_keys):
+                reasons.append("registry_source_target_ambiguous")
+                return record
+            alias_drifts = _registered_alias_drift_matches(
+                before,
+                source_key=source_key,
+                canonical=canonical,
+                context=context,
+                min_chars=alias_min_chars,
+            )
+            fuzzy_drifts = (
+                _one_char_name_drift_matches(before, canonical, min_chars=min_chars)
+                if _canonical_name_chars(canonical, min_chars) else []
+            )
+            drift_mode = "registered_alias" if alias_drifts else "one_char_cjk"
+            drifts = alias_drifts or fuzzy_drifts
+        if not drifts:
+            source_scoped = _pending_source_scoped_term_matches(
+                item, canonical, source_key=source_key, context=context)
+            record["source_scoped_variant"] = source_scoped
+            if source_scoped.get("status") == "eligible":
+                drift_mode = "source_scoped_variant"
+                drifts = list(source_scoped.get("matches") or [])
+            elif len(active_owners) != 1:
+                reasons.append(
+                    "registry_active_owner_count:%d" % len(active_owners))
+                return record
+    if not drifts:
+        if entity_only_low:
+            reasons.append("critic_scores_below_floor")
+        migration_reason = str(target_migration.get("reason") or "")
+        if migration_reason:
+            reasons.append("target_migration:%s" % migration_reason)
+        reasons.append(
+            "canonical_not_pure_cjk_or_too_short"
+            if drift_mode not in {"raw_provenance", "raw_rewrite"}
+            and not _canonical_name_chars(canonical, min_chars)
+            else "no_one_char_name_drift")
+        return record
+    unique_forms = {str(match["normalized"]) for match in drifts}
+    if len(unique_forms) != 1:
+        reasons.append("multiple_drift_forms")
+        return record
+    if entity_only_low and drift_mode != "source_scoped_variant":
+        reasons.append("critic_scores_below_floor")
+    wrong_key = next(iter(unique_forms))
+    if wrong_key in _protected_active_name_keys(context, target_key):
+        reasons.append("drift_form_belongs_to_another_active_name")
+        return record
+
+    after = _replace_name_drift_spans(before, drifts, canonical)
+    if after == before:
+        reasons.append("no_name_change")
+        return record
+    if drift_mode == "decision_target_migration":
+        old_target = str(target_migration.get("old_target") or "")
+        if old_target and old_target in after:
+            reasons.append("residual_target_migration_form")
+            return record
+    elif drift_mode == "registered_alias":
+        if _registered_alias_drift_matches(
+                after,
+                source_key=source_key,
+                canonical=canonical,
+                context=context,
+                min_chars=alias_min_chars):
+            reasons.append("residual_registered_alias_drift")
+            return record
+    elif drift_mode == "one_char_cjk" and _one_char_name_drift_matches(
+            after, canonical, min_chars=min_chars):
+        reasons.append("residual_one_char_name_drift")
+        return record
+    elif drift_mode == "source_scoped_variant":
+        wrong_forms = {
+            str(match.get("form") or "")
+            for match in drifts
+            if str(match.get("form") or "")
+        }
+        if any(form in after for form in wrong_forms):
+            reasons.append("residual_source_scoped_variant")
+            return record
+    if not canonical or canonical not in after:
+        reasons.append("canonical_not_present_after_repair")
+        return record
+
+    proposed_entries = _pending_rows_for_chunk(context, cid, after)
+    record["pending_after"] = proposed_entries
+    if len(proposed_entries) != 1 or proposed_entries[0].get("status") != "satisfied":
+        reasons.append("pending_not_satisfied_by_proposed_final")
+        return record
+
+    decision = (context.get("decisions") or {}).get(
+        int(record["decision_id"]) if record["decision_id"] is not None else -1)
+    if not decision:
+        reasons.append("decision_missing")
+        return record
+    corpus = authority_corpus
+    gram_cache = authority_gram_cache
+    if corpus is None or gram_cache is None:
+        corpus, gram_cache = build_lock_authority_corpus(context)
+    authority = evaluate_decision_lock_authority(
+        decision_id=int(decision["id"]),
+        source_key=str(decision.get("source_key") or ""),
+        target=str(decision.get("translation") or ""),
+        context=context,
+        corpus=corpus,
+        gram_cache=gram_cache,
+        proposed_chunk_id=cid,
+        proposed_text=after,
+    )
+    record["lock_authority"] = authority
+    if not authority.get("lock_allowed"):
+        reasons.append(
+            "decision_authority_not_confirmed:%s"
+            % str(authority.get("status") or "unknown"))
+        return record
+    record["applied_decisions"] = [{
+        "id": int(decision["id"]),
+        "source_key": str(decision.get("source_key") or ""),
+        "translation": str(decision.get("translation") or ""),
+        "locked": int(decision.get("locked") or 0),
+        "authority": authority,
+    }]
+    record.update({
+        "final_sha256_after": sha256_text(after),
+        "wrong_forms": sorted({str(match["form"]) for match in drifts}),
+        "repair_mode": drift_mode,
+        "drift_matches": drifts,
+        "changed_spans": _changed_spans(before, after),
+        "status": "candidate" if not reasons else "kept",
+    })
+    return record
+
+
+def _completed_repair_plan(
+    root: Path,
+    *,
+    chapter_id: Optional[str] = None,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    min_chars: int = 4,
+) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    root = Path(root)
+    decision_path = Path(decision_db) if decision_db else root / "db" / "decision_db.sqlite"
+    workflow_path = Path(workflow_db) if workflow_db else root / "db" / "workflow.db"
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    result: Dict[str, Any] = {
+        "schema_version": 1,
+        "mode": "read_only",
+        "write_attempted": False,
+        "generated_at": _now_iso(),
+        "chapter": chapter_id,
+        "counts": {},
+        "reject_memo_skipped": 0,
+        "candidates": [],
+        "kept": [],
+        "failed": [],
+        "ok": False,
+    }
+    if not decision_path.exists() or not workflow_path.exists():
+        result["failed"].append({"reason": "database_missing"})
+        result["counts"] = {"failed": 1}
+        return result, {}, {}
+    context = load_pending_context(
+        root, decision_db=decision_path, workflow_db=workflow_path,
+        output_dir=out_dir,
+    )
+    if not context.get("available"):
+        result["failed"].append({
+            "reason": "pending_context_unavailable",
+            "detail": context.get("reason") or "",
+        })
+        result["counts"] = {"failed": 1}
+        return result, {}, context
+    classification = classify_pending_snapshot(context)
+    pending_by_chunk = {
+        str(entry.get("chunk_id") or ""): entry
+        for entry in (classification.get("entries") or [])
+    }
+    memo_path = _completed_reject_memo_path(root, out_dir)
+    reject_memo = _load_completed_reject_memo(memo_path)
+    result["reject_memo_path"] = str(memo_path)
+    items = _load_completed_items(workflow_path, out_dir, chapter_id)
+    items_by_cid = {str(item["task"]["chunk_id"]): item for item in items}
+    authority_corpus, authority_gram_cache = build_lock_authority_corpus(context)
+    for item in items:
+        cid = str(item["task"]["chunk_id"])
+        try:
+            record = _classify_completed_name_candidate(
+                item, context=context,
+                pending_entry=pending_by_chunk.get(cid),
+                min_chars=min_chars,
+                authority_corpus=authority_corpus,
+                authority_gram_cache=authority_gram_cache,
+            )
+        except Exception as exc:  # noqa: BLE001 - planner must report truthfully
+            result["failed"].append({
+                "chunk_id": cid,
+                "chapter": str(item["task"].get("chapter_id") or ""),
+                "reason": "%s: %s" % (type(exc).__name__, exc),
+            })
+            continue
+        if record.get("status") == "candidate":
+            memo_entry = _completed_reject_memo_entry(reject_memo, record)
+            if memo_entry:
+                record["status"] = "kept"
+                record["reasons"] = ["reaudit_reject_memo"]
+                record["reject_memo"] = {
+                    "key": memo_entry.get("key"),
+                    "reject_reasons": memo_entry.get("reasons") or [],
+                    "rejected_at": memo_entry.get("rejected_at"),
+                    "run_id": memo_entry.get("run_id"),
+                }
+                result["reject_memo_skipped"] += 1
+                result["kept"].append(record)
+            else:
+                result["candidates"].append(record)
+        else:
+            # Only surface kept rows that were plausibly in scope; otherwise
+            # every ordinary COMPLETED chunk would drown the report.
+            if record.get("pending_before"):
+                result["kept"].append(record)
+    reason_counts: Dict[str, int] = {}
+    for record in result["kept"]:
+        for reason in record.get("reasons") or []:
+            key = str(reason).split(":", 1)[0]
+            reason_counts[key] = reason_counts.get(key, 0) + 1
+    result["reason_counts"] = dict(sorted(reason_counts.items()))
+    result["counts"] = {
+        "completed_scanned": len(items),
+        "candidates": len(result["candidates"]),
+        "kept": len(result["kept"]),
+        "failed": len(result["failed"]),
+        "memo_skipped": result["reject_memo_skipped"],
+    }
+    result["ok"] = not result["failed"]
+    result["pending_counts"] = dict(classification.get("counts") or {})
+    return result, items_by_cid, context
+
+
+def _completed_repair_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# COMPLETED 专名漂移修复计划（只读）", ""]
+    lines.append("- 生成时间: %s" % result.get("generated_at"))
+    lines.append("- 章节: %s" % (result.get("chapter") or "全书"))
+    lines.append("- 结论: **%s**" % (
+        "存在可修复候选" if result.get("candidates") else "无候选"))
+    counts = result.get("counts") or {}
+    if counts:
+        lines.append("- 扫描: " + ", ".join(
+            "`%s`=%s" % (key, value) for key, value in counts.items()))
+    if result.get("reason_counts"):
+        lines.append("- 保留原因: " + ", ".join(
+            "`%s`=%s" % (key, value)
+            for key, value in result["reason_counts"].items()))
+    if result.get("reject_memo_skipped"):
+        lines.append("- 拒绝备忘录跳过: `%s`；文件: `%s`" % (
+            result.get("reject_memo_skipped"), result.get("reject_memo_path")))
+    candidates = result.get("candidates") or []
+    if candidates:
+        lines.extend(["", "## 候选（前 40 / 共 %d）" % len(candidates)])
+        for record in candidates[:40]:
+            lines.append(
+                "- `%s` %s → %s；错形 %s；出现 %d 处；pending=%s"
+                % (record.get("chunk_id"), record.get("source_key"),
+                   record.get("canonical_name"),
+                   " / ".join(record.get("wrong_forms") or []),
+                   len(record.get("changed_spans") or []),
+                   record.get("decision_id")))
+        if len(candidates) > 40:
+            lines.append("- 其余 %d 条见 JSON。" % (len(candidates) - 40))
+    kept = result.get("kept") or []
+    if kept:
+        lines.extend(["", "## 明确保留（前 30 / 共 %d）" % len(kept)])
+        for record in kept[:30]:
+            lines.append(
+                "- `%s` %s / %s" % (
+                    record.get("chunk_id"),
+                    record.get("source_key") or "-",
+                    ",".join(record.get("reasons") or [])))
+        if len(kept) > 30:
+            lines.append("- 其余 %d 条见 JSON。" % (len(kept) - 30))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def audit_completed_name_repair(
+    project_root: Path,
+    *,
+    chapter_id: Optional[str] = None,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    min_chars: int = 4,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+) -> Dict[str, Any]:
+    root = Path(project_root)
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "completed_name_repair.json"
+    mpath = Path(md_out) if md_out else out_dir / "completed_name_repair.md"
+    result, _items, _context = _completed_repair_plan(
+        root, chapter_id=chapter_id, decision_db=decision_db,
+        workflow_db=workflow_db, output_dir=out_dir, min_chars=min_chars,
+    )
+    result["json_path"] = str(jpath)
+    result["md_path"] = str(mpath)
+    _atomic_json(jpath, result)
+    _atomic_text(mpath, _completed_repair_markdown(result))
+    return result
+
+
+def _blocked_reasons(
+    *,
+    root: Path,
+    task: Dict[str, Any],
+    final_path: Path,
+    final: Optional[dict],
+    critic_report: Optional[dict],
+    maps: Dict[str, Any],
+    stats: Dict[str, Any],
+    source_text: str,
+    context: Dict[str, Any],
+    decision_index: Dict[str, List[dict]],
+    predicted_text: str,
+    allow_state_only: bool = False,
+    authority_corpus: Optional[Dict[str, Dict[str, str]]] = None,
+    authority_gram_cache: Optional[Dict[str, set]] = None,
+) -> Tuple[List[str], Dict[str, Any]]:
+    reasons: List[str] = []
+    diagnostics: Dict[str, Any] = {}
+    if str(task.get("state") or "") != "DIRTY":
+        reasons.append(f"state_not_dirty:{task.get('state')}")
+    if task.get("rescue_stage"):
+        reasons.append("rescue_stage_present")
+    if not context.get("available"):
+        reasons.append("pending_context_unavailable")
+    elif context.get("decisions_complete") is False:
+        reasons.append("decision_db_schema_incomplete")
+    if final is None or not str(final.get("text") or "").strip():
+        reasons.append("final_missing_or_unreadable")
+        return reasons, diagnostics
+    meta = final.get("metadata") if isinstance(final.get("metadata"), dict) else {}
+    if meta.get("fallback") or meta.get("fallback_used"):
+        reasons.append("final_fallback")
+    if meta.get("quality_waived"):
+        reasons.append("final_quality_waived")
+
+    report = critic_report or {}
+    evidence = critic_evidence_state(report, final_path, project_root=root)
+    diagnostics["critic_evidence"] = evidence
+    if evidence.get("status") not in {"exact", "repaired"}:
+        reasons.append(f"critic_evidence_{evidence.get('status') or 'missing'}")
+    backend = str(report.get("_backend_path") or "missing")
+    diagnostics["critic_backend"] = backend
+    if backend not in _calibrated_backends():
+        reasons.append(f"critic_backend_uncalibrated:{backend}")
+    low = _scores_below_floor(report)
+    if low:
+        diagnostics["low_scores"] = low
+        reasons.append("critic_scores_below_floor")
+
+    n_sep = int(stats.get("sep_restore") or 0)
+    n_forms = int(stats.get("forms") or 0)
+    n_tokens = int(stats.get("tokens") or 0)
+    diagnostics["mapping_counts"] = {
+        "sep_restore": n_sep, "forms": n_forms, "tokens": n_tokens}
+    text_changed = predicted_text != str(final.get("text") or "")
+    diagnostics["change_mode"] = "name_only" if text_changed else "state_only"
+    if (n_sep + n_forms + n_tokens <= 0 or not text_changed) \
+            and not allow_state_only:
+        reasons.append("no_name_change")
+    if n_tokens:
+        # The first production slice is deliberately narrower than the long-term
+        # contract: token drift needs its own false-positive measurement.
+        reasons.append("token_level_change_requires_separate_validation")
+
+    mapping_targets = _mapping_targets(maps, stats)
+    for target in mapping_targets:
+        if canonical_is_title_only(target):
+            reasons.append(f"role_only_target:{target}")
+            break
+
+    residual_forms = _residual_authority_forms(
+        predicted_text, maps.get("authorities") or [])
+    if residual_forms:
+        diagnostics["residual_authority_forms"] = residual_forms
+        reasons.append("residual_authority_form")
+
+    conflicts = _active_authority_conflicts(
+        source_text, context, decision_index, targets=mapping_targets)
+    if conflicts:
+        diagnostics["authority_conflicts"] = conflicts
+        reasons.append("authority_conflict")
+
+    lockable = _lockable_decisions(
+        source_text, maps, stats, context, decision_index,
+        chunk_id=str(task.get("chunk_id") or ""),
+        proposed_text=predicted_text,
+        authority_corpus=authority_corpus,
+        authority_gram_cache=authority_gram_cache,
+    )
+    diagnostics["decision_authority"] = lockable
+    allowed_lockable = [row for row in lockable if row.get("lock_allowed")]
+    diagnostics["lockable_decisions"] = allowed_lockable
+    blocked_authority = [row for row in lockable if not row.get("lock_allowed")]
+    if blocked_authority:
+        diagnostics["blocked_decision_authority"] = blocked_authority
+        reasons.append("decision_authority_not_confirmed")
+    if not lockable and (text_changed or not allow_state_only):
+        reasons.append("no_lockable_decision")
+    elif not allowed_lockable and (text_changed or not allow_state_only):
+        reasons.append("no_authorized_lockable_decision")
+
+    pending_before = classify_pending_snapshot(
+        context, final_overrides={str(task["chunk_id"]): predicted_text})
+    chunk_entries = [e for e in pending_before.get("entries") or []
+                     if e.get("chunk_id") == task.get("chunk_id")]
+    diagnostics["pending"] = chunk_entries
+    # A fast path bypasses the normal DIRTY rerun, so "covered by the upcoming
+    # run" is no longer a sufficient explanation.  The proposed final itself
+    # must satisfy the outbox row.
+    pending_blocking = [e for e in chunk_entries if e.get("status") not in {
+        "satisfied"}]
+    if pending_blocking:
+        reasons.append("pending_not_satisfied_by_proposed_final")
+        diagnostics["pending_blocking"] = pending_blocking
+    return list(dict.fromkeys(reasons)), diagnostics
+
+
+def audit_name_only_fastpath(
+    project_root: Path,
+    *,
+    chapter_id: Optional[str] = None,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+    allow_state_only: bool = False,
+) -> Dict[str, Any]:
+    """Classify DIRTY chunks without mutating any production artifact."""
+    root = Path(project_root)
+    decision_path = Path(decision_db) if decision_db else root / "db" / "decision_db.sqlite"
+    workflow_path = Path(workflow_db) if workflow_db else root / "db" / "workflow.db"
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "name_only_fastpath.json"
+    mpath = Path(md_out) if md_out else out_dir / "name_only_fastpath.md"
+    result: Dict[str, Any] = {
+        "schema_version": 1,
+        "mode": "read_only",
+        "generated_at": _now_iso(),
+        "chapter": chapter_id,
+        "candidates": [],
+        "kept_dirty": [],
+        "failed": [],
+        "counts": {},
+        "write_attempted": False,
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+    }
+    if not decision_path.exists() or not workflow_path.exists():
+        result["counts"] = {"failed": 1}
+        result["failed"].append({"reason": "database_missing"})
+        result["ok"] = False
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, "# name-only fast path dry-run\n\n数据库缺失；未执行。\n")
+        return result
+
+    wcon = sqlite3.connect(f"file:{workflow_path.resolve()}?mode=ro", uri=True)
+    wcon.row_factory = sqlite3.Row
+    try:
+        sql = ("SELECT chunk_id, chapter_id, text_content, state, rescue_stage "
+               "FROM chunk_tasks WHERE state='DIRTY'")
+        params: tuple = ()
+        if chapter_id:
+            sql += " AND chapter_id=?"
+            params = (chapter_id,)
+        tasks = [dict(r) for r in wcon.execute(sql + " ORDER BY chunk_id", params)]
+    finally:
+        wcon.close()
+
+    loaded: List[Dict[str, Any]] = []
+    for task in tasks:
+        cid = str(task["chunk_id"])
+        ch = str(task["chapter_id"])
+        final_path = out_dir / ch / f"{cid}_final.json"
+        final = _read_json(final_path)
+        loaded.append({
+            "task": task,
+            "final_path": final_path,
+            "final": final,
+            "text": str((final or {}).get("text") or ""),
+            "critic": _read_json(out_dir / ch / f"{cid}_critic_report.json"),
+        })
+
+    try:
+        maps = _build_maps(root, decision_path, loaded)
+    except Exception as exc:  # noqa: BLE001 - report a truthful dry-run failure
+        result["ok"] = False
+        result["failed"].append({"reason": "map_build_failed", "error": str(exc)})
+        result["counts"] = {"failed": 1}
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, f"# name-only fast path dry-run\n\n映射构建失败：{exc}\n")
+        return result
+
+    context = load_pending_context(
+        root, decision_db=decision_path, workflow_db=workflow_path,
+        output_dir=out_dir,
+    )
+    decision_index = _decision_index(context)
+    authority_corpus, authority_gram_cache = build_lock_authority_corpus(context)
+    for item in loaded:
+        task = item["task"]
+        cid = str(task["chunk_id"])
+        before = item["text"]
+        try:
+            after, stats = apply_name_unification(before, maps)
+            reasons, diagnostics = _blocked_reasons(
+                root=root, task=task, final_path=item["final_path"],
+                final=item["final"], critic_report=item["critic"],
+                maps=maps, stats=stats, source_text=str(task.get("text_content") or ""),
+                context=context, decision_index=decision_index,
+                predicted_text=after,
+                allow_state_only=allow_state_only,
+                authority_corpus=authority_corpus,
+                authority_gram_cache=authority_gram_cache,
+            )
+            record = {
+                "chunk_id": cid,
+                "chapter": str(task["chapter_id"]),
+                "state_before": str(task.get("state") or ""),
+                "final_sha256_before": sha256_text(before),
+                "final_sha256_after": sha256_text(after),
+                "mapping_counts": diagnostics.get("mapping_counts") or {},
+                "change_mode": diagnostics.get("change_mode") or "name_only",
+                "changed_spans": _changed_spans(before, after),
+                "critic_before": {
+                    "backend_path": diagnostics.get("critic_backend"),
+                    "evidence": diagnostics.get("critic_evidence"),
+                    "scores": (item["critic"] or {}).get("scores") or {},
+                },
+                "pending_before": diagnostics.get("pending") or [],
+                "authority_conflicts": diagnostics.get("authority_conflicts") or [],
+                "residual_authority_forms": (
+                    diagnostics.get("residual_authority_forms") or []),
+                "decision_authority": diagnostics.get("decision_authority") or [],
+                "applied_decisions": diagnostics.get("lockable_decisions") or [],
+                "reaudit_required": True,
+                "status": "candidate" if not reasons else "kept_dirty",
+                "reasons": reasons,
+            }
+            if reasons:
+                result["kept_dirty"].append(record)
+            else:
+                result["candidates"].append(record)
+        except Exception as exc:  # noqa: BLE001
+            result["failed"].append({
+                "chunk_id": cid,
+                "chapter": str(task["chapter_id"]),
+                "reason": f"{type(exc).__name__}: {exc}",
+            })
+
+    result["counts"] = {
+        "dirty_scanned": len(loaded),
+        "candidates": len(result["candidates"]),
+        "kept_dirty": len(result["kept_dirty"]),
+        "failed": len(result["failed"]),
+    }
+    reason_counts: Dict[str, int] = {}
+    for record in result["kept_dirty"]:
+        for reason in record.get("reasons") or []:
+            key = str(reason).split(":", 1)[0]
+            reason_counts[key] = reason_counts.get(key, 0) + 1
+    result["reason_counts"] = dict(sorted(reason_counts.items()))
+    result["ok"] = not result["failed"]
+    _atomic_json(jpath, result)
+    _atomic_text(mpath, _name_only_markdown(result))
+    return result
+
+
+def _restore_file_from_backup(path: Path, backup: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".rollback.tmp")
+    tmp.write_bytes(Path(backup).read_bytes())
+    with open(tmp, "rb") as fh:
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _copy_file_atomic(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp = destination.with_name(destination.name + ".tmp")
+    tmp.write_bytes(Path(source).read_bytes())
+    with open(tmp, "rb") as fh:
+        os.fsync(fh.fileno())
+    os.replace(tmp, destination)
+
+
+def apply_name_only_fastpath(
+    project_root: Path,
+    *,
+    chapter_id: Optional[str] = None,
+    apply: bool = False,
+    limit: Optional[int] = None,
+    run_id: Optional[str] = None,
+    critic_fn: Optional[Any] = None,
+    pipeline_factory: Optional[Any] = None,
+    scheduler: Any = None,
+    require_authority_audit: Optional[bool] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+    allow_state_only: bool = False,
+) -> Dict[str, Any]:
+    """Apply strict name-only repairs, or return the read-only plan.
+
+    Every candidate is revalidated from scratch under the caller's flock.  The
+    final and critic report are only replaced after a real calibrated re-audit
+    succeeds.  If the workflow transition fails, both files are restored from
+    the isolated run backup and the task remains DIRTY.
+    """
+    root = Path(project_root)
+    decision_path = root / "db" / "decision_db.sqlite"
+    workflow_path = root / "db" / "workflow.db"
+    out_dir = root / "output"
+    cfg = (_config.get("pipeline.name_only_fastpath", {}) or {})
+    jpath = Path(json_out) if json_out else out_dir / "name_only_fastpath_apply.json"
+    mpath = Path(md_out) if md_out else out_dir / "name_only_fastpath_apply.md"
+    if not apply:
+        return audit_name_only_fastpath(
+            root, chapter_id=chapter_id, decision_db=decision_path,
+            workflow_db=workflow_path, output_dir=out_dir,
+            allow_state_only=allow_state_only)
+
+    result: Dict[str, Any] = {
+        "schema_version": 1,
+        "mode": "apply",
+        "write_attempted": False,
+        "generated_at": _now_iso(),
+        "chapter": chapter_id,
+        "run_id": str(run_id or (
+            _dt.datetime.now().strftime("name-only-%Y%m%dT%H%M%S") +
+            f"-{os.getpid()}")).replace("/", "_"),
+        "actions": [],
+        "counts": {},
+        "errors": [],
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+    }
+    if not bool(cfg.get("enabled", True)):
+        result.update(ok=True, disabled=True, reason="name_only_fastpath_disabled")
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, "# name-only fast path apply\n\n配置已关闭；未执行。\n")
+        return result
+
+    require_auth = (bool(cfg.get("require_authority_audit", True))
+                    if require_authority_audit is None
+                    else bool(require_authority_audit))
+    if require_auth:
+        from src.name_authority_audit import audit_name_authorities
+        authority = audit_name_authorities(root)
+        result["authority"] = {
+            "ok": bool(authority.get("ok")),
+            "status": authority.get("status"),
+            "counts": authority.get("counts") or {},
+            "blocking_count": int(authority.get("blocking_count") or 0),
+            "report": authority.get("md_path"),
+        }
+        if not authority.get("ok"):
+            result.update(
+                ok=False,
+                authority_blocked=True,
+                reason="name_authority_audit_not_clean",
+            )
+            _atomic_json(jpath, result)
+            _atomic_text(mpath, _apply_markdown(result))
+            return result
+
+    plan = audit_name_only_fastpath(
+        root, chapter_id=chapter_id, decision_db=decision_path,
+        workflow_db=workflow_path, output_dir=out_dir,
+        allow_state_only=allow_state_only)
+    candidates = list(plan.get("candidates") or [])
+    try:
+        cap = max(0, int(limit if limit is not None
+                         else cfg.get("max_chunks_per_run", 50)))
+    except (TypeError, ValueError):
+        cap = 50
+    candidates = candidates[:cap]
+    result["planned_candidates"] = len(plan.get("candidates") or [])
+    result["planned_kept_dirty"] = len(plan.get("kept_dirty") or [])
+    result["planned_failed"] = len(plan.get("failed") or [])
+    result["write_attempted"] = bool(candidates)
+    if not candidates:
+        result.update(ok=not bool(plan.get("failed")), no_candidates=True)
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _apply_markdown(result))
+        return result
+
+    if not decision_path.exists() or not workflow_path.exists():
+        result.update(ok=False, errors=["database_missing"])
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _apply_markdown(result))
+        return result
+
+    loaded = _load_dirty_items(workflow_path, out_dir, chapter_id)
+    loaded_by_cid = {str(item["task"]["chunk_id"]): item for item in loaded}
+    try:
+        maps = _build_maps(root, decision_path, loaded)
+    except Exception as exc:  # noqa: BLE001
+        result.update(ok=False, errors=[f"map_build_failed:{exc}"])
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _apply_markdown(result))
+        return result
+    context = load_pending_context(
+        root, decision_db=decision_path, workflow_db=workflow_path,
+        output_dir=out_dir)
+    decision_index = _decision_index(context)
+    authority_corpus, authority_gram_cache = build_lock_authority_corpus(context)
+    if scheduler is None:
+        from src.core.scheduler import TaskScheduler
+        scheduler = TaskScheduler(db_path=str(workflow_path))
+    if pipeline_factory is None:
+        from src.pipeline import TranslationPipeline
+        pipeline_factory = lambda ch: TranslationPipeline(chapter_id=ch)
+    pipelines: Dict[str, Any] = {}
+    backup_root = out_dir / "name_only_fastpath" / str(result["run_id"])
+
+    for candidate in candidates:
+        cid = str(candidate.get("chunk_id") or "")
+        item = loaded_by_cid.get(cid)
+        action: Dict[str, Any] = {
+            "chunk_id": cid,
+            "chapter": candidate.get("chapter"),
+            "status": "failed",
+            "reason": "",
+            "final_sha256_before": candidate.get("final_sha256_before"),
+            "final_sha256_after": candidate.get("final_sha256_after"),
+            "applied_decisions": candidate.get("applied_decisions") or [],
+            "change_mode": candidate.get("change_mode") or "name_only",
+        }
+        result["actions"].append(action)
+        if item is None:
+            action.update(status="kept_dirty", reason="chunk_no_longer_dirty")
+            continue
+        task = item["task"]
+        before = str(item.get("text") or "")
+        final_payload = item.get("final")
+        critic_payload = item.get("critic")
+        final_path = Path(item["final_path"])
+        report_path = final_path.with_name(f"{cid}_critic_report.json")
+        if not final_payload or not critic_payload:
+            action.update(status="kept_dirty", reason="final_or_critic_missing")
+            continue
+        if sha256_text(before) != str(candidate.get("final_sha256_before") or ""):
+            action.update(status="kept_dirty", reason="final_changed_since_plan")
+            continue
+        try:
+            after, stats = apply_name_unification(before, maps)
+        except Exception as exc:  # noqa: BLE001
+            action.update(status="failed", reason=f"apply_error:{exc}")
+            continue
+        if sha256_text(after) != str(candidate.get("final_sha256_after") or ""):
+            action.update(status="kept_dirty", reason="predicted_final_hash_changed")
+            continue
+        reasons, diagnostics = _blocked_reasons(
+            root=root, task=task, final_path=final_path,
+            final=final_payload, critic_report=critic_payload,
+            maps=maps, stats=stats,
+            source_text=str(task.get("text_content") or ""),
+            context=context, decision_index=decision_index,
+            predicted_text=after,
+            allow_state_only=allow_state_only,
+            authority_corpus=authority_corpus,
+            authority_gram_cache=authority_gram_cache,
+        )
+        if reasons:
+            action.update(status="kept_dirty", reason=",".join(reasons))
+            action["diagnostics"] = diagnostics
+            continue
+        applied_decisions = diagnostics.get("lockable_decisions") or []
+        change_mode = str(diagnostics.get("change_mode") or "name_only")
+        action["change_mode"] = change_mode
+        if not applied_decisions and change_mode != "state_only":
+            action.update(status="kept_dirty", reason="no_lockable_decision")
+            continue
+        action["applied_decisions"] = applied_decisions
+
+        chapter = str(task.get("chapter_id") or candidate.get("chapter") or "")
+        pipeline = None
+        if critic_fn is None:
+            pipeline = pipelines.get(chapter)
+            if pipeline is None:
+                pipeline = pipeline_factory(chapter)
+                pipelines[chapter] = pipeline
+        raw_payload = _read_json(final_path.with_name(f"{cid}_raw.json")) or {}
+        raw_text = str(raw_payload.get("text") or before)
+        try:
+            if critic_fn is None:
+                report = _default_critic_fn(
+                    candidate, str(task.get("text_content") or ""),
+                    raw_text, after, pipeline)
+            else:
+                report = critic_fn(
+                    candidate, str(task.get("text_content") or ""),
+                    raw_text, after, pipeline)
+        except Exception as exc:  # noqa: BLE001 - no final has been written yet
+            action.update(status="kept_dirty", reason=f"critic_reaudit_failed:{exc}")
+            continue
+        critic_reasons = _validate_reauthored_report(report, proposed_text=after)
+        if critic_reasons:
+            action.update(status="kept_dirty", reason=",".join(critic_reasons))
+            action["critic_after"] = {
+                "backend_path": (report or {}).get("_backend_path"),
+                "scores": (report or {}).get("scores") or {},
+            }
+            continue
+
+        after_sha = sha256_text(after)
+        report = dict(report or {})
+        report["_reaudit"] = {
+            "tool": "name-only-fastpath",
+            "schema_version": 1,
+            "at": _now_iso(),
+            "previous_backend_path": diagnostics.get("critic_backend"),
+            "final_sha256": after_sha,
+            "raw_input": "raw" if raw_payload else "final_before",
+            "literary_input": "proposed_final",
+        }
+        report["_final_binding"] = {
+            "schema_version": 1,
+            "final_sha256": after_sha,
+            "before_sha256": sha256_text(before),
+            "reason": "name-only-fastpath real critic re-audit",
+        }
+        report["_audit_target"] = {
+            "schema_version": 1,
+            "source_sha256": sha256_text(str(task.get("text_content") or "")),
+            "raw_sha256": sha256_text(raw_text),
+            "literary_sha256": after_sha,
+        }
+
+        chunk_backup_dir = backup_root / chapter
+        chunk_backup_dir.mkdir(parents=True, exist_ok=True)
+        final_backup_path = chunk_backup_dir / f"{cid}_final_before.json"
+        report_backup_path = chunk_backup_dir / f"{cid}_critic_report_before.json"
+        _copy_file_atomic(final_path, final_backup_path)
+        _copy_file_atomic(report_path, report_backup_path)
+        new_final = dict(final_payload)
+        if change_mode == "name_only":
+            meta = dict(new_final.get("metadata") or {})
+            meta.update({
+                "name_unification_run_id": result["run_id"],
+                "name_unification_at": _now_iso(),
+                "name_unification_counts": diagnostics.get("mapping_counts") or {},
+            })
+            new_final["text"] = after
+            new_final["metadata"] = meta
+
+        final_written = False
+        report_written = False
+        state_completed = False
+        try:
+            if change_mode == "name_only":
+                _atomic_json_fsync(final_path, new_final)
+                final_written = True
+            _atomic_json_fsync(report_path, report)
+            report_written = True
+            pending_entries = _pending_rows_for_chunk(context, cid, after)
+            pending_blocking = [e for e in pending_entries
+                                if e.get("status") != "satisfied"]
+            if pending_blocking:
+                raise RuntimeError(
+                    "pending_not_satisfied:" + ",".join(
+                        str(e.get("status")) for e in pending_blocking))
+            evidence_path = chunk_backup_dir / f"{cid}_name_only_evidence.json"
+            evidence = {
+                "schema_version": 1,
+                "chunk_id": cid,
+                "status": "verified_for_completion",
+                "run_id": result["run_id"],
+                "final_sha256_before": sha256_text(before),
+                "final_sha256_after": after_sha,
+                "critic_final_sha256": after_sha,
+                "critic_report_sha256": _sha256_file(report_path),
+                "pending_checked": True,
+                "pending_before": pending_entries,
+                "applied_decisions": applied_decisions,
+                "decision_authority": diagnostics.get("decision_authority") or [],
+                "change_mode": change_mode,
+                "changed_spans": candidate.get("changed_spans") or [],
+                "mapping_counts": diagnostics.get("mapping_counts") or {},
+            }
+            _atomic_json_fsync(evidence_path, evidence)
+
+            dcon = _open_decision_write_db(decision_path)
+            try:
+                dcon.execute("BEGIN IMMEDIATE")
+                outbox = None
+                for row in (context.get("pending") or []):
+                    if str(row.get("chunk_id") or "") == cid:
+                        outbox = row
+                        break
+                if outbox is not None and not _delete_pending_row_if_unchanged(
+                        dcon, outbox):
+                    raise RuntimeError("pending_cas_failed")
+                decision_ids = sorted({int(d["id"]) for d in applied_decisions})
+                if decision_ids:
+                    placeholders = ",".join("?" for _ in decision_ids)
+                    dcon.execute(
+                        f"UPDATE decision_db SET locked = 1 "
+                        f"WHERE id IN ({placeholders})", tuple(decision_ids))
+                completed = scheduler.complete_name_only(
+                    cid,
+                    final_path=final_path,
+                    critic_report_path=report_path,
+                    evidence_path=evidence_path,
+                    final_sha256=after_sha,
+                )
+                if not completed.get("ok"):
+                    dcon.rollback()
+                    raise RuntimeError(
+                        "state_completion_failed:" + str(completed.get("reason")))
+                state_completed = True
+                try:
+                    dcon.commit()
+                except sqlite3.Error as exc:
+                    try:
+                        dcon.rollback()
+                    except sqlite3.Error:
+                        pass
+                    reopened = scheduler.reopen_name_only(cid)
+                    if reopened.get("ok"):
+                        rollback_errors = []
+                        try:
+                            _restore_file_from_backup(final_path, final_backup_path)
+                        except Exception as rollback_exc:  # noqa: BLE001
+                            rollback_errors.append(
+                                f"final_rollback_failed:{rollback_exc}")
+                        try:
+                            _restore_file_from_backup(report_path, report_backup_path)
+                        except Exception as rollback_exc:  # noqa: BLE001
+                            rollback_errors.append(
+                                f"critic_rollback_failed:{rollback_exc}")
+                        action.update(
+                            status=("rolled_back" if not rollback_errors
+                                    else "decision_commit_failed_rollback_partial"),
+                            reason=f"decision_commit_failed:{exc}",
+                        )
+                        result["errors"].append(
+                            f"{cid}:decision_commit_failed:{exc}")
+                        result["errors"].extend(
+                            f"{cid}:{item}" for item in rollback_errors)
+                    else:
+                        action.update(
+                            status="completed_decision_commit_failed",
+                            reason=(f"decision_commit_failed:{exc};"
+                                    f"reopen_failed:{reopened.get('reason')}"),
+                        )
+                        result["errors"].append(
+                            f"{cid}:decision_commit_failed:{exc};"
+                            f"reopen_failed:{reopened.get('reason')}")
+                    continue
+            except Exception:
+                try:
+                    dcon.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+            finally:
+                dcon.close()
+
+            action.update(
+                status="completed",
+                reason="name_only_completed",
+                critic_report_sha256=_sha256_file(report_path),
+                evidence_path=str(evidence_path),
+                pending_before=pending_entries,
+                critic_after={
+                    "backend_path": report.get("_backend_path"),
+                    "scores": report.get("scores") or {},
+                    "evidence": "exact",
+                },
+                decision_locked=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            if state_completed:
+                action.update(
+                    status="completed_postcommit_error",
+                    reason=f"{type(exc).__name__}: {exc}",
+                )
+                result["errors"].append(f"{cid}:postcommit:{exc}")
+                continue
+            if final_written:
+                try:
+                    _restore_file_from_backup(final_path, final_backup_path)
+                except Exception as rollback_exc:  # noqa: BLE001
+                    result["errors"].append(
+                        f"{cid}:final_rollback_failed:{rollback_exc}")
+            if report_written:
+                try:
+                    _restore_file_from_backup(report_path, report_backup_path)
+                except Exception as rollback_exc:  # noqa: BLE001
+                    result["errors"].append(
+                        f"{cid}:critic_rollback_failed:{rollback_exc}")
+            action.update(status="rolled_back", reason=f"{type(exc).__name__}: {exc}")
+
+    counts: Dict[str, int] = {}
+    for action in result["actions"]:
+        key = str(action.get("status") or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    result["counts"] = dict(sorted(counts.items()))
+    result["completed"] = counts.get("completed", 0)
+    result["kept_dirty"] = counts.get("kept_dirty", 0)
+    result["rolled_back"] = counts.get("rolled_back", 0)
+    result["failed"] = sum(
+        value for key, value in counts.items()
+        if key not in {"completed", "kept_dirty"})
+    result["ok"] = result["failed"] == 0 and not result["errors"]
+    result["write_attempted"] = bool(candidates)
+    _atomic_json(jpath, result)
+    _atomic_text(mpath, _apply_markdown(result))
+    return result
+
+
+def _completed_repair_apply_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# COMPLETED 专名漂移修复（受控写入）", ""]
+    lines.append("- 生成时间: %s" % result.get("generated_at"))
+    lines.append("- 模式: **%s**" % result.get("mode"))
+    lines.append("- ok: `%s`；写入尝试: `%s`" % (
+        result.get("ok"), result.get("write_attempted")))
+    counts = result.get("counts") or {}
+    if counts:
+        lines.append("- 动作: " + ", ".join(
+            "`%s`=%s" % (key, value) for key, value in counts.items()))
+    if result.get("after_counts"):
+        lines.append("- 修复后 pending: " + ", ".join(
+            "`%s`=%s" % (key, value)
+            for key, value in result["after_counts"].items()))
+    if result.get("reject_memo_skipped") or result.get("reject_memo_recorded"):
+        lines.append(
+            "- 拒绝备忘录: skipped=`%s`, recorded=`%s`；文件: `%s`" % (
+                result.get("reject_memo_skipped"),
+                result.get("reject_memo_recorded"),
+                result.get("reject_memo_path")))
+    actions = result.get("actions") or []
+    if actions:
+        lines.extend(["", "## 动作（前 60 / 共 %d）" % len(actions)])
+        for action in actions[:60]:
+            lines.append(
+                "- `%s` %s / %s%s" % (
+                    action.get("chunk_id"), action.get("status"),
+                    action.get("reason"),
+                    " / DIRTY" if action.get("state_after") == "DIRTY" else ""))
+        if len(actions) > 60:
+            lines.append("- 其余 %d 条见 JSON。" % (len(actions) - 60))
+    errors = result.get("errors") or []
+    if errors:
+        lines.extend(["", "## 错误", ""])
+        lines.extend("- %s" % error for error in errors[:40])
+    memo_errors = result.get("reject_memo_errors") or []
+    if memo_errors:
+        lines.extend(["", "## 备忘录告警", ""])
+        lines.extend("- %s" % error for error in memo_errors[:20])
+    lines.append("")
+    return "\n".join(lines)
+
+
+def apply_completed_name_repair(
+    project_root: Path,
+    *,
+    chapter_id: Optional[str] = None,
+    apply: bool = False,
+    limit: Optional[int] = None,
+    run_id: Optional[str] = None,
+    critic_fn: Optional[Any] = None,
+    pipeline_factory: Optional[Any] = None,
+    require_authority_audit: Optional[bool] = None,
+    min_chars: Optional[int] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Repair a COMPLETED final's one-character CJK name drift.
+
+    Unlike ``apply_name_only_fastpath``, this path never changes a workflow
+    state.  It is only allowed when the chunk is already COMPLETED, the
+    Decision DB outbox still says the canonical target is missing, and the
+    proposed change is a single active-name spelling correction.  The final,
+    the critic report and the outbox/decision lock are all updated together;
+    any failure restores final/report and leaves the pending row intact.
+    """
+    root = Path(project_root)
+    cfg = (_config.get("pipeline.completed_name_repair", {}) or {})
+    min_chars_value = max(1, int(
+        min_chars if min_chars is not None else cfg.get("min_cjk_chars", 4)))
+    if not apply:
+        return audit_completed_name_repair(
+            root, chapter_id=chapter_id, min_chars=min_chars_value,
+            json_out=json_out, md_out=md_out)
+
+    decision_path = root / "db" / "decision_db.sqlite"
+    workflow_path = root / "db" / "workflow.db"
+    out_dir = root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "completed_name_repair_apply.json"
+    mpath = Path(md_out) if md_out else out_dir / "completed_name_repair_apply.md"
+    result: Dict[str, Any] = {
+        "schema_version": 1,
+        "mode": "apply",
+        "write_attempted": False,
+        "generated_at": _now_iso(),
+        "chapter": chapter_id,
+        "run_id": str(run_id or (
+            _dt.datetime.now().strftime("completed-name-%Y%m%dT%H%M%S") +
+            "-" + str(os.getpid()))).replace("/", "_"),
+        "actions": [],
+        "counts": {},
+        "errors": [],
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+    }
+    if not bool(cfg.get("enabled", True)):
+        result.update(ok=True, disabled=True, reason="completed_name_repair_disabled")
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _completed_repair_apply_markdown(result))
+        return result
+
+    require_auth = (bool(cfg.get("require_authority_audit", True))
+                    if require_authority_audit is None
+                    else bool(require_authority_audit))
+    if require_auth:
+        from src.name_authority_audit import audit_name_authorities
+        authority = audit_name_authorities(root)
+        result["authority"] = {
+            "ok": bool(authority.get("ok")),
+            "status": authority.get("status"),
+            "counts": authority.get("counts") or {},
+            "blocking_count": int(authority.get("blocking_count") or 0),
+            "report": authority.get("md_path"),
+        }
+        if not authority.get("ok"):
+            result.update(
+                ok=False,
+                authority_blocked=True,
+                reason="name_authority_audit_not_clean",
+            )
+            _atomic_json(jpath, result)
+            _atomic_text(mpath, _completed_repair_apply_markdown(result))
+            return result
+
+    plan, items_by_cid, context = _completed_repair_plan(
+        root, chapter_id=chapter_id, decision_db=decision_path,
+        workflow_db=workflow_path, output_dir=out_dir,
+        min_chars=min_chars_value,
+    )
+    result["plan_counts"] = plan.get("counts") or {}
+    result["planned_candidates"] = len(plan.get("candidates") or [])
+    result["planned_kept"] = len(plan.get("kept") or [])
+    result["reject_memo_skipped"] = int(plan.get("reject_memo_skipped") or 0)
+    result["reject_memo_recorded"] = 0
+    result["reject_memo_errors"] = []
+    memo_path = _completed_reject_memo_path(root, out_dir)
+    result["reject_memo_path"] = str(memo_path)
+    reject_memo = _load_completed_reject_memo(memo_path)
+    if plan.get("failed"):
+        result["errors"].extend(
+            "plan:%s" % item.get("reason") for item in plan.get("failed") or [])
+    try:
+        cap = max(0, int(
+            limit if limit is not None else cfg.get("max_chunks_per_run", 50)))
+    except (TypeError, ValueError):
+        cap = 50
+    candidates = list(plan.get("candidates") or [])[:cap]
+    result["write_attempted"] = bool(candidates)
+    if not candidates:
+        result.update(ok=not bool(result["errors"]), no_candidates=True)
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _completed_repair_apply_markdown(result))
+        return result
+    if not decision_path.exists() or not workflow_path.exists():
+        result.update(ok=False, errors=["database_missing"])
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _completed_repair_apply_markdown(result))
+        return result
+
+    pending_by_chunk = {
+        str(entry.get("chunk_id") or ""): entry
+        for entry in (classify_pending_snapshot(context).get("entries") or [])
+    }
+    outbox_by_chunk = {
+        str(row.get("chunk_id") or ""): row
+        for row in (context.get("pending") or [])
+    }
+    authority_corpus, authority_gram_cache = build_lock_authority_corpus(context)
+    backup_root = out_dir / "completed_name_repair" / result["run_id"]
+    pipeline = None
+    pipelines: Dict[str, Any] = {}
+    for planned in candidates:
+        cid = str(planned.get("chunk_id") or "")
+        action: Dict[str, Any] = {
+            "chunk_id": cid,
+            "chapter": planned.get("chapter"),
+            "status": "failed",
+            "reason": "",
+            "final_sha256_before": planned.get("final_sha256_before"),
+            "final_sha256_after": planned.get("final_sha256_after"),
+            "decision_id": planned.get("decision_id"),
+            "source_key": planned.get("source_key"),
+            "canonical_name": planned.get("canonical_name"),
+        }
+        result["actions"].append(action)
+        item = items_by_cid.get(cid)
+        if item is None:
+            action.update(status="kept", reason="chunk_no_longer_loaded")
+            continue
+        final_path = Path(item["final_path"])
+        report_path = final_path.with_name("%s_critic_report.json" % cid)
+        current_final = _read_json(final_path)
+        current_text = str((current_final or {}).get("text") or "")
+        if not current_final or not current_text:
+            action.update(status="kept", reason="final_missing_or_unreadable")
+            continue
+        if sha256_text(current_text) != str(planned.get("final_sha256_before") or ""):
+            action.update(status="kept", reason="final_changed_since_plan")
+            continue
+        # Re-run every mechanical gate against the bytes currently on disk.
+        current_item = dict(item)
+        current_item.update({
+            "text": current_text,
+            "final": current_final,
+            "critic": _read_json(report_path),
+        })
+        fresh = _classify_completed_name_candidate(
+            current_item, context=context,
+            pending_entry=pending_by_chunk.get(cid),
+            min_chars=min_chars_value,
+            authority_corpus=authority_corpus,
+            authority_gram_cache=authority_gram_cache,
+        )
+        if fresh.get("status") != "candidate":
+            action.update(status="kept", reason=",".join(fresh.get("reasons") or []))
+            continue
+        after = _replace_name_drift_spans(
+            current_text,
+            fresh.get("drift_matches") or [],
+            str(fresh.get("canonical_name") or ""),
+        )
+        if sha256_text(after) != str(fresh.get("final_sha256_after") or ""):
+            action.update(status="kept", reason="predicted_final_hash_changed")
+            continue
+        chapter = str(fresh.get("chapter") or "")
+        if critic_fn is None:
+            pipeline = pipelines.get(chapter)
+            if pipeline is None:
+                if pipeline_factory is None:
+                    from src.pipeline import TranslationPipeline
+                    pipeline_factory = lambda ch: TranslationPipeline(chapter_id=ch)
+                pipeline = pipeline_factory(chapter)
+                pipelines[chapter] = pipeline
+        raw_payload = _read_json(final_path.with_name("%s_raw.json" % cid)) or {}
+        raw_text = str(raw_payload.get("text") or current_text)
+        source_text = str(item["task"].get("text_content") or "")
+        try:
+            if critic_fn is None:
+                report = _default_critic_fn(
+                    fresh, source_text, raw_text, after, pipeline)
+            else:
+                report = critic_fn(fresh, source_text, raw_text, after, pipeline)
+        except Exception as exc:  # noqa: BLE001 - no final has been written yet
+            action.update(status="kept", reason="critic_reaudit_failed:%s" % exc)
+            continue
+        critic_reasons = _validate_reauthored_report(report, proposed_text=after)
+        if critic_reasons:
+            action.update(status="kept", reason=",".join(critic_reasons))
+            action["critic_after"] = {
+                "backend_path": (report or {}).get("_backend_path"),
+                "scores": (report or {}).get("scores") or {},
+            }
+            if _stable_critic_rejection(report, critic_reasons):
+                try:
+                    action["reject_memo_key"] = _record_completed_reject(
+                        memo_path, reject_memo, fresh, critic_reasons,
+                        run_id=str(result["run_id"]),
+                    )
+                    result["reject_memo_recorded"] += 1
+                except Exception as memo_exc:  # noqa: BLE001 - memo is an optimization
+                    result["reject_memo_errors"].append(
+                        "%s:%s" % (cid, memo_exc))
+            continue
+
+        after_sha = sha256_text(after)
+        report = dict(report or {})
+        report["_reaudit"] = {
+            "tool": "completed-name-repair",
+            "schema_version": 1,
+            "at": _now_iso(),
+            "previous_backend_path": (current_item.get("critic") or {}).get(
+                "_backend_path"),
+            "final_sha256": after_sha,
+            "raw_input": "raw" if raw_payload else "final_before",
+            "literary_input": "proposed_final",
+        }
+        report["_final_binding"] = {
+            "schema_version": 1,
+            "final_sha256": after_sha,
+            "before_sha256": sha256_text(current_text),
+            "reason": "completed-name-repair real critic re-audit",
+        }
+        report["_audit_target"] = {
+            "schema_version": 1,
+            "source_sha256": sha256_text(source_text),
+            "raw_sha256": sha256_text(raw_text),
+            "literary_sha256": after_sha,
+        }
+
+        backup_dir = backup_root / chapter
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        final_backup = backup_dir / ("%s_final_before.json" % cid)
+        report_backup = backup_dir / ("%s_critic_report_before.json" % cid)
+        evidence_path = backup_dir / ("%s_completed_name_repair_evidence.json" % cid)
+        _copy_file_atomic(final_path, final_backup)
+        _copy_file_atomic(report_path, report_backup)
+        new_final = dict(current_final)
+        metadata = dict(new_final.get("metadata") or {})
+        metadata.update({
+            "completed_name_repair_run_id": result["run_id"],
+            "completed_name_repair_at": _now_iso(),
+            "completed_name_repair_before_sha256": sha256_text(current_text),
+            "completed_name_repair_decision_id": fresh.get("decision_id"),
+            "completed_name_repair_forms": fresh.get("wrong_forms") or [],
+        })
+        new_final["text"] = after
+        new_final["metadata"] = metadata
+        final_written = False
+        report_written = False
+        evidence_written = False
+        decision_done = False
+        try:
+            _atomic_json_fsync(final_path, new_final)
+            final_written = True
+            _atomic_json_fsync(report_path, report)
+            report_written = True
+            evidence = {
+                "schema_version": 1,
+                "chunk_id": cid,
+                "status": "verified_completed_name_repair",
+                "run_id": result["run_id"],
+                "state_before": "COMPLETED",
+                "state_after": "COMPLETED",
+                "decision_id": fresh.get("decision_id"),
+                "source_key": fresh.get("source_key"),
+                "canonical_name": fresh.get("canonical_name"),
+                "wrong_forms": fresh.get("wrong_forms") or [],
+                "final_sha256_before": sha256_text(current_text),
+                "final_sha256_after": after_sha,
+                "critic_final_sha256": after_sha,
+                "critic_report_sha256": _sha256_file(report_path),
+                "pending_before": fresh.get("pending_before") or [],
+                "pending_checked": True,
+                "applied_decisions": fresh.get("applied_decisions") or [],
+                "lock_authority": fresh.get("lock_authority") or {},
+                "changed_spans": fresh.get("changed_spans") or [],
+            }
+            _atomic_json_fsync(evidence_path, evidence)
+            evidence_written = True
+
+            dcon = _open_decision_write_db(decision_path)
+            try:
+                dcon.execute("BEGIN IMMEDIATE")
+                outbox = outbox_by_chunk.get(cid)
+                if outbox is None:
+                    raise RuntimeError("pending_row_missing_at_apply")
+                if not _delete_pending_row_if_unchanged(dcon, outbox):
+                    raise RuntimeError("pending_cas_failed")
+                cursor = dcon.execute(
+                    "UPDATE decision_db SET locked = 1 WHERE id = ?",
+                    (int(fresh["decision_id"]),),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError("decision_lock_cas_failed")
+                dcon.commit()
+                decision_done = True
+            finally:
+                dcon.close()
+
+            # The completed state is an invariant, not a side effect of this
+            # repair.  Verify it after the cross-DB transaction committed.
+            wcon = sqlite3.connect(
+                "file:%s?mode=ro" % workflow_path.resolve(), uri=True)
+            try:
+                row = wcon.execute(
+                    "SELECT state, rescue_stage FROM chunk_tasks WHERE chunk_id=?",
+                    (cid,)).fetchone()
+            finally:
+                wcon.close()
+            state_after = str(row[0]) if row else "MISSING"
+            action["state_after"] = state_after
+            if state_after != "COMPLETED" or (row and row[1]):
+                raise RuntimeError("completed_state_changed:%s" % state_after)
+            action.update(
+                status="repaired",
+                reason="completed_name_repaired",
+                evidence_path=str(evidence_path),
+                critic_report_sha256=_sha256_file(report_path),
+                critic_after={
+                    "backend_path": report.get("_backend_path"),
+                    "scores": report.get("scores") or {},
+                    "evidence": "exact",
+                },
+                decision_locked=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep evidence truthfully
+            if decision_done:
+                action.update(
+                    status="repaired_postcommit_error",
+                    reason="%s: %s" % (type(exc).__name__, exc),
+                )
+                result["errors"].append("%s:postcommit:%s" % (cid, exc))
+                continue
+            for flag, path, backup, label in (
+                (final_written, final_path, final_backup, "final"),
+                (report_written, report_path, report_backup, "critic"),
+            ):
+                if not flag:
+                    continue
+                try:
+                    _restore_file_from_backup(path, backup)
+                except Exception as rollback_exc:  # noqa: BLE001
+                    result["errors"].append(
+                        "%s:%s_rollback_failed:%s" % (cid, label, rollback_exc))
+            if evidence_written:
+                try:
+                    evidence_path.unlink()
+                except OSError:
+                    pass
+            action.update(
+                status="rolled_back",
+                reason="%s: %s" % (type(exc).__name__, exc),
+            )
+
+    counts: Dict[str, int] = {}
+    for action in result["actions"]:
+        key = str(action.get("status") or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    result["counts"] = dict(sorted(counts.items()))
+    result["repaired"] = counts.get("repaired", 0)
+    result["kept"] = counts.get("kept", 0)
+    result["failed_count"] = sum(
+        value for key, value in counts.items()
+        if key not in {"repaired", "kept"})
+    try:
+        after_context = load_pending_context(
+            root, decision_db=decision_path, workflow_db=workflow_path,
+            output_dir=out_dir,
+        )
+        after_classification = classify_pending_snapshot(after_context)
+        result["after_counts"] = dict(after_classification.get("counts") or {})
+        result["pending_ok"] = bool(after_classification.get("ok"))
+    except Exception as exc:  # noqa: BLE001 - report failure without hiding it
+        result["errors"].append("post_audit:%s" % exc)
+    result["ok"] = result["failed_count"] == 0 and not result["errors"]
+    _atomic_json(jpath, result)
+    _atomic_text(mpath, _completed_repair_apply_markdown(result))
+    return result
+
+
+def _confirmed_term_plan_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# confirmed specific term drift repair", ""]
+    lines.append("- 生成时间: `%s`" % result.get("generated_at"))
+    lines.append("- 模式: **%s**" % result.get("mode"))
+    lines.append("- 统计: `%s`" % (result.get("counts") or {}))
+    candidates = result.get("candidates") or []
+    if candidates:
+        lines.extend(["", "## 候选组"])
+        for item in candidates:
+            lines.append(
+                "- Decision #%s `%s` → `%s`; wrong=`%s`; chunks=%s"
+                % (item.get("decision_id"), item.get("source_key"),
+                   item.get("canonical_name"), item.get("wrong_form"),
+                   ",".join(str(chunk.get("chunk_id") or "")
+                            for chunk in item.get("chunks") or [])))
+    blocked = result.get("blocked") or []
+    if blocked:
+        lines.extend(["", "## 阻断组"])
+        for item in blocked[:40]:
+            lines.append(
+                "- Decision #%s `%s` → `%s`: `%s`"
+                % (item.get("decision_id"), item.get("source_key"),
+                   item.get("canonical_name"), item.get("reason")))
+        if len(blocked) > 40:
+            lines.append("- 其余 %d 组见 JSON。" % (len(blocked) - 40))
+    residual = result.get("residual") or []
+    if residual:
+        lines.extend(["", "## 无需修复 / 延后"])
+        for item in residual[:40]:
+            lines.append(
+                "- Decision #%s `%s`: `%s`"
+                % (item.get("decision_id"), item.get("source_key"),
+                   item.get("reason")))
+        if len(residual) > 40:
+            lines.append("- 其余 %d 组见 JSON。" % (len(residual) - 40))
+    if result.get("errors"):
+        lines.extend(["", "## 错误"])
+        lines.extend("- `%s`" % error for error in result["errors"][:40])
+    lines.extend([
+        "", "本命令只接受锁目标权威审计中的 `confirmed + specific` 组。"
+        "错误形必须在每个 source-positive 块中与 source 出现次数完全一致，"
+        "且不得到达其他活跃专名的保护集。", ""])
+    return "\n".join(lines)
+
+
+def _gloss_term_from_raw_forms(
+    forms: List[str],
+    target_key: str,
+) -> str:
+    """Recover the glossed term without swallowing preceding Chinese prose.
+
+    A CJK run immediately before ``（Source）`` has no whitespace boundary, so a
+    regex cannot know where the term starts.  Repeated glosses provide the
+    evidence: the shorter surface form (usually the footnote form) is a suffix
+    of the longer body form.  With only one occurrence, accept the raw form
+    only when no trimming is needed; a welded context is ambiguous and must
+    fall back to a normal rerun instead of deleting prose.
+    """
+    values = [str(form or "") for form in forms if str(form or "")]
+    if not values:
+        return ""
+    if len(values) == 1:
+        raw = values[0]
+        return raw if _best_glossed_term_form(raw, target_key) == raw else ""
+    shortest = min(values, key=len)
+    if all(value.endswith(shortest) for value in values):
+        term = shortest
+    else:
+        term = shortest
+        for candidate_length in range(len(shortest), 0, -1):
+            suffix = shortest[-candidate_length:]
+            if all(value.endswith(suffix) for value in values):
+                term = suffix
+                break
+    if len(term) < 2 or is_likely_common_word(term):
+        return ""
+    if term[0] in "的了着过在和与把被向从对将给为是个一":
+        return ""
+    return term
+
+
+def _confirmed_term_chunk_occurrences(
+    source_text: str,
+    final_text: str,
+    *,
+    source_key: str,
+    target: str,
+    candidate_rows: List[dict],
+    protected_keys: set,
+) -> Tuple[int, List[Dict[str, Any]]]:
+    source_count = _confirmed_term_source_count(source_text, source_key)
+    if source_count <= 0:
+        return 0, []
+    body = _body_before_footnotes(final_text)
+    target_key = _name_key(target)
+    if target_key and target_key in _name_key(body):
+        return source_count, []
+    matches: List[Dict[str, Any]] = []
+    for row in candidate_rows:
+        if int(row.get("negative_chunks") or 0):
+            continue
+        form = str(row.get("form") or "").strip()
+        normalized = _name_key(form)
+        if (not form or not normalized or normalized == target_key
+                or normalized in protected_keys
+                or any(normalized in key or key in normalized
+                       for key in protected_keys if key)):
+            continue
+        if not all(re.fullmatch(r"[\u4e00-\u9fff]", char)
+                   for char in normalized):
+            continue
+        if len(normalized) < 2 or is_likely_common_word(form):
+            continue
+        all_spans = [match.span() for match in re.finditer(
+            re.escape(form), final_text)]
+        body_spans = [match.span() for match in re.finditer(
+            re.escape(form), body)]
+        if len(all_spans) != source_count or len(body_spans) != source_count:
+            continue
+        matches.append({
+            "start": all_spans[0][0],
+            "end": all_spans[0][1],
+            "form": form,
+            "normalized": normalized,
+            "source_count": source_count,
+            "spans": all_spans,
+            "authority_positive_chunks": int(row.get("positive_chunks") or 0),
+            "authority_similarity": float(row.get("similarity_to_target") or 0.0),
+            "chunk_id": str(row.get("chunk_id") or ""),
+        })
+    # A translator gloss is independent, exact provenance: ``护盾墙（Shield
+    # Wall）`` binds the Chinese form to this source phrase even when the English
+    # phrase was wrapped across a newline in the source.  Accept it only when
+    # every occurrence of that CJK form in the final is glossed, so a common
+    # unglossed word cannot enter through this route.
+    source_pattern = re.compile(
+        r"(?<![A-Za-z0-9])"
+        + r"\s+".join(re.escape(part) for part in source_key.split())
+        + r"(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+    gloss_groups: Dict[str, List[Tuple[str, Tuple[int, int]]]] = {}
+    for gloss in re.finditer(
+            r"(?P<form>[\u4e00-\u9fff]{2,12})"
+            r"[\"'”’」』]*\s*[（(]\s*(?P<source>[^）)]+?)\s*[）)]",
+            final_text):
+        if not source_pattern.fullmatch(gloss.group("source").strip()):
+            continue
+        gloss_groups.setdefault(
+            _phrase_key(gloss.group("source")), []
+        ).append((gloss.group("form"), gloss.span("form")))
+
+    glossed: Dict[str, List[Tuple[int, int]]] = {}
+    for raw_forms in gloss_groups.values():
+        forms = [form for form, _span in raw_forms]
+        term = _gloss_term_from_raw_forms(forms, target_key)
+        normalized = _name_key(term)
+        if (not term or not normalized or normalized == target_key
+                or normalized in protected_keys
+                or any(normalized in key or key in normalized
+                       for key in protected_keys if key)
+                or is_likely_common_word(term)):
+            continue
+        term_spans: List[Tuple[int, int]] = []
+        for raw, (_start, end) in raw_forms:
+            if not raw.endswith(term):
+                term_spans = []
+                break
+            start = end - len(term)
+            if final_text[start:end] != term:
+                term_spans = []
+                break
+            term_spans.append((start, end))
+        if not term_spans:
+            continue
+        glossed.setdefault(term, []).extend(term_spans)
+    for form, spans in glossed.items():
+        all_spans = [match.span() for match in re.finditer(
+            re.escape(form), final_text)]
+        if not all_spans or len(spans) != len(all_spans):
+            continue
+        if len(spans) < source_count or not source_count:
+            continue
+        normalized = _name_key(form)
+        matches.append({
+            "start": spans[0][0],
+            "end": spans[0][1],
+            "form": form,
+            "normalized": normalized,
+            "source_count": source_count,
+            "spans": all_spans,
+            "gloss_bound": True,
+            "authority_positive_chunks": 0,
+            "authority_similarity": 0.0,
+            "chunk_id": "",
+        })
+    if gloss_groups:
+        # An explicit ``term（Source）`` gloss is stronger evidence than a
+        # shorter authority form that happens to occur inside the glossed CJK
+        # run.  If the gloss term cannot be recovered safely, fail closed rather
+        # than falling back to that substring (``护盾墙`` must not become the
+        # two-character candidate ``盾墙`` with a dangling ``护`` prefix).
+        if not glossed:
+            return source_count, []
+        matches = [
+            item for item in matches if bool(item.get("gloss_bound"))
+        ]
+    forms = {str(item.get("normalized") or "") for item in matches}
+    if len(matches) != 1 or len(forms) != 1:
+        return source_count, []
+    return source_count, matches
+
+
+def _confirmed_term_source_count(text: str, source_key: str) -> int:
+    """Count a Decision phrase with source line wraps normalized."""
+    parts = [part for part in str(source_key or "").split() if part]
+    body = _body_before_footnotes(text)
+    if len(parts) < 1 or not body:
+        return 0
+    pattern = re.compile(
+        r"(?<![A-Za-z0-9])" + r"\s+".join(
+            re.escape(part) for part in parts) + r"(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+    return len(pattern.findall(body))
+
+
+def _confirmed_term_group_plan(
+    group: Dict[str, Any],
+    *,
+    context: Dict[str, Any],
+    snapshot_by_chunk: Dict[str, dict],
+    out_dir: Path,
+    chapter_id: Optional[str],
+) -> Tuple[Optional[dict], Optional[dict], Optional[dict]]:
+    decision_id = int(group.get("decision_id") or 0)
+    source_key = str(group.get("source_key") or "")
+    target = _term_target_core(group.get("target"))
+    target_key = _name_key(target)
+    base = {
+        "decision_id": decision_id,
+        "source_key": source_key,
+        "canonical_name": target,
+        "authority": {
+            "classification": group.get("classification"),
+            "reason": group.get("reason"),
+            "source_positive_chunks": int(group.get("source_positive_chunks") or 0),
+            "authority_chunks": int(group.get("authority_chunks") or 0),
+            "target_hits": int(group.get("target_hits") or 0),
+        },
+    }
+    if (group.get("classification") != "confirmed"
+            or group.get("authority_kind") != "specific"
+            or group.get("pending_reason") not in {
+                "specific_decision_target_missing",
+                "specific_decision_target_missing_no_pending",
+            }):
+        base["reason"] = "group_not_confirmed_specific"
+        return None, None, base
+    if (not source_key or not target or not target_key
+            or not all(re.fullmatch(r"[\u4e00-\u9fff]", char)
+                       for char in target_key)):
+        base["reason"] = "target_not_pure_cjk"
+        return None, None, base
+    decision = (context.get("decisions") or {}).get(decision_id)
+    if not decision:
+        base["reason"] = "decision_missing"
+        return None, base, None
+    if (str(decision.get("source_key") or "") != source_key
+            or _name_key(decision.get("translation") or "") != target_key):
+        base["reason"] = "decision_target_changed"
+        return None, base, None
+
+    protected = _protected_active_name_keys(context, target_key)
+    candidate_rows = list(group.get("candidates") or [])
+    chunk_candidates: List[Dict[str, Any]] = []
+    deferred: List[Dict[str, Any]] = []
+    for cid, task in sorted((context.get("tasks") or {}).items()):
+        task_chapter = str(task.get("chapter_id") or "")
+        if chapter_id and task_chapter != chapter_id:
+            continue
+        source_text = str(task.get("text_content") or "")
+        source_count = _confirmed_term_source_count(source_text, source_key)
+        if source_count <= 0:
+            continue
+        state = str(task.get("state") or "")
+        final_path = out_dir / task_chapter / ("%s_final.json" % cid)
+        final_payload = _read_json(final_path)
+        final_text = str((final_payload or {}).get("text") or "")
+        if not final_text.strip():
+            if state == "COMPLETED":
+                base["reason"] = "final_missing:%s" % cid
+                return None, base, None
+            deferred.append({"chunk_id": cid, "reason": "final_missing"})
+            continue
+        if target_key in _name_key(_body_before_footnotes(final_text)):
+            continue
+        if state != "COMPLETED":
+            deferred.append({
+                "chunk_id": cid,
+                "state": state,
+                "reason": "noncompleted_missing_target",
+            })
+            continue
+        if task.get("rescue_stage"):
+            base["reason"] = "rescue_stage:%s" % cid
+            return None, base, None
+        metadata = (final_payload or {}).get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if metadata.get("fallback") or metadata.get("fallback_used"):
+            base["reason"] = "final_fallback:%s" % cid
+            return None, base, None
+        if metadata.get("quality_waived"):
+            base["reason"] = "final_quality_waived:%s" % cid
+            return None, base, None
+        pending = snapshot_by_chunk.get(cid)
+        if pending and str(pending.get("reason") or "") != (
+                "specific_decision_target_missing"):
+            base["reason"] = "pending_reason:%s" % (
+                pending.get("reason") or "missing")
+            return None, base, None
+        resolved_source_count, matches = _confirmed_term_chunk_occurrences(
+            source_text,
+            final_text,
+            source_key=source_key,
+            target=target,
+            candidate_rows=candidate_rows,
+            protected_keys=protected,
+        )
+        if resolved_source_count != source_count or len(matches) != 1:
+            base["reason"] = "no_unique_counted_candidate:%s" % cid
+            return None, base, None
+        match = matches[0]
+        replacement_matches = [
+            {"start": start, "end": end, "form": match.get("form"),
+             "normalized": match.get("normalized")}
+            for start, end in match.get("spans") or []
+        ]
+        proposed_text = _replace_name_drift_spans(
+            final_text, replacement_matches, target)
+        wrong_form = str(match.get("form") or "")
+        if (wrong_form in proposed_text or target not in proposed_text):
+            base["reason"] = "proposed_text_invariant_failed:%s" % cid
+            return None, base, None
+        chunk_candidates.append({
+            "chunk_id": cid,
+            "chapter": task_chapter,
+            "state_before": state,
+            "final_path": str(final_path),
+            "final_sha256_before": sha256_text(final_text),
+            "final_sha256_after": sha256_text(proposed_text),
+            "source_count": source_count,
+            "wrong_form": wrong_form,
+            "gloss_bound": bool(match.get("gloss_bound")),
+            "wrong_normalized": str(match.get("normalized") or ""),
+            "changed_spans": _changed_spans(final_text, proposed_text),
+            "pending_before": [pending] if pending else [],
+            "critic_sha256": _stable_payload_sha256(
+                _read_json(final_path.with_name(
+                    "%s_critic_report.json" % cid)) or {}),
+            "authority": {
+                "positive_chunks": int(match.get("authority_positive_chunks") or 0),
+                "similarity_to_target": float(
+                    match.get("authority_similarity") or 0.0),
+            },
+        })
+    if not chunk_candidates:
+        base["reason"] = "no_completed_source_positive_missing_target"
+        return None, None, base
+    wrong_forms = sorted({str(item.get("wrong_form") or "")
+                          for item in chunk_candidates if item.get("wrong_form")})
+    if deferred:
+        base["deferred"] = deferred
+    candidate = dict(base)
+    candidate.update({
+        "wrong_form": ", ".join(wrong_forms),
+        "wrong_forms": wrong_forms,
+        "chunks": chunk_candidates,
+    })
+    return candidate, None, None
+
+
+def audit_confirmed_term_drift_repair(
+    project_root: Path,
+    *,
+    chapter_id: Optional[str] = None,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Plan repairs for confirmed specific-term drift without writing prose."""
+    root = Path(project_root)
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "confirmed_term_drift_repair.json"
+    mpath = Path(md_out) if md_out else out_dir / "confirmed_term_drift_repair.md"
+    result: Dict[str, Any] = {
+        "schema_version": 1,
+        "mode": "read_only",
+        "write_attempted": False,
+        "generated_at": _now_iso(),
+        "chapter": chapter_id,
+        "counts": {},
+        "candidates": [],
+        "blocked": [],
+        "residual": [],
+        "errors": [],
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+        "ok": False,
+    }
+    context = load_pending_context(
+        root, decision_db=decision_db, workflow_db=workflow_db,
+        output_dir=out_dir,
+    )
+    if not context.get("available"):
+        result["errors"].append(
+            str(context.get("reason") or "pending_context_unavailable"))
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _confirmed_term_plan_markdown(result))
+        return result
+    snapshot = classify_pending_snapshot(context)
+    snapshot_by_chunk = {
+        str(entry.get("chunk_id") or ""): entry
+        for entry in snapshot.get("entries") or []
+    }
+    from src.locked_target_authority_audit import audit_locked_target_authorities
+    authority = audit_locked_target_authorities(
+        root, decision_db=decision_db, workflow_db=workflow_db,
+        output_dir=out_dir, include_marked_repair_sweep=True,
+    )
+    result["authority_counts"] = authority.get("counts") or {}
+    if authority.get("errors"):
+        result["errors"].extend(
+            "authority:%s" % error for error in authority.get("errors") or [])
+    for group in authority.get("groups") or []:
+        candidate, blocked, residual = _confirmed_term_group_plan(
+            group, context=context, snapshot_by_chunk=snapshot_by_chunk,
+            out_dir=out_dir, chapter_id=chapter_id,
+        )
+        if candidate is not None:
+            result["candidates"].append(candidate)
+        if blocked is not None:
+            result["blocked"].append(blocked)
+        if residual is not None:
+            result["residual"].append(residual)
+    result["counts"] = {
+        "authority_groups": len(authority.get("groups") or []),
+        "candidate_groups": len(result["candidates"]),
+        "candidate_chunks": sum(
+            len(item.get("chunks") or []) for item in result["candidates"]),
+        "blocked_groups": len(result["blocked"]),
+        "residual_groups": len(result["residual"]),
+        "errors": len(result["errors"]),
+    }
+    result["ok"] = not result["errors"]
+    _atomic_json(jpath, result)
+    _atomic_text(mpath, _confirmed_term_plan_markdown(result))
+    return result
+
+
+def apply_confirmed_term_drift_repair(
+    project_root: Path,
+    *,
+    chapter_id: Optional[str] = None,
+    apply: bool = False,
+    limit: Optional[int] = None,
+    run_id: Optional[str] = None,
+    critic_fn: Optional[Any] = None,
+    pipeline_factory: Optional[Any] = None,
+    require_authority_audit: Optional[bool] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Apply a confirmed specific-term drift group atomically.
+
+    Every affected chunk must pass a fresh calibrated critic re-audit before
+    any prose is written.  The final, critic report, evidence, pending CAS and
+    Decision lock are one group transaction; a failure restores every final and
+    report written by this group.
+    """
+    root = Path(project_root)
+    out_dir = root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "confirmed_term_drift_repair_apply.json"
+    mpath = Path(md_out) if md_out else out_dir / "confirmed_term_drift_repair_apply.md"
+    result: Dict[str, Any] = {
+        "schema_version": 1,
+        "mode": "apply" if apply else "read_only",
+        "write_attempted": False,
+        "generated_at": _now_iso(),
+        "chapter": chapter_id,
+        "run_id": str(run_id or (
+            _dt.datetime.now().strftime("confirmed-term-%Y%m%dT%H%M%S") +
+            "-" + str(os.getpid()))),
+        "actions": [],
+        "counts": {},
+        "errors": [],
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+        "ok": False,
+    }
+    if not apply:
+        plan = audit_confirmed_term_drift_repair(
+            root, chapter_id=chapter_id, output_dir=out_dir,
+            json_out=jpath, md_out=mpath,
+        )
+        plan["mode"] = "read_only"
+        return plan
+    cfg = (_config.get("pipeline.confirmed_term_drift_repair", {}) or {})
+    if not bool(cfg.get("enabled", True)):
+        result.update(ok=True, disabled=True,
+                      reason="confirmed_term_drift_repair_disabled")
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _confirmed_term_plan_markdown(result))
+        return result
+
+    require_auth = (bool(cfg.get("require_authority_audit", True))
+                    if require_authority_audit is None
+                    else bool(require_authority_audit))
+    if require_auth:
+        from src.name_authority_audit import audit_name_authorities
+        authority = audit_name_authorities(root)
+        result["authority"] = {
+            "ok": bool(authority.get("ok")),
+            "status": authority.get("status"),
+            "counts": authority.get("counts") or {},
+            "blocking_count": int(authority.get("blocking_count") or 0),
+            "report": authority.get("md_path"),
+        }
+        if not authority.get("ok"):
+            result.update(
+                ok=False,
+                authority_blocked=True,
+                reason="name_authority_audit_not_clean",
+            )
+            _atomic_json(jpath, result)
+            _atomic_text(mpath, _confirmed_term_plan_markdown(result))
+            return result
+
+    plan = audit_confirmed_term_drift_repair(
+        root, chapter_id=chapter_id, output_dir=out_dir,
+        json_out=(out_dir / "confirmed_term_drift_repair.json"),
+        md_out=(out_dir / "confirmed_term_drift_repair.md"),
+    )
+    result["plan_counts"] = plan.get("counts") or {}
+    result["blocked"] = plan.get("blocked") or []
+    result["residual"] = plan.get("residual") or []
+    result["errors"].extend(plan.get("errors") or [])
+    candidates = list(plan.get("candidates") or [])
+    try:
+        cap = max(0, int(
+            limit if limit is not None else cfg.get("max_groups_per_run", 10)))
+    except (TypeError, ValueError):
+        cap = 10
+    candidates = candidates[:cap]
+    if plan.get("errors") or plan.get("blocked"):
+        result["ok"] = False
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _confirmed_term_plan_markdown(result))
+        return result
+    if not candidates:
+        result.update(ok=True, no_candidates=True)
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _confirmed_term_plan_markdown(result))
+        return result
+
+    decision_path = root / "db" / "decision_db.sqlite"
+    workflow_path = root / "db" / "workflow.db"
+    context = load_pending_context(
+        root, decision_db=decision_path, workflow_db=workflow_path,
+        output_dir=out_dir,
+    )
+    raw_pending = {
+        str(row.get("chunk_id") or ""): row
+        for row in context.get("pending") or []
+    }
+    pipelines: Dict[str, Any] = {}
+    backup_root = out_dir / "confirmed_term_drift_repair" / result["run_id"]
+    for candidate in candidates:
+        action: Dict[str, Any] = {
+            "decision_id": candidate.get("decision_id"),
+            "source_key": candidate.get("source_key"),
+            "canonical_name": candidate.get("canonical_name"),
+            "wrong_form": candidate.get("wrong_form"),
+            "status": "failed",
+            "reason": "",
+            "chunks": [],
+        }
+        result["actions"].append(action)
+        prepared: List[Dict[str, Any]] = []
+        for chunk in candidate.get("chunks") or []:
+            cid = str(chunk.get("chunk_id") or "")
+            chapter = str(chunk.get("chapter") or "")
+            final_path = out_dir / chapter / ("%s_final.json" % cid)
+            report_path = out_dir / chapter / ("%s_critic_report.json" % cid)
+            current_final = _read_json(final_path)
+            current_text = str((current_final or {}).get("text") or "")
+            if not current_final or sha256_text(current_text) != str(
+                    chunk.get("final_sha256_before") or ""):
+                action.update(status="kept", reason="final_changed_since_plan")
+                break
+            task = (context.get("tasks") or {}).get(cid) or {}
+            if str(task.get("state") or "") != "COMPLETED":
+                action.update(status="kept", reason="state_changed_since_plan")
+                break
+            matches = [{
+                "start": int(span.get("start")),
+                "end": int(span.get("end")),
+                "form": chunk.get("wrong_form"),
+                "normalized": chunk.get("wrong_normalized"),
+            } for span in chunk.get("changed_spans") or []]
+            # Recover exact spans from the current bytes instead of trusting the
+            # flattened report summary.
+            wrong = str(chunk.get("wrong_form") or "")
+            current_matches = [
+                {"start": match.start(), "end": match.end(),
+                 "form": match.group(0), "normalized": _name_key(match.group(0))}
+                for match in re.finditer(re.escape(wrong), current_text)
+            ]
+            proposed_text = _replace_name_drift_spans(
+                current_text, current_matches,
+                str(candidate.get("canonical_name") or ""))
+            if sha256_text(proposed_text) != str(
+                    chunk.get("final_sha256_after") or ""):
+                action.update(status="kept", reason="proposed_hash_changed")
+                break
+            raw_payload = _read_json(final_path.with_name("%s_raw.json" % cid)) or {}
+            raw_text = str(raw_payload.get("text") or current_text)
+            pipeline = None
+            if critic_fn is None:
+                pipeline = pipelines.get(chapter)
+                if pipeline is None:
+                    if pipeline_factory is None:
+                        from src.pipeline import TranslationPipeline
+                        pipeline_factory = lambda ch: TranslationPipeline(chapter_id=ch)
+                    pipeline = pipeline_factory(chapter)
+                    pipelines[chapter] = pipeline
+            critic_record = dict(chunk)
+            critic_record.update({
+                "decision_id": candidate.get("decision_id"),
+                "source_key": candidate.get("source_key"),
+                "canonical_name": candidate.get("canonical_name"),
+            })
+            try:
+                if critic_fn is None:
+                    report = _default_critic_fn(
+                        critic_record, str(task.get("text_content") or ""),
+                        raw_text, proposed_text, pipeline)
+                else:
+                    report = critic_fn(
+                        critic_record, str(task.get("text_content") or ""),
+                        raw_text, proposed_text, pipeline)
+            except Exception as exc:  # noqa: BLE001 - no prose written yet
+                action.update(status="kept",
+                              reason="critic_reaudit_failed:%s" % exc)
+                break
+            critic_reasons = _validate_reauthored_report(
+                report, proposed_text=proposed_text)
+            if critic_reasons:
+                action.update(status="kept", reason=",".join(critic_reasons))
+                action["critic_after"] = {
+                    "backend_path": (report or {}).get("_backend_path"),
+                    "scores": (report or {}).get("scores") or {},
+                }
+                break
+            prepared.append({
+                "chunk": chunk,
+                "cid": cid,
+                "chapter": chapter,
+                "final_path": final_path,
+                "report_path": report_path,
+                "current_final": current_final,
+                "current_text": current_text,
+                "proposed_text": proposed_text,
+                "proposed_sha256": sha256_text(proposed_text),
+                "report": dict(report or {}),
+                "source_text": str(task.get("text_content") or ""),
+                "raw_text": raw_text,
+                "raw_present": bool(raw_payload),
+            })
+        else:
+            # Python for/else: all chunks passed re-audit.
+            if prepared:
+                written: List[Tuple[Path, Path]] = []
+                evidence_paths: List[Path] = []
+                final_done = False
+                db_done = False
+                try:
+                    backup_dir = backup_root / str(
+                        candidate.get("decision_id"))
+                    backup_dir.mkdir(parents=True, exist_ok=True)
+                    for item in prepared:
+                        final_backup = backup_dir / (
+                            "%s_final_before.json" % item["cid"])
+                        report_backup = backup_dir / (
+                            "%s_critic_report_before.json" % item["cid"])
+                        _copy_file_atomic(item["final_path"], final_backup)
+                        _copy_file_atomic(item["report_path"], report_backup)
+                        written.append((item["final_path"], final_backup))
+                        written.append((item["report_path"], report_backup))
+                    for item in prepared:
+                        report = item["report"]
+                        report["_reaudit"] = {
+                            "tool": "confirmed-term-drift-repair",
+                            "schema_version": 1,
+                            "at": _now_iso(),
+                            "previous_backend_path": (
+                                _read_json(item["report_path"]) or {}).get(
+                                    "_backend_path"),
+                            "final_sha256": item["proposed_sha256"],
+                            "raw_input": "raw" if item["raw_present"] else "final_before",
+                            "literary_input": "proposed_final",
+                        }
+                        report["_final_binding"] = {
+                            "schema_version": 1,
+                            "final_sha256": item["proposed_sha256"],
+                            "before_sha256": sha256_text(item["current_text"]),
+                            "reason": "confirmed term drift real critic re-audit",
+                        }
+                        report["_audit_target"] = {
+                            "schema_version": 1,
+                            "source_sha256": sha256_text(item["source_text"]),
+                            "raw_sha256": sha256_text(item["raw_text"]),
+                            "literary_sha256": item["proposed_sha256"],
+                        }
+                        new_final = dict(item["current_final"])
+                        metadata = dict(new_final.get("metadata") or {})
+                        metadata.update({
+                            "confirmed_term_drift_repair_run_id": result["run_id"],
+                            "confirmed_term_drift_repair_at": _now_iso(),
+                            "confirmed_term_drift_repair_decision_id": (
+                                candidate.get("decision_id")),
+                            "confirmed_term_drift_repair_forms": [
+                                item["chunk"].get("wrong_form")],
+                        })
+                        new_final["text"] = item["proposed_text"]
+                        new_final["metadata"] = metadata
+                        _atomic_json_fsync(item["final_path"], new_final)
+                        _atomic_json_fsync(item["report_path"], report)
+                        evidence_path = backup_dir / (
+                            "%s_confirmed_term_drift_evidence.json" % item["cid"])
+                        _atomic_json_fsync(evidence_path, {
+                            "schema_version": 1,
+                            "chunk_id": item["cid"],
+                            "status": "verified_confirmed_term_drift_repair",
+                            "run_id": result["run_id"],
+                            "state_before": "COMPLETED",
+                            "state_after": "COMPLETED",
+                            "decision_id": candidate.get("decision_id"),
+                            "source_key": candidate.get("source_key"),
+                            "canonical_name": candidate.get("canonical_name"),
+                            "wrong_form": item["chunk"].get("wrong_form"),
+                            "gloss_bound": bool(item["chunk"].get("gloss_bound")),
+                            "source_count": item["chunk"].get("source_count"),
+                            "final_sha256_before": sha256_text(item["current_text"]),
+                            "final_sha256_after": item["proposed_sha256"],
+                            "critic_report_sha256": _sha256_file(item["report_path"]),
+                            "pending_before": item["chunk"].get("pending_before") or [],
+                            "changed_spans": item["chunk"].get("changed_spans") or [],
+                            "lock_authority": candidate.get("authority") or {},
+                        })
+                        evidence_paths.append(evidence_path)
+                    final_done = True
+
+                    wcon = sqlite3.connect(
+                        "file:%s?mode=ro" % workflow_path.resolve(), uri=True)
+                    try:
+                        for item in prepared:
+                            row = wcon.execute(
+                                "SELECT state, rescue_stage FROM chunk_tasks "
+                                "WHERE chunk_id=?", (item["cid"],)).fetchone()
+                            if not row or str(row[0]) != "COMPLETED" or row[1]:
+                                raise RuntimeError(
+                                    "completed_state_changed:%s" % item["cid"])
+                    finally:
+                        wcon.close()
+
+                    dcon = _open_decision_write_db(decision_path)
+                    try:
+                        dcon.execute("BEGIN IMMEDIATE")
+                        for item in prepared:
+                            outbox = raw_pending.get(item["cid"])
+                            if outbox is None:
+                                continue
+                            if not _delete_pending_row_if_unchanged(dcon, outbox):
+                                raise RuntimeError(
+                                    "pending_cas_failed:%s" % item["cid"])
+                        did = int(candidate.get("decision_id") or 0)
+                        row = dcon.execute(
+                            "SELECT source_key, translation, reason, locked "
+                            "FROM decision_db WHERE id=?", (did,)).fetchone()
+                        if not row:
+                            raise RuntimeError("decision_missing:%s" % did)
+                        if str(row[0]) != str(candidate.get("source_key") or ""):
+                            raise RuntimeError("decision_source_changed:%s" % did)
+                        if _name_key(row[1]) != _name_key(
+                                candidate.get("canonical_name") or ""):
+                            raise RuntimeError("decision_target_changed:%s" % did)
+                        reason = str(row[2] or "")
+                        marker = "Round 158 confirmed term drift lock: %s" % (
+                            candidate.get("canonical_name"))
+                        if marker not in reason:
+                            reason = (reason.rstrip() + " | " + marker).strip(" |")
+                        cursor = dcon.execute(
+                            "UPDATE decision_db SET locked=1, reason=? "
+                            "WHERE id=? AND source_key=? AND translation=?",
+                            (reason, did, candidate.get("source_key"),
+                             candidate.get("canonical_name")))
+                        if cursor.rowcount != 1:
+                            raise RuntimeError("decision_lock_cas_failed:%s" % did)
+                        dcon.commit()
+                        db_done = True
+                    finally:
+                        dcon.close()
+                    action.update(
+                        status="repaired",
+                        reason="confirmed_term_drift_repaired",
+                        decision_locked=True,
+                        chunks=[{
+                            "chunk_id": item["cid"],
+                            "final_sha256_before": sha256_text(item["current_text"]),
+                            "final_sha256_after": item["proposed_sha256"],
+                            "evidence_path": str(evidence_paths[index]),
+                            "critic_backend_path": item["report"].get("_backend_path"),
+                        } for index, item in enumerate(prepared)],
+                    )
+                except Exception as exc:  # noqa: BLE001 - rollback group writes
+                    if db_done:
+                        action.update(
+                            status="repaired_postcommit_error",
+                            reason="%s: %s" % (type(exc).__name__, exc))
+                        result["errors"].append(
+                            "decision#%s:postcommit:%s" % (
+                                candidate.get("decision_id"), exc))
+                    else:
+                        for path, backup in written:
+                            try:
+                                _restore_file_from_backup(path, backup)
+                            except Exception as rollback_exc:  # noqa: BLE001
+                                result["errors"].append(
+                                    "decision#%s:rollback_failed:%s:%s" % (
+                                        candidate.get("decision_id"),
+                                        path, rollback_exc))
+                        for evidence_path in evidence_paths:
+                            try:
+                                evidence_path.unlink()
+                            except OSError:
+                                pass
+                        action.update(
+                            status="rolled_back",
+                            reason="%s: %s" % (type(exc).__name__, exc))
+
+    counts: Dict[str, int] = {}
+    for action in result["actions"]:
+        key = str(action.get("status") or "unknown")
+        counts[key] = counts.get(key, 0) + 1
+    result["counts"] = dict(sorted(counts.items()))
+    result["ok"] = not result["errors"] and not any(
+        str(action.get("status") or "") in {
+            "failed", "rolled_back", "repaired_postcommit_error"}
+        for action in result["actions"])
+    result["write_attempted"] = any(
+        str(action.get("status") or "") == "repaired"
+        for action in result["actions"])
+    try:
+        after_context = load_pending_context(
+            root, decision_db=decision_path, workflow_db=workflow_path,
+            output_dir=out_dir,
+        )
+        after_snapshot = classify_pending_snapshot(after_context)
+        result["after_counts"] = dict(after_snapshot.get("counts") or {})
+    except Exception as exc:  # noqa: BLE001
+        result["errors"].append("post_audit:%s" % exc)
+    _atomic_json(jpath, result)
+    _atomic_text(mpath, _confirmed_term_apply_markdown(result))
+    return result
+
+
+def _confirmed_term_apply_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# confirmed specific term drift repair（受控写入）", ""]
+    lines.append("- 生成时间: `%s`" % result.get("generated_at"))
+    lines.append("- 模式: **%s**；ok=`%s`；write=`%s`" % (
+        result.get("mode"), result.get("ok"), result.get("write_attempted")))
+    lines.append("- 计划统计: `%s`" % (result.get("plan_counts") or {}))
+    lines.append("- 动作统计: `%s`" % (result.get("counts") or {}))
+    actions = result.get("actions") or []
+    if actions:
+        lines.extend(["", "## 动作"])
+        for action in actions[:40]:
+            lines.append(
+                "- Decision #%s `%s` → `%s`: **%s** / `%s`; chunks=%s"
+                % (action.get("decision_id"), action.get("source_key"),
+                   action.get("canonical_name"), action.get("status"),
+                   action.get("reason"), len(action.get("chunks") or [])))
+            for chunk in action.get("chunks") or []:
+                lines.append(
+                    "  - `%s` before=%s after=%s backend=`%s`"
+                    % (chunk.get("chunk_id"),
+                       str(chunk.get("final_sha256_before"))[:12],
+                       str(chunk.get("final_sha256_after"))[:12],
+                       chunk.get("critic_backend_path")))
+    if result.get("blocked"):
+        lines.extend(["", "## 计划阻断"])
+        for item in result.get("blocked")[:30]:
+            lines.append(
+                "- Decision #%s `%s`: `%s`"
+                % (item.get("decision_id"), item.get("source_key"),
+                   item.get("reason")))
+    if result.get("after_counts"):
+        lines.append("- 修复后 pending: `%s`" % result.get("after_counts"))
+    if result.get("errors"):
+        lines.extend(["", "## 错误"])
+        lines.extend("- `%s`" % error for error in result["errors"][:40])
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _apply_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# name-only fast path（受控写入）", ""]
+    lines.append(f"- 生成时间: {result.get('generated_at')}")
+    lines.append(f"- 状态: `{result.get('mode')}` / ok=`{result.get('ok')}`")
+    lines.append(f"- run_id: `{result.get('run_id')}`")
+    if result.get("authority"):
+        auth = result["authority"]
+        lines.append(f"- 权威审计: ok=`{auth.get('ok')}` "
+                     f"blocking={auth.get('blocking_count')} report={auth.get('report')}")
+    if result.get("reason"):
+        lines.append(f"- 未执行原因: `{result.get('reason')}`")
+    counts = result.get("counts") or {}
+    if counts:
+        lines.append("- 动作计数: " + ", ".join(
+            f"`{k}`={v}" for k, v in counts.items()))
+    actions = result.get("actions") or []
+    if actions:
+        lines.append("")
+        lines.append(f"## Chunks（{len(actions)}）")
+        for action in actions[:80]:
+            lines.append(f"- `{action.get('chunk_id')}` {action.get('status')} / "
+                         f"{action.get('reason')}")
+    if result.get("errors"):
+        lines.append("")
+        lines.append("## Errors")
+        for error in result["errors"][:20]:
+            lines.append(f"- {error}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _name_only_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# name-only fast path 只读分类", ""]
+    lines.append(f"- 生成时间: {result.get('generated_at')}")
+    lines.append(f"- 范围: `{result.get('chapter') or '全书'}`")
+    counts = result.get("counts") or {}
+    lines.append("- 计数: " + ", ".join(f"`{k}`={v}" for k, v in counts.items()))
+    reason_counts = result.get("reason_counts") or {}
+    if reason_counts:
+        lines.append("- 未准入原因: " + ", ".join(
+            f"`{k}`={v}" for k, v in reason_counts.items()))
+    candidates = result.get("candidates") or []
+    lines.append("")
+    lines.append(f"## Candidates（{len(candidates)}）")
+    lines.append("这些块仍必须在后续受控阶段对预测 final 重新调用 calibrated critic；"
+                 "本报告不代表已完成或已获准写状态。")
+    for item in candidates[:80]:
+        mc = item.get("mapping_counts") or {}
+        lines.append(
+            f"- `{item['chunk_id']}` sep={mc.get('sep_restore', 0)}, "
+            f"forms={mc.get('forms', 0)}, tokens={mc.get('tokens', 0)}; "
+            f"before={str(item.get('final_sha256_before'))[:12]}, "
+            f"after={str(item.get('final_sha256_after'))[:12]}")
+    lines.append("")
+    lines.append("## 阻断样例")
+    blocked = [r for r in result.get("kept_dirty") or [] if r.get("reasons")]
+    if not blocked:
+        lines.append("- 无")
+    else:
+        for item in blocked[:30]:
+            lines.append(f"- `{item['chunk_id']}`: {', '.join(item['reasons'])}")
+        if len(blocked) > 30:
+            lines.append(f"- 其余 {len(blocked) - 30} 个 kept_dirty 详见 JSON。")
+    if result.get("failed"):
+        lines.append("")
+        lines.append("## Failed")
+        for item in result["failed"][:20]:
+            lines.append(f"- `{item.get('chunk_id', '-')}`: {item.get('reason')}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+FORM_ALIGN_SIMILARITY = 0.78
+_NAME_AUTHORITY_ARTICLE_PREFIX_RE = re.compile(
+    r"^(?:the|a|an)\s+", re.IGNORECASE)
+
+# Generic group/category vocabulary shared with the registry merger.  These
+# words describe a category of entity rather than the entity identity and must
+# never bridge two unrelated source families (House A / House B / House Troop)
+# or turn a distinct term phrase into an alias of its base name.
+_GENERIC_GROUP_ANCHORS = _EN_GROUP_TERM_WORDS
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _read_json(path: Path) -> Optional[dict]:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _atomic_json(path: Path, payload: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    tmp.replace(path)
+
+
+def _atomic_text(path: Path, text: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _authority_table_exists(con: sqlite3.Connection, name: str) -> bool:
+    return bool(con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone())
+
+
+def _json_list(raw: Any) -> List[str]:
+    try:
+        value = json.loads(raw or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(x).strip() for x in value if isinstance(x, str) and str(x).strip()]
+
+
+def _decision_source_key(text: str) -> str:
+    return source_name_normalized(text) or _phrase_key(text)
+
+
+def _decision_lookup_keys(text: str) -> List[str]:
+    """Keys used to join a registry alias to an authoritative decision.
+
+    Article stripping mirrors ``build_name_unification_maps``: a registry alias
+    such as ``the Bene Gesserit Plan`` and a Decision DB source key ``Bene
+    Gesserit Plan`` are the same executable source.  Without this join the
+    audit can report a clean registry while the name-unification map still
+    deletes the distinct term ``Plan`` from prose.
+    """
+    keys: List[str] = []
+    seen = set()
+    for key in (_decision_source_key(text), _phrase_key(text)):
+        if not key:
+            continue
+        candidates = (key, _NAME_AUTHORITY_ARTICLE_PREFIX_RE.sub("", key))
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                keys.append(candidate)
+    return keys
+
+
+def _alias_owner_key(text: str) -> str:
+    return _NAME_AUTHORITY_ARTICLE_PREFIX_RE.sub(
+        "", _decision_source_key(text)).strip()
+
+
+def _similarity(a: str, b: str) -> float:
+    ka, kb = _name_key(a), _name_key(b)
+    if not ka or not kb:
+        return 0.0
+    if ka == kb:
+        return 1.0
+    try:
+        value = float(name_char_similarity(ka, kb))
+        if value > 1.0:
+            value = value / 100.0
+        if value > 0.0:
+            return value
+    except Exception:
+        pass
+    return float(difflib.SequenceMatcher(None, ka, kb, autojunk=False).ratio())
+
+
+def _decision_rows(con: sqlite3.Connection) -> Tuple[List[dict], Dict[str, List[dict]], str]:
+    if not _authority_table_exists(con, "decision_db"):
+        return [], {}, "decision_db_missing_table"
+    cols = {r[1] for r in con.execute("PRAGMA table_info(decision_db)")}
+    required = {"id", "source_key", "translation"}
+    missing = sorted(required - cols)
+    if missing:
+        return [], {}, "decision_db_schema_incompatible:" + ",".join(missing)
+    level_expr = "level" if "level" in cols else "NULL AS level"
+    lock_expr = "COALESCE(locked, 0) AS locked" if "locked" in cols else "0 AS locked"
+    rows = [dict(r) for r in con.execute(
+        "SELECT id, source_key, translation, "
+        f"{level_expr}, {lock_expr} FROM decision_db ORDER BY id"
+    )]
+    index: Dict[str, List[dict]] = {}
+    for row in rows:
+        keys = {
+            _decision_source_key(str(row.get("source_key") or "")),
+            _phrase_key(str(row.get("source_key") or "")),
+        }
+        for key in keys:
+            if key:
+                index.setdefault(key, []).append(row)
+    return rows, index, ""
+
+
+def _authority_registry_rows(con: sqlite3.Connection) -> Tuple[List[dict], str]:
+    if not _authority_table_exists(con, "entity_registry"):
+        return [], "entity_registry_missing_table"
+    cols = {r[1] for r in con.execute("PRAGMA table_info(entity_registry)")}
+    required = {"id", "canonical_name", "source_names"}
+    missing = sorted(required - cols)
+    if missing:
+        return [], "entity_registry_schema_incompatible:" + ",".join(missing)
+
+    def col(name: str, default: str) -> str:
+        return name if name in cols else f"{default} AS {name}"
+
+    select = [
+        "id", "canonical_name", "source_names",
+        col("context_names", "'[]'"),
+        col("quarantined_names", "'[]'"),
+        col("variant_names", "'[]'"),
+        col("entity_type", "''"),
+        col("confidence", "'low'"),
+        col("pending_review", "0"),
+    ]
+    rows: List[dict] = []
+    for row in con.execute(f"SELECT {', '.join(select)} FROM entity_registry ORDER BY id"):
+        item = dict(row)
+        for field in ("source_names", "context_names", "quarantined_names", "variant_names"):
+            item[field] = _json_list(item.get(field))
+        rows.append(item)
+    return rows, ""
+
+
+def _decision_for_alias(alias: str, index: Dict[str, List[dict]]) -> List[dict]:
+    seen: Dict[int, dict] = {}
+    for key in _decision_lookup_keys(alias):
+        for row in index.get(key, []):
+            seen[int(row["id"])] = row
+    return list(seen.values())
+
+
+def _alias_owner_index(registry: List[dict]) -> Dict[str, set]:
+    owners: Dict[str, set] = {}
+    for row in registry:
+        canonical = str(row.get("canonical_name") or "").strip()
+        if not canonical:
+            continue
+        for alias in row.get("source_names") or []:
+            key = _alias_owner_key(alias)
+            if key:
+                owners.setdefault(key, set()).add(canonical)
+    return owners
+
+
+def _proper_token_groups(decisions: List[dict]) -> List[dict]:
+    """Group short/titled/full source forms that share the same proper-name core."""
+    items = []
+    for row in decisions:
+        source = str(row.get("source_key") or "").strip()
+        if classify_entity_source_name(source) != "proper":
+            continue
+        tokens = frozenset(source_name_proper_tokens(source))
+        words = tuple(
+            word for word in re_find_words(source_name_normalized(source))
+            if word in tokens
+        )
+        if source and words:
+            items.append((source, words, row))
+
+    parent: Dict[str, str] = {source: source for source, _tokens, _row in items}
+
+    def find(value: str) -> str:
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    # Only a contiguous prefix/short-form relation is evidence of a legitimate
+    # title/full-name family.  A shared token in the middle of two names is not
+    # enough (e.g. unrelated houses that both contain "Atreides").
+    for i in range(len(items)):
+        source_a, words_a, _row_a = items[i]
+        for j in range(i + 1, len(items)):
+            source_b, words_b, _row_b = items[j]
+            short, long_ = ((words_a, words_b) if len(words_a) <= len(words_b)
+                            else (words_b, words_a))
+            if not short or long_[:len(short)] != short:
+                continue
+            if short[0] in _GENERIC_GROUP_ANCHORS:
+                continue
+            if any(token in _GENERIC_GROUP_ANCHORS for token in long_[len(short):]):
+                continue
+            union(source_a, source_b)
+
+    groups: Dict[str, List[Tuple[str, Tuple[str, ...], dict]]] = {}
+    for item in items:
+        groups.setdefault(find(item[0]), []).append(item)
+    out: List[dict] = []
+    for members in groups.values():
+        sources = sorted({source for source, _tokens, _row in members})
+        if len(sources) < 2:
+            continue
+        rows = []
+        seen_ids = set()
+        for _source, _tokens, row in members:
+            rid = int(row["id"])
+            if rid in seen_ids:
+                continue
+            seen_ids.add(rid)
+            rows.append({
+                "id": rid,
+                "source_key": str(row.get("source_key") or ""),
+                "translation": str(row.get("translation") or ""),
+            })
+        rows.sort(key=lambda r: (len(r["source_key"]), r["source_key"]))
+        translations = [r["translation"] for r in rows if r["translation"]]
+        incompatible = []
+        for i in range(len(rows)):
+            for j in range(i + 1, len(rows)):
+                a = rows[i]["translation"]
+                b = rows[j]["translation"]
+                if a and b and not _name_compatible(a, b):
+                    incompatible.append({
+                        "left": rows[i]["source_key"],
+                        "right": rows[j]["source_key"],
+                        "left_translation": a,
+                        "right_translation": b,
+                    })
+        out.append({
+            "sources": sources,
+            "decisions": rows,
+            "forms": list(dict.fromkeys(translations)),
+            "incompatible_pairs": incompatible,
+            "needs_form_contract": bool(incompatible),
+        })
+    return sorted(out, key=lambda g: (g["sources"][0], g["sources"]))
+
+
+def re_find_words(text: str) -> Tuple[str, ...]:
+    """Small local word tokenizer for normalized English source keys."""
+    return tuple(re.findall(r"[a-z0-9]+", str(text or "").lower()))
+
+
+def _translation_extras(base: str, current: str) -> List[str]:
+    """Return inserted CJK content that is not merely a title/role suffix.
+
+    Insertions are inspected separately from replacements so a one-character
+    transliteration repair (杰赛 -> 杰瑟) is not mistaken for new meaning.  A
+    title such as 夫人, 博士 or 男爵 is harmless in a short/full name form; a
+    term such as 计划, 学校 or 护航舰 changes the referent and must not be a
+    hard alias of the shorter entity.
+    """
+    base_key = _name_key(base)
+    current_key = _name_key(current)
+    if not base_key or not current_key or base_key == current_key:
+        return []
+    out: List[str] = []
+    matcher = difflib.SequenceMatcher(None, base_key, current_key, autojunk=False)
+    for tag, _i1, _i2, j1, j2 in matcher.get_opcodes():
+        if tag != "insert":
+            continue
+        inserted = current_key[j1:j2]
+        residual = inserted
+        for word in sorted(set(_ZH_ROLE_WORDS) | set(_ZH_GENERIC_MODIFIERS),
+                           key=len, reverse=True):
+            residual = residual.replace(word, "")
+        if any("\u4e00" <= ch <= "\u9fff" for ch in residual):
+            out.append(inserted)
+    return out
+
+
+def _source_content_tokens(text: str) -> set:
+    """Case-insensitive source tokens that can add semantic content."""
+    return {
+        token for token in source_name_normalized(text).split()
+        if token and token not in _EN_DETERMINERS
+        and token not in _EN_ROLE_WORDS
+        and token not in _EN_GENERIC_MODIFIERS
+    }
+
+
+def _term_phrase_alias_evidence(alias: str, canonical: str, translation: str,
+                                decisions: List[dict]) -> Optional[dict]:
+    """Detect a distinct term phrase accidentally owned by a shorter entity.
+
+    The proof is deliberately narrow and mechanical:
+
+    * a shorter Decision key is a contiguous sub-phrase of the alias;
+    * that shorter key's translation is exactly the registry canonical;
+    * the alias contributes a generic group/term token (``plan``, ``school``,
+      ``way`` … rather than a surname or role); and
+    * the alias decision adds CJK content beyond title/role words.
+
+    ``Bene Gesserit Plan -> 贝尼·杰瑟里特计划`` meets all four conditions.
+    ``Lady Jessica -> 杰西卡夫人`` and ``Dr. Kynes -> 凯恩斯博士`` do not,
+    because 夫人/博士 are role forms rather than new semantic content.
+    """
+    alias_source = source_name_normalized(alias)
+    alias_tokens = _source_content_tokens(alias)
+    canonical_key = _name_key(canonical)
+    if not alias_source or not alias_tokens or not canonical_key:
+        return None
+
+    candidates: List[dict] = []
+    for decision in decisions:
+        base_source = str(decision.get("source_key") or "")
+        base_normalized = source_name_normalized(base_source)
+        if (not base_normalized or base_normalized == alias_source
+                or base_normalized not in alias_source):
+            continue
+        base_translation = str(decision.get("translation") or "").strip()
+        if not base_translation or _name_key(base_translation) != canonical_key:
+            continue
+        base_tokens = _source_content_tokens(base_source)
+        extra_tokens = sorted(alias_tokens - base_tokens)
+        if not extra_tokens:
+            continue
+        if not any(token in _GENERIC_GROUP_ANCHORS for token in extra_tokens):
+            continue
+        extras = _translation_extras(base_translation, translation)
+        if not extras:
+            continue
+        candidates.append({
+            "base_decision_id": int(decision.get("id") or 0),
+            "base_source_key": base_source,
+            "base_translation": base_translation,
+            "extra_source_tokens": extra_tokens,
+            "inserted_translation": extras,
+        })
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (
+        -len(str(item.get("base_source_key") or "")), item.get("base_decision_id") or 0))
+    return candidates[0]
+
+
+def _term_phrase_variant_evidence(variant: str, canonical: str,
+                                  decisions: List[dict]) -> Optional[dict]:
+    """Map a Chinese registry variant back to a flagged term-phrase decision.
+
+    ``variant_names`` is also executable: name unification may replace a
+    variant with the canonical.  A variant such as ``贝尼·杰瑟里特学校`` must
+    therefore be quarantined just like its English source alias, while a full
+    personal name or a title form remains untouched.
+    """
+    variant_key = _name_key(variant)
+    if not variant_key:
+        return None
+    for decision in decisions:
+        translation = str(decision.get("translation") or "").strip()
+        if not translation:
+            continue
+        if (_name_key(translation) != variant_key
+                and _similarity(variant, translation) < FORM_ALIGN_SIMILARITY):
+            continue
+        evidence = _term_phrase_alias_evidence(
+            str(decision.get("source_key") or ""), canonical, translation,
+            decisions)
+        if not evidence:
+            continue
+        out = dict(evidence)
+        out.update({
+            "term_decision_id": int(decision.get("id") or 0),
+            "term_source_key": str(decision.get("source_key") or ""),
+            "variant_translation": translation,
+            "variant_similarity": round(_similarity(variant, translation), 4),
+        })
+        return out
+    return None
+
+
+def _classify_alias_relation(alias: str, canonical: str, translation: str,
+                            owners: Dict[str, set],
+                            term_evidence: Optional[dict] = None) -> Tuple[str, float]:
+    if term_evidence:
+        return "term_phrase_alias_quarantine", _similarity(canonical, translation)
+    if _name_compatible(canonical, translation):
+        return "compatible", _similarity(canonical, translation)
+    similarity = _similarity(canonical, translation)
+    key = _alias_owner_key(alias)
+    if similarity >= FORM_ALIGN_SIMILARITY:
+        return "form_align_candidate", similarity
+    if len(owners.get(key) or set()) > 1:
+        return "cross_person_alias_conflict", similarity
+    # A title/relation/description phrase or a decision translation with no
+    # proper-name core is contextual.  Otherwise this is still quarantined,
+    # but labelled as an authority mismatch rather than inventing a person.
+    if classify_entity_source_name(alias) != "proper" or canonical_is_title_only(translation):
+        return "context_alias_quarantine", similarity
+    return "authority_mismatch_quarantine", similarity
+
+
+def audit_name_authorities(
+    project_root: Path,
+    *,
+    decision_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Compare Decision DB names with registry hard aliases; never mutate DBs."""
+    root = Path(project_root)
+    db_path = Path(decision_db) if decision_db else root / "db" / "decision_db.sqlite"
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "name_authority_audit.json"
+    mpath = Path(md_out) if md_out else out_dir / "name_authority_audit.md"
+    result: Dict[str, Any] = {
+        "schema_version": 1,
+        "mode": "read_only",
+        "generated_at": _now_iso(),
+        "write_attempted": False,
+        "decision_db": str(db_path),
+        "records": [],
+        "multi_form_groups": [],
+        "counts": {},
+        "blocking_count": 0,
+        "ok": False,
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+        "errors": [],
+    }
+    if not db_path.exists():
+        result["errors"].append("decision_db_missing")
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, "# 名称权威审计\n\nDecision DB 不存在；未执行。\n")
+        return result
+
+    con = sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        decisions, decision_index, decision_error = _decision_rows(con)
+        registry, registry_error = _authority_registry_rows(con)
+    finally:
+        con.close()
+    for error in (decision_error, registry_error):
+        if error:
+            result["errors"].append(error)
+    if decision_error or registry_error:
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, "# 名称权威审计\n\n" + "\n".join(
+            f"- 错误: `{e}`" for e in result["errors"]) + "\n")
+        return result
+
+    owners = _alias_owner_index(registry)
+    records: List[dict] = []
+    for row in registry:
+        canonical = str(row.get("canonical_name") or "").strip()
+        if not canonical:
+            continue
+        if str(row.get("confidence") or "") not in {"high", "medium"}:
+            continue
+        for alias in row.get("source_names") or []:
+            matches = _decision_for_alias(alias, decision_index)
+            if not matches:
+                continue
+            # One alias can match more than one decision only in legacy DBs;
+            # all mappings are retained as evidence.
+            for decision in matches:
+                translation = str(decision.get("translation") or "").strip()
+                if not translation:
+                    continue
+                term_evidence = _term_phrase_alias_evidence(
+                    alias, canonical, translation, decisions)
+                relation, similarity = _classify_alias_relation(
+                    alias, canonical, translation, owners,
+                    term_evidence=term_evidence)
+                if relation == "compatible":
+                    continue
+                action = "align_registry_form"
+                if relation in {"context_alias_quarantine",
+                                 "authority_mismatch_quarantine",
+                                 "term_phrase_alias_quarantine"}:
+                    action = "remove_from_source_names_or_quarantine"
+                elif relation == "cross_person_alias_conflict":
+                    action = "quarantine_alias_until_single_owner"
+                record = {
+                    "kind": relation,
+                    "registry_id": int(row["id"]),
+                    "registry_canonical": canonical,
+                    "registry_confidence": str(row.get("confidence") or ""),
+                    "registry_pending_review": int(row.get("pending_review") or 0),
+                    "alias": alias,
+                    "alias_class": classify_entity_source_name(alias),
+                    "decision_id": int(decision["id"]),
+                    "decision_source_key": str(decision.get("source_key") or ""),
+                    "decision_translation": translation,
+                    "similarity": round(float(similarity), 4),
+                    "alias_registry_owners": sorted(owners.get(_alias_owner_key(alias), set())),
+                    "suggested_action": action,
+                }
+                if term_evidence:
+                    record["term_phrase_evidence"] = term_evidence
+                records.append(record)
+
+        for variant in row.get("variant_names") or []:
+            term_evidence = _term_phrase_variant_evidence(
+                variant, canonical, decisions)
+            if not term_evidence:
+                continue
+            translation = str(term_evidence.get("variant_translation") or "")
+            records.append({
+                "kind": "term_phrase_variant_quarantine",
+                "registry_id": int(row["id"]),
+                "registry_canonical": canonical,
+                "registry_confidence": str(row.get("confidence") or ""),
+                "registry_pending_review": int(row.get("pending_review") or 0),
+                "alias": variant,
+                "alias_class": "variant",
+                "decision_id": int(term_evidence.get("term_decision_id") or 0),
+                "decision_source_key": str(
+                    term_evidence.get("term_source_key") or ""),
+                "decision_translation": translation,
+                "similarity": float(
+                    term_evidence.get("variant_similarity") or 0.0),
+                "alias_registry_owners": [canonical],
+                "suggested_action": "remove_from_variant_names_or_quarantine",
+                "term_phrase_evidence": term_evidence,
+            })
+
+    multi_form = _proper_token_groups(decisions)
+    result["records"] = sorted(
+        records,
+        key=lambda r: (r["kind"], r["alias"], r["registry_canonical"], r["decision_id"]))
+    result["multi_form_groups"] = multi_form
+    counts = Counter(r["kind"] for r in records)
+    result["counts"] = dict(sorted(counts.items()))
+    result["multi_form_count"] = len(multi_form)
+    result["multi_form_needing_contract"] = sum(
+        1 for group in multi_form if group.get("needs_form_contract"))
+    blocking_kinds = {
+        "form_align_candidate",
+        "cross_person_alias_conflict",
+        "context_alias_quarantine",
+        "authority_mismatch_quarantine",
+        "term_phrase_alias_quarantine",
+        "term_phrase_variant_quarantine",
+    }
+    result["blocking_count"] = sum(
+        int(v) for k, v in counts.items() if k in blocking_kinds)
+    result["ok"] = result["blocking_count"] == 0 and not result["errors"]
+    result["status"] = "clean" if result["ok"] else "needs_alignment"
+    _atomic_json(jpath, result)
+    _atomic_text(mpath, _authority_markdown(result))
+    return result
+
+
+def _authority_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# 名称权威审计（只读）", ""]
+    lines.append(f"- 生成时间: {result.get('generated_at')}")
+    lines.append("- 模式: **read-only**（Decision DB / entity_registry 均未写入）")
+    counts = result.get("counts") or {}
+    lines.append("- 硬别名分歧: " + (", ".join(
+        f"`{k}`={v}" for k, v in counts.items()) or "无"))
+    lines.append(f"- 多重称谓权威组: **{result.get('multi_form_count', 0)}** "
+                 f"(需 form contract: {result.get('multi_form_needing_contract', 0)})")
+    lines.append(f"- 结论: **{'可进入下一阶段' if result.get('ok') else '需先对齐/隔离'}**")
+    if result.get("errors"):
+        lines.append("- 错误: " + ", ".join(f"`{e}`" for e in result["errors"]))
+
+    records = result.get("records") or []
+    if records:
+        lines.append("")
+        lines.append(f"## 硬别名分歧（仅列前 40 / 共 {len(records)}）")
+        for item in records[:40]:
+            lines.append(
+                f"- `{item['alias']}` {item['registry_canonical']} ↔ "
+                f"{item['decision_translation']} / {item['kind']} / "
+                f"sim={item['similarity']:.3f} / action={item['suggested_action']}")
+    groups = result.get("multi_form_groups") or []
+    if groups:
+        lines.append("")
+        lines.append(f"## 多重称谓权威（仅列前 30 / 共 {len(groups)}）")
+        for group in groups[:30]:
+            forms = " | ".join(group.get("forms") or [])
+            lines.append(f"- {' + '.join(group.get('sources') or [])}: {forms}")
+    lines.append("")
+    lines.append("本报告不提供自动修复。若存在阻断项，`name-only-fastpath` 不得进入写闭环。")
+    lines.append("")
+    return "\n".join(lines)
+
+
+ALIGNMENT_SCHEMA_VERSION = 1
+_ALIGN_ANNOTATION_RE = re.compile(r"[（(][^（()）]*[）)]")
+
+
+def _align_now_iso() -> str:
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _align_read_json(path: Path) -> Optional[dict]:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _align_atomic_json(path: Path, payload: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    tmp.replace(path)
+
+
+def _align_atomic_text(path: Path, text: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _align_json_list(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        values = raw
+    else:
+        try:
+            values = json.loads(str(raw) or "[]")
+        except (TypeError, json.JSONDecodeError):
+            return []
+    if not isinstance(values, list):
+        return []
+    return [str(x).strip() for x in values if str(x).strip()]
+
+
+def _align_json_dump(values: Iterable[str]) -> str:
+    deduped: List[str] = []
+    seen = set()
+    for value in values:
+        text = str(value or "").strip()
+        key = _phrase_key(text)
+        if text and key and key not in seen:
+            seen.add(key)
+            deduped.append(text)
+    return json.dumps(deduped, ensure_ascii=False)
+
+
+def _align_table_exists(con: sqlite3.Connection, name: str) -> bool:
+    return bool(con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone())
+
+
+def _align_load_registry(con: sqlite3.Connection) -> Tuple[List[dict], str]:
+    if not _align_table_exists(con, "entity_registry"):
+        return [], "entity_registry_missing_table"
+    cols = {row[1] for row in con.execute("PRAGMA table_info(entity_registry)")}
+    required = {"id", "canonical_name", "source_names"}
+    missing = sorted(required - cols)
+    if missing:
+        return [], "entity_registry_schema_incompatible:" + ",".join(missing)
+    if "quarantined_names" not in cols:
+        return [], "entity_registry_missing_quarantined_names"
+
+    def expr(name: str, default: str) -> str:
+        return name if name in cols else f"{default} AS {name}"
+
+    select = [
+        "id", "canonical_name", "source_names",
+        expr("variant_names", "NULL"),
+        "quarantined_names",
+        expr("confidence", "'low'"),
+        expr("pending_review", "0"),
+        expr("review_reason", "NULL"),
+        expr("updated_at", "NULL"),
+    ]
+    rows: List[dict] = []
+    for row in con.execute(
+            f"SELECT {', '.join(select)} FROM entity_registry ORDER BY id"):
+        item = dict(row)
+        for field in ("source_names", "variant_names", "quarantined_names"):
+            item[field] = _align_json_list(item.get(field))
+        rows.append(item)
+    return rows, ""
+
+
+def _align_owners_for_alias(rows: List[dict], alias: str) -> List[int]:
+    key = _phrase_key(alias)
+    return [
+        int(row["id"]) for row in rows
+        if any(_phrase_key(value) == key for value in row.get("source_names") or [])
+    ]
+
+
+def _align_target_owner(rows: List[dict], target: str,
+                        exclude_id: int) -> Optional[int]:
+    key = _name_key(target)
+    for row in rows:
+        if int(row["id"]) == int(exclude_id):
+            continue
+        if _name_key(row.get("canonical_name") or "") == key:
+            return int(row["id"])
+    return None
+
+
+def _align_rows_by_canonical(rows: List[dict], canonical: str) -> List[dict]:
+    key = _name_key(canonical)
+    if not key:
+        return []
+    return [
+        row for row in rows
+        if _name_key(row.get("canonical_name") or "") == key
+    ]
+
+
+def build_name_authority_alignment(
+    project_root: Path,
+    *,
+    decision_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Build a deterministic alignment proposal without mutating the DB."""
+    root = Path(project_root)
+    db_path = (Path(decision_db) if decision_db
+               else root / "db" / "decision_db.sqlite")
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "name_authority_align.json"
+    mpath = Path(md_out) if md_out else out_dir / "name_authority_align.md"
+    result: Dict[str, Any] = {
+        "schema_version": ALIGNMENT_SCHEMA_VERSION,
+        "mode": "read_only",
+        "write_attempted": False,
+        "generated_at": _align_now_iso(),
+        "decision_db": str(db_path),
+        "actions": [],
+        "manual_review": [],
+        "counts": {},
+        "errors": [],
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+    }
+    audit = audit_name_authorities(root, decision_db=db_path, output_dir=out_dir)
+    result["audit_before"] = {
+        "ok": bool(audit.get("ok")),
+        "status": audit.get("status"),
+        "blocking_count": int(audit.get("blocking_count") or 0),
+        "counts": audit.get("counts") or {},
+        "report": audit.get("md_path"),
+    }
+    if not db_path.exists():
+        result["errors"].append("decision_db_missing")
+        _align_atomic_json(jpath, result)
+        _align_atomic_text(mpath, "# 名称权威对齐计划\n\nDecision DB 不存在。\n")
+        return result
+
+    for error in audit.get("errors") or []:
+        result["errors"].append("audit_before:" + str(error))
+
+    con = sqlite3.connect(f"file:{db_path.resolve()}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        rows, schema_error = _align_load_registry(con)
+        decisions, decision_index, decision_error = _decision_rows(con)
+    finally:
+        con.close()
+    if schema_error or decision_error:
+        for error in (schema_error, decision_error):
+            if error:
+                result["errors"].append(error)
+        _align_atomic_json(jpath, result)
+        _align_atomic_text(mpath, "# 名称权威对齐计划\n\n" + "\n".join(
+            f"- 错误: `{error}`" for error in result["errors"]) + "\n")
+        return result
+
+    by_id = {int(row["id"]): row for row in rows}
+    quarantine: Dict[int, Dict[str, Any]] = {}
+    form_groups: Dict[Tuple[int, str], List[dict]] = {}
+    manual: List[dict] = []
+
+    def add_quarantine(registry_id: int, alias: str, record: dict,
+                       reason: str) -> None:
+        if registry_id not in by_id:
+            manual.append({
+                "registry_id": registry_id, "alias": alias,
+                "reason": "registry_row_missing", "evidence": record,
+            })
+            return
+        slot = quarantine.get(registry_id)
+        if slot is None:
+            slot = {"aliases": {}, "kinds": set(), "decision_ids": set(),
+                    "reasons": []}
+            quarantine[registry_id] = slot
+        slot["aliases"][_phrase_key(alias)] = alias
+        slot["kinds"].add(str(record.get("kind") or ""))
+        slot["decision_ids"].add(int(record.get("decision_id") or 0))
+        slot["reasons"].append(reason)
+
+    for record in audit.get("records") or []:
+        rid = int(record.get("registry_id") or 0)
+        alias = str(record.get("alias") or "")
+        kind = str(record.get("kind") or "")
+        if not rid or not alias:
+            continue
+        if kind == "form_align_candidate":
+            form_groups.setdefault((rid, _phrase_key(alias)), []).append(record)
+            continue
+        if kind == "cross_person_alias_conflict":
+            owner_ids = _align_owners_for_alias(rows, alias)
+            if not owner_ids:
+                owner_ids = [rid]
+            for owner_id in sorted(set(owner_ids)):
+                add_quarantine(
+                    owner_id, alias, record,
+                    f"cross_person:{','.join(record.get('alias_registry_owners') or [])}")
+            continue
+        add_quarantine(rid, alias, record, kind)
+
+    align_by_id: Dict[int, Dict[str, Any]] = {}
+    for (registry_id, alias_key), records in sorted(form_groups.items()):
+        row = by_id.get(registry_id)
+        alias = str(records[0].get("alias") or "")
+        if not row:
+            manual.append({"registry_id": registry_id, "alias": alias,
+                           "reason": "registry_row_missing"})
+            continue
+        translations = {
+            str(record.get("decision_translation") or "").strip()
+            for record in records
+            if str(record.get("decision_translation") or "").strip()
+        }
+        owners = set()
+        for record in records:
+            owners.update(record.get("alias_registry_owners") or [])
+        if len(translations) != 1:
+            manual.append({
+                "registry_id": registry_id, "alias": alias,
+                "reason": "ambiguous_decision_forms",
+                "decision_translations": sorted(translations),
+            })
+            continue
+        target = next(iter(translations))
+        if _name_key(target) == _name_key(row.get("canonical_name") or ""):
+            continue
+        # A source alias may legitimately be shared by a short/titled/full form
+        # family.  When one owner already carries the authoritative canonical
+        # and is active, keep that owner and quarantine the alias only from the
+        # drifting owners.  This is deterministic and avoids a false "manual
+        # review" for a mere spelling drift.
+        target_rows = _align_rows_by_canonical(rows, target)
+        active_target_rows = [
+            candidate for candidate in target_rows
+            if not int(candidate.get("pending_review") or 0)
+        ]
+        if len(owners) > 1:
+            if not target_rows:
+                manual.append({
+                    "registry_id": registry_id, "alias": alias,
+                    "reason": "form_alias_multiple_owners",
+                    "owners": sorted(owners),
+                })
+                continue
+            if not active_target_rows:
+                manual.append({
+                    "registry_id": registry_id, "alias": alias,
+                    "reason": "form_alias_target_owner_pending",
+                    "owners": sorted(owners),
+                    "target": target,
+                })
+                continue
+            quarantined_any = False
+            for owner in sorted(owners):
+                if _name_key(owner) == _name_key(target):
+                    continue
+                owner_rows = _align_rows_by_canonical(rows, owner)
+                if not owner_rows:
+                    manual.append({
+                        "registry_id": registry_id, "alias": alias,
+                        "reason": "form_alias_owner_row_missing",
+                        "owner": owner,
+                    })
+                    continue
+                for owner_row in owner_rows:
+                    if int(owner_row.get("id") or 0) == int(registry_id):
+                        add_quarantine(
+                            registry_id, alias, records[0],
+                            f"form_target_owned:{target}")
+                    else:
+                        add_quarantine(
+                            int(owner_row["id"]), alias, records[0],
+                            f"form_target_owned:{target}")
+                    quarantined_any = True
+            if not quarantined_any:
+                manual.append({
+                    "registry_id": registry_id, "alias": alias,
+                    "reason": "form_alias_no_drift_owner",
+                    "owners": sorted(owners),
+                    "target": target,
+                })
+            continue
+        if int(row.get("pending_review") or 0):
+            manual.append({
+                "registry_id": registry_id, "alias": alias,
+                "reason": "pending_registry_row_requires_review",
+            })
+            continue
+        target_owner = _align_target_owner(rows, target, registry_id)
+        if target_owner is not None:
+            record = records[0]
+            add_quarantine(
+                registry_id, alias, record,
+                f"target_canonical_owned_by:{target_owner}")
+            continue
+        previous = align_by_id.get(registry_id)
+        if previous and _name_key(previous.get("canonical_after") or "") != _name_key(target):
+            manual.append({
+                "registry_id": registry_id,
+                "aliases": sorted({previous.get("alias"), alias} - {None, ""}),
+                "reason": "multiple_form_targets",
+                "targets": sorted({
+                    str(previous.get("canonical_after") or ""), target}),
+            })
+            align_by_id.pop(registry_id, None)
+            continue
+        align_by_id[registry_id] = {
+            "action": "align_canonical",
+            "registry_id": registry_id,
+            "alias": alias,
+            "canonical_before": str(row.get("canonical_name") or ""),
+            "canonical_after": target,
+            "decision_ids": sorted({
+                int(record.get("decision_id") or 0) for record in records
+                if int(record.get("decision_id") or 0)}),
+            "reason": "single_form_drift_with_unique_target",
+        }
+
+    # A canonical rename is atomic at row level, but the row may carry other
+    # hard aliases whose Decision translations still embed the old canonical
+    # (for example ``B.G. -> 贝尼·杰赛里特（B.G.）``).  Keeping such an alias
+    # after the rename would manufacture a new authority conflict.  Predict
+    # that second-order effect now and quarantine only the affected aliases;
+    # the Decision DB remains untouched and fail-closed.
+    for registry_id, action in list(align_by_id.items()):
+        row = by_id.get(registry_id)
+        if not row:
+            continue
+        target = str(action.get("canonical_after") or "")
+        form_alias_key = _phrase_key(str(action.get("alias") or ""))
+        for alias in row.get("source_names") or []:
+            if _phrase_key(alias) == form_alias_key:
+                continue
+            matches = _decision_for_alias(alias, decision_index)
+            if not matches:
+                continue
+            translations = [
+                str(decision.get("translation") or "").strip()
+                for decision in matches
+                if str(decision.get("translation") or "").strip()
+            ]
+            if not translations or all(
+                    _name_compatible(target, translation)
+                    for translation in translations):
+                continue
+            add_quarantine(
+                registry_id, alias, {
+                    "kind": "post_form_align_conflict",
+                    "decision_id": int(matches[0].get("id") or 0),
+                },
+                "post_form_align_conflict:" + target)
+
+    variant_actions, variant_manual = _align_locked_short_variants(
+        rows, decisions)
+    variant_actions = [
+        action for action in variant_actions
+        if int(action.get("registry_id") or 0) not in align_by_id
+    ]
+    manual.extend(variant_manual)
+
+    actions: List[dict] = []
+    for registry_id, slot in sorted(quarantine.items()):
+        row = by_id.get(registry_id)
+        if not row:
+            continue
+        aliases = sorted(slot["aliases"].values(), key=_phrase_key)
+        actions.append({
+            "action": "quarantine_aliases",
+            "registry_id": registry_id,
+            "canonical_before": str(row.get("canonical_name") or ""),
+            "aliases": aliases,
+            "kinds": sorted(slot["kinds"]),
+            "decision_ids": sorted(did for did in slot["decision_ids"] if did),
+            "reasons": list(dict.fromkeys(slot["reasons"])),
+        })
+    actions.extend(align_by_id.values())
+    actions.extend(variant_actions)
+    # Apply alias removals before canonical renames on the same row: the rename
+    # is guarded by the pre-plan canonical value, while quarantine only touches
+    # alias columns and is safe to run first.
+    action_order = {
+        "quarantine_aliases": 0,
+        "align_canonical": 1,
+        "register_locked_variant": 2,
+    }
+    actions.sort(key=lambda item: (
+        int(item.get("registry_id", 0)),
+        action_order.get(str(item.get("action") or ""), 9),
+        str(item.get("action") or ""),
+    ))
+    result["actions"] = actions
+    result["manual_review"] = manual
+    counts = Counter(str(action.get("action") or "") for action in actions)
+    result["counts"] = {
+        "quarantine_aliases": counts.get("quarantine_aliases", 0),
+        "align_canonical": counts.get("align_canonical", 0),
+        "register_locked_variant": counts.get("register_locked_variant", 0),
+        "manual_review": len(manual),
+    }
+    result["ok"] = not result["errors"] and not manual
+    _align_atomic_json(jpath, result)
+    _align_atomic_text(mpath, _align_markdown(result))
+    return result
+
+
+def _align_remove_alias(values: List[str], aliases: Iterable[str]) -> List[str]:
+    remove = {_phrase_key(alias) for alias in aliases if _phrase_key(alias)}
+    return [value for value in values if _phrase_key(value) not in remove]
+
+
+def _align_db_backup(db_path: Path, backup_path: Path) -> None:
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    source = sqlite3.connect(str(db_path))
+    destination = sqlite3.connect(str(backup_path))
+    try:
+        source.backup(destination)
+    finally:
+        destination.close()
+        source.close()
+
+
+def _align_active(rows: Iterable[dict]) -> List[dict]:
+    return [
+        row for row in rows
+        if not int(row.get("pending_review") or 0)
+        and str(row.get("confidence") or "high").lower() == "high"
+    ]
+
+
+def _align_locked_short_variants(
+    rows: List[dict],
+    decisions: List[dict],
+) -> Tuple[List[dict], List[dict]]:
+    """Register a locked Decision short form as its active owner's variant.
+
+    This is deliberately narrower than general alias synthesis: the source
+    alias must have exactly one active owner, the locked target must be one
+    non-generic CJK token already present in that owner's canonical, and the
+    token must not be owned by any other active entity.
+    """
+    active = _align_active(rows)
+    by_source: Dict[str, List[dict]] = {}
+    for row in active:
+        for alias in row.get("source_names") or []:
+            key = _phrase_key(alias)
+            if key:
+                by_source.setdefault(key, []).append(row)
+
+    actions: List[dict] = []
+    manual: List[dict] = []
+    seen: set = set()
+    for decision in decisions:
+        if not int(decision.get("locked") or 0):
+            continue
+        source_key = _phrase_key(decision.get("source_key") or "")
+        translation = _target_core(str(decision.get("translation") or ""))
+        if not source_key or not translation:
+            continue
+        if _ALIGN_ANNOTATION_RE.search(translation):
+            translation = _ALIGN_ANNOTATION_RE.sub("", translation).strip()
+        tokens = canonical_tokens(translation)
+        if len(tokens) != 1:
+            continue
+        variant = tokens[0].strip()
+        if (not variant or len(variant) < 2
+                or canonical_is_title_only(variant)):
+            continue
+        owners = by_source.get(source_key) or []
+        if len(owners) != 1:
+            if len(owners) > 1 and any(
+                    variant in canonical_tokens(row.get("canonical_name") or "")
+                    for row in owners):
+                manual.append({
+                    "source_key": str(decision.get("source_key") or ""),
+                    "decision_id": int(decision.get("id") or 0),
+                    "variant": variant,
+                    "reason": "locked_variant_multiple_active_owners",
+                    "registry_ids": sorted(int(row.get("id") or 0)
+                                           for row in owners),
+                })
+            continue
+        owner = owners[0]
+        rid = int(owner.get("id") or 0)
+        canonical = str(owner.get("canonical_name") or "")
+        canonical_parts = canonical_tokens(canonical)
+        variant_key = _name_key(variant)
+        canonical_key = _name_key(canonical)
+        if not rid or variant_key == canonical_key:
+            continue
+        if variant not in canonical_parts:
+            continue
+        quarantined = _align_json_list(owner.get("quarantined_names"))
+        if any(_name_key(value) == variant_key for value in quarantined):
+            manual.append({
+                "registry_id": rid,
+                "canonical": canonical,
+                "variant": variant,
+                "decision_id": int(decision.get("id") or 0),
+                "reason": "locked_variant_is_quarantined",
+            })
+            continue
+        variants = _align_json_list(owner.get("variant_names"))
+        if any(_name_key(value) == variant_key for value in variants):
+            continue
+        competing = []
+        for other in active:
+            if int(other.get("id") or 0) == rid:
+                continue
+            other_canonical = str(other.get("canonical_name") or "")
+            other_forms = [other_canonical]
+            other_forms.extend(_align_json_list(other.get("variant_names")))
+            other_forms.extend(_align_json_list(other.get("quarantined_names")))
+            if any(variant in str(value or "") for value in other_forms):
+                competing.append(int(other.get("id") or 0))
+        if competing:
+            manual.append({
+                "registry_id": rid,
+                "canonical": canonical,
+                "variant": variant,
+                "decision_id": int(decision.get("id") or 0),
+                "reason": "locked_variant_cross_person_conflict",
+                "competing_registry_ids": sorted(competing),
+            })
+            continue
+        key = (rid, variant_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        actions.append({
+            "action": "register_locked_variant",
+            "registry_id": rid,
+            "canonical_before": canonical,
+            "variant": variant,
+            "source_key": str(decision.get("source_key") or ""),
+            "decision_ids": [int(decision.get("id") or 0)],
+            "reason": "locked_decision_short_form",
+        })
+    return actions, manual
+
+
+def align_name_authorities(
+    project_root: Path,
+    *,
+    apply: bool = False,
+    decision_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+    run_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Apply the deterministic alignment proposal, or produce a read-only plan."""
+    root = Path(project_root)
+    db_path = (Path(decision_db) if decision_db
+               else root / "db" / "decision_db.sqlite")
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "name_authority_align_apply.json"
+    mpath = Path(md_out) if md_out else out_dir / "name_authority_align_apply.md"
+    if not apply:
+        return build_name_authority_alignment(
+            root, decision_db=db_path, output_dir=out_dir,
+            json_out=(Path(json_out) if json_out else out_dir / "name_authority_align.json"),
+            md_out=(Path(md_out) if md_out else out_dir / "name_authority_align.md"),
+        )
+
+    plan = build_name_authority_alignment(root, decision_db=db_path,
+                                          output_dir=out_dir)
+    result: Dict[str, Any] = {
+        "schema_version": ALIGNMENT_SCHEMA_VERSION,
+        "mode": "apply",
+        "write_attempted": False,
+        "generated_at": _align_now_iso(),
+        "run_id": str(run_id or (
+            _dt.datetime.now().strftime("name-align-%Y%m%dT%H%M%S") +
+            f"-{os.getpid()}")).replace("/", "_"),
+        "decision_db": str(db_path),
+        "plan_counts": plan.get("counts") or {},
+        "audit_before": plan.get("audit_before") or {},
+        "actions": [],
+        "manual_review": plan.get("manual_review") or [],
+        "errors": list(plan.get("errors") or []),
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+    }
+    if result["errors"]:
+        _align_atomic_json(jpath, result)
+        _align_atomic_text(mpath, _align_markdown(result))
+        return result
+    eligible = [
+        action for action in (plan.get("actions") or [])
+        if action.get("action") in {
+            "quarantine_aliases", "align_canonical", "register_locked_variant",
+        }
+    ]
+    result["write_attempted"] = bool(eligible)
+    if not eligible:
+        result["applied_count"] = 0
+        result["ok"] = bool((plan.get("audit_before") or {}).get("ok"))
+        result["after_audit"] = plan.get("audit_before") or {}
+        result["audit_after"] = plan.get("audit_before") or {}
+        _align_atomic_json(jpath, result)
+        _align_atomic_text(mpath, _align_markdown(result))
+        return result
+
+    backup_path = out_dir / "name_authority_align" / result["run_id"] / "decision_db.sqlite.bak"
+    try:
+        _align_db_backup(db_path, backup_path)
+    except Exception as exc:  # noqa: BLE001 - do not mutate without a backup
+        result["errors"].append(f"backup_failed:{type(exc).__name__}:{exc}")
+        _align_atomic_json(jpath, result)
+        _align_atomic_text(mpath, _align_markdown(result))
+        return result
+    result["backup_path"] = str(backup_path)
+
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
+    try:
+        cols = {row[1] for row in con.execute("PRAGMA table_info(entity_registry)")}
+        updated_expr = ", updated_at = CURRENT_TIMESTAMP" if "updated_at" in cols else ""
+        variant_expr = "variant_names" if "variant_names" in cols else "NULL AS variant_names"
+        reason_expr = "review_reason" if "review_reason" in cols else "NULL AS review_reason"
+        con.execute("BEGIN IMMEDIATE")
+        for action in eligible:
+            out_action = dict(action)
+            out_action["status"] = "kept"
+            rid = int(action.get("registry_id") or 0)
+            row = con.execute(
+                f"SELECT id, canonical_name, source_names, {variant_expr}, "
+                f"quarantined_names, pending_review, {reason_expr} "
+                "FROM entity_registry WHERE id=?", (rid,)).fetchone()
+            if not row:
+                out_action["status"] = "stale_row_missing"
+                result["actions"].append(out_action)
+                continue
+            canonical = str(row["canonical_name"] or "")
+            if canonical != str(action.get("canonical_before") or ""):
+                out_action["status"] = "stale_canonical_changed"
+                result["actions"].append(out_action)
+                continue
+            if action.get("action") == "align_canonical":
+                target = str(action.get("canonical_after") or "")
+                target_key = _name_key(target)
+                duplicate = None
+                for other_id, other_canonical in con.execute(
+                        "SELECT id, canonical_name FROM entity_registry WHERE id!=?",
+                        (rid,)):
+                    if _name_key(other_canonical or "") == target_key:
+                        duplicate = other_id
+                        break
+                if duplicate:
+                    out_action["status"] = "target_canonical_conflict"
+                    result["actions"].append(out_action)
+                    continue
+                con.execute(
+                    f"UPDATE entity_registry SET canonical_name=?{updated_expr} "
+                    "WHERE id=? AND canonical_name=?",
+                    (target, rid, canonical))
+                out_action["status"] = "applied"
+                result["actions"].append(out_action)
+                continue
+
+            if action.get("action") == "register_locked_variant":
+                variant = str(action.get("variant") or "").strip()
+                variant_key = _name_key(variant)
+                sources = _align_json_list(row["source_names"])
+                if not any(_phrase_key(source) == _phrase_key(
+                        action.get("source_key") or "") for source in sources):
+                    out_action["status"] = "stale_source_alias_missing"
+                    result["actions"].append(out_action)
+                    continue
+                variants = _align_json_list(row["variant_names"])
+                quarantined = _align_json_list(row["quarantined_names"])
+                if any(_name_key(value) == variant_key for value in quarantined):
+                    out_action["status"] = "variant_is_quarantined"
+                    result["actions"].append(out_action)
+                    continue
+                if any(_name_key(value) == variant_key for value in variants):
+                    out_action["status"] = "already_registered"
+                    result["actions"].append(out_action)
+                    continue
+                variants.append(variant)
+                reason_note = (
+                    "Round158 authority align: register locked short variant "
+                    f"{variant} from decision {','.join(str(x) for x in action.get('decision_ids') or [])}")
+                old_reason = str(row["review_reason"] or "")
+                review_reason = (old_reason + " | " if old_reason else "") + reason_note
+                assignments = ["variant_names=?"]
+                params: List[Any] = [_align_json_dump(variants)]
+                if "review_reason" in cols:
+                    assignments.append("review_reason=?")
+                    params.append(review_reason)
+                if "updated_at" in cols:
+                    assignments.append("updated_at=CURRENT_TIMESTAMP")
+                params.append(rid)
+                con.execute(
+                    "UPDATE entity_registry SET " + ", ".join(assignments)
+                    + " WHERE id=?", tuple(params))
+                out_action["status"] = "applied"
+                result["actions"].append(out_action)
+                continue
+
+            aliases = [str(value) for value in action.get("aliases") or []]
+            sources = _align_remove_alias(
+                _align_json_list(row["source_names"]), aliases)
+            variants = _align_remove_alias(
+                _align_json_list(row["variant_names"]), aliases)
+            quarantined = _align_json_list(row["quarantined_names"])
+            qkeys = {_phrase_key(value) for value in quarantined}
+            changed = False
+            for alias in aliases:
+                key = _phrase_key(alias)
+                if key and key not in qkeys:
+                    quarantined.append(alias)
+                    qkeys.add(key)
+                    changed = True
+            if (sources != _align_json_list(row["source_names"])
+                    or variants != _align_json_list(row["variant_names"])):
+                changed = True
+            if not changed:
+                out_action["status"] = "already_quarantined"
+                result["actions"].append(out_action)
+                continue
+            reason_note = (
+                "Round158 authority align: quarantine "
+                + ",".join(aliases) + "; kinds="
+                + ",".join(action.get("kinds") or []))
+            old_reason = str(row["review_reason"] or "")
+            review_reason = (old_reason + " | " if old_reason else "") + reason_note
+            assignments = ["source_names=?", "quarantined_names=?"]
+            params: List[Any] = [
+                _align_json_dump(sources), _align_json_dump(quarantined)]
+            if "variant_names" in cols:
+                assignments.append("variant_names=?")
+                params.append(_align_json_dump(variants))
+            if "review_reason" in cols:
+                assignments.append("review_reason=?")
+                params.append(review_reason)
+            if "updated_at" in cols:
+                assignments.append("updated_at=CURRENT_TIMESTAMP")
+            params.append(rid)
+            con.execute(
+                "UPDATE entity_registry SET " + ", ".join(assignments)
+                + " WHERE id=?", tuple(params))
+            out_action["status"] = "applied"
+            result["actions"].append(out_action)
+        con.commit()
+    except Exception as exc:  # noqa: BLE001 - preserve a truthful failure report
+        try:
+            con.rollback()
+        except sqlite3.Error:
+            pass
+        for action in result["actions"]:
+            if action.get("status") == "applied":
+                action["status"] = "rolled_back"
+        result["errors"].append(f"apply_failed:{type(exc).__name__}:{exc}")
+    finally:
+        con.close()
+
+    after = audit_name_authorities(root, decision_db=db_path, output_dir=out_dir)
+    result["audit_after"] = {
+        "ok": bool(after.get("ok")),
+        "status": after.get("status"),
+        "blocking_count": int(after.get("blocking_count") or 0),
+        "counts": after.get("counts") or {},
+        "report": after.get("md_path"),
+    }
+    applied = sum(1 for action in result["actions"]
+                  if action.get("status") == "applied")
+    result["applied_count"] = applied
+    result["ok"] = (not result["errors"] and bool(after.get("ok"))
+                    and applied == len(eligible))
+    _align_atomic_json(jpath, result)
+    _align_atomic_text(mpath, _align_markdown(result))
+    return result
+
+
+def _align_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# 名称权威对齐（Round 158 Phase 1.5a）", ""]
+    lines.append(f"- 生成时间: {result.get('generated_at')}")
+    lines.append(f"- 模式: **{result.get('mode')}** / ok=`{result.get('ok')}`")
+    if result.get("run_id"):
+        lines.append(f"- run_id: `{result.get('run_id')}`")
+    if result.get("backup_path"):
+        lines.append(f"- 备份: `{result.get('backup_path')}`")
+    before = result.get("audit_before") or {}
+    if before:
+        lines.append(f"- 对齐前: blocking={before.get('blocking_count', 0)} "
+                     f"status={before.get('status')}")
+    after = result.get("audit_after") or {}
+    if after:
+        lines.append(f"- 对齐后: blocking={after.get('blocking_count', 0)} "
+                     f"status={after.get('status')}")
+    counts = result.get("counts") or {}
+    if counts:
+        lines.append("- 计划计数: " + ", ".join(
+            f"`{key}`={value}" for key, value in counts.items()))
+    actions = result.get("actions") or []
+    if actions:
+        lines.extend(["", f"## 动作（{len(actions)}）"])
+        for action in actions[:80]:
+            if action.get("action") == "quarantine_aliases":
+                detail = ",".join(action.get("aliases") or [])
+            elif action.get("action") == "register_locked_variant":
+                detail = (
+                    f"{action.get('variant')} ← decision "
+                    f"{','.join(str(x) for x in action.get('decision_ids') or [])}")
+            else:
+                detail = f"{action.get('canonical_before')} → {action.get('canonical_after')}"
+            lines.append(
+                f"- id={action.get('registry_id')} `{action.get('action')}` "
+                f"{detail} / status={action.get('status', 'planned')}")
+    manual = result.get("manual_review") or []
+    if manual:
+        lines.extend(["", f"## 需人工/LLM 复核（{len(manual)}）"])
+        for item in manual[:60]:
+            lines.append(f"- {json.dumps(item, ensure_ascii=False)}")
+    if result.get("errors"):
+        lines.extend(["", "## 错误"])
+        lines.extend(f"- `{error}`" for error in result["errors"])
+    lines.extend([
+        "",
+        "本工具不改正文、不改 Decision DB；只隔离派生 registry 的冲突别名。",
+        "任何 ambiguous / multi-owner 项均保持原样。",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+AUTHORITY_ALIGN_SCHEMA_VERSION = 1
+_ARTICLE_ALIAS_RE = re.compile(
+    r"^(?:the|a|an)\s+(?P<rest>\S.*)$", re.IGNORECASE)
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _atomic_json(path: Path, payload: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    tmp.replace(path)
+
+
+def _atomic_text(path: Path, text: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _read_json(path: Path) -> Optional[dict]:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def _json_list(raw: Any) -> List[str]:
+    if isinstance(raw, list):
+        values = raw
+    else:
+        try:
+            values = json.loads(str(raw or "[]"))
+        except (TypeError, json.JSONDecodeError):
+            return []
+    return [str(value).strip() for value in values
+            if isinstance(value, str) and str(value).strip()]
+
+
+def _json_dump(values: List[str]) -> str:
+    return json.dumps(values, ensure_ascii=False)
+
+
+def _table_exists(con: sqlite3.Connection, name: str) -> bool:
+    return bool(con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone())
+
+
+def _columns(con: sqlite3.Connection, table: str) -> set:
+    return {str(row[1]) for row in con.execute(f"PRAGMA table_info({table})")}
+
+
+def _update_row(
+    con: sqlite3.Connection,
+    table: str,
+    row_id: int,
+    values: Dict[str, Any],
+) -> None:
+    columns = _columns(con, table)
+    assignments: List[str] = []
+    params: List[Any] = []
+    for column, value in values.items():
+        if column in columns:
+            assignments.append(column + "=?")
+            params.append(value)
+    if "updated_at" in columns:
+        assignments.append("updated_at=CURRENT_TIMESTAMP")
+    if not assignments:
+        return
+    con.execute(
+        "UPDATE " + table + " SET " + ", ".join(assignments) + " WHERE id=?",
+        tuple(params + [row_id]))
+
+
+def _connect_ro(path: Path) -> sqlite3.Connection:
+    con = sqlite3.connect(f"file:{Path(path).resolve()}?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _cjk_only(value: str) -> str:
+    text = re.sub(r"（[^）]*）|\([^)]*\)", "", str(value or "")).strip()
+    return text if text and re.fullmatch(r"[\u4e00-\u9fff]+", text) else ""
+
+
+def _one_char_cjk_drift(left: str, right: str) -> bool:
+    a, b = _cjk_only(left), _cjk_only(right)
+    return bool(
+        a and b and len(a) == len(b) and a != b
+        and sum(x != y for x, y in zip(a, b)) == 1
+    )
+
+
+def _source_fragment_spans(text: str, source_key: str) -> List[Tuple[int, int]]:
+    tokens = _source_tokens(source_key)
+    if len(tokens) != 1 or len(tokens[0]) < 4:
+        return []
+    token = tokens[0]
+    fragment = token[1:]
+    pattern = re.compile(
+        r"(?:(?:\.\s*){2,}|…\s*)" + re.escape(fragment)
+        + r"(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+    return [match.span() for match in pattern.finditer(str(text or ""))]
+
+
+def _load_registry(con: sqlite3.Connection) -> Tuple[List[dict], str]:
+    if not _table_exists(con, "entity_registry"):
+        return [], "entity_registry_missing"
+    cols = _columns(con, "entity_registry")
+    required = {"id", "canonical_name", "source_names", "variant_names",
+                "quarantined_names", "confidence", "pending_review"}
+    missing = sorted(required - cols)
+    if missing:
+        return [], "entity_registry_schema_incompatible:" + ",".join(missing)
+    rows: List[dict] = []
+    for row in con.execute(
+            "SELECT id, canonical_name, source_names, variant_names, "
+            "quarantined_names, confidence, pending_review "
+            "FROM entity_registry ORDER BY id"):
+        item = dict(row)
+        for field in ("source_names", "variant_names", "quarantined_names"):
+            item[field] = _json_list(item.get(field))
+        rows.append(item)
+    return rows, ""
+
+
+def _load_decisions(con: sqlite3.Connection) -> Tuple[List[dict], str]:
+    if not _table_exists(con, "decision_db"):
+        return [], "decision_db_missing"
+    cols = _columns(con, "decision_db")
+    required = {"id", "source_key", "translation", "locked"}
+    missing = sorted(required - cols)
+    if missing:
+        return [], "decision_db_schema_incompatible:" + ",".join(missing)
+    reason_expr = "reason" if "reason" in cols else "NULL AS reason"
+    rows = [dict(row) for row in con.execute(
+        "SELECT id, source_key, translation, locked, "
+        f"{reason_expr} FROM decision_db ORDER BY id")]
+    return rows, ""
+
+
+def _load_tasks(path: Path) -> Tuple[List[dict], str]:
+    if not Path(path).exists():
+        return [], "workflow_db_missing"
+    con = _connect_ro(path)
+    try:
+        if not _table_exists(con, "chunk_tasks"):
+            return [], "workflow_chunk_tasks_missing"
+        cols = _columns(con, "chunk_tasks")
+        required = {"chunk_id", "chapter_id", "text_content", "state"}
+        missing = sorted(required - cols)
+        if missing:
+            return [], "workflow_schema_incompatible:" + ",".join(missing)
+        return [dict(row) for row in con.execute(
+            "SELECT chunk_id, chapter_id, text_content, state "
+            "FROM chunk_tasks ORDER BY chapter_id, chunk_id")], ""
+    finally:
+        con.close()
+
+
+def _load_pending(con: sqlite3.Connection) -> Tuple[Dict[str, dict], str]:
+    if not _table_exists(con, "pending_backtrack"):
+        return {}, "pending_backtrack_missing"
+    cols = _columns(con, "pending_backtrack")
+    required = {"chunk_id", "decision_id", "source_key"}
+    missing = sorted(required - cols)
+    if missing:
+        return {}, "pending_backtrack_schema_incompatible:" + ",".join(missing)
+    return {str(row["chunk_id"]): dict(row) for row in con.execute(
+        "SELECT chunk_id, decision_id, source_key FROM pending_backtrack")}, ""
+
+
+def _load_impacts(con: sqlite3.Connection) -> Tuple[Dict[int, List[str]], str]:
+    if not _table_exists(con, "decision_impact"):
+        return {}, "decision_impact_missing"
+    cols = _columns(con, "decision_impact")
+    required = {"decision_id", "chunk_id"}
+    missing = sorted(required - cols)
+    if missing:
+        return {}, "decision_impact_schema_incompatible:" + ",".join(missing)
+    impacts: Dict[int, List[str]] = {}
+    for row in con.execute(
+            "SELECT decision_id, chunk_id FROM decision_impact "
+            "ORDER BY decision_id, chunk_id"):
+        impacts.setdefault(int(row[0]), []).append(str(row[1]))
+    return impacts, ""
+
+
+def _active_form_keys(rows: List[dict], *, exclude_id: int) -> set:
+    keys = set()
+    for row in rows:
+        if int(row["id"]) == int(exclude_id):
+            continue
+        if str(row.get("confidence") or "") != "high":
+            continue
+        if int(row.get("pending_review") or 0):
+            continue
+        canonical = str(row.get("canonical_name") or "")
+        key = _name_key(canonical)
+        if key:
+            keys.add(key)
+        for variant in row.get("variant_names") or []:
+            key = _name_key(variant)
+            if key:
+                keys.add(key)
+    return keys
+
+
+def _candidate_repair_text(
+    root: Path,
+    task: dict,
+    source_key: str,
+    old_target: str,
+    new_target: str,
+) -> Dict[str, Any]:
+    cid = str(task["chunk_id"])
+    chapter = str(task["chapter_id"])
+    state = str(task["state"])
+    final_path = root / "output" / chapter / f"{cid}_final.json"
+    row: Dict[str, Any] = {
+        "chunk_id": cid,
+        "chapter": chapter,
+        "state": state,
+        "final_path": str(final_path),
+        "wrong_occurrences": 0,
+        "correct_occurrences": 0,
+        "repair_required": False,
+        "status": "ok",
+        "reason": "",
+    }
+    if state != "COMPLETED":
+        row.update(status="rerun", reason="nonterminal_will_use_updated_decision")
+        return row
+    final = _read_json(final_path)
+    text = str((final or {}).get("text") or "")
+    if not final or not text:
+        row.update(status="blocked", reason="completed_final_missing")
+        return row
+    row["wrong_occurrences"] = text.count(old_target)
+    row["correct_occurrences"] = text.count(new_target)
+    if not row["wrong_occurrences"] and not row["correct_occurrences"]:
+        row.update(status="blocked", reason="completed_final_uses_third_form")
+        return row
+    if row["wrong_occurrences"]:
+        source_spans = _source_phrase_spans(str(task.get("text_content") or ""),
+                                            source_key)
+        fragment_spans = _source_fragment_spans(
+            str(task.get("text_content") or ""), source_key)
+        row["source_occurrences"] = len(source_spans)
+        row["source_fragment_occurrences"] = len(fragment_spans)
+        if row["wrong_occurrences"] > len(source_spans) + len(fragment_spans):
+            row.update(status="blocked", reason="wrong_form_count_exceeds_source")
+            return row
+        row["repair_required"] = True
+    return row
+
+
+def _plan_decision(
+    root: Path,
+    decision: dict,
+    registry: List[dict],
+    tasks: List[dict],
+    pending: Dict[str, dict],
+) -> Optional[Dict[str, Any]]:
+    source_key = str(decision.get("source_key") or "").strip()
+    old_target = str(decision.get("translation") or "").strip()
+    if not source_key or not _cjk_only(old_target):
+        return None
+    if _source_tokens(source_key) and len(_source_tokens(source_key)) != 1:
+        return None
+    if int(decision.get("locked") or 0):
+        return None
+    old_key = _name_key(old_target)
+    owners = [
+        row for row in registry
+        if str(row.get("confidence") or "") == "high"
+        and int(row.get("pending_review") or 0) == 0
+        and any(_name_key(value).startswith(old_key)
+                for value in row.get("variant_names") or [])
+        and any(_name_key(value) == _name_key(source_key)
+                for value in row.get("quarantined_names") or [])
+    ]
+    if len(owners) != 1:
+        return None
+    owner = owners[0]
+    canonical = str(owner.get("canonical_name") or "")
+    tokens = [token for token in canonical_tokens(canonical) if _cjk_only(token)]
+    if not tokens:
+        return None
+    new_target = tokens[0]
+    if not _one_char_cjk_drift(old_target, new_target):
+        return None
+    if not _name_compatible(new_target, canonical):
+        return None
+    if _name_compatible(old_target, canonical):
+        return None
+    protected = _active_form_keys(registry, exclude_id=int(owner["id"]))
+    if _name_key(new_target) in protected or _name_key(old_target) in protected:
+        return None
+    variants_to_quarantine = [
+        value for value in owner.get("variant_names") or []
+        if _name_key(value).startswith(old_key)
+        and _name_key(value) != _name_key(new_target)
+    ]
+    if old_target not in variants_to_quarantine:
+        variants_to_quarantine.append(old_target)
+    if not variants_to_quarantine:
+        return None
+
+    active_tasks = [
+        task for task in tasks
+        if _source_phrase_spans(str(task.get("text_content") or ""), source_key)
+        or _source_fragment_spans(str(task.get("text_content") or ""), source_key)
+    ]
+    if not active_tasks:
+        return None
+    evidence_rows = [
+        _candidate_repair_text(root, task, source_key, old_target, new_target)
+        for task in active_tasks
+    ]
+    blocked = [row for row in evidence_rows if row["status"] == "blocked"]
+    repairs = [row for row in evidence_rows if row["repair_required"]]
+    correct = [row for row in evidence_rows
+               if row["status"] == "ok" and not row["repair_required"]]
+    rerun = [row for row in evidence_rows if row["status"] == "rerun"]
+    if blocked:
+        return {
+            "status": "blocked",
+            "reason": blocked[0]["reason"],
+            "decision_id": int(decision["id"]),
+            "source_key": source_key,
+            "old_translation": old_target,
+            "new_translation": new_target,
+            "registry_id": int(owner["id"]),
+            "registry_canonical": canonical,
+            "blocked_chunks": blocked,
+            "repair_chunks": repairs,
+            "correct_chunks": correct,
+            "rerun_chunks": rerun,
+            "variants_to_quarantine": variants_to_quarantine,
+        }
+    if len(correct) < 2 or not repairs:
+        return None
+    pending_conflicts = []
+    for row in repairs:
+        existing = pending.get(row["chunk_id"])
+        if existing and (
+                int(existing.get("decision_id") or 0) != int(decision["id"])
+                or str(existing.get("source_key") or "") != source_key):
+            pending_conflicts.append(row["chunk_id"])
+    if pending_conflicts:
+        return {
+            "status": "blocked",
+            "reason": "repair_chunk_has_other_pending_decision",
+            "decision_id": int(decision["id"]),
+            "source_key": source_key,
+            "old_translation": old_target,
+            "new_translation": new_target,
+            "registry_id": int(owner["id"]),
+            "registry_canonical": canonical,
+            "pending_conflicts": pending_conflicts,
+            "repair_chunks": repairs,
+            "correct_chunks": correct,
+            "rerun_chunks": rerun,
+            "variants_to_quarantine": variants_to_quarantine,
+        }
+    return {
+        "status": "ready",
+        "reason": "book_wide_form_consensus",
+        "decision_id": int(decision["id"]),
+        "source_key": source_key,
+        "old_translation": old_target,
+        "new_translation": new_target,
+        "registry_id": int(owner["id"]),
+        "registry_canonical": canonical,
+        "correct_chunks": correct,
+        "repair_chunks": repairs,
+        "rerun_chunks": rerun,
+        "variants_to_quarantine": variants_to_quarantine,
+        "evidence": {
+            "active_source_chunks": len(active_tasks),
+            "correct_completed": len(correct),
+            "repair_completed": len(repairs),
+            "rerun_pending": len(rerun),
+            "wrong_occurrences": sum(int(row["wrong_occurrences"]) for row in repairs),
+            "correct_occurrences": sum(int(row["correct_occurrences"]) for row in correct),
+        },
+    }
+
+
+def audit_decision_authorities(
+    project_root: Path,
+    *,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+) -> Dict[str, Any]:
+    root = Path(project_root)
+    db_path = Path(decision_db) if decision_db else root / "db" / "decision_db.sqlite"
+    wf_path = Path(workflow_db) if workflow_db else root / "db" / "workflow.db"
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "decision_authority_align.json"
+    mpath = Path(md_out) if md_out else out_dir / "decision_authority_align.md"
+    result: Dict[str, Any] = {
+        "schema_version": AUTHORITY_ALIGN_SCHEMA_VERSION,
+        "mode": "read_only",
+        "write_attempted": False,
+        "generated_at": _now_iso(),
+        "decision_db": str(db_path),
+        "workflow_db": str(wf_path),
+        "candidates": [],
+        "blocked_candidates": [],
+        "errors": [],
+        "counts": {},
+        "ok": False,
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+    }
+    if not db_path.exists():
+        result["errors"].append("decision_db_missing")
+        _write_authority_reports(result, jpath, mpath)
+        return result
+    con = _connect_ro(db_path)
+    try:
+        registry, registry_error = _load_registry(con)
+        decisions, decision_error = _load_decisions(con)
+        pending, pending_error = _load_pending(con)
+    finally:
+        con.close()
+    tasks, task_error = _load_tasks(wf_path)
+    for error in (registry_error, decision_error, pending_error, task_error):
+        if error:
+            result["errors"].append(error)
+    if result["errors"]:
+        _write_authority_reports(result, jpath, mpath)
+        return result
+    for decision in decisions:
+        candidate = _plan_decision(
+            root, decision, registry, tasks, pending)
+        if candidate is None:
+            continue
+        if candidate["status"] == "ready":
+            result["candidates"].append(candidate)
+        else:
+            result["blocked_candidates"].append(candidate)
+    result["counts"] = {
+        "ready": len(result["candidates"]),
+        "blocked": len(result["blocked_candidates"]),
+        "repair_chunks": sum(len(c.get("repair_chunks") or [])
+                             for c in result["candidates"]),
+        "variant_quarantines": sum(len(c.get("variants_to_quarantine") or [])
+                                   for c in result["candidates"]),
+    }
+    result["ok"] = not result["errors"] and not result["blocked_candidates"]
+    _write_authority_reports(result, jpath, mpath)
+    return result
+
+
+def _write_authority_reports(result: Dict[str, Any], jpath: Path,
+                             mpath: Path) -> None:
+    _atomic_json(Path(jpath), result)
+    lines = ["# Decision 权威对齐计划", "",
+             f"- 生成时间: {result.get('generated_at')}",
+             f"- 模式: **{result.get('mode')}**",
+             f"- ok: `{result.get('ok')}`",
+             f"- counts: `{result.get('counts') or {}}`", ""]
+    for candidate in result.get("candidates") or []:
+        lines.extend([
+            f"## Decision #{candidate.get('decision_id')} "
+            f"{candidate.get('source_key')}",
+            f"- 旧目标: `{candidate.get('old_translation')}` → "
+            f"`{candidate.get('new_translation')}`",
+            f"- Registry #{candidate.get('registry_id')} canonical: "
+            f"`{candidate.get('registry_canonical')}`",
+            f"- 已完成证据: `{len(candidate.get('correct_chunks') or [])}` 正确，"
+            f"`{len(candidate.get('repair_chunks') or [])}` 待修复，"
+            f"`{len(candidate.get('rerun_chunks') or [])}` 在途重跑",
+            "- 待隔离 variants: " + ", ".join(
+                f"`{value}`" for value in candidate.get("variants_to_quarantine") or []),
+            "- 待修复 chunks: " + ", ".join(
+                f"`{row['chunk_id']}`" for row in candidate.get("repair_chunks") or []),
+            "",
+        ])
+    for candidate in result.get("blocked_candidates") or []:
+        lines.extend([
+            f"## BLOCKED Decision #{candidate.get('decision_id')} "
+            f"{candidate.get('source_key')}",
+            f"- 原因: `{candidate.get('reason')}`",
+            "",
+        ])
+    if result.get("errors"):
+        lines.extend(["## 错误", ""] + [
+            f"- `{error}`" for error in result["errors"]])
+    _atomic_text(Path(mpath), "\n".join(lines).rstrip() + "\n")
+
+
+def _sqlite_backup(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    src = sqlite3.connect(str(source))
+    dst = sqlite3.connect(str(target))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+
+
+def apply_decision_authority_alignment(
+    project_root: Path,
+    *,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    apply: bool = False,
+    run_id: Optional[str] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+) -> Dict[str, Any]:
+    root = Path(project_root)
+    db_path = Path(decision_db) if decision_db else root / "db" / "decision_db.sqlite"
+    wf_path = Path(workflow_db) if workflow_db else root / "db" / "workflow.db"
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "decision_authority_align_apply.json"
+    mpath = Path(md_out) if md_out else out_dir / "decision_authority_align_apply.md"
+    plan = audit_decision_authorities(
+        root, decision_db=db_path, workflow_db=wf_path, output_dir=out_dir)
+    result: Dict[str, Any] = {
+        "schema_version": AUTHORITY_ALIGN_SCHEMA_VERSION,
+        "mode": "apply" if apply else "read_only",
+        "write_attempted": False,
+        "generated_at": _now_iso(),
+        "run_id": run_id or _now_iso().replace(":", ""),
+        "plan_counts": plan.get("counts") or {},
+        "planned": plan.get("candidates") or [],
+        "blocked_candidates": plan.get("blocked_candidates") or [],
+        "actions": [],
+        "errors": list(plan.get("errors") or []),
+        "backup_path": "",
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+        "ok": False,
+    }
+    if not apply:
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _apply_markdown(result))
+        return result
+    if not plan.get("candidates"):
+        result["ok"] = not plan.get("blocked_candidates") and not result["errors"]
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _apply_markdown(result))
+        return result
+    if result["errors"] or plan.get("blocked_candidates"):
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _apply_markdown(result))
+        return result
+    backup_path = (out_dir / "decision_authority_align" /
+                   str(result["run_id"]) / "decision_db.sqlite.bak")
+    try:
+        _sqlite_backup(db_path, backup_path)
+    except Exception as exc:
+        result["errors"].append("backup_failed:%s:%s" % (type(exc).__name__, exc))
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _apply_markdown(result))
+        return result
+    result["backup_path"] = str(backup_path)
+    result["write_attempted"] = True
+    con = sqlite3.connect(str(db_path), timeout=30)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        for candidate in plan["candidates"]:
+            did = int(candidate["decision_id"])
+            rid = int(candidate["registry_id"])
+            decision = con.execute(
+                "SELECT source_key, translation, locked, reason "
+                "FROM decision_db WHERE id=?", (did,)).fetchone()
+            registry = con.execute(
+                "SELECT canonical_name, variant_names, quarantined_names, "
+                "confidence, pending_review FROM entity_registry WHERE id=?",
+                (rid,)).fetchone()
+            if not decision or not registry:
+                raise RuntimeError("authority_row_missing:%s" % did)
+            if int(decision["locked"] or 0):
+                raise RuntimeError("decision_locked:%s" % did)
+            if str(decision["source_key"]) != candidate["source_key"]:
+                raise RuntimeError("decision_source_changed:%s" % did)
+            if str(decision["translation"]) != candidate["old_translation"]:
+                raise RuntimeError("decision_translation_changed:%s" % did)
+            if str(registry["canonical_name"]) != candidate["registry_canonical"]:
+                raise RuntimeError("registry_canonical_changed:%s" % rid)
+            if str(registry["confidence"]) != "high" or int(registry["pending_review"] or 0):
+                raise RuntimeError("registry_owner_not_active:%s" % rid)
+            variants = _json_list(registry["variant_names"])
+            quarantined = _json_list(registry["quarantined_names"])
+            to_quarantine = set(candidate.get("variants_to_quarantine") or [])
+            new_variants = [value for value in variants
+                            if value not in to_quarantine]
+            quarantined = list(dict.fromkeys(quarantined + sorted(to_quarantine)))
+            reason = str(decision["reason"] or "")
+            marker = "Round 158 decision authority align: %s -> %s" % (
+                candidate["old_translation"], candidate["new_translation"])
+            if marker not in reason:
+                reason = (reason.rstrip() + " | " + marker).strip(" |")
+            _update_row(
+                con, "decision_db", did,
+                {"translation": candidate["new_translation"], "reason": reason})
+            _update_row(
+                con, "entity_registry", rid,
+                {"variant_names": _json_dump(new_variants),
+                 "quarantined_names": _json_dump(quarantined)})
+            for row in candidate.get("repair_chunks") or []:
+                cid = str(row["chunk_id"])
+                existing = con.execute(
+                    "SELECT decision_id, source_key FROM pending_backtrack "
+                    "WHERE chunk_id=?", (cid,)).fetchone()
+                if existing and (
+                        int(existing["decision_id"] or 0) != did
+                        or str(existing["source_key"]) != candidate["source_key"]):
+                    raise RuntimeError("pending_conflict:%s" % cid)
+                con.execute(
+                    "INSERT INTO pending_backtrack (chunk_id, decision_id, "
+                    "source_key, queue_rounds, created_at, updated_at) "
+                    "VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+                    "ON CONFLICT(chunk_id) DO UPDATE SET "
+                    "decision_id=excluded.decision_id, "
+                    "source_key=excluded.source_key, "
+                    "queue_rounds=COALESCE(pending_backtrack.queue_rounds,0)+1, "
+                    "updated_at=CURRENT_TIMESTAMP",
+                    (cid, did, candidate["source_key"]))
+            result["actions"].append({
+                "decision_id": did,
+                "source_key": candidate["source_key"],
+                "old_translation": candidate["old_translation"],
+                "new_translation": candidate["new_translation"],
+                "registry_id": rid,
+                "variants_quarantined": sorted(to_quarantine),
+                "queued_chunks": [row["chunk_id"]
+                                  for row in candidate.get("repair_chunks") or []],
+                "status": "applied",
+            })
+        con.commit()
+    except Exception as exc:
+        try:
+            con.rollback()
+        except sqlite3.Error:
+            pass
+        result["errors"].append("%s:%s" % (type(exc).__name__, exc))
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _apply_markdown(result))
+        return result
+    finally:
+        con.close()
+    result["ok"] = not result["errors"]
+    _atomic_json(jpath, result)
+    _atomic_text(mpath, _apply_markdown(result))
+    return result
+
+
+def _apply_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# Decision 权威对齐（受控写入）", "",
+             f"- 生成时间: {result.get('generated_at')}",
+             f"- 模式: **{result.get('mode')}**",
+             f"- ok: `{result.get('ok')}`；写入尝试: `{result.get('write_attempted')}`",
+             f"- 备份: `{result.get('backup_path') or '(无)'}`", ""]
+    for action in result.get("actions") or []:
+        lines.extend([
+            f"## Decision #{action.get('decision_id')} {action.get('source_key')}",
+            f"- `{action.get('old_translation')}` → `{action.get('new_translation')}`",
+            f"- Registry #{action.get('registry_id')}",
+            "- 隔离 variants: " + ", ".join(
+                f"`{value}`" for value in action.get("variants_quarantined") or []),
+            "- 排队待重审: " + ", ".join(
+                f"`{value}`" for value in action.get("queued_chunks") or []),
+            "",
+        ])
+    if result.get("errors"):
+        lines.extend(["## 错误", ""] + [
+            f"- `{error}`" for error in result["errors"]])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _final_text_for_task(root: Path, task: Dict[str, Any]) -> str:
+    chunk_id = str(task.get("chunk_id") or "")
+    chapter = str(task.get("chapter_id") or chunk_id[:4])
+    payload = _read_json(root / "output" / chapter / f"{chunk_id}_final.json")
+    return str((payload or {}).get("text") or "")
+
+
+def _active_registry_form_sources(rows: List[dict]) -> Dict[str, set]:
+    owners: Dict[str, set] = {}
+    for row in rows:
+        if str(row.get("confidence") or "") != "high":
+            continue
+        if int(row.get("pending_review") or 0):
+            continue
+        sources = {
+            str(value).strip() for value in row.get("source_names") or []
+            if str(value).strip()
+        }
+        forms = [str(row.get("canonical_name") or "")]
+        forms.extend(str(value) for value in row.get("variant_names") or [])
+        for form in forms:
+            key = _name_key(form)
+            if key:
+                owners.setdefault(key, set()).update(sources)
+    return owners
+
+
+def _article_alias_remainder(source_key: str) -> str:
+    match = _ARTICLE_ALIAS_RE.match(str(source_key or "").strip())
+    return match.group("rest") if match else ""
+
+
+def audit_article_shadow_decisions(
+    project_root: Path,
+    *,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+    write_reports: bool = True,
+) -> Dict[str, Any]:
+    """Plan deletion of pending article-led shadow rows.
+
+    The match is deliberately narrow and case-sensitive after the article:
+    ``the Lady Jessica`` can defer to ``Lady Jessica``, while ``the one`` does
+    not defer to ``One``.  A row is eligible only when it is unlocked, already
+    has pending work, and every source-positive final agrees with the existing
+    exact-key authority.
+    """
+    root = Path(project_root)
+    db_path = Path(decision_db) if decision_db else root / "db" / "decision_db.sqlite"
+    wf_path = Path(workflow_db) if workflow_db else root / "db" / "workflow.db"
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "decision_article_alias_repair.json"
+    mpath = Path(md_out) if md_out else out_dir / "decision_article_alias_repair.md"
+    result: Dict[str, Any] = {
+        "schema_version": AUTHORITY_ALIGN_SCHEMA_VERSION,
+        "mode": "read_only",
+        "write_attempted": False,
+        "generated_at": _now_iso(),
+        "decision_db": str(db_path),
+        "workflow_db": str(wf_path),
+        "candidates": [],
+        "blocked_candidates": [],
+        "errors": [],
+        "counts": {},
+        "ok": False,
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+    }
+    if not db_path.exists():
+        result["errors"].append("decision_db_missing")
+        if write_reports:
+            _atomic_json(jpath, result)
+            _atomic_text(mpath, _article_alias_markdown(result))
+        return result
+    con = _connect_ro(db_path)
+    try:
+        decisions, decision_error = _load_decisions(con)
+        pending, pending_error = _load_pending(con)
+        impacts, impact_error = _load_impacts(con)
+    finally:
+        con.close()
+    tasks, task_error = _load_tasks(wf_path)
+    for error in (decision_error, pending_error, impact_error, task_error):
+        if error:
+            result["errors"].append(error)
+    if result["errors"]:
+        if write_reports:
+            _atomic_json(jpath, result)
+            _atomic_text(mpath, _article_alias_markdown(result))
+        return result
+
+    by_source = {str(row.get("source_key") or ""): row for row in decisions}
+    tasks_by_id = {str(row.get("chunk_id") or ""): row for row in tasks}
+    for alias in decisions:
+        source_key = str(alias.get("source_key") or "").strip()
+        remainder = _article_alias_remainder(source_key)
+        canonical = by_source.get(remainder)
+        if not canonical or int(canonical["id"]) == int(alias["id"]):
+            continue
+        if int(alias.get("locked") or 0):
+            continue
+        alias_target = str(alias.get("translation") or "").strip()
+        canonical_target = str(canonical.get("translation") or "").strip()
+        if not alias_target or not canonical_target:
+            continue
+        alias_pending = [
+            row for row in pending.values()
+            if int(row.get("decision_id") or 0) == int(alias["id"])
+        ]
+        if not alias_pending:
+            continue
+
+        blocked_reason = ""
+        wrong_pending_sources = sorted({
+            str(row.get("source_key") or "") for row in alias_pending
+            if str(row.get("source_key") or "") != source_key
+        })
+        if wrong_pending_sources:
+            blocked_reason = "pending_source_key_mismatch:" + ",".join(wrong_pending_sources)
+
+        source_tasks = []
+        for task in tasks:
+            source_text = str(task.get("text_content") or "")
+            if (_source_phrase_spans(source_text, source_key)
+                    or _source_fragment_spans(source_text, source_key)):
+                source_tasks.append(task)
+        completed = []
+        inert = []
+        blocked_chunks = set()
+        if not source_tasks and not blocked_reason:
+            blocked_reason = "no_source_positive_tasks"
+        for task in source_tasks:
+            state = str(task.get("state") or "")
+            chunk_id = str(task.get("chunk_id") or "")
+            if state == "PENDING":
+                inert.append(chunk_id)
+                continue
+            if state != "COMPLETED":
+                if not blocked_reason:
+                    blocked_reason = (
+                        "nonterminal_source_task:%s:%s" % (chunk_id, state))
+                continue
+            text = _final_text_for_task(root, task)
+            if not text:
+                blocked_chunks.add(chunk_id)
+                if not blocked_reason:
+                    blocked_reason = "completed_final_missing:%s" % chunk_id
+                continue
+            if alias_target in text:
+                blocked_chunks.add(chunk_id)
+                if not blocked_reason:
+                    blocked_reason = "alias_target_still_present:%s" % chunk_id
+                continue
+            if canonical_target not in text:
+                blocked_chunks.add(chunk_id)
+                if not blocked_reason:
+                    blocked_reason = "canonical_target_absent:%s" % chunk_id
+                continue
+            completed.append(chunk_id)
+        if not completed and not blocked_reason:
+            blocked_reason = "no_completed_authority_evidence"
+
+        if blocked_reason:
+            result["blocked_candidates"].append({
+                "decision_id": int(alias["id"]),
+                "source_key": source_key,
+                "canonical_decision_id": int(canonical["id"]),
+                "canonical_source_key": remainder,
+                "alias_translation": alias_target,
+                "canonical_translation": canonical_target,
+                "reason": blocked_reason,
+                "blocked_chunks": sorted(blocked_chunks),
+                "pending_chunks": sorted(row["chunk_id"] for row in alias_pending),
+            })
+            continue
+        result["candidates"].append({
+            "decision_id": int(alias["id"]),
+            "source_key": source_key,
+            "canonical_decision_id": int(canonical["id"]),
+            "canonical_source_key": remainder,
+            "alias_translation": alias_target,
+            "canonical_translation": canonical_target,
+            "completed_chunks": sorted(completed),
+            "inert_pending_chunks": sorted(inert),
+            "pending_chunks": sorted(row["chunk_id"] for row in alias_pending),
+            "impact_chunks": sorted(impacts.get(int(alias["id"]), [])),
+        })
+    result["counts"] = {
+        "candidates": len(result["candidates"]),
+        "blocked": len(result["blocked_candidates"]),
+        "pending_rows": sum(len(row.get("pending_chunks") or [])
+                            for row in result["candidates"]),
+        "completed_evidence": sum(len(row.get("completed_chunks") or [])
+                                  for row in result["candidates"]),
+    }
+    result["ok"] = not result["errors"] and not result["blocked_candidates"]
+    if write_reports:
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _article_alias_markdown(result))
+    return result
+
+
+def _article_alias_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# Decision 冠词影子归并（只读/受控写入）", "",
+             f"- 生成时间: {result.get('generated_at')}",
+             f"- 模式: **{result.get('mode')}**",
+             f"- ok: `{result.get('ok')}`；写入尝试: `{result.get('write_attempted')}`",
+             f"- 备份: `{result.get('backup_path') or '(无)'}`",
+             f"- counts: `{result.get('counts') or {}}`", ""]
+    for candidate in result.get("candidates") or []:
+        lines.extend([
+            f"## Decision #{candidate.get('decision_id')} "
+            f"{candidate.get('source_key')}",
+            f"- 归并到 #{candidate.get('canonical_decision_id')} "
+            f"`{candidate.get('canonical_source_key')}`",
+            f"- 影子译文 `{candidate.get('alias_translation')}`；"
+            f"既有权威 `{candidate.get('canonical_translation')}`",
+            f"- COMPLETED 证据: `{len(candidate.get('completed_chunks') or [])}`；"
+            f"PENDING: `{len(candidate.get('inert_pending_chunks') or [])}`；"
+            f"待清 pending: `{len(candidate.get('pending_chunks') or [])}`",
+            "",
+        ])
+    for blocked in result.get("blocked_candidates") or []:
+        lines.extend([
+            f"## BLOCKED Decision #{blocked.get('decision_id')} "
+            f"{blocked.get('source_key')}",
+            f"- 原因: `{blocked.get('reason')}`",
+            "",
+        ])
+    if result.get("errors"):
+        lines.extend(["## 错误", ""] + [
+            f"- `{error}`" for error in result["errors"]])
+    lines.extend([
+        "", "归并只删除已证实无原文正文依赖的影子 Decision 及其 pending 行；"
+        "不修改 canonical Decision、正文、registry 或 workflow 状态。", ""])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def apply_article_shadow_alias_repairs(
+    project_root: Path,
+    *,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+    apply: bool = False,
+    run_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    root = Path(project_root)
+    db_path = Path(decision_db) if decision_db else root / "db" / "decision_db.sqlite"
+    wf_path = Path(workflow_db) if workflow_db else root / "db" / "workflow.db"
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "decision_article_alias_repair_apply.json"
+    mpath = Path(md_out) if md_out else out_dir / "decision_article_alias_repair_apply.md"
+    plan = audit_article_shadow_decisions(
+        root, decision_db=db_path, workflow_db=wf_path, output_dir=out_dir,
+        write_reports=False)
+    result: Dict[str, Any] = {
+        "schema_version": AUTHORITY_ALIGN_SCHEMA_VERSION,
+        "mode": "apply" if apply else "read_only",
+        "write_attempted": False,
+        "generated_at": _now_iso(),
+        "run_id": run_id or _now_iso().replace(":", ""),
+        "decision_db": str(db_path),
+        "workflow_db": str(wf_path),
+        "candidates": plan.get("candidates") or [],
+        "blocked_candidates": plan.get("blocked_candidates") or [],
+        "errors": list(plan.get("errors") or []),
+        "counts": dict(plan.get("counts") or {}),
+        "actions": [],
+        "backup_path": "",
+        "ok": False,
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+    }
+    if not apply:
+        result["ok"] = bool(plan.get("ok"))
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _article_alias_markdown(result))
+        return result
+    if not result["candidates"]:
+        result["ok"] = not result["errors"] and not result["blocked_candidates"]
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _article_alias_markdown(result))
+        return result
+    if result["errors"] or result["blocked_candidates"]:
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _article_alias_markdown(result))
+        return result
+
+    backup_path = (out_dir / "decision_article_alias_repair" /
+                   str(result["run_id"]) / "decision_db.sqlite.bak")
+    try:
+        _sqlite_backup(db_path, backup_path)
+    except Exception as exc:
+        result["errors"].append("backup_failed:%s:%s" % (type(exc).__name__, exc))
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _article_alias_markdown(result))
+        return result
+    result["backup_path"] = str(backup_path)
+    result["write_attempted"] = True
+    con = sqlite3.connect(str(db_path), timeout=30)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        for candidate in result["candidates"]:
+            alias_id = int(candidate["decision_id"])
+            canonical_id = int(candidate["canonical_decision_id"])
+            source_key = str(candidate["source_key"])
+            alias_target = str(candidate["alias_translation"])
+            alias_row = con.execute(
+                "SELECT source_key, translation, locked FROM decision_db WHERE id=?",
+                (alias_id,)).fetchone()
+            canonical_row = con.execute(
+                "SELECT source_key, translation FROM decision_db WHERE id=?",
+                (canonical_id,)).fetchone()
+            if not alias_row or not canonical_row:
+                raise RuntimeError("article_alias_authority_missing:%s" % alias_id)
+            if (str(alias_row["source_key"]) != source_key
+                    or str(alias_row["translation"]) != alias_target
+                    or int(alias_row["locked"] or 0)):
+                raise RuntimeError("article_alias_changed:%s" % alias_id)
+            if str(canonical_row["source_key"]) != candidate["canonical_source_key"]:
+                raise RuntimeError("article_alias_canonical_changed:%s" % canonical_id)
+            con.execute(
+                "INSERT OR IGNORE INTO decision_impact (decision_id, chunk_id) "
+                "SELECT ?, chunk_id FROM decision_impact WHERE decision_id=?",
+                (canonical_id, alias_id))
+            con.execute("DELETE FROM decision_impact WHERE decision_id=?", (alias_id,))
+            con.execute(
+                "DELETE FROM pending_backtrack WHERE decision_id=? AND source_key=?",
+                (alias_id, source_key))
+            cursor = con.execute(
+                "DELETE FROM decision_db WHERE id=? AND source_key=? "
+                "AND translation=? AND COALESCE(locked, 0)=0",
+                (alias_id, source_key, alias_target))
+            if cursor.rowcount != 1:
+                raise RuntimeError("article_alias_delete_cas_failed:%s" % alias_id)
+            result["actions"].append({
+                "decision_id": alias_id,
+                "source_key": source_key,
+                "canonical_decision_id": canonical_id,
+                "status": "merged",
+            })
+        con.commit()
+    except Exception as exc:
+        con.rollback()
+        result["errors"].append("%s:%s" % (type(exc).__name__, exc))
+    finally:
+        con.close()
+
+    after = audit_article_shadow_decisions(
+        root, decision_db=db_path, workflow_db=wf_path, output_dir=out_dir,
+        write_reports=False)
+    result["after_counts"] = after.get("counts") or {}
+    result["after_ok"] = bool(after.get("ok"))
+    result["ok"] = (not result["errors"] and bool(after.get("ok"))
+                    and not (after.get("blocked_candidates") or []))
+    _atomic_json(jpath, result)
+    _atomic_text(mpath, _article_alias_markdown(result))
+    return result
+
+
+def _corpus_repair_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# 锁目标 corpus 权威修复（受控写入）", "",
+             f"- 生成时间: {result.get('generated_at')}",
+             f"- 模式: **{result.get('mode')}**",
+             f"- ok: `{result.get('ok')}`；写入尝试: `{result.get('write_attempted')}`",
+             f"- 备份: `{result.get('backup_path') or '(无)'}`",
+             f"- 计划统计: `{result.get('counts') or {}}`", ""]
+    for candidate in result.get("candidates") or []:
+        evidence = candidate.get("authority") or {}
+        lines.extend([
+            f"## Decision #{candidate.get('decision_id')} "
+            f"{candidate.get('source_key')}",
+            f"- `{candidate.get('old_translation')}` → "
+            f"`{candidate.get('new_translation')}`",
+            f"- 全书证据: `{evidence.get('positive_chunks')}` / "
+            f"`{evidence.get('authority_chunks')}` 个 source-positive 块；"
+            f"第二候选 `{evidence.get('second_positive_chunks')}` 块",
+            "- 已验证 pending finals: " + ", ".join(
+                f"`{value}`" for value in candidate.get("pending_chunks") or []),
+            "",
+        ])
+    for blocked in result.get("blocked_candidates") or []:
+        lines.extend([
+            f"## BLOCKED Decision #{blocked.get('decision_id')} "
+            f"{blocked.get('source_key')}",
+            f"- 原因: `{blocked.get('reason')}`",
+            "",
+        ])
+    if result.get("errors"):
+        lines.extend(["## 错误", ""] + [
+            f"- `{error}`" for error in result["errors"]])
+    lines.extend([
+        "", "本命令只更新 Decision 的 translation/reason/lock 证据；"
+        "不修改正文、registry、pending 或 workflow 状态。", ""])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def audit_locked_target_authority_repairs(
+    project_root: Path,
+    *,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+    majority_ratio: float = 0.70,
+) -> Dict[str, Any]:
+    """Plan corpus-backed repairs for locked generic Decisions only.
+
+    The auditor already separates generic keys from concepts covered by a more
+    specific Decision.  This planner adds the write preconditions: a clear
+    candidate majority, every affected pending final already using the
+    candidate, no third form, a locked Decision, and CAS-friendly identity.
+    """
+    root = Path(project_root)
+    db_path = Path(decision_db) if decision_db else root / "db" / "decision_db.sqlite"
+    wf_path = Path(workflow_db) if workflow_db else root / "db" / "workflow.db"
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "locked_target_authority_repair.json"
+    mpath = Path(md_out) if md_out else out_dir / "locked_target_authority_repair.md"
+    result: Dict[str, Any] = {
+        "schema_version": AUTHORITY_ALIGN_SCHEMA_VERSION,
+        "mode": "read_only",
+        "write_attempted": False,
+        "generated_at": _now_iso(),
+        "candidates": [],
+        "blocked_candidates": [],
+        "residual_groups": [],
+        "counts": {},
+        "errors": [],
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+        "ok": False,
+    }
+    audit = audit_locked_target_authorities(
+        root, decision_db=db_path, workflow_db=wf_path, output_dir=out_dir)
+    result["audit_counts"] = audit.get("counts") or {}
+    result["errors"].extend(str(error) for error in audit.get("errors") or [])
+    if not audit.get("ok"):
+        result["counts"] = {"candidates": 0, "blocked": 0}
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _corpus_repair_markdown(result))
+        return result
+
+    ro = _connect_ro(db_path)
+    try:
+        decisions_rows, decision_error = _load_decisions(ro)
+        registry_rows, registry_error = _load_registry(ro)
+        pending, pending_error = _load_pending(ro)
+    finally:
+        ro.close()
+    if decision_error:
+        result["errors"].append(decision_error)
+    if registry_error:
+        result["errors"].append(registry_error)
+    tasks, task_error = _load_tasks(wf_path)
+    if task_error:
+        result["errors"].append(task_error)
+    if pending_error:
+        result["errors"].append(pending_error)
+    if result["errors"]:
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _corpus_repair_markdown(result))
+        return result
+
+    decisions = {int(row["id"]): row for row in decisions_rows}
+    tasks_by_id = {str(row["chunk_id"]): row for row in tasks}
+    specific_targets = {
+        _name_key(_target_core(row.get("translation")))
+        for row in decisions_rows
+        if _name_key(_target_core(row.get("translation")))
+    }
+    registry_sources = _active_registry_form_sources(registry_rows)
+    contradicted_groups = [
+        group for group in audit.get("groups") or []
+        if group.get("authority_kind") == "generic"
+        and group.get("classification") == "contradicted"
+    ]
+    residual = [
+        {key: group.get(key) for key in (
+            "decision_id", "source_key", "target", "classification",
+            "reason", "authority_chunks", "target_hits")}
+        for group in audit.get("groups") or []
+        if group.get("classification") != "contradicted"
+    ]
+    for group in contradicted_groups:
+        did = int(group.get("decision_id") or 0)
+        source_key = str(group.get("source_key") or "")
+        old_target = str(group.get("target") or "")
+        decision = decisions.get(did)
+        blocked_reason = ""
+        if not decision:
+            blocked_reason = "decision_missing"
+        elif str(decision.get("source_key") or "") != source_key:
+            blocked_reason = "decision_source_changed"
+        elif str(decision.get("translation") or "") != old_target:
+            blocked_reason = "decision_translation_changed"
+        elif not int(decision.get("locked") or 0):
+            blocked_reason = "decision_not_locked"
+
+        candidates = list(group.get("candidates") or [])
+        best = candidates[0] if candidates else None
+        new_target = str((best or {}).get("form") or "")
+        authority_chunks = int(group.get("authority_chunks") or 0)
+        best_hits = int((best or {}).get("positive_chunks") or 0)
+        second_hits = int(
+            (candidates[1] or {}).get("positive_chunks") or 0
+            if len(candidates) > 1 else 0)
+        threshold = max(2, int(math.ceil(
+            authority_chunks * max(0.5, min(0.9, float(majority_ratio))))))
+        if not blocked_reason:
+            if not new_target or new_target == old_target:
+                blocked_reason = "no_candidate_form"
+            elif authority_chunks < 3:
+                blocked_reason = "insufficient_authority_chunks"
+            elif best_hits < threshold:
+                blocked_reason = "candidate_below_majority_threshold"
+            elif second_hits and best_hits < second_hits * 2:
+                blocked_reason = "second_candidate_too_close"
+            elif _name_key(new_target) in specific_targets:
+                blocked_reason = "candidate_owned_by_specific_decision"
+            else:
+                owners = registry_sources.get(_name_key(new_target)) or set()
+                if owners and _name_key(source_key) not in {
+                        _name_key(value) for value in owners}:
+                    blocked_reason = "candidate_owned_by_other_registry_source"
+
+        pending_chunks = [str(value) for value in group.get("pending_chunks") or []]
+        verified_chunks: List[str] = []
+        if not blocked_reason:
+            if not pending_chunks:
+                blocked_reason = "no_pending_chunks"
+            for chunk_id in pending_chunks:
+                row = pending.get(chunk_id)
+                task = tasks_by_id.get(chunk_id)
+                if not row or int(row.get("decision_id") or 0) != did:
+                    blocked_reason = "pending_decision_mismatch:%s" % chunk_id
+                    break
+                if not task or str(task.get("state") or "") != "COMPLETED":
+                    blocked_reason = "pending_chunk_not_completed:%s" % chunk_id
+                    break
+                text = _final_text_for_task(root, task)
+                if not text:
+                    blocked_reason = "pending_final_missing:%s" % chunk_id
+                    break
+                if old_target in text:
+                    blocked_reason = "old_target_still_present:%s" % chunk_id
+                    break
+                if new_target not in text:
+                    blocked_reason = "candidate_absent_from_pending_final:%s" % chunk_id
+                    break
+                verified_chunks.append(chunk_id)
+
+        if blocked_reason:
+            result["blocked_candidates"].append({
+                "decision_id": did,
+                "source_key": source_key,
+                "old_translation": old_target,
+                "new_translation": new_target,
+                "reason": blocked_reason,
+            })
+            continue
+        result["candidates"].append({
+            "decision_id": did,
+            "source_key": source_key,
+            "old_translation": old_target,
+            "new_translation": new_target,
+            "pending_chunks": verified_chunks,
+            "authority": {
+                "positive_chunks": best_hits,
+                "authority_chunks": authority_chunks,
+                "second_positive_chunks": second_hits,
+                "threshold": threshold,
+                "classification": group.get("classification"),
+                "reason": group.get("reason"),
+            },
+        })
+    result["residual_groups"] = residual
+    result["counts"] = {
+        "groups": len(audit.get("groups") or []),
+        "contradicted": len(contradicted_groups),
+        "candidates": len(result["candidates"]),
+        "blocked": len(result["blocked_candidates"]),
+        "residual": len(residual),
+    }
+    result["ok"] = not result["errors"] and not result["blocked_candidates"]
+    _atomic_json(jpath, result)
+    _atomic_text(mpath, _corpus_repair_markdown(result))
+    return result
+
+
+def apply_locked_target_authority_repairs(
+    project_root: Path,
+    *,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    apply: bool = False,
+    run_id: Optional[str] = None,
+    majority_ratio: float = 0.70,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+) -> Dict[str, Any]:
+    root = Path(project_root)
+    db_path = Path(decision_db) if decision_db else root / "db" / "decision_db.sqlite"
+    wf_path = Path(workflow_db) if workflow_db else root / "db" / "workflow.db"
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "locked_target_authority_repair_apply.json"
+    mpath = Path(md_out) if md_out else out_dir / "locked_target_authority_repair_apply.md"
+    plan = audit_locked_target_authority_repairs(
+        root, decision_db=db_path, workflow_db=wf_path, output_dir=out_dir,
+        majority_ratio=majority_ratio)
+    result: Dict[str, Any] = {
+        "schema_version": AUTHORITY_ALIGN_SCHEMA_VERSION,
+        "mode": "apply" if apply else "read_only",
+        "write_attempted": False,
+        "generated_at": _now_iso(),
+        "run_id": run_id or _now_iso().replace(":", ""),
+        "plan_counts": plan.get("counts") or {},
+        "counts": plan.get("counts") or {},
+        "candidates": plan.get("candidates") or [],
+        "blocked_candidates": plan.get("blocked_candidates") or [],
+        "residual_groups": plan.get("residual_groups") or [],
+        "actions": [],
+        "errors": list(plan.get("errors") or []),
+        "backup_path": "",
+        "audit_after_counts": {},
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+        "ok": bool(plan.get("ok")),
+    }
+    if not apply:
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _corpus_repair_markdown(result))
+        return result
+    if result["errors"] or result["blocked_candidates"]:
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _corpus_repair_markdown(result))
+        return result
+    if not result["candidates"]:
+        result["ok"] = True
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _corpus_repair_markdown(result))
+        return result
+
+    backup_path = (out_dir / "locked_target_authority_repair" /
+                   str(result["run_id"]) / "decision_db.sqlite.bak")
+    try:
+        _sqlite_backup(db_path, backup_path)
+    except Exception as exc:
+        result["errors"].append(
+            "backup_failed:%s:%s" % (type(exc).__name__, exc))
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _corpus_repair_markdown(result))
+        return result
+    result["backup_path"] = str(backup_path)
+    result["write_attempted"] = True
+    con = sqlite3.connect(str(db_path), timeout=30)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        for candidate in result["candidates"]:
+            did = int(candidate["decision_id"])
+            row = con.execute(
+                "SELECT source_key, translation, reason, locked "
+                "FROM decision_db WHERE id=?", (did,)).fetchone()
+            if not row:
+                raise RuntimeError("decision_missing:%s" % did)
+            if str(row["source_key"]) != candidate["source_key"]:
+                raise RuntimeError("decision_source_changed:%s" % did)
+            if str(row["translation"]) != candidate["old_translation"]:
+                raise RuntimeError("decision_translation_changed:%s" % did)
+            if not int(row["locked"] or 0):
+                raise RuntimeError("decision_not_locked:%s" % did)
+            reason = str(row["reason"] or "")
+            marker = "Round 158 corpus lock authority: %s -> %s" % (
+                candidate["old_translation"], candidate["new_translation"])
+            if marker not in reason:
+                reason = (reason.rstrip() + " | " + marker).strip(" |")
+            _update_row(
+                con, "decision_db", did,
+                {"translation": candidate["new_translation"], "reason": reason})
+            result["actions"].append({
+                "decision_id": did,
+                "source_key": candidate["source_key"],
+                "old_translation": candidate["old_translation"],
+                "new_translation": candidate["new_translation"],
+                "pending_chunks_verified": candidate["pending_chunks"],
+                "status": "applied",
+            })
+        con.commit()
+    except Exception as exc:
+        try:
+            con.rollback()
+        except sqlite3.Error:
+            pass
+        result["errors"].append("%s:%s" % (type(exc).__name__, exc))
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _corpus_repair_markdown(result))
+        return result
+    finally:
+        con.close()
+
+    audit_after = audit_locked_target_authorities(
+        root, decision_db=db_path, workflow_db=wf_path, output_dir=out_dir)
+    result["audit_after_counts"] = audit_after.get("counts") or {}
+    result["ok"] = not result["errors"]
+    _atomic_json(jpath, result)
+    _atomic_text(mpath, _corpus_repair_markdown(result))
+    return result
+
+
+__all__ = [
+    "AUTHORITY_ALIGN_SCHEMA_VERSION",
+    "audit_decision_authorities",
+    "apply_decision_authority_alignment",
+    "audit_locked_target_authority_repairs",
+    "apply_locked_target_authority_repairs",
+]
+
+
+TERM_FORM_AUDIT_SCHEMA_VERSION = 1
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _atomic_json(path: Path, payload: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    tmp.replace(path)
+
+
+def _atomic_text(path: Path, text: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _cjk_ngrams(text: str) -> set:
+    out = set()
+    for run in _CJK_RE.findall(str(text or "")):
+        limit = min(8, len(run))
+        for size in range(2, limit + 1):
+            for start in range(len(run) - size + 1):
+                out.add(run[start:start + size])
+    return out
+
+
+def _similarity(left: str, right: str) -> float:
+    a, b = _name_key(left), _name_key(right)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    return float(difflib.SequenceMatcher(None, a, b, autojunk=False).ratio())
+
+
+def _read_final_text(context: Dict[str, Any], chunk_id: str,
+                     chapter: str) -> str:
+    path = ((context.get("output_dir") or Path(".")) / chapter /
+            ("%s_final.json" % chunk_id))
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+    return str(payload.get("text") or "") if isinstance(payload, dict) else ""
+
+
+def _completed_corpus(context: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    corpus: Dict[str, Dict[str, str]] = {}
+    for chunk_id, task in (context.get("tasks") or {}).items():
+        if str(task.get("state") or "") != "COMPLETED":
+            continue
+        chapter = str(task.get("chapter_id") or str(chunk_id)[:4])
+        final_text = _read_final_text(context, str(chunk_id), chapter)
+        corpus[str(chunk_id)] = {
+            "chapter": chapter,
+            "source": str(task.get("text_content") or ""),
+            "final": body_before_footnotes(final_text),
+        }
+    return corpus
+
+
+def _rank_candidates(
+    positive_ids: set,
+    gram_cache: Dict[str, set],
+    limit: int = 12,
+) -> List[Dict[str, Any]]:
+    total_positive = len(positive_ids)
+    total_negative = max(0, len(gram_cache) - total_positive)
+    if not total_positive or not total_negative:
+        return []
+    positive_df: Counter = Counter()
+    negative_df: Counter = Counter()
+    for chunk_id, grams in gram_cache.items():
+        bucket = positive_df if chunk_id in positive_ids else negative_df
+        for gram in grams:
+            bucket[gram] += 1
+    ranked: List[Tuple[float, Dict[str, Any]]] = []
+    for gram, positive_hits in positive_df.items():
+        if len(gram) < 2:
+            continue
+        if total_positive >= 3 and positive_hits < 2:
+            continue
+        negative_hits = int(negative_df.get(gram, 0))
+        if (total_positive >= 3 and total_negative
+                and negative_hits > max(2, int(total_negative * 0.08))):
+            continue
+        coverage = positive_hits / float(total_positive)
+        background = negative_hits / float(total_negative)
+        lift = coverage - background * 1.5
+        adjusted = lift + min(len(gram), 6) * 0.02
+        ranked.append((adjusted, {
+            "form": gram,
+            "positive_chunks": int(positive_hits),
+            "positive_coverage": round(coverage, 4),
+            "negative_chunks": negative_hits,
+            "negative_coverage": round(background, 4),
+            "lift": round(lift, 4),
+            "score": round(adjusted, 4),
+        }))
+    ranked.sort(key=lambda item: (-item[0], -len(item[1]["form"]),
+                                  item[1]["form"]))
+    selected: List[Dict[str, Any]] = []
+    keys = set()
+    for _score, row in ranked:
+        form = str(row["form"])
+        key = _name_key(form)
+        if not key or key in keys:
+            continue
+        keys.add(key)
+        selected.append(row)
+        if len(selected) >= max(1, int(limit)):
+            break
+    return selected
+
+
+def _near_target_forms(text: str, target: str, *,
+                       limit: int = 6) -> List[Dict[str, Any]]:
+    target_key = _name_key(target)
+    if not target_key:
+        return []
+    rows: List[Tuple[float, int, str]] = []
+    for gram in _cjk_ngrams(text):
+        key = _name_key(gram)
+        if not key or key == target_key:
+            continue
+        similarity = _similarity(key, target_key)
+        if similarity < 0.45:
+            continue
+        rows.append((similarity, len(key), gram))
+    rows.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    unique: List[Dict[str, Any]] = []
+    seen = set()
+    for similarity, length, form in rows:
+        key = _name_key(form)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append({
+            "form": form,
+            "similarity": round(similarity, 4),
+            "length": length,
+            "key": key,
+            "target_substring": bool(key in target_key and key != target_key),
+            "target_stem": bool(
+                key != target_key
+                and len(key) >= 3
+                and len(target_key) >= 4
+                and (target_key.startswith(key) or target_key.endswith(key))),
+        })
+    out: List[Dict[str, Any]] = []
+    for row in unique:
+        key = str(row.get("key") or "")
+        similarity = float(row.get("similarity") or 0.0)
+        if any(
+                len(other["key"]) > len(key)
+                and key in other["key"]
+                and float(other.get("similarity") or 0.0) >= similarity - 0.04
+                for other in unique):
+            continue
+        payload = dict(row)
+        payload.pop("key", None)
+        out.append(payload)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _candidate_stats(candidate: str, gram_cache: Dict[str, set],
+                     positive_ids: set) -> Dict[str, Any]:
+    key = _name_key(candidate)
+    hits = [cid for cid, grams in gram_cache.items() if key in grams]
+    positive_hits = sum(1 for cid in hits if cid in positive_ids)
+    return {
+        "form": candidate,
+        "positive_chunks": positive_hits,
+        "negative_chunks": len(hits) - positive_hits,
+    }
+
+
+def _classify_group(
+    *,
+    target: str,
+    target_hits: int,
+    total_positive: int,
+    pending_rows: List[Dict[str, Any]],
+    candidates: List[Dict[str, Any]],
+) -> Tuple[str, str]:
+    if not pending_rows or not candidates:
+        return "weak_evidence", "no_group_candidate_or_pending_row"
+    all_stem = all(
+        any(form.get("target_stem") for form in row.get("near_target_forms") or [])
+        for row in pending_rows)
+    if all_stem and (target_hits or total_positive):
+        return "target_stem_contract", "every_pending_chunk_uses_target_stem"
+    near_forms = [
+        form for row in pending_rows
+        for form in row.get("near_target_forms") or []
+        if not form.get("target_stem") and not form.get("target_substring")
+    ]
+    if target_hits == 0:
+        return "target_missing_contract", "decision_target_absent_from_completed_corpus"
+    if near_forms:
+        best = max(near_forms, key=lambda form: form.get("similarity") or 0.0)
+        stats = best.get("corpus") or {}
+        alternate_hits = int(stats.get("positive_chunks") or 0)
+        if alternate_hits * 2 > max(1, target_hits):
+            return "multi_form_contract", "alternate_form_is_materially_frequent"
+        return "body_drift_candidate", "target_is_book_majority_but_pending_uses_near_form"
+    return "target_missing_contract", "pending_rows_have_no_near_target_form"
+
+
+def audit_term_forms(
+    project_root: Path,
+    *,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+) -> Dict[str, Any]:
+    root = Path(project_root)
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "term_form_audit.json"
+    mpath = Path(md_out) if md_out else out_dir / "term_form_audit.md"
+    result: Dict[str, Any] = {
+        "schema_version": TERM_FORM_AUDIT_SCHEMA_VERSION,
+        "mode": "read_only",
+        "write_attempted": False,
+        "generated_at": _now_iso(),
+        "groups": [],
+        "counts": {},
+        "errors": [],
+        "ok": False,
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+    }
+    context = load_pending_context(
+        root, decision_db=decision_db, workflow_db=workflow_db,
+        output_dir=out_dir)
+    if not context.get("available"):
+        result["errors"].append(str(context.get("reason") or "pending_context_unavailable"))
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _render_markdown(result))
+        return result
+    snapshot = classify_pending_snapshot(context)
+    outstanding = [
+        entry for entry in snapshot.get("entries") or []
+        if entry.get("status") == "outstanding"
+    ]
+    corpus = _completed_corpus(context)
+    gram_cache = {
+        chunk_id: _cjk_ngrams(row.get("final") or "")
+        for chunk_id, row in corpus.items()
+    }
+    grouped: Dict[Tuple[int, str, str], List[dict]] = defaultdict(list)
+    for entry in outstanding:
+        grouped[(
+            int(entry.get("decision_id") or 0),
+            str(entry.get("decision_source_key") or ""),
+            str(entry.get("decision_translation") or ""),
+        )].append(entry)
+    groups: List[Dict[str, Any]] = []
+    for (decision_id, source_key, target), pending_rows in sorted(
+            grouped.items(), key=lambda item: (-len(item[1]), item[0][1])):
+        positive_ids = {
+            chunk_id for chunk_id, row in corpus.items()
+            if _source_phrase_spans(row.get("source") or "", source_key)
+        }
+        if not positive_ids:
+            groups.append({
+                "decision_id": decision_id,
+                "source_key": source_key,
+                "target": target,
+                "classification": "weak_evidence",
+                "reason": "source_phrase_absent_from_completed_corpus",
+                "pending_chunks": [row.get("chunk_id") for row in pending_rows],
+                "pending_rows": [],
+                "candidates": [],
+                "target_hits": 0,
+                "source_positive_chunks": 0,
+            })
+            continue
+        candidates = _rank_candidates(positive_ids, gram_cache)
+        target_key = _name_key(_target_core(target))
+        target_hits = sum(
+            1 for chunk_id in positive_ids
+            if target_key in _name_key(corpus[chunk_id].get("final") or ""))
+        enriched_rows: List[Dict[str, Any]] = []
+        for pending_row in pending_rows:
+            chunk_id = str(pending_row.get("chunk_id") or "")
+            text = corpus.get(chunk_id, {}).get("final") or ""
+            near = _near_target_forms(text, _target_core(target))
+            for form in near:
+                form["corpus"] = _candidate_stats(
+                    str(form.get("form") or ""), gram_cache, positive_ids)
+            matching_candidates = []
+            for candidate in candidates:
+                form = str(candidate.get("form") or "")
+                if _name_key(form) and _name_key(form) in _name_key(text):
+                    matching_candidates.append(candidate)
+            enriched_rows.append({
+                "chunk_id": chunk_id,
+                "state": pending_row.get("state"),
+                "queue_rounds": pending_row.get("queue_rounds"),
+                "final_chars": len(text),
+                "near_target_forms": near,
+                "matching_group_candidates": matching_candidates[:6],
+            })
+        classification, reason = _classify_group(
+            target=target, target_hits=target_hits,
+            total_positive=len(positive_ids), pending_rows=enriched_rows,
+            candidates=candidates)
+        groups.append({
+            "decision_id": decision_id,
+            "source_key": source_key,
+            "target": target,
+            "classification": classification,
+            "reason": reason,
+            "pending_chunks": [row.get("chunk_id") for row in pending_rows],
+            "pending_rows": enriched_rows,
+            "candidates": candidates,
+            "target_hits": target_hits,
+            "source_positive_chunks": len(positive_ids),
+        })
+    by_class = Counter(str(group.get("classification") or "") for group in groups)
+    result.update({
+        "groups": groups,
+        "counts": {
+            "outstanding_rows": len(outstanding),
+            "groups": len(groups),
+            "completed_corpus": len(corpus),
+            **{key: int(value) for key, value in sorted(by_class.items())},
+        },
+        "ok": not result["errors"],
+    })
+    _atomic_json(jpath, result)
+    _atomic_text(mpath, _render_markdown(result))
+    return result
+
+
+def _render_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# 术语形态只读审计", "",
+             "- 模式: **read_only**",
+             "- 生成时间: %s" % result.get("generated_at"),
+             "- 统计: `%s`" % (result.get("counts") or {}), ""]
+    groups = result.get("groups") or []
+    if groups:
+        lines.extend(["## 分诊（前 40 组）"])
+        for group in groups[:40]:
+            lines.append(
+                "- `#%s %s → %s` / %s / target_hits=%s/%s / pending=%s"
+                % (group.get("decision_id"), group.get("source_key"),
+                   group.get("target"), group.get("classification"),
+                   group.get("target_hits"), group.get("source_positive_chunks"),
+                   ",".join(group.get("pending_chunks") or [])))
+            candidates = group.get("candidates") or []
+            if candidates:
+                lines.append("  - 候选: " + ", ".join(
+                    "`%s`(pos=%s,neg=%s)" % (
+                        row.get("form"), row.get("positive_chunks"),
+                        row.get("negative_chunks"))
+                    for row in candidates[:6]))
+            for pending in (group.get("pending_rows") or [])[:4]:
+                near = pending.get("near_target_forms") or []
+                if near:
+                    lines.append("  - `%s` 近形: %s" % (
+                        pending.get("chunk_id"), ", ".join(
+                            "`%s`(sim=%.2f%s)" % (
+                                row.get("form"), row.get("similarity") or 0.0,
+                                ",stem" if row.get("target_stem") else "")
+                            for row in near[:4])))
+    if result.get("errors"):
+        lines.extend(["", "## 错误", ""] + [
+            "- `%s`" % error for error in result["errors"]])
+    lines.extend(["", "本报告不修改正文、Decision、registry、pending 或 workflow。", ""])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+__all__ = [
+    "TERM_FORM_AUDIT_SCHEMA_VERSION",
+    "audit_term_forms",
+]
+
+
+LOCKED_TARGET_AUDIT_SCHEMA_VERSION = 1
+LOCK_AUTHORITY_REASONS = {
+    "locked_decision_target_missing",
+    "specific_decision_target_missing",
+}
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _atomic_json(path: Path, payload: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    tmp.replace(path)
+
+
+def _atomic_text(path: Path, text: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _source_positive_ids(corpus: Dict[str, Dict[str, str]],
+                         source_key: str) -> List[str]:
+    return [
+        chunk_id for chunk_id, row in corpus.items()
+        if _source_phrase_spans(row.get("source") or "", source_key)
+    ]
+
+
+def _authority_ids_for_decision(
+    *,
+    context: Dict[str, Any],
+    corpus: Dict[str, Dict[str, str]],
+    decision_id: int,
+    source_key: str,
+) -> Tuple[List[str], List[str]]:
+    source_positive = _source_positive_ids(corpus, source_key)
+    generic_positive = [
+        chunk_id for chunk_id in source_positive
+        if not _all_source_occurrences_have_more_specific_decision(
+            pending_source=source_key,
+            pending_decision_id=int(decision_id),
+            source_text=corpus[chunk_id].get("source") or "",
+            decisions=context.get("decisions") or {},
+        )
+    ]
+    return source_positive, generic_positive
+
+
+def _target_hit_ids(corpus: Dict[str, Dict[str, str]],
+                    positive_ids: List[str], target: str) -> List[str]:
+    target_key = _name_key(_target_core(target))
+    if not target_key:
+        return []
+    return [
+        chunk_id for chunk_id in positive_ids
+        if target_key in _name_key(corpus[chunk_id].get("final") or "")
+    ]
+
+
+def _same_character_multiset(left: str, right: str) -> bool:
+    a, b = _name_key(left), _name_key(right)
+    return bool(a and b and a != b and sorted(a) == sorted(b))
+
+
+def _contains_character_permutation(text: str, target: str) -> bool:
+    """Detect title/word-order variants such as 圣母盖乌斯… vs 盖乌斯…圣母."""
+    text_key = _name_key(text)
+    target_key = _name_key(_target_core(target))
+    if not text_key or not target_key or len(text_key) < len(target_key):
+        return False
+    wanted = sorted(target_key)
+    size = len(target_key)
+    for start in range(len(text_key) - size + 1):
+        if sorted(text_key[start:start + size]) == wanted:
+            return True
+    return False
+
+
+def _specific_covering_decisions(
+    *,
+    source_text: str,
+    generic_source: str,
+    generic_decision_id: int,
+    decisions: Dict[int, dict],
+) -> List[Dict[str, Any]]:
+    """Return longer Decisions that cover every generic source occurrence."""
+    generic_spans = _source_phrase_spans(source_text, generic_source)
+    if not generic_spans:
+        return []
+    covering: List[Dict[str, Any]] = []
+    for decision_id, decision in (decisions or {}).items():
+        if int(decision_id) == int(generic_decision_id):
+            continue
+        candidate_source = str(decision.get("source_key") or "")
+        if not _strictly_more_specific_source(generic_source, candidate_source):
+            continue
+        spans = _source_phrase_spans(source_text, candidate_source)
+        if not spans:
+            continue
+        covering.append({
+            "decision_id": int(decision_id),
+            "source_key": candidate_source,
+            "target": _target_core(decision.get("translation")),
+            "spans": spans,
+        })
+    if not covering:
+        return []
+    if not all(
+        any(start <= span[0] and span[1] <= end
+            for item in covering for start, end in item["spans"])
+        for span in generic_spans
+    ):
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in covering:
+        payload = dict(item)
+        payload.pop("spans", None)
+        out.append(payload)
+    return sorted(out, key=lambda row: (len(row["source_key"]), row["decision_id"]))
+
+
+def _ranked_lock_candidates(
+    *,
+    target: str,
+    positive_ids: List[str],
+    corpus: Dict[str, Dict[str, str]],
+    gram_cache: Dict[str, set],
+) -> List[Dict[str, Any]]:
+    target_key = _name_key(_target_core(target))
+    ranked = _rank_candidates(set(positive_ids), gram_cache, limit=64)
+    out: List[Dict[str, Any]] = []
+    for row in ranked:
+        form = str(row.get("form") or "")
+        key = _name_key(form)
+        if not key or key == target_key:
+            continue
+        if key in target_key or target_key in key:
+            continue
+        if form.startswith(_FUNCTION_PREFIXES):
+            continue
+        if form.endswith(_FUNCTION_SUFFIXES):
+            continue
+        if any(char in form[1:-1] for char in _FUNCTION_INFIXES):
+            continue
+        if len(key) > len(target_key) + 1:
+            continue
+        target_inside_candidate = bool(target_key and target_key in key)
+        evidence = _candidate_stats(form, gram_cache, set(positive_ids))
+        coverage = evidence["positive_chunks"] / float(max(1, len(positive_ids)))
+        similarity = _similarity(form, target_key)
+        if coverage < 0.5 and similarity < 0.3:
+            continue
+        evidence.update({
+            "positive_coverage": round(coverage, 4),
+            "target_substring": bool(key in target_key),
+            "target_inside_candidate": target_inside_candidate,
+            "similarity_to_target": round(similarity, 4),
+            "pending_chunks": [
+                chunk_id for chunk_id in positive_ids
+                if key in _name_key(corpus[chunk_id].get("final") or "")
+            ],
+        })
+        out.append(evidence)
+    filtered: List[Dict[str, Any]] = []
+    for row in out:
+        form = str(row.get("form") or "")
+        hits = int(row.get("positive_chunks") or 0)
+        if any(
+            form != str(other.get("form") or "")
+            and form in str(other.get("form") or "")
+            and int(other.get("positive_chunks") or 0) >= hits - 1
+            for other in out
+        ):
+            continue
+        filtered.append(row)
+    return filtered
+
+
+def _pending_form_evidence(
+    *,
+    pending_entries: List[Dict[str, Any]],
+    corpus: Dict[str, Dict[str, str]],
+    target: str,
+    candidates: List[Dict[str, Any]],
+    gram_cache: Dict[str, set],
+    positive_ids: List[str],
+) -> Tuple[List[Dict[str, Any]], bool]:
+    rows: List[Dict[str, Any]] = []
+    legitimate_variant = False
+    positive_set = set(positive_ids)
+    for entry in pending_entries:
+        chunk_id = str(entry.get("chunk_id") or "")
+        text = corpus.get(chunk_id, {}).get("final") or ""
+        if _contains_character_permutation(text, target):
+            legitimate_variant = True
+        near = _near_target_forms(text, target)
+        for form in near:
+            form["corpus"] = _candidate_stats(
+                str(form.get("form") or ""), gram_cache, positive_set)
+            if _same_character_multiset(
+                    str(form.get("form") or ""), _target_core(target)):
+                legitimate_variant = True
+        matching = [
+            row for row in candidates
+            if _name_key(str(row.get("form") or "")) in _name_key(text)
+        ]
+        rows.append({
+            "chunk_id": chunk_id,
+            "reason": entry.get("reason"),
+            "state": entry.get("state"),
+            "queue_rounds": entry.get("queue_rounds"),
+            "final_chars": len(text),
+            "near_target_forms": near,
+            "matching_candidates": matching[:8],
+        })
+    return rows, legitimate_variant
+
+
+def _classify_lock_authority(
+    *,
+    target: str,
+    target_hits: int,
+    total_positive: int,
+    candidates: List[Dict[str, Any]],
+    legitimate_variant: bool,
+) -> Tuple[str, str]:
+    if total_positive <= 0:
+        return "insufficient_evidence", "source_phrase_absent_from_completed_corpus"
+    usable = [
+        row for row in candidates
+        if int(row.get("positive_chunks") or 0) >= 2
+        and not bool(row.get("target_substring"))
+        and not bool(row.get("target_inside_candidate"))
+        and (target_hits == 0 or float(row.get("similarity_to_target") or 0.0) >= 0.2)
+    ]
+    usable.sort(key=lambda row: (
+        -int(row.get("positive_chunks") or 0),
+        -float(row.get("positive_coverage") or 0.0),
+        -len(str(row.get("form") or "")),
+        str(row.get("form") or ""),
+    ))
+    best = usable[0] if usable else None
+    second_hits = int(usable[1].get("positive_chunks") or 0) if len(usable) > 1 else 0
+    best_hits = int(best.get("positive_chunks") or 0) if best else 0
+    majority = max(2, int(math.ceil(total_positive * 0.5)))
+
+    if target_hits == 0:
+        if legitimate_variant:
+            return "legitimate_variant", "pending_uses_same_characters_in_another_order"
+        if best and best_hits >= majority and best_hits >= second_hits * 2:
+            return "contradicted", "locked_target_absent_and_alternate_form_dominates"
+        if best and best_hits >= 2:
+            return "ambiguous", "locked_target_absent_and_alternate_forms_split"
+        return "insufficient_evidence", "locked_target_absent_without_strong_alternate"
+
+    if target_hits >= majority:
+        return "confirmed", "locked_target_is_book_wide_majority"
+    return "ambiguous", "locked_target_is_minority_in_completed_corpus"
+
+
+def _build_group(
+    *,
+    authority_kind: str,
+    decision_id: int,
+    source_key: str,
+    target: str,
+    pending_entries: List[Dict[str, Any]],
+    context: Dict[str, Any],
+    corpus: Dict[str, Dict[str, str]],
+    gram_cache: Dict[str, set],
+    pending_decision_id: int = 0,
+    pending_reason: str = "",
+) -> Dict[str, Any]:
+    source_positive, generic_positive = _authority_ids_for_decision(
+        context=context, corpus=corpus, decision_id=decision_id,
+        source_key=source_key)
+    authority_ids = generic_positive
+    if authority_kind != "generic":
+        authority_ids = source_positive
+    target_hits = _target_hit_ids(corpus, authority_ids, target)
+    candidates = _ranked_lock_candidates(
+        target=target, positive_ids=authority_ids,
+        corpus=corpus, gram_cache=gram_cache)
+    if target_hits:
+        target_chars = set(_name_key(_target_core(target)))
+        candidates = [
+            row for row in candidates
+            if target_chars & set(_name_key(str(row.get("form") or "")))
+        ]
+    if authority_kind == "generic":
+        specific_target_keys = {
+            _name_key(_target_core(decision.get("translation")))
+            for decision in (context.get("decisions") or {}).values()
+            if _strictly_more_specific_source(
+                source_key, str(decision.get("source_key") or ""))
+        }
+        candidates = [
+            row for row in candidates
+            if _name_key(str(row.get("form") or "")) not in specific_target_keys
+        ]
+    pending_rows, legitimate_variant = _pending_form_evidence(
+        pending_entries=pending_entries, corpus=corpus, target=target,
+        candidates=candidates, gram_cache=gram_cache,
+        positive_ids=authority_ids)
+    classification, reason = _classify_lock_authority(
+        target=target, target_hits=len(target_hits),
+        total_positive=len(authority_ids), candidates=candidates,
+        legitimate_variant=legitimate_variant)
+    if classification == "legitimate_variant":
+        target_chars = set(_name_key(_target_core(target)))
+        candidates = [
+            row for row in candidates
+            if len(target_chars & set(_name_key(str(row.get("form") or "")))) >= 2
+        ]
+    return {
+        "authority_kind": authority_kind,
+        "decision_id": int(decision_id),
+        "source_key": source_key,
+        "target": _target_core(target),
+        "classification": classification,
+        "reason": reason,
+        "pending_decision_id": int(pending_decision_id or 0),
+        "pending_reason": pending_reason,
+        "pending_chunks": [str(e.get("chunk_id") or "") for e in pending_entries],
+        "pending_rows": pending_rows,
+        "source_positive_chunks": len(source_positive),
+        "authority_chunks": len(authority_ids),
+        "target_hits": len(target_hits),
+        "target_hit_chunks": target_hits,
+        "candidates": candidates[:12],
+    }
+
+
+def build_lock_authority_corpus(
+    context: Dict[str, Any],
+) -> Tuple[Dict[str, Dict[str, str]], Dict[str, set]]:
+    """Build the COMPLETED final cache used by lock-acquisition checks."""
+    corpus = _completed_corpus(context)
+    gram_cache = {
+        chunk_id: _cjk_ngrams(row.get("final") or "")
+        for chunk_id, row in corpus.items()
+    }
+    return corpus, gram_cache
+
+
+def evaluate_decision_lock_authority(
+    *,
+    decision_id: int,
+    source_key: str,
+    target: str,
+    context: Dict[str, Any],
+    corpus: Dict[str, Dict[str, str]],
+    gram_cache: Dict[str, set],
+    proposed_chunk_id: str = "",
+    proposed_text: str = "",
+    low_corpus_threshold: int = 1,
+) -> Dict[str, Any]:
+    """Decide whether a Decision target may acquire/reinforce a lock.
+
+    The current chunk is treated as COMPLETED with ``proposed_text`` so a
+    genuine one-chunk entity can still lock its first authoritative form.  A
+    book with several source-positive chunks must independently support the
+    target; one local repair cannot manufacture a majority by itself.
+    """
+    effective = dict(corpus)
+    effective_grams = dict(gram_cache)
+    proposed_chunk_id = str(proposed_chunk_id or "")
+    if proposed_chunk_id:
+        task = (context.get("tasks") or {}).get(proposed_chunk_id) or {}
+        chapter = str(task.get("chapter_id") or proposed_chunk_id[:4])
+        proposed_final = str(proposed_text or "")
+        effective[proposed_chunk_id] = {
+            "chapter": chapter,
+            "source": str(task.get("text_content") or ""),
+            "final": proposed_final,
+        }
+        # Candidate ranking must see the bytes that the mutating path is about
+        # to write.  Otherwise a proposed majority can be counted in
+        # ``target_hits`` while its form is absent from the positive-gram
+        # statistics, producing a contradictory decision from the same input.
+        effective_grams[proposed_chunk_id] = _cjk_ngrams(proposed_final)
+    source_positive, generic_positive = _authority_ids_for_decision(
+        context=context, corpus=effective, decision_id=int(decision_id),
+        source_key=source_key)
+    authority_ids = generic_positive
+    if not authority_ids and not source_positive:
+        authority_ids = []
+    target_hits = _target_hit_ids(effective, authority_ids, target)
+    book_authority_ids = [
+        chunk_id for chunk_id in authority_ids
+        if chunk_id != proposed_chunk_id
+    ]
+    book_target_hits = _target_hit_ids(effective, book_authority_ids, target)
+    target_key = _name_key(_target_core(target))
+    legitimate_variant = any(
+        _contains_character_permutation(
+            effective[chunk_id].get("final") or "", target)
+        for chunk_id in (book_authority_ids or authority_ids)
+    )
+    candidates = _ranked_lock_candidates(
+        target=target, positive_ids=authority_ids,
+        corpus=effective, gram_cache=effective_grams)
+    classification_target_hits = (
+        book_target_hits if book_authority_ids else target_hits)
+    classification_authority_total = (
+        len(book_authority_ids) if book_authority_ids else len(authority_ids))
+    if classification_target_hits:
+        target_chars = set(target_key)
+        candidates = [
+            row for row in candidates
+            if target_chars & set(_name_key(str(row.get("form") or "")))
+        ]
+    total = classification_authority_total
+    if total > 0:
+        classification, reason = _classify_lock_authority(
+            target=target, target_hits=len(classification_target_hits),
+            total_positive=total, candidates=candidates,
+            legitimate_variant=legitimate_variant)
+    else:
+        classification = "insufficient_evidence"
+        reason = "source_phrase_absent_from_completed_corpus"
+    low_corpus = 0 < total <= max(1, int(low_corpus_threshold))
+    if (total > 0 and low_corpus and target_hits
+            and not book_authority_ids):
+        classification = "confirmed"
+        reason = "low_corpus_target_confirmed_by_proposed_final"
+    if classification == "legitimate_variant":
+        target_chars = set(target_key)
+        candidates = [
+            row for row in candidates
+            if len(target_chars & set(_name_key(str(row.get("form") or "")))) >= 2
+        ]
+    lock_allowed = classification == "confirmed" and bool(target_hits)
+    return {
+        "decision_id": int(decision_id),
+        "source_key": str(source_key),
+        "target": _target_core(target),
+        "status": classification,
+        "reason": reason,
+        "lock_allowed": lock_allowed,
+        "low_corpus": low_corpus,
+        "source_positive_chunks": len(source_positive),
+        "authority_chunks": total,
+        "target_hits": len(target_hits),
+        "target_hit_chunks": target_hits,
+        "book_authority_chunks": len(book_authority_ids),
+        "book_target_hits": len(book_target_hits),
+        "book_target_hit_chunks": book_target_hits,
+        "proposed_target_hit": bool(
+            proposed_chunk_id and proposed_chunk_id in target_hits),
+        "proposed_chunk_id": proposed_chunk_id,
+        "candidates": candidates[:12],
+    }
+
+
+def audit_locked_target_authorities(
+    project_root: Path,
+    *,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    include_marked_repair_sweep: bool = False,
+    json_out: Optional[Path] = None,
+    md_out: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Audit locked-target blocking rows without changing project state."""
+    root = Path(project_root)
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    jpath = Path(json_out) if json_out else out_dir / "locked_target_authority_audit.json"
+    mpath = Path(md_out) if md_out else out_dir / "locked_target_authority_audit.md"
+    result: Dict[str, Any] = {
+        "schema_version": LOCKED_TARGET_AUDIT_SCHEMA_VERSION,
+        "mode": "read_only",
+        "write_attempted": False,
+        "generated_at": _now_iso(),
+        "groups": [],
+        "counts": {},
+        "errors": [],
+        "ok": False,
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+    }
+    context = load_pending_context(
+        root, decision_db=decision_db, workflow_db=workflow_db,
+        output_dir=out_dir)
+    if not context.get("available"):
+        result["errors"].append(str(context.get("reason") or "pending_context_unavailable"))
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _render_markdown(result))
+        return result
+    snapshot = classify_pending_snapshot(context)
+    locked_entries = [
+        entry for entry in snapshot.get("entries") or []
+        if entry.get("reason") in LOCK_AUTHORITY_REASONS
+    ]
+    corpus = _completed_corpus(context)
+    gram_cache = {
+        chunk_id: _cjk_ngrams(row.get("final") or "")
+        for chunk_id, row in corpus.items()
+    }
+    grouped: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = defaultdict(list)
+    for entry in locked_entries:
+        source_key = str(entry.get("decision_source_key") or
+                         entry.get("pending_source_key") or "")
+        target = str(entry.get("decision_translation") or "")
+        decision_id = int(entry.get("decision_id") or 0)
+        reason = str(entry.get("reason") or "")
+        task = (context.get("tasks") or {}).get(str(entry.get("chunk_id") or ""))
+        source_text = str((task or {}).get("text_content") or "")
+        if reason == "specific_decision_target_missing":
+            covers = _specific_covering_decisions(
+                source_text=source_text, generic_source=source_key,
+                generic_decision_id=decision_id,
+                decisions=context.get("decisions") or {})
+            if covers:
+                for cover in covers:
+                    grouped[(
+                        "specific", int(cover["decision_id"]), str(cover["source_key"]),
+                        str(cover["target"]), decision_id, reason,
+                    )].append(entry)
+                continue
+        grouped[("generic", decision_id, source_key, target, 0, reason)].append(entry)
+
+    groups: List[Dict[str, Any]] = []
+    for key, entries in sorted(grouped.items(), key=lambda item: (
+            item[0][0], item[0][1], item[0][2])):
+        authority_kind, decision_id, source_key, target, generic_id, reason = key
+        groups.append(_build_group(
+            authority_kind=authority_kind, decision_id=int(decision_id),
+            source_key=str(source_key), target=str(target),
+            pending_entries=entries, context=context, corpus=corpus,
+            gram_cache=gram_cache, pending_decision_id=int(generic_id),
+            pending_reason=str(reason)))
+
+    if include_marked_repair_sweep:
+        # A successful repair consumes its pending row, but a *different*
+        # source-positive COMPLETED chunk may still carry the same drift with
+        # no outbox row (the Shield Wall / ch03_chunk012 case).  Sweep locked
+        # Decisions independently of pending only when this repairer left its
+        # explicit marker.  Sweeping every locked proper name makes unrelated
+        # names look like repair candidates and violates least authority.
+        seen_authority = {
+            (int(group.get("decision_id") or 0), str(group.get("source_key") or ""))
+            for group in groups
+        }
+        for decision_id, decision in sorted((context.get("decisions") or {}).items()):
+            if not int(decision.get("locked") or 0):
+                continue
+            reason = str(decision.get("reason") or "")
+            if "Round 158 confirmed term drift lock:" not in reason:
+                continue
+            source_key = str(decision.get("source_key") or "")
+            target = str(decision.get("translation") or "")
+            if ((int(decision_id), source_key) in seen_authority
+                    or not source_key.strip() or not target.strip()):
+                continue
+            group = _build_group(
+                authority_kind="specific", decision_id=int(decision_id),
+                source_key=source_key, target=target, pending_entries=[],
+                context=context, corpus=corpus, gram_cache=gram_cache,
+                pending_decision_id=0,
+                pending_reason="specific_decision_target_missing_no_pending",
+            )
+            if int(group.get("source_positive_chunks") or 0) <= 0:
+                continue
+            if int(group.get("target_hits") or 0) >= int(
+                    group.get("authority_chunks") or 0):
+                continue
+            group["sweep"] = True
+            groups.append(group)
+        groups.sort(key=lambda group: (
+            str(group.get("authority_kind") or ""),
+            int(group.get("decision_id") or 0), str(group.get("source_key") or "")))
+    by_class = Counter(str(group.get("classification") or "") for group in groups)
+    result.update({
+        "groups": groups,
+        "counts": {
+            "pending_rows": len(locked_entries),
+            "groups": len(groups),
+            "completed_corpus": len(corpus),
+            **{key: int(value) for key, value in sorted(by_class.items())},
+        },
+        "ok": not result["errors"],
+    })
+    _atomic_json(jpath, result)
+    _atomic_text(mpath, _render_markdown(result))
+    return result
+
+
+def _render_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# 锁定目标权威审计（只读）", "",
+             "- 模式: **read_only**",
+             "- 生成时间: %s" % result.get("generated_at"),
+             "- 统计: `%s`" % (result.get("counts") or {}), ""]
+    groups = result.get("groups") or []
+    if groups:
+        lines.append("## 分组")
+        for group in groups:
+            lines.append(
+                "- `#%s %s → %s` / **%s** / %s / target_hits=%s/%s / pending=%s"
+                % (group.get("decision_id"), group.get("source_key"),
+                   group.get("target"), group.get("classification"),
+                   group.get("reason"), group.get("target_hits"),
+                   group.get("authority_chunks"),
+                   ",".join(group.get("pending_chunks") or [])))
+            candidates = group.get("candidates") or []
+            if candidates:
+                lines.append("  - 候选: " + ", ".join(
+                    "`%s`(pos=%s,neg=%s)" % (
+                        row.get("form"), row.get("positive_chunks"),
+                        row.get("negative_chunks")) for row in candidates[:6]))
+    if result.get("errors"):
+        lines.extend(["", "## 错误", ""] + [
+            "- `%s`" % error for error in result["errors"]])
+    lines.extend(["", "本报告不修改正文、Decision、registry、pending 或 workflow。", ""])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+__all__ = [
+    "LOCKED_TARGET_AUDIT_SCHEMA_VERSION",
+    "audit_locked_target_authorities",
+    "build_lock_authority_corpus",
+    "evaluate_decision_lock_authority",
+]
+
+
+TERM_CONTRACT_SCHEMA_VERSION = 1
+DEFAULT_CONTRACT_PATH = "input/term_form_contracts.json"
+DEFAULT_AUDIT_PATH = "output/term_form_contracts.json"
+DEFAULT_AUDIT_MD_PATH = "output/term_form_contracts.md"
+
+_CJK_FORM_RE = re.compile(r"^[\u4e00-\u9fff·・－\-]+$")
+_CJK_RUN_RE = re.compile(r"[\u4e00-\u9fff]+")
+_ROLE_SUFFIXES = ("家族", "医生", "琴")
+_FUNCTION_PREFIXES = (
+    "的", "了", "着", "地", "得", "在", "和", "与", "把", "被", "是",
+    "这", "那", "一", "些", "个", "其", "他", "她", "它", "向", "从",
+    "没", "有", "无", "像", "将", "只", "道", "给", "对",
+    "会", "能", "可", "要", "已", "还", "又", "也", "都", "就", "才",
+    "仅", "正", "仍", "却", "便", "再", "更", "很", "太", "不", "未",
+    "别", "请", "让", "叫", "使", "为",
+)
+_FUNCTION_SUFFIXES = (
+    "的", "地", "得", "了", "着", "是", "在", "和", "与", "这", "那",
+    "个", "些", "们", "一", "样",
+)
+_FUNCTION_INFIXES = ("的", "地", "得", "了", "着", "之")
+_GLOSS_CLAUSE_CHARS = frozenset("的地得了着之在是我你他她它您这那")
+_GLOSS_BOUNDARIES = (
+    "成为", "作为", "称为", "叫做", "尝试", "采用", "看到", "看见",
+    "拥有", "使用", "写作", "译作", "叫作", "借助", "通过", "利用",
+    "凭借",
+    "是", "为", "有", "用", "将", "把", "被", "叫", "称", "能", "着",
+    "在", "和", "与", "从", "向", "对", "给", "让", "使",
+    "我", "你", "您", "他", "她", "它",
+)
+
+_SOURCE_GLOSS_RE = re.compile(
+    r"(?P<cjk>[\u4e00-\u9fff·・－\-]{2,40})\s*[（(]\s*"
+    r"(?P<source>[A-Za-z][A-Za-z0-9'’\- .]{1,100}?)"
+    r"\s*(?:\[\^[^\]]+\]\s*)*[）)]"
+)
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _cjk_edit_distance(left: str, right: str) -> int:
+    """Small-string Levenshtein distance for lexical near-form checks."""
+    if left == right:
+        return 0
+    if abs(len(left) - len(right)) > 1:
+        return 2
+    if len(left) == len(right):
+        return sum(a != b for a, b in zip(left, right))
+    shorter, longer = (left, right) if len(left) < len(right) else (right, left)
+    i = j = edits = 0
+    while i < len(shorter) and j < len(longer):
+        if shorter[i] == longer[j]:
+            i += 1
+            j += 1
+            continue
+        edits += 1
+        if edits > 1:
+            return 2
+        j += 1
+    return edits + (len(longer) - j)
+
+
+def _atomic_json(path: Path, payload: Any) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                   encoding="utf-8")
+    tmp.replace(path)
+
+
+def _atomic_text(path: Path, text: str) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+
+
+def _source_match_key(value: Any) -> str:
+    key = re.sub(r"\s+", " ", str(value or "").casefold()).strip()
+    if key.endswith("'s"):
+        key = key[:-2]
+    # Profile hints use the collective plural while Decision keys often use the
+    # singular (Harkonnens vs Harkonnen).  Only trim a simple final ``s``.
+    if len(key) > 3 and key.endswith("s") and not key.endswith("ss"):
+        key = key[:-1]
+    return key
+
+
+def _clean_form(value: Any) -> str:
+    form = str(value or "").strip().strip("《》“”\"'")
+    if not form or len(form) > 24 or not _CJK_FORM_RE.fullmatch(form):
+        return ""
+    return form
+
+
+def _forms_from_hint(source: str, hint: str) -> List[str]:
+    """Extract only surface forms, not the explanatory description."""
+    if "=" not in hint:
+        return []
+    left, right = hint.split("=", 1)
+    if _source_match_key(left) != _source_match_key(source):
+        return []
+    head = re.split(r"[：;；]", right, maxsplit=1)[0].strip()
+    forms: List[str] = []
+    for part in re.split(r"[／/]", head):
+        form = _clean_form(re.sub(r"[（(][^（()）]*[）)]", "", part))
+        if form:
+            forms.append(form)
+    # Some hints put the executable form in quotes after prose
+    # (Kwisatz Haderach).  Do not harvest every quoted word: clauses such as
+    # "不宜仅译“生态学家”" are explicitly rejected forms.
+    for quoted in re.findall(r"(?:可统一为|统一为|统一|首次写作)[^“]*“([^”]+)”", right):
+        form = _clean_form(re.sub(r"[（(][^（()）]*[）)]", "", quoted))
+        if form:
+            forms.append(form)
+    return forms
+
+
+def _profile_forms(profile: dict) -> Dict[str, List[Dict[str, str]]]:
+    out: Dict[str, List[Dict[str, str]]] = {}
+    for hint in profile.get("translation_hints") or []:
+        if not isinstance(hint, str) or "=" not in hint:
+            continue
+        source = hint.split("=", 1)[0].strip()
+        for form in _forms_from_hint(source, hint):
+            out.setdefault(_source_match_key(source), []).append({
+                "form": form,
+                "authority": "profile_translation_hint",
+                "evidence": hint,
+            })
+    for item in profile.get("pun_watchlist") or []:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("source") or "")
+        key = _source_match_key(source)
+        hint_keys = {_name_key(row.get("form") or "")
+                     for row in out.get(key, []) if row.get("form")}
+        for anchor in item.get("anchors") or []:
+            form = _clean_form(anchor)
+            # Pun explanations often contain ordinary phrases ("缩短距离").
+            # An anchor becomes an executable form only when the same source's
+            # translation hint already lists it as a form.
+            if (form and _name_key(form) in hint_keys
+                    and form.casefold() != source.casefold()):
+                out.setdefault(key, []).append({
+                    "form": form,
+                    "authority": "profile_pun_anchor",
+                    "evidence": str(item.get("strategy") or source),
+                })
+    return out
+
+
+def _same_cjk_word_order(left: str, right: str) -> bool:
+    """True for a title word-order variant with identical CJK characters."""
+    left_key = _name_key(left)
+    right_key = _name_key(right)
+    return bool(left_key and right_key and left_key != right_key
+                and sorted(left_key) == sorted(right_key))
+
+
+def _gloss_surface_form(prefix: str, target: str) -> str:
+    """Pick the noun phrase immediately before an explicit source gloss.
+
+    A gloss such as ``会用杂酚灌木（creosote bush）`` has a verb in the
+    same CJK run.  Keep only a suffix that has no function-word boundary and
+    is closest to the Decision target.  The returned form is evidence for a
+    contract, never a rewrite instruction.
+    """
+    target_key = _name_key(target)
+    if not target_key:
+        return ""
+    # The gloss prefix can be exactly the target.  Do not let a literal
+    # function character inside the target (``之`` in ``外世界之声``) cause the
+    # heuristic below to trim a valid full form down to its tail (``之声``).
+    if _name_key(prefix).endswith(target_key):
+        return target
+    candidates: List[Tuple[float, int, str]] = []
+    limit = min(12, len(prefix))
+    for size in range(2, limit + 1):
+        form = prefix[-size:]
+        if not _CJK_FORM_RE.fullmatch(form):
+            continue
+        if form.startswith(_FUNCTION_PREFIXES):
+            continue
+        if form.endswith(_FUNCTION_SUFFIXES):
+            continue
+        if any(char in form[1:-1] for char in _FUNCTION_INFIXES):
+            continue
+        candidates.append((_similarity(form, target), len(form), form))
+    if not candidates:
+        return ""
+    # When a short, clean CJK run is immediately followed by its source gloss,
+    # prefer the whole run over a target-similar suffix.  ``宾杜悬浮（Bindu
+    # suspension）`` must yield the full term, not the generic ``悬浮``.  Clause
+    # markers veto this shortcut so ``如果我在沙虫活动区（worm zone）`` still
+    # reaches the boundary-based extraction below.
+    full = prefix
+    if (2 <= len(full) <= 8
+            and _CJK_FORM_RE.fullmatch(full)
+            and not any(char in full for char in _GLOSS_CLAUSE_CHARS)
+            and not full.startswith(_FUNCTION_PREFIXES)
+            and not full.endswith(_FUNCTION_SUFFIXES)
+            and not any(char in full[1:-1] for char in _FUNCTION_INFIXES)):
+        has_boundary = any(boundary in prefix for boundary in _GLOSS_BOUNDARIES)
+        if not has_boundary:
+            return full
+    # A verb or function word often shares the CJK run
+    # (会用杂酚灌木 / 你以为我是奎萨茨·哈德拉赫).  Prefer the suffix after
+    # the last such boundary when it is a plausible term.
+    boundary_forms: List[Tuple[int, str]] = []
+    for boundary in _GLOSS_BOUNDARIES:
+        pos = prefix.rfind(boundary)
+        if pos < 0:
+            continue
+        form = prefix[pos + len(boundary):]
+        if 2 <= len(form) <= 12 and _CJK_FORM_RE.fullmatch(form):
+            if (not form.startswith(_FUNCTION_PREFIXES)
+                    and not form.endswith(_FUNCTION_SUFFIXES)
+                    and not any(char in form[1:-1]
+                                for char in _FUNCTION_INFIXES)):
+                boundary_forms.append((pos, form))
+    if boundary_forms:
+        return max(boundary_forms, key=lambda item: item[0])[1]
+    # If the gloss shares the target's head, the longer form is the compound
+    # (杂酚灌木, not the bare 灌木).  Otherwise use similarity, then length for
+    # alternate names such as Kwisatz Haderach -> 奎萨茨·哈德拉赫.
+    target_key = _name_key(target)
+    for _score, _length, form in candidates:
+        if _name_key(form) == target_key:
+            return form
+    head = target_key[-2:] if len(target_key) >= 2 else target_key
+    head_forms = [item for item in candidates
+                  if head and _name_key(item[2]).endswith(head)]
+    if head_forms:
+        return max(head_forms, key=lambda item: (item[1], item[0]))[2]
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def _source_gloss_forms(
+    corpus: Dict[str, Dict[str, str]],
+    source_key: str,
+    target: str,
+) -> List[Dict[str, Any]]:
+    """Harvest forms explicitly bound to the source key by a parenthetical.
+
+    The source phrase must match the complete parenthetical text, not merely a
+    token inside it.  This prevents ``carryall wing`` from becoming evidence
+    for the shorter ``carryall`` Decision.  Only source-positive COMPLETED
+    finals participate, so a pending chunk cannot validate itself.
+    """
+    wanted = _phrase_key(source_key)
+    if not wanted:
+        return []
+    forms: List[Dict[str, Any]] = []
+    seen = set()
+    for chunk_id, row in corpus.items():
+        if not _source_phrase_spans(row.get("source") or "", source_key):
+            continue
+        final = body_before_footnotes(row.get("final") or "")
+        for match in _SOURCE_GLOSS_RE.finditer(final):
+            if _phrase_key(match.group("source")) != wanted:
+                continue
+            form = _gloss_surface_form(match.group("cjk"), target)
+            if not form or form in seen:
+                continue
+            seen.add(form)
+            forms.append({
+                "form": form,
+                "authority": "source_gloss",
+                "evidence": "explicit gloss in %s: %s（%s）" % (
+                    chunk_id, form, match.group("source")),
+            })
+    return forms
+
+
+def _embedded_source_gloss_forms(
+    corpus: Dict[str, Dict[str, str]],
+    source_key: str,
+    target: str,
+    decisions: Optional[Dict[int, Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Allow a glossed longer phrase whose final token is the Decision key.
+
+    Examples are ``Great Erg`` for the Decision key ``erg`` and ``Bene
+    Gesserit litany`` for ``litany``.  The source chapter must contain the full
+    gloss phrase, the pending text must contain the extracted CJK form, and the
+    phrase must not already be owned by a more specific Decision (for example
+    ``body shield`` must not authorise the generic key ``shield``).
+    """
+    key_tokens = _source_tokens(source_key)
+    if len(key_tokens) != 1 or len(key_tokens[0]) < 3:
+        return []
+    key = key_tokens[0]
+    target_key = _name_key(_target_core(target))
+    decision_keys = {
+        _phrase_key(str(item.get("source_key") or ""))
+        for item in (decisions or {}).values()
+        if str(item.get("source_key") or "").strip()
+    }
+    forms: List[Dict[str, Any]] = []
+    seen = set()
+    for chunk_id, row in corpus.items():
+        source_text = str(row.get("source") or "")
+        if not _source_phrase_spans(source_text, source_key):
+            continue
+        final = body_before_footnotes(str(row.get("final") or ""))
+        for match in _SOURCE_GLOSS_RE.finditer(final):
+            phrase = str(match.group("source") or "").strip()
+            phrase_tokens = _source_tokens(phrase)
+            if (len(phrase_tokens) < 2 or phrase_tokens[-1] != key
+                    or _phrase_key(phrase) in decision_keys
+                    or not _source_phrase_spans(source_text, phrase)):
+                continue
+            form = _gloss_surface_form(match.group("cjk"), target)
+            form_key = _name_key(form)
+            if (not form_key or len(form_key) < len(target_key)
+                    or form_key == _name_key(source_key)):
+                continue
+            dedupe = (form_key, _phrase_key(phrase))
+            if dedupe in seen:
+                continue
+            seen.add(dedupe)
+            forms.append({
+                "form": form,
+                "authority": "source_gloss_embedded_term",
+                "evidence": "explicit gloss in %s: %s（%s）; Decision key %s is the phrase head" % (
+                    chunk_id, form, phrase, source_key),
+            })
+    return forms
+
+
+def _gloss_extension_forms(
+    pending_texts: List[str],
+    source_key: str,
+    target: str,
+    corpus: Dict[str, Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    """Allow one CJK insertion into an explicitly glossed term.
+
+    ``杂酚灌木（creosote bush）`` and the body form ``杂酚油灌木`` are
+    morphological variants of the same plant name.  The base gloss is
+    independently attested in a completed source-positive chunk; the pending
+    final supplies only the one-character extension.
+    """
+    joined = "\n".join(body_before_footnotes(text) for text in pending_texts)
+    if not joined:
+        return []
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for item in _source_gloss_forms(corpus, source_key, target):
+        base = str(item.get("form") or "")
+        if not base or len(base) < 2 or len(base) > 16:
+            continue
+        # Candidate generation is bounded by the CJK characters actually in
+        # the pending text; never synthesize an unseen string.
+        chars = set("".join(_CJK_RUN_RE.findall(joined)))
+        for pos in range(1, len(base)):
+            for inserted in sorted(chars):
+                candidate = base[:pos] + inserted + base[pos:]
+                if candidate == base or candidate in seen:
+                    continue
+                if not _CJK_FORM_RE.fullmatch(candidate):
+                    continue
+                if not _contains_name(joined, candidate):
+                    continue
+                if candidate.startswith(_FUNCTION_PREFIXES) or candidate.endswith(
+                        _FUNCTION_SUFFIXES):
+                    continue
+                if any(value in candidate[1:-1] for value in _FUNCTION_INFIXES):
+                    continue
+                seen.add(candidate)
+                out.append({
+                    "form": candidate,
+                    "authority": "source_gloss_one_char_extension",
+                    "evidence": "%s; one-character body extension of %s" % (
+                        item.get("evidence") or "explicit source gloss", base),
+                })
+    return out
+
+
+def _gloss_modifier_elision_forms(
+    pending_texts: List[str],
+    source_key: str,
+    target: str,
+    corpus: Dict[str, Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    """Allow a short, bounded modifier elision from an explicit gloss."""
+    joined = "\n".join(body_before_footnotes(text) for text in pending_texts)
+    if not joined:
+        return []
+    modifiers = ("两色", "色的", "活动", "区域", "地区", "家族", "的")
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for item in _source_gloss_forms(corpus, source_key, target):
+        base = str(item.get("form") or "")
+        if not base:
+            continue
+        for modifier in modifiers:
+            if modifier not in base:
+                continue
+            candidate = _clean_form(base.replace(modifier, "", 1))
+            if not candidate or candidate == base or candidate in seen:
+                continue
+            if not _contains_name(joined, candidate):
+                continue
+            seen.add(candidate)
+            out.append({
+                "form": candidate,
+                "authority": "source_gloss_modifier_elision",
+                "evidence": "%s; bounded modifier elision %s" % (
+                    item.get("evidence") or "explicit source gloss", modifier),
+            })
+    return out
+
+
+def _registry_word_order_forms(
+    context: Dict[str, Any],
+    source_key: str,
+    target: str,
+) -> List[Dict[str, Any]]:
+    """Return full active registry variants that only reorder title characters."""
+    owners = ((context.get("registry_form_owners") or {}).get(
+        _phrase_key(source_key)) or [])
+    out: List[Dict[str, Any]] = []
+    for owner in owners:
+        if int(owner.get("pending_review") or 0):
+            continue
+        canonical = str(owner.get("canonical") or "")
+        if not canonical or not _name_compatible(canonical, target):
+            continue
+        for variant in owner.get("variants") or []:
+            if not _same_cjk_word_order(str(variant), target):
+                continue
+            out.append({
+                "form": str(variant),
+                "authority": "registry_active_word_order_variant",
+                "evidence": "entity_registry canonical %s" % canonical,
+            })
+    return out
+
+
+def _completed_corpus(context: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    out: Dict[str, Dict[str, str]] = {}
+    out_dir = context.get("output_dir") or Path(".")
+    for chunk_id, task in (context.get("tasks") or {}).items():
+        if str(task.get("state") or "") != "COMPLETED":
+            continue
+        chapter = str(task.get("chapter_id") or str(chunk_id)[:4])
+        path = Path(out_dir) / chapter / f"{chunk_id}_final.json"
+        payload = _read_json(path)
+        out[str(chunk_id)] = {
+            "source": str(task.get("text_content") or ""),
+            "final": body_before_footnotes(payload.get("text")),
+        }
+    return out
+
+
+def _corpus_coverage(
+    source_key: str,
+    form: str,
+    corpus: Dict[str, Dict[str, str]],
+    *,
+    exclude_chunk_ids: Optional[set] = None,
+) -> Tuple[int, int]:
+    positive = 0
+    hits = 0
+    excluded = exclude_chunk_ids or set()
+    for chunk_id, row in corpus.items():
+        if chunk_id in excluded:
+            continue
+        if not _source_phrase_spans(row.get("source") or "", source_key):
+            continue
+        positive += 1
+        if _contains_name(body_before_footnotes(row.get("final")), form):
+            hits += 1
+    return hits, positive
+
+
+def _registry_forms(
+    context: Dict[str, Any],
+    source_key: str,
+) -> List[Dict[str, str]]:
+    trusted = ((context.get("registry_trusted_by_source") or {}).get(
+        _phrase_key(source_key)) or set())
+    canonicals = sorted({str(value).strip() for value in trusted
+                         if str(value).strip()})
+    if len({_name_key(value) for value in canonicals}) != 1:
+        return []
+    canonical = _clean_form(canonicals[0])
+    if not canonical:
+        return []
+    return [{
+        "form": canonical,
+        "authority": "registry_trusted_canonical",
+        "evidence": "entity_registry source_names + pending_review=0",
+    }]
+
+
+def _sibling_decision_forms(
+    context: Dict[str, Any],
+    source_key: str,
+    current_decision_id: int,
+) -> List[Dict[str, str]]:
+    """Other active Decisions for the exact same source key.
+
+    A source key occasionally has two Decision rows with distinct surface
+    forms (for example crysknife -> 晶牙刀 / 晶牙匕).  Both rows are explicit
+    human-curated authorities, unlike corpus guesses.  They are safe as
+    evidence for a form contract, but they do not change either Decision.
+    """
+    wanted = _source_match_key(source_key)
+    out: List[Dict[str, str]] = []
+    for decision in (context.get("decisions") or {}).values():
+        try:
+            decision_id = int(decision.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if decision_id == int(current_decision_id or 0):
+            continue
+        if _source_match_key(decision.get("source_key")) != wanted:
+            continue
+        form = _clean_form(_target_core(
+            str(decision.get("translation") or "")))
+        if not form:
+            continue
+        out.append({
+            "form": form,
+            "authority": "sibling_decision_alias",
+            "evidence": "Decision #%d shares source_key %s" % (
+                decision_id, source_key),
+        })
+    return out
+
+
+def _short_forms(
+    target: str,
+    source_key: str,
+    corpus: Dict[str, Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    core = _target_core(target)
+    candidates: List[Dict[str, Any]] = []
+    for suffix in _ROLE_SUFFIXES:
+        if core.endswith(suffix) and len(core) > len(suffix):
+            stem = core[:-len(suffix)]
+            if suffix == "医生" and len(stem) != 1:
+                continue
+            if len(stem) >= 2 or suffix == "医生":
+                hits, positive = _corpus_coverage(source_key, stem, corpus)
+                if positive and hits * 2 >= positive:
+                    candidates.append({
+                        "form": stem,
+                        "authority": "target_" + suffix + "_short_form",
+                        "evidence": "attested %d/%d source-positive COMPLETED chunks" % (
+                            hits, positive),
+                    })
+    if "·" in core:
+        head = _clean_form(core.split("·", 1)[0])
+        if head:
+            core_key = _name_key(core)
+            head_key = _name_key(head)
+            # A family-name head is useful for ``吉迪·普莱姆 -> 吉迪`` but
+            # not for a faction-plus-noun title such as
+            # ``贝尼·杰瑟里特妖妇 -> 贝尼``.  Require the head to retain at
+            # least 40% of the canonical CJK form.
+            ratio_ok = bool(head_key) and len(head_key) * 5 >= len(core_key) * 2
+            hits, positive = _corpus_coverage(source_key, head, corpus)
+            if ratio_ok and positive and hits * 2 >= positive:
+                candidates.append({
+                    "form": head,
+                    "authority": "multi_part_name_head",
+                    "evidence": "attested %d/%d source-positive COMPLETED chunks" % (
+                        hits, positive),
+                })
+    return candidates
+
+
+def _corpus_consensus_forms(
+    pending_texts: List[str],
+    source_key: str,
+    target: str,
+    corpus: Dict[str, Dict[str, str]],
+    *,
+    pending_chunk_ids: Optional[List[str]] = None,
+    allow_self_attestation: bool = False,
+    require_target_length: bool = False,
+) -> List[Dict[str, Any]]:
+    """Return stable alternate surface forms observed in the book body.
+
+    This is intentionally stricter than "contains a similar n-gram".  A form
+    must occur in the pending final and in a material share of *other*
+    source-positive COMPLETED chunks.  The pending chunk itself is excluded:
+    counting it as evidence would make every local substring a circular 1/1
+    "consensus".  Typos such as 马普斯 vs 马佩斯 (0 independent positive chunks)
+    therefore never qualify.
+    """
+    core = _target_core(target)
+    target_key = _name_key(core)
+    target_len = len(target_key)
+    source_lower = bool(source_key) and any(ch.isalpha() for ch in source_key) and all(
+        (not ch.isalpha()) or ch.islower() for ch in source_key)
+    if not target_key:
+        return []
+    out: List[Dict[str, Any]] = []
+    for text_index, text in enumerate(pending_texts):
+        text = body_before_footnotes(text)
+        exclude = set()
+        if (not allow_self_attestation and pending_chunk_ids
+                and text_index < len(pending_chunk_ids)):
+            chunk_id = str(pending_chunk_ids[text_index] or "")
+            if chunk_id:
+                exclude.add(chunk_id)
+        candidates = set()
+        for near in _near_target_forms(text, core, limit=12):
+            form = str(near.get("form") or "")
+            if not form:
+                continue
+            for run in _CJK_RUN_RE.findall(text):
+                if form not in run:
+                    continue
+                run_len = len(run)
+                for size in range(2, min(10, run_len) + 1):
+                    for start in range(0, run_len - size + 1):
+                        candidate = run[start:start + size]
+                        if form in candidate:
+                            candidates.add(candidate)
+        scored: List[Tuple[int, int, float, int, str, int]] = []
+        for candidate in candidates:
+            key = _name_key(candidate)
+            if not key or key == target_key:
+                continue
+            if candidate.startswith(_FUNCTION_PREFIXES):
+                continue
+            if candidate.endswith(_FUNCTION_SUFFIXES):
+                continue
+            if any(char in candidate[1:-1] for char in _FUNCTION_INFIXES):
+                continue
+            # A short generic fragment inside the canonical target is already
+            # handled by the explicit short-form policy, not corpus consensus.
+            if key in target_key and key != target_key:
+                # A lowercase compound may legitimately drop a descriptive
+                # prefix (factory crawler -> 采集车); uppercase proper names may
+                # not be shortened through this corpus-only path.
+                if not (source_lower and len(key) >= 3 and target_key.endswith(key)):
+                    continue
+            # Consensus is only a fallback for an alternate surface form of the
+            # same term.  Allowing several extra characters lets a neighbouring
+            # clause become a "term" (e.g. 会为卫星控制 instead of 天气控制).
+            if len(key) > target_len + 1:
+                continue
+            if require_target_length and len(key) != target_len:
+                continue
+            shared_bigram = any(
+                key[index:index + 2] in target_key
+                for index in range(max(0, len(key) - 1)))
+            same_head = key[-1:] == target_key[-1:]
+            if not shared_bigram and not same_head:
+                continue
+            embedded = key in target_key or target_key in key
+            lexical_near = embedded or _cjk_edit_distance(key, target_key) <= 1
+            hits, positive = _corpus_coverage(
+                source_key, candidate, corpus, exclude_chunk_ids=exclude)
+            if not positive:
+                continue
+            if lexical_near:
+                # Exact substrings and one-edit forms (保护传教团 vs
+                # 保护性传教团) may rely on the ordinary majority threshold.
+                if positive <= 4:
+                    if hits < 1 or hits * 2 < positive:
+                        continue
+                elif hits < 2 or hits * 5 < positive * 2:
+                    continue
+            elif positive == 1 and source_lower and same_head and hits >= 1:
+                # A singleton lowercase context can still justify a close
+                # contextual noun (酒壶/水壶).  Multi-positive paraphrases use
+                # the stricter consensus check below.
+                pass
+            elif positive <= 4:
+                if hits < 1 or hits * 2 < positive:
+                    continue
+            elif hits < 2 or hits * 5 < positive * 2:
+                continue
+            # Non-lexical paraphrases need a 2/3 majority.  The former 50%
+            # threshold allowed wrong forms such as ``desert power -> 空中力量``
+            # (2/4) and ``worm zone -> 沙虫区启动`` (1/2) to become contracts.
+            if not lexical_near and positive > 1 and (
+                    hits < 2 or hits * 3 < positive * 2):
+                continue
+            scored.append((
+                hits,
+                len(candidate),
+                _similarity(candidate, core),
+                len(candidate),
+                candidate,
+                positive,
+            ))
+        if not scored:
+            continue
+        hits, _preferred_length, _similarity_sort, _len_sort, form, positive = max(
+            scored, key=lambda row: (row[0], row[1], row[2], row[3], row[4]))
+        out.append({
+            "form": form,
+            "authority": "corpus_consensus",
+            "evidence": "attested %d/%d source-positive COMPLETED chunks" % (
+                hits, positive),
+        })
+    return out
+
+
+def _single_context_common_noun_forms(
+    pending_texts: List[str],
+    source_key: str,
+    target: str,
+    corpus: Dict[str, Dict[str, str]],
+    pending_chunk_ids: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Accept a near-target form for a lowercase common noun in its own context.
+
+    This is deliberately narrower than proper-name normalization.  Lowercase
+    source phrases such as ``flagon of water`` may have a contextually better
+    Chinese noun than the single Decision string (``水壶`` versus ``酒壶``);
+    forcing the Decision target would make the prose worse.  Uppercase proper
+    names are never eligible here, and the same prefix/suffix/length filters as
+    corpus consensus still apply.
+    """
+    has_alpha = any(ch.isalpha() for ch in (source_key or ""))
+    source_lower = bool(source_key) and has_alpha and all(
+        (not ch.isalpha()) or ch.islower() for ch in source_key)
+    if not source_lower:
+        return []
+    forms = _corpus_consensus_forms(
+        pending_texts,
+        source_key,
+        target,
+        corpus,
+        pending_chunk_ids=pending_chunk_ids,
+        allow_self_attestation=True,
+        require_target_length=True,
+    )
+    for item in forms:
+        item["authority"] = "single_context_common_noun_variant"
+        item["evidence"] = (
+            "%s; scoped to a lowercase common noun in this source context"
+            % item.get("evidence", "")
+        )
+    return forms
+
+
+def _title_variant_forms(
+    pending_texts: List[str],
+    source_key: str,
+    target: str,
+    corpus: Dict[str, Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    """Contextual honorific/title variants, separate from lexical spelling."""
+    core = _target_core(target)
+    key = _source_match_key(source_key).casefold()
+    candidates: set = set()
+    if key == "my lord":
+        candidates.update({"大人", "阁下", "陛下", "主公"})
+    if key.endswith("mother") and core.endswith("母"):
+        for text in pending_texts:
+            for near in _near_target_forms(text, core, limit=12):
+                form = str(near.get("form") or "")
+                if len(form) == 2 and form.endswith("母"):
+                    candidates.add(form)
+    out: List[Dict[str, Any]] = []
+    joined = "\n".join(pending_texts)
+    for candidate in sorted(candidates):
+        if candidate == core or not _contains_name(joined, candidate):
+            continue
+        hits, positive = _corpus_coverage(source_key, candidate, corpus)
+        if hits >= 2 and positive:
+            out.append({
+                "form": candidate,
+                "authority": "contextual_title_variant",
+                "evidence": "attested %d/%d source-positive COMPLETED chunks" % (
+                    hits, positive),
+            })
+    return out
+
+
+def _registry_name_short_forms(
+    pending_texts: List[str],
+    source_key: str,
+    target: str,
+    corpus: Dict[str, Dict[str, str]],
+    context: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Short heads of active registry variants compatible with the Decision."""
+    owners = ((context.get("registry_form_owners") or {}).get(
+        _phrase_key(source_key)) or [])
+    joined = "\n".join(pending_texts)
+    out: List[Dict[str, Any]] = []
+    for owner in owners:
+        if int(owner.get("pending_review") or 0):
+            continue
+        canonical = str(owner.get("canonical") or "")
+        if not canonical or not _name_compatible(canonical, target):
+            continue
+        for full_form in [canonical] + list(owner.get("variants") or []):
+            if "·" not in str(full_form):
+                continue
+            head = _clean_form(str(full_form).split("·", 1)[0])
+            if not head or not _contains_name(joined, head):
+                continue
+            hits, positive = _corpus_coverage(source_key, head, corpus)
+            if hits >= 1 and positive:
+                out.append({
+                    "form": head,
+                    "authority": "registry_variant_short_form",
+                    "evidence": "%s / attested %d/%d source-positive COMPLETED chunks" % (
+                        full_form, hits, positive),
+                })
+    return out
+
+
+def _merge_forms(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+    for item in items:
+        form = _clean_form(item.get("form"))
+        if not form:
+            continue
+        key = _name_key(form)
+        if not key:
+            continue
+        row = merged.setdefault(key, {
+            "form": form,
+            "authorities": [],
+            "evidence": [],
+        })
+        authority = str(item.get("authority") or "")
+        if authority and authority not in row["authorities"]:
+            row["authorities"].append(authority)
+        evidence = str(item.get("evidence") or "")
+        if evidence and evidence not in row["evidence"]:
+            row["evidence"].append(evidence)
+    return list(merged.values())
+
+
+def build_term_form_contracts(
+    project_root: Path,
+    *,
+    decision_db: Optional[Path] = None,
+    workflow_db: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
+    profile_path: Optional[Path] = None,
+    contracts_path: Optional[Path] = None,
+    report_json: Optional[Path] = None,
+    report_md: Optional[Path] = None,
+) -> Dict[str, Any]:
+    root = Path(project_root)
+    out_dir = Path(output_dir) if output_dir else root / "output"
+    cpath = (Path(contracts_path) if contracts_path
+             else root / DEFAULT_CONTRACT_PATH)
+    jpath = Path(report_json) if report_json else out_dir / "term_form_contracts.json"
+    mpath = Path(report_md) if report_md else out_dir / "term_form_contracts.md"
+    ppath = (Path(profile_path) if profile_path
+             else root / "input" / "book_profile.json")
+    result: Dict[str, Any] = {
+        "schema_version": TERM_CONTRACT_SCHEMA_VERSION,
+        "mode": "read_only",
+        "write_attempted": False,
+        "generated_at": _now_iso(),
+        "profile_path": str(ppath),
+        "contracts_path": str(cpath),
+        "contracts": [],
+        "counts": {},
+        "errors": [],
+        "ok": False,
+        "json_path": str(jpath),
+        "md_path": str(mpath),
+    }
+    context = load_pending_context(
+        root, decision_db=decision_db, workflow_db=workflow_db,
+        output_dir=out_dir,
+    )
+    if not context.get("available"):
+        result["errors"].append(str(context.get("reason") or "pending_context_unavailable"))
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _render_markdown(result))
+        return result
+    profile = _read_json(ppath)
+    if not profile:
+        result["errors"].append("profile_missing_or_invalid")
+        _atomic_json(jpath, result)
+        _atomic_text(mpath, _render_markdown(result))
+        return result
+    profile_forms = _profile_forms(profile)
+    corpus = _completed_corpus(context)
+    decisions = context.get("decisions") or {}
+
+    # Unresolved rows need contracts.  For a locked Decision, a contract is
+    # only emitted when every pending row is covered; the lock remains the
+    # primary authority and a contract must not leave a mixed lock state.
+    from src.pending_backtrack_reconcile import classify_pending_snapshot
+    snapshot = classify_pending_snapshot(context)
+    grouped: Dict[Tuple[int, str, str], List[dict]] = {}
+    for entry in snapshot.get("entries") or []:
+        status = str(entry.get("status") or "")
+        reason = str(entry.get("reason") or "")
+        if not (status == "outstanding"
+                or (status == "blocked" and reason == "locked_decision_target_missing")):
+            continue
+        key = (int(entry.get("decision_id") or 0),
+               str(entry.get("decision_source_key") or ""),
+               str(entry.get("decision_translation") or ""))
+        grouped.setdefault(key, []).append(entry)
+
+    contracts: List[Dict[str, Any]] = []
+    for (decision_id, source_key, target), pending_rows in sorted(grouped.items()):
+        if _article_shadow_authority_id(
+                decisions.get(int(decision_id)) or {}, decisions):
+            continue
+        core = _target_core(target)
+        pending_texts = [
+            body_before_footnotes(_read_json(
+                Path(out_dir) / str(row.get("chapter") or str(row.get("chunk_id"))[:4])
+                / f"{row.get('chunk_id')}_final.json").get("text"))
+            for row in pending_rows]
+        source_is_quote = (
+            len(source_key) >= 80
+            or (len(source_key.split()) >= 12 and (";" in source_key or "!" in source_key))
+        )
+        if source_is_quote:
+            matched_rows: List[Dict[str, str]] = []
+            uncovered: List[str] = []
+            minimum = 0.8
+            for row, text in zip(pending_rows, pending_texts):
+                chunk_id = str(row.get("chunk_id") or "")
+                similarity = term_text_similarity(text, core)
+                if similarity >= minimum:
+                    matched_rows.append({
+                        "chunk_id": chunk_id,
+                        "form": "fuzzy_text:%.4f" % similarity,
+                    })
+                else:
+                    uncovered.append(chunk_id)
+            if matched_rows:
+                contracts.append({
+                    "contract_id": "term-quote-%d" % decision_id,
+                    "decision_id": decision_id,
+                    "source_key": source_key,
+                    "decision_translation": target,
+                    "forms": [],
+                    "match_mode": "fuzzy_text",
+                    "reference": core,
+                    "min_similarity": minimum,
+                    "pending_chunks": [
+                        str(row.get("chunk_id") or "") for row in pending_rows],
+                    "matched_chunks": matched_rows,
+                    "uncovered_chunks": uncovered,
+                    "status": "complete" if not uncovered else "partial",
+                })
+            continue
+        evidence_items = [{
+            "form": core,
+            "authority": "decision_target",
+            "evidence": "Decision #%d" % decision_id,
+        }]
+        evidence_items.extend(profile_forms.get(_source_match_key(source_key), []))
+        evidence_items.extend(_registry_forms(context, source_key))
+        evidence_items.extend(_registry_word_order_forms(
+            context, source_key, target))
+        evidence_items.extend(_sibling_decision_forms(
+            context, source_key, decision_id))
+        evidence_items.extend(_source_gloss_forms(corpus, source_key, target))
+        evidence_items.extend(_embedded_source_gloss_forms(
+            corpus, source_key, target, decisions))
+        evidence_items.extend(_gloss_extension_forms(
+            pending_texts, source_key, target, corpus))
+        evidence_items.extend(_gloss_modifier_elision_forms(
+            pending_texts, source_key, target, corpus))
+        evidence_items.extend(_short_forms(core, source_key, corpus))
+        evidence_items.extend(_title_variant_forms(
+            pending_texts, source_key, core, corpus))
+        evidence_items.extend(_registry_name_short_forms(
+            pending_texts, source_key, core, corpus, context))
+        explicit_forms = _merge_forms(evidence_items)
+        explicit_covered = all(
+            any(_contains_name(text, item.get("form") or "")
+                for item in explicit_forms)
+            for text in pending_texts)
+        if not explicit_covered:
+            evidence_items.extend(_corpus_consensus_forms(
+                pending_texts, source_key, core, corpus,
+                pending_chunk_ids=[
+                    str(row.get("chunk_id") or "") for row in pending_rows]))
+            evidence_items.extend(_single_context_common_noun_forms(
+                pending_texts, source_key, core, corpus,
+                pending_chunk_ids=[
+                    str(row.get("chunk_id") or "") for row in pending_rows]))
+        forms = _merge_forms(evidence_items)
+        # This artifact is scoped to currently unresolved rows.  Keeping only
+        # forms actually present in one of those finals prevents descriptive
+        # profile prose (for example "男性先知性称谓" or a pun explanation)
+        # from becoming an executable surface form.
+        observed_texts = pending_texts
+        forms = [
+            item for item in forms
+            if "decision_target" in item.get("authorities", [])
+            or any(_contains_name(text, item.get("form") or "")
+                   for text in observed_texts)
+        ]
+        # A long proper name must not be silently reduced to a 3-character
+        # head just because that head occurs somewhere in the pending prose.
+        # Shorter registered forms are still allowed for ordinary short names.
+        core_key = _name_key(core)
+        if len(core_key) >= 8:
+            forms = [item for item in forms
+                     if len(_name_key(item.get("form") or ""))
+                     >= len(core_key) - 3]
+        if len(forms) <= 1:
+            continue
+        matched_rows: List[Dict[str, str]] = []
+        uncovered: List[str] = []
+        for row in pending_rows:
+            chunk_id = str(row.get("chunk_id") or "")
+            chapter = str(row.get("chapter") or chunk_id[:4])
+            final = _read_json(Path(out_dir) / chapter / f"{chunk_id}_final.json")
+            text = body_before_footnotes(final.get("text"))
+            match = next((item for item in forms
+                          if _contains_name(text, item["form"])), None)
+            if match:
+                matched_rows.append({"chunk_id": chunk_id,
+                                     "form": str(match["form"])})
+            else:
+                uncovered.append(chunk_id)
+        decision_locked = bool(int(((context.get("decisions") or {}).get(
+            decision_id) or {}).get("locked") or 0))
+        if not matched_rows or (decision_locked and uncovered):
+            continue
+        contracts.append({
+            "contract_id": "term-%d-%s" % (
+                decision_id, re.sub(r"[^a-z0-9]+", "-", source_key.casefold())[:40]),
+            "decision_id": decision_id,
+            "source_key": source_key,
+            "decision_translation": target,
+            "forms": forms,
+            "pending_chunks": [str(row.get("chunk_id") or "") for row in pending_rows],
+            "matched_chunks": matched_rows,
+            "uncovered_chunks": uncovered,
+            "status": "complete" if not uncovered else "partial",
+        })
+    complete = sum(1 for contract in contracts if contract["status"] == "complete")
+    partial = len(contracts) - complete
+    covered_rows = sum(len(contract.get("matched_chunks") or [])
+                       for contract in contracts)
+    result.update({
+        "contracts": contracts,
+        "counts": {
+            "outstanding_rows": sum(len(rows) for rows in grouped.values()),
+            "groups": len(grouped),
+            "contracts": len(contracts),
+            "complete_contracts": complete,
+            "partial_contracts": partial,
+            "covered_rows": covered_rows,
+            "uncovered_rows": sum(len(contract.get("uncovered_chunks") or [])
+                                  for contract in contracts),
+        },
+        "ok": not result["errors"],
+    })
+    _atomic_json(jpath, result)
+    _atomic_text(mpath, _render_markdown(result))
+    return result
+
+
+def apply_term_form_contracts(
+    project_root: Path,
+    *,
+    contracts_path: Optional[Path] = None,
+    run_id: str = "",
+) -> Dict[str, Any]:
+    root = Path(project_root)
+    cpath = (Path(contracts_path) if contracts_path
+             else root / DEFAULT_CONTRACT_PATH)
+    result = build_term_form_contracts(root, contracts_path=cpath)
+    result["mode"] = "apply"
+    result["write_attempted"] = True
+    result["run_id"] = run_id
+    if not result.get("ok"):
+        result["applied"] = False
+        return result
+    existing_contracts: List[dict] = []
+    if cpath.exists():
+        existing = _read_json(cpath)
+        if int(existing.get("schema_version") or 0) == TERM_CONTRACT_SCHEMA_VERSION:
+            existing_contracts = [
+                item for item in existing.get("contracts") or []
+                if isinstance(item, dict)
+            ]
+    merged: Dict[Tuple[int, str, str], dict] = {}
+    for contract in existing_contracts:
+        try:
+            decision_id = int(contract.get("decision_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        source_key = str(contract.get("source_key") or "")
+        translation = str(contract.get("decision_translation") or "")
+        if decision_id and source_key and translation:
+            merged[(decision_id, _phrase_key(source_key),
+                    _phrase_key(translation))] = contract
+    for contract in result.get("contracts") or []:
+        try:
+            decision_id = int(contract.get("decision_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        source_key = str(contract.get("source_key") or "")
+        translation = str(contract.get("decision_translation") or "")
+        if decision_id and source_key and translation:
+            merged[(decision_id, _phrase_key(source_key),
+                    _phrase_key(translation))] = contract
+    payload = {
+        "schema_version": TERM_CONTRACT_SCHEMA_VERSION,
+        "generated_at": result.get("generated_at"),
+        "generation": {
+            "module": "src.term_form_contracts",
+            "run_id": run_id,
+            "profile_path": result.get("profile_path"),
+        },
+        "contracts": list(merged.values()),
+    }
+    backup = ""
+    if cpath.exists():
+        bpath = cpath.with_name(cpath.name + ".bak")
+        shutil.copy2(str(cpath), str(bpath))
+        backup = str(bpath)
+    _atomic_json(cpath, payload)
+    result.update({"applied": True, "artifact_path": str(cpath),
+                   "backup_path": backup})
+    _atomic_json(Path(result["json_path"]), result)
+    _atomic_text(Path(result["md_path"]), _render_markdown(result))
+    return result
+
+
+def _render_markdown(result: Dict[str, Any]) -> str:
+    lines = ["# 术语形态合同（证据约束）", "",
+             "- 模式: **%s**" % result.get("mode"),
+             "- 写入尝试: `%s`" % result.get("write_attempted"),
+             "- 生成时间: %s" % result.get("generated_at"),
+             "- 统计: `%s`" % (result.get("counts") or {}), ""]
+    if result.get("artifact_path"):
+        lines.append("- 合同制品: `%s`" % result["artifact_path"])
+        lines.append("- 备份: `%s`" % (result.get("backup_path") or ""))
+        lines.append("")
+    contracts = result.get("contracts") or []
+    if contracts:
+        lines.extend(["## 合同（前 40 组）"])
+        for contract in contracts[:40]:
+            lines.append(
+                "- `#%s %s → %s` / %s / covered=%s uncovered=%s"
+                % (contract.get("decision_id"), contract.get("source_key"),
+                   contract.get("decision_translation"), contract.get("status"),
+                   len(contract.get("matched_chunks") or []),
+                   len(contract.get("uncovered_chunks") or [])))
+            lines.append("  - 合法形态: " + ", ".join(
+                "`%s`(%s)" % (item.get("form"),
+                              ",".join(item.get("authorities") or []))
+                for item in contract.get("forms") or []))
+            if contract.get("uncovered_chunks"):
+                lines.append("  - 仍待修: " + ", ".join(
+                    "`%s`" % chunk for chunk in contract["uncovered_chunks"]))
+    if result.get("errors"):
+        lines.extend(["", "## 错误", ""] + [
+            "- `%s`" % error for error in result["errors"]])
+    lines.extend(["", "本制品只声明有权威证据的合法形态；不修改正文、Decision、registry、pending 或 workflow。", ""])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+__all__ = [
+    "TERM_CONTRACT_SCHEMA_VERSION",
+    "DEFAULT_CONTRACT_PATH",
+    "build_term_form_contracts",
+    "apply_term_form_contracts",
+]
 
 
 AUDIT_VERSION = 1
@@ -23692,6 +38404,16 @@ def normalize_profile(data: Dict[str, Any]) -> Dict[str, Any]:
     # profile does not lose its provenance and coverage story on every load.
     if isinstance(data.get("deep_read"), dict):
         prof["deep_read"] = dict(data["deep_read"])
+    # Round 158: derived chapter digests are top-level artifacts.  Without
+    # this preservation every load_profile() would silently erase them, making
+    # a freshly backfilled profile look untracked again.
+    if isinstance(data.get("chapter_digests"), list):
+        prof["chapter_digests"] = [dict(d) for d in data["chapter_digests"]
+                                   if isinstance(d, dict)]
+    if isinstance(data.get("chapter_digests_summary"), dict):
+        prof["chapter_digests_summary"] = dict(data["chapter_digests_summary"])
+    if "chapter_digests_complete" in data:
+        prof["chapter_digests_complete"] = bool(data.get("chapter_digests_complete"))
     # L2: translation_hints 中提及双关/谐音/戏拟的条目并入 pun_watchlist（LLM 漏报兜底；
     #     与既有条目同词（结构化已登记）时不重复合成）
     _GENERIC_EN = {
@@ -24196,6 +38918,191 @@ def apply_setup_pairs(
     return out
 
 
+def _coverage_union(spans: Sequence[Sequence[int]], total: int) -> float:
+    """Fraction of ``[0, total)`` covered by possibly overlapping spans."""
+    if total <= 0:
+        return 1.0
+    intervals = []
+    for span in spans:
+        try:
+            start = max(0, int(span[0]))
+            end = min(total, int(span[1]))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if end > start:
+            intervals.append((start, end))
+    if not intervals:
+        return 0.0
+    intervals.sort()
+    covered = 0
+    cur_start, cur_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= cur_end:
+            cur_end = max(cur_end, end)
+        else:
+            covered += cur_end - cur_start
+            cur_start, cur_end = start, end
+    covered += cur_end - cur_start
+    return round(covered / float(total), 6)
+
+
+def build_chapter_digests(
+    chapter_texts: Dict[str, str],
+    segment_payloads: Sequence[Dict[str, Any]],
+    model: str = "",
+    params: Optional[Dict[str, Any]] = None,
+    generated_at: str = "",
+) -> Dict[str, Any]:
+    """Deterministically derive one digest per chapter from audit payloads.
+
+    A digest is ``complete`` only when every source character is covered by a
+    segment, every segment parsed, and every segment produced a non-empty
+    synopsis.  Incomplete chapters publish explicit ``complete=false`` and
+    reasons instead of a plausible-looking partial digest.
+    """
+    by_chapter: Dict[str, List[Dict[str, Any]]] = {}
+    orphan_parts: List[str] = []
+    for payload in segment_payloads:
+        if not isinstance(payload, dict):
+            continue
+        cid = str(payload.get("chapter_id") or "")
+        if cid in chapter_texts:
+            by_chapter.setdefault(cid, []).append(payload)
+        elif cid:
+            orphan_parts.append(str(payload.get("part_id") or cid))
+
+    digests: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    for cid, text in sorted(chapter_texts.items()):
+        payloads = sorted(
+            by_chapter.get(cid, []),
+            key=lambda p: (int(p.get("char_start") or 0),
+                           int(p.get("char_end") or 0)),
+        )
+        parts: List[str] = []
+        synopses: List[str] = []
+        registers: List[str] = []
+        parse_errors: List[str] = []
+        synopsis_missing: List[str] = []
+        spans: List[Sequence[int]] = []
+        for payload in payloads:
+            part_id = str(payload.get("part_id") or f"{cid}:?")
+            parts.append(part_id)
+            spans.append((payload.get("char_start") or 0, payload.get("char_end") or 0))
+            parse_error = str(payload.get("parse_error") or "").strip()
+            if parse_error:
+                parse_errors.append(f"{part_id}:{parse_error}")
+            synopsis = str(payload.get("synopsis") or "").strip()
+            if synopsis:
+                synopses.append(synopsis)
+            else:
+                synopsis_missing.append(part_id)
+            register = str(payload.get("register_summary") or "").strip()
+            if register and register not in registers:
+                registers.append(register)
+
+        coverage = _coverage_union(spans, len(text))
+        reasons: List[str] = []
+        if not text.strip():
+            reasons.append("empty_source")
+        if not payloads:
+            reasons.append("no_segments")
+        if parse_errors:
+            reasons.append("segment_parse_error")
+        if synopsis_missing:
+            reasons.append("segment_synopsis_missing")
+        if coverage < 0.999999:
+            reasons.append("segment_coverage_incomplete")
+        complete = not reasons
+        digest = "\n\n".join(synopses) if complete else ""
+        entry = {
+            "chapter_id": cid,
+            "source_sha256": sha256_text(text),
+            "source_chars": len(text),
+            "segment_ids": parts,
+            "segment_coverage": coverage,
+            "digest": digest,
+            "register_summary": "；".join(registers),
+            "complete": complete,
+            "generation": {
+                "model": model,
+                "params": dict(params or {}),
+                "time": generated_at or _now(),
+            },
+        }
+        if not complete:
+            entry["missing_reason"] = ";".join(reasons)
+            entry["parse_errors"] = parse_errors[:10]
+            entry["synopsis_missing_parts"] = synopsis_missing[:10]
+            missing.append(cid)
+        digests.append(entry)
+
+    complete_all = bool(digests) and not missing
+    summary = {
+        "complete": complete_all,
+        "chapters_total": len(digests),
+        "chapters_complete": len(digests) - len(missing),
+        "missing": missing,
+        "orphan_parts": orphan_parts[:20],
+    }
+    return {"ok": bool(digests), "complete": complete_all,
+            "digests": digests, "summary": summary}
+
+
+def derive_profile_digests(
+    project_root: Path,
+    profile: Dict[str, Any],
+    audit: Dict[str, Any],
+    input_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Bind an existing deep profile to current chapter bytes and audit payloads.
+
+    This is the Round-158 no-LLM path for the current Dune profile: the deep
+    read is not repeated; the audit's segment ranges and synopses are the
+    provenance, and the coverage check proves every character was read.
+    """
+    root = Path(project_root)
+    in_dir = Path(input_dir) if input_dir else root / "input"
+    docs = load_chapter_documents(in_dir)
+    chapter_texts = {d["chapter_id"]: d["text"] for d in docs}
+    payloads = audit.get("segment_payloads") if isinstance(audit, dict) else None
+    if not isinstance(payloads, list) or not payloads:
+        return {"ok": False, "error": "audit_segment_payloads_missing",
+                "digests": [], "summary": {"complete": False}}
+
+    generation = profile.get("generation") if isinstance(profile.get("generation"), dict) else {}
+    audit_generation = audit.get("generation") if isinstance(audit.get("generation"), dict) else {}
+    model = str(audit_generation.get("model") or generation.get("model") or "")
+    params = audit_generation.get("params") if isinstance(audit_generation.get("params"), dict) else {}
+    generated_at = str(audit.get("generated_at") or generation.get("time") or _now())
+    res = build_chapter_digests(chapter_texts, payloads, model=model,
+                                params=params, generated_at=generated_at)
+    if not res.get("ok"):
+        return {"ok": False, "error": "no_chapter_digests",
+                "digests": [], "summary": res.get("summary") or {}}
+
+    out = dict(profile)
+    out["generation"] = dict(generation)
+    inputs = dict(out["generation"].get("inputs") or {})
+    inputs["chapters"] = {d["chapter_id"]: d["source_sha256"]
+                          for d in res["digests"]}
+    inputs["profile_version"] = PROFILE_VERSION
+    inputs["prompt_version"] = str(
+        out["generation"].get("prompt_version") or "r131.deep.v3")
+    out["generation"]["inputs"] = inputs
+    out["generation"]["digest_source"] = {
+        "artifact": "output/style_profile_audit.json",
+        "audit_generated_at": generated_at,
+        "derived_at": _now(),
+        "method": "audit_segment_payloads+chapter_sha256",
+    }
+    out["chapter_digests"] = res["digests"]
+    out["chapter_digests_summary"] = res["summary"]
+    out["chapter_digests_complete"] = bool(res["complete"])
+    return {"ok": True, "complete": bool(res["complete"]), "profile": out,
+            "digests": res["digests"], "summary": res["summary"]}
+
+
 def pair_setup_candidates(
     chapter_ids: Sequence[str],
     setup_candidates: Sequence[Dict[str, Any]],
@@ -24650,6 +39557,21 @@ def build_deep_profile(
         "time": _now(),
         "prompt_version": "r131.deep.v3",
     }
+    _chapter_hashes = {cid: sha256_text(text)
+                       for cid, text in sorted(chapter_texts.items())}
+    profile["generation"]["inputs"] = {
+        "chapters": _chapter_hashes,
+        "profile_version": PROFILE_VERSION,
+        "prompt_version": "r131.deep.v3",
+    }
+    _digest_res = build_chapter_digests(
+        chapter_texts, payloads, model=_deep_model,
+        params=profile["generation"]["params"],
+        generated_at=profile["generation"]["time"],
+    )
+    profile["chapter_digests"] = _digest_res["digests"]
+    profile["chapter_digests_summary"] = _digest_res["summary"]
+    profile["chapter_digests_complete"] = bool(_digest_res["complete"])
     profile["generated_at"] = _now()
     active_notes_out = [n for n in l2["notes"] if n.get("status") == "active"]
     covered_chapters = set()
@@ -24735,10 +39657,234 @@ def build_deep_profile(
 
 # 剖面 → 运行时 style_guide 覆盖层
 
+def _json_string_list(value: Any) -> List[str]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _pure_cjk_name_form(name: str) -> tuple:
+    base = re.sub(r"（[^）]*）|\([^)]*\)", "", str(name or "")).strip()
+    tokens = canonical_tokens(base)
+    if not tokens:
+        return base, tokens, ""
+    key = "".join(tokens)
+    if len(key) < 4 or not re.fullmatch(r"[\u4e00-\u9fff]+", key):
+        return base, tokens, ""
+    return base, tokens, key
+
+
+def _one_char_name_drift_spans(text: str, canonical: str) -> List[Dict[str, Any]]:
+    """Find one-character CJK spelling drift for a registered canonical name."""
+    base, tokens, canonical_key = _pure_cjk_name_form(canonical)
+    # A single-token CJK phrase is too close to ordinary prose.  Only names
+    # with real token structure participate in hint rewriting; single-token
+    # canonicals and variants still enter the protection set in the loader.
+    if not canonical_key or len(tokens) < 2 or not text:
+        return []
+    sep = r"[\s" + re.escape(_NAME_SEP_CHARS) + r"]*"
+    patterns: List[str] = []
+    for changed in range(len(canonical_key)):
+        pieces: List[str] = []
+        char_index = 0
+        for token_index, token in enumerate(tokens):
+            if token_index:
+                pieces.append(sep)
+            for char in token:
+                pieces.append(
+                    r"[\u4e00-\u9fff]" if char_index == changed
+                    else re.escape(char))
+                char_index += 1
+        patterns.append("(?:%s)" % "".join(pieces))
+    matcher = re.compile("|".join(patterns))
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for match in matcher.finditer(str(text)):
+        form = match.group(0)
+        found_key = re.sub(
+            r"[\s" + re.escape(_NAME_SEP_CHARS) + r"]+", "", form)
+        if len(found_key) != len(canonical_key) or found_key == canonical_key:
+            continue
+        if sum(a != b for a, b in zip(canonical_key, found_key)) != 1:
+            continue
+        signature = (match.start(), match.end(), found_key)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        out.append({
+            "start": match.start(),
+            "end": match.end(),
+            "found": form,
+            "found_key": found_key,
+            "canonical": base,
+            "canonical_key": canonical_key,
+        })
+    return out
+
+
+def _load_active_name_authorities(
+    decision_db: Optional[Path] = None,
+) -> tuple:
+    """Load strict canonical names without mutating the Decision DB.
+
+    Active high-confidence registry rows are primary authority.  A locked
+    decision may add a canonical only when its source key is not already owned
+    by that registry, and when it is not a one-character drift of an active
+    canonical.  This deliberately never trusts an unlocked or superseded
+    decision translation as a new spelling authority.
+    """
+    if decision_db is None:
+        decision_db = Path(__file__).resolve().parent.parent / "db" / "decision_db.sqlite"
+    path = Path(decision_db)
+    if not path.exists():
+        return [], set(), {}
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % path.resolve(), uri=True)
+        con.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return [], set(), {}
+    canonicals: List[str] = []
+    allowed_keys = set()
+    active_by_source: Dict[str, str] = {}
+    try:
+        tables = {
+            str(row[0]) for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if "entity_registry" in tables:
+            cols = {str(row[1]) for row in con.execute(
+                "PRAGMA table_info(entity_registry)")}
+            if {"canonical_name", "confidence"} <= cols:
+                source_col = "source_names" if "source_names" in cols else "''"
+                variant_col = "variant_names" if "variant_names" in cols else "''"
+                pending_col = "pending_review" if "pending_review" in cols else "0"
+                query = (
+                    "SELECT canonical_name, %s AS source_names, %s AS variant_names, "
+                    "confidence, %s AS pending_review FROM entity_registry"
+                    % (source_col, variant_col, pending_col)
+                )
+                for row in con.execute(query):
+                    if str(row["confidence"] or "").casefold() != "high":
+                        continue
+                    if int(row["pending_review"] or 0):
+                        continue
+                    canonical, _tokens, key = _pure_cjk_name_form(
+                        str(row["canonical_name"] or ""))
+                    if not canonical:
+                        continue
+                    if key:
+                        allowed_keys.add(key)
+                        if len(_tokens) >= 2:
+                            canonicals.append(canonical)
+                    for source in _json_string_list(row["source_names"]):
+                        active_by_source[source.casefold()] = canonical
+                    for variant in _json_string_list(row["variant_names"]):
+                        _variant, _v_tokens, variant_key = _pure_cjk_name_form(variant)
+                        if variant_key:
+                            allowed_keys.add(variant_key)
+        if "decision_db" in tables:
+            cols = {str(row[1]) for row in con.execute(
+                "PRAGMA table_info(decision_db)")}
+            if {"source_key", "translation"} <= cols:
+                locked_expr = "locked" if "locked" in cols else "0"
+                query = (
+                    "SELECT source_key, translation, %s AS locked "
+                    "FROM decision_db WHERE %s=1" % (locked_expr, locked_expr)
+                )
+                for row in con.execute(query):
+                    source = str(row["source_key"] or "").strip().casefold()
+                    if source and source in active_by_source:
+                        continue
+                    canonical, _tokens, key = _pure_cjk_name_form(
+                        str(row["translation"] or ""))
+                    if not canonical or not key or len(_tokens) < 2:
+                        continue
+                    if any(_one_char_name_drift_spans(canonical, existing)
+                           for existing in canonicals
+                           if key != _pure_cjk_name_form(existing)[2]):
+                        continue
+                    canonicals.append(canonical)
+                    allowed_keys.add(key)
+    except sqlite3.Error:
+        return [], set(), {}
+    finally:
+        con.close()
+    return list(dict.fromkeys(canonicals)), allowed_keys, active_by_source
+
+
+def _canonicalize_hint_source_form(
+    hint: str, active_by_source: Dict[str, str]
+) -> Tuple[str, Optional[Dict[str, str]]]:
+    """Replace the leading form of an exact-source profile hint when safe."""
+    if "=" not in hint:
+        return hint, None
+    left, right = hint.split("=", 1)
+    canonical = active_by_source.get(left.strip().casefold())
+    if not canonical:
+        return hint, None
+    match = re.match(
+        r"(?P<lead>\s*)(?P<form>[\u4e00-\u9fff·・－\-]{1,24})"
+        r"(?P<tail>[：:／/;；，,]|$)", right)
+    if not match:
+        return hint, None
+    found = match.group("form")
+    if found == canonical:
+        return hint, None
+    return (
+        left + "=" + match.group("lead") + canonical + right[match.end("form"):],
+        {"wrong": found, "canonical": canonical},
+    )
+
+
+def _sanitize_translation_hints(
+    hints: Sequence[Any],
+    decision_db: Optional[Path] = None,
+) -> tuple:
+    canonicals, allowed_keys, active_by_source = _load_active_name_authorities(
+        decision_db)
+    if not hints or not (canonicals or active_by_source):
+        return list(hints or []), []
+    repairs: List[Dict[str, str]] = []
+    out: List[str] = []
+    ordered = sorted(canonicals, key=len, reverse=True)
+    for raw_hint in hints:
+        hint = str(raw_hint)
+        hint, source_repair = _canonicalize_hint_source_form(
+            hint, active_by_source)
+        if source_repair:
+            found_key = _pure_cjk_name_form(source_repair["wrong"])[2]
+            if not found_key or found_key not in allowed_keys:
+                repairs.append(source_repair)
+            else:
+                hint = str(raw_hint)
+        for canonical in ordered:
+            spans = [
+                span for span in _one_char_name_drift_spans(hint, canonical)
+                if span["found_key"] not in allowed_keys
+            ]
+            for span in sorted(spans, key=lambda item: item["start"], reverse=True):
+                hint = (
+                    hint[:int(span["start"])] + str(span["canonical"])
+                    + hint[int(span["end"]):]
+                )
+                repairs.append({
+                    "wrong": str(span["found"]),
+                    "canonical": str(span["canonical"]),
+                })
+        out.append(hint)
+    return out, repairs
+
+
 def profile_to_style_guide(
     profile: Optional[Dict[str, Any]],
     chapter_id: Optional[str] = None,
     base: Optional[Dict[str, Any]] = None,
+    decision_db: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """把剖面映射为 config.style_guide 覆盖 dict（与 config.yaml 基线合并）。
 
@@ -24767,7 +39913,11 @@ def profile_to_style_guide(
     guide["register_default"] = reg
 
     guide["forbidden_modernisms"] = list(profile.get("forbidden_modernisms") or [])
-    guide["translation_hints"] = list(profile.get("translation_hints") or [])
+    hints, hint_repairs = _sanitize_translation_hints(
+        profile.get("translation_hints") or [], decision_db=decision_db)
+    guide["translation_hints"] = hints
+    if hint_repairs:
+        guide["_translation_hint_name_repairs"] = hint_repairs
     guide["pun_watchlist"] = list(profile.get("pun_watchlist") or [])
 
     era_region = "，".join(x for x in (profile.get("era"), profile.get("region")) if x)
@@ -24973,6 +40123,321 @@ def generate_book_profile(
         "graph_path": graph_path,
         "graph_coverage": graph_stats,
     }
+
+
+BUILDER_VERSION = 1
+DEFAULT_OUTPUT_PATH = "docs/ROUND158_PHASE2_EVAL.json"
+DEFAULT_REPORT_PATH = "output/query_gold_set_build.json"
+DEFAULT_MIN_SETUP = 10
+DEFAULT_MIN_ARC = 10
+DEFAULT_MIN_VOICE = 5
+DEFAULT_MIN_NEGATIVE = 5
+DEFAULT_MAX_CASES = 50
+
+
+_NEGATIVE_QUESTIONS = (
+    "这本书是否包含会说话的机械龙与厄崔迪家族结盟的章节？",
+    "书中是否描写了主角使用量子计算机编写操作系统？",
+    "这本小说是否讲述了星际舰队在银河中心举行编程竞赛？",
+    "书中是否有一段关于现代股票交易所高频交易的完整教程？",
+    "故事里是否出现过用魔法咒语启动宇宙飞船的场景？",
+)
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _chapter_sort_key(chapter: str) -> Tuple[int, str]:
+    text = str(chapter or "")
+    digits = "".join(ch for ch in text if ch.isdigit())
+    return (int(digits) if digits else 10 ** 9, text)
+
+
+def _read_chapters(input_dir: Path) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for path in sorted(Path(input_dir).glob("ch*.md")):
+        try:
+            out[path.stem] = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+    return out
+
+
+def _validated_gold(note: Dict[str, Any], chapters: Dict[str, str],
+                    min_similarity: float = 0.9) -> List[dict]:
+    gold: List[dict] = []
+    seen = set()
+    for evidence in note.get("evidence") or []:
+        if not isinstance(evidence, dict):
+            continue
+        chapter = str(evidence.get("chapter") or "")
+        quote = str(evidence.get("quote") or "")
+        text = chapters.get(chapter)
+        if not text or not quote:
+            continue
+        hit = match_quote(text, quote, min_similarity=min_similarity,
+                          preferred_offset=evidence.get("offset"))
+        if not hit.get("ok"):
+            continue
+        offset = hit.get("offset")
+        key = (chapter, int(offset or 0), quote)
+        if key in seen:
+            continue
+        seen.add(key)
+        gold.append({
+            "chapter": chapter,
+            "quote": quote,
+            "offset": offset,
+            "match_kind": hit.get("match_kind") or "",
+            "match_score": hit.get("match_score"),
+        })
+    gold.sort(key=lambda item: (_chapter_sort_key(item["chapter"]),
+                                int(item.get("offset") or 0), item["quote"]))
+    return gold
+
+
+def _question_for(note: Dict[str, Any]) -> str:
+    claim = str(note.get("claim") or "").strip()
+    ntype = str(note.get("type") or "")
+    if ntype == "setup_payoff":
+        return "找出这个伏笔的埋设点以及它在后文被回收的具体场景：" + claim
+    if ntype == "arc":
+        return "找出能支撑以下叙事弧线判断的具体原文场景：" + claim
+    if ntype == "voice":
+        return "找出能验证以下叙述语气判断的具体原文场景：" + claim
+    return "找出能支撑以下判断的具体原文场景：" + claim
+
+
+def _note_pool(profile: Dict[str, Any], chapters: Dict[str, str]) -> Dict[str, List[dict]]:
+    pool: Dict[str, List[dict]] = {"setup_payoff": [], "arc": [], "voice": []}
+    for note in all_notes(profile):
+        if not note_is_validated(note):
+            continue
+        ntype = str(note.get("type") or "")
+        if ntype not in pool:
+            continue
+        gold = _validated_gold(note, chapters)
+        if not gold:
+            continue
+        if ntype == "setup_payoff":
+            evidence_chapters = {item["chapter"] for item in gold}
+            if len(evidence_chapters) < 2:
+                continue
+        item = {
+            "id": str(note.get("id") or ""),
+            "type": ntype,
+            "claim": str(note.get("claim") or ""),
+            "chapters": [str(c) for c in (note.get("chapters") or [])],
+            "confidence": float(note.get("confidence") or 0.0),
+            "status": str(note.get("status") or ""),
+            "gold": gold,
+        }
+        if item["id"]:
+            pool[ntype].append(item)
+    return pool
+
+
+def _select_diverse(notes: Sequence[dict], count: int) -> List[dict]:
+    """Pick highest-confidence notes while spreading chapters round-robin."""
+    if count <= 0:
+        return []
+    ordered = sorted(
+        notes,
+        key=lambda n: (-float(n.get("confidence") or 0.0),
+                       _chapter_sort_key((n.get("chapters") or [""])[0]),
+                       str(n.get("id") or "")),
+    )
+    by_chapter: Dict[str, List[dict]] = {}
+    for note in ordered:
+        primary = str((note.get("chapters") or [""])[0] or "")
+        by_chapter.setdefault(primary, []).append(note)
+    selected: List[dict] = []
+    seen = set()
+    chapter_order = sorted(by_chapter, key=_chapter_sort_key)
+    while len(selected) < count and chapter_order:
+        progressed = False
+        for chapter in list(chapter_order):
+            bucket = by_chapter.get(chapter) or []
+            if not bucket:
+                chapter_order.remove(chapter)
+                continue
+            note = bucket.pop(0)
+            if note["id"] in seen:
+                progressed = True
+                continue
+            seen.add(note["id"])
+            selected.append(note)
+            progressed = True
+            if len(selected) >= count:
+                break
+        if not progressed:
+            break
+    return selected
+
+
+def _case_from_note(note: dict) -> dict:
+    return {
+        "id": "r158-" + str(note["type"]) + "-" + str(note["id"]).replace(":", "-"),
+        "note_id": str(note["id"]),
+        "question": _question_for(note),
+        "type": str(note["type"]),
+        "gold": note["gold"],
+        "answerable": True,
+        "lineage": {
+            "note_status": note.get("status"),
+            "note_confidence": note.get("confidence"),
+            "question_source": "note.claim",
+            "gold_source": "note.evidence:L1_revalidated",
+        },
+    }
+
+
+def _negative_cases(count: int) -> List[dict]:
+    out: List[dict] = []
+    for index, question in enumerate(_NEGATIVE_QUESTIONS[:max(0, int(count))], 1):
+        out.append({
+            "id": f"r158-negative-{index:02d}",
+            "question": question,
+            "type": "negative",
+            "gold": [],
+            "answerable": False,
+            "negative": True,
+            "lineage": {"question_source": "deterministic_out_of_domain",
+                        "gold_source": "none"},
+        })
+    return out
+
+
+def build_query_gold_set(
+    project_root: Path,
+    *,
+    profile: Optional[Dict[str, Any]] = None,
+    graph: Optional[Dict[str, Any]] = None,
+    profile_path: Optional[Path] = None,
+    graph_path: Optional[Path] = None,
+    input_dir: Optional[Path] = None,
+    output_path: Optional[Path] = None,
+    report_path: Optional[Path] = None,
+    min_setup: int = DEFAULT_MIN_SETUP,
+    min_arc: int = DEFAULT_MIN_ARC,
+    min_voice: int = DEFAULT_MIN_VOICE,
+    min_negative: int = DEFAULT_MIN_NEGATIVE,
+    max_cases: int = DEFAULT_MAX_CASES,
+    write_partial: bool = False,
+) -> Dict[str, Any]:
+    root = Path(project_root)
+    in_dir = Path(input_dir) if input_dir else root / "input"
+    prof_path = Path(profile_path) if profile_path else in_dir / "book_profile.json"
+    if profile is None:
+        profile = load_profile(prof_path)
+    graph_payload = graph
+    if graph_payload is None and graph_path and Path(graph_path).exists():
+        try:
+            graph_payload = json.loads(Path(graph_path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            graph_payload = None
+    out_path = Path(output_path) if output_path else root / DEFAULT_OUTPUT_PATH
+    rep_path = Path(report_path) if report_path else root / DEFAULT_REPORT_PATH
+    result: Dict[str, Any] = {
+        "builder_version": BUILDER_VERSION,
+        "ok": False,
+        "status": "invalid",
+        "generated_at": _now_iso(),
+        "profile_path": str(prof_path),
+        "input_dir": str(in_dir),
+        "output_path": str(out_path),
+        "report_path": str(rep_path),
+        "eval_written": False,
+        "counts": {},
+        "required": {
+            "setup_payoff": int(min_setup), "arc": int(min_arc),
+            "voice": int(min_voice), "negative": int(min_negative),
+            "total": int(min_setup + min_arc + min_voice + min_negative),
+        },
+        "gaps": {},
+        "errors": [],
+    }
+    if not isinstance(profile, dict):
+        result["errors"].append("profile_missing_or_unreadable")
+        atomic_write_json(rep_path, result)
+        return result
+    chapters = _read_chapters(in_dir)
+    if not graph_payload:
+        result["errors"].append("graph_missing_or_unreadable")
+    if result["errors"]:
+        atomic_write_json(rep_path, result)
+        return result
+
+    pool = _note_pool(profile, chapters)
+    setup = _select_diverse(pool["setup_payoff"], int(min_setup))
+    arc = _select_diverse(pool["arc"], int(min_arc))
+    voice = _select_diverse(pool["voice"], int(min_voice))
+    negatives = _negative_cases(int(min_negative))
+    available = {
+        "setup_payoff": len(pool["setup_payoff"]),
+        "arc": len(pool["arc"]),
+        "voice": len(pool["voice"]),
+        "negative": len(negatives),
+    }
+    gaps = {
+        "setup_payoff": max(0, int(min_setup) - len(setup)),
+        "arc": max(0, int(min_arc) - len(arc)),
+        "voice": max(0, int(min_voice) - len(voice)),
+        "negative": max(0, int(min_negative) - len(negatives)),
+    }
+    cases = ([_case_from_note(n) for n in setup]
+             + [_case_from_note(n) for n in arc]
+             + [_case_from_note(n) for n in voice]
+             + negatives)
+    if len(cases) > int(max_cases):
+        result["status"] = "too_many_cases"
+        result["errors"].append("case_count_exceeds_max")
+        atomic_write_json(rep_path, result)
+        return result
+    result["counts"] = dict(Counter(case["type"] for case in cases))
+    result["available"] = available
+    result["gaps"] = {key: value for key, value in gaps.items() if value}
+    case_chapters = sorted({
+        str(gold.get("chapter") or "")
+        for case in cases for gold in (case.get("gold") or [])
+        if gold.get("chapter")
+    }, key=_chapter_sort_key)
+    result["chapter_coverage"] = case_chapters
+    result["chapter_manifest"] = chapter_manifest(in_dir)
+    result["profile_notes_hash"] = profile_notes_hash(profile)
+    result["graph_fingerprint"] = str(graph_payload.get("fingerprint") or "")
+    if result["gaps"] or len(cases) < int(result["required"]["total"]):
+        result["status"] = "insufficient_case_mix"
+        result["errors"].append("case_mix_below_required")
+        if not write_partial:
+            atomic_write_json(rep_path, result)
+            return result
+    title = str(((profile.get("work_guess") or {}).get("title")) or "unknown")
+    eval_payload = {
+        "schema_version": EVAL_SCHEMA_VERSION,
+        "book": title,
+        "source": "validated active notes + deterministic negatives",
+        "generated_at": result["generated_at"],
+        "builder_version": BUILDER_VERSION,
+        "profile_notes_hash": result["profile_notes_hash"],
+        "chapter_manifest": result["chapter_manifest"],
+        "graph_fingerprint": result["graph_fingerprint"],
+        "counts": result["counts"],
+        "chapter_coverage": case_chapters,
+        "cases": cases,
+    }
+    atomic_write_json(out_path, eval_payload)
+    result["case_count"] = len(cases)
+    result["eval_written"] = True
+    if result["gaps"]:
+        result["status"] = "partial_draft"
+        atomic_write_json(rep_path, result)
+        return result
+    result["ok"] = True
+    result["status"] = "fresh"
+    atomic_write_json(rep_path, result)
+    return result
 
 
 def _utc_now() -> str:
@@ -25228,11 +40693,19 @@ def _select_targets(root: Path, scheduler, chapters: Iterable[str],
                 continue
             report = _read_json(report_path) if report_path.exists() else None
             old_backend = str((report or {}).get("_backend_path") or "missing")
-            stale = report is not None and not _report_matches_final(report, final_path)
+            # Round 158: a normal pipeline report carries
+            # ``_audit_target.literary_sha256`` but no ``_reaudit.final_sha256``.
+            # The old helper therefore treated a report from before finalize /
+            # name-unification as current.  Use the same evidence contract as
+            # the delivery gate so stale reports are selected without --force.
+            evidence = (critic_evidence_state(report, final_path, project_root=root)
+                        if report is not None else {})
+            evidence_status = str(evidence.get("status") or "")
+            stale = evidence_status in {"stale", "missing_final"}
             if report is not None and old_backend in calibrated and not force and not stale:
                 continue
             reason = "missing_report" if report is None else "uncalibrated_report"
-            if stale and old_backend in calibrated:
+            if stale:
                 reason = "stale_report"
             targets.append({
                 "chapter": chapter_id,
@@ -25242,6 +40715,7 @@ def _select_targets(root: Path, scheduler, chapters: Iterable[str],
                 "old_avg": _score_average(report),
                 "report_path": str(report_path),
                 "final_path": str(final_path),
+                "evidence_status": evidence_status,
             })
     return targets
 
@@ -25427,7 +40901,16 @@ def run_recalibrate_critic(
     if not all_chapters and not chapter_id:
         raise ValueError("recalibrate-critic 需要 --chapter 或 --all")
 
-    from src.core.scheduler import TaskScheduler
+    # In the generated single-file snapshot, ``src.core`` is a shim that the
+    # build script intentionally removes when probing for the real scheduler.
+    # The scheduler is already inlined in that deployment; fall back to the
+    # inlined class when the import cannot resolve.
+    try:
+        from src.core.scheduler import TaskScheduler
+    except ImportError:
+        TaskScheduler = globals().get("TaskScheduler")
+        if TaskScheduler is None:
+            raise
     scheduler = TaskScheduler(db_path=str(root / "db" / "workflow.db"))
     try:
         chapters = _iter_chapter_ids(scheduler) if all_chapters else [str(chapter_id)]
@@ -26003,8 +41486,8 @@ _BR_GOM_WRONG_MARKERS = (
 # list deliberately small: ambiguous person names belong in a separate,
 # evidence-mapped review rather than a generic find/replace pass.
 _BR_CANONICAL_ALIAS_RULES: Tuple[Tuple[str, str, str, str], ...] = (
-    ("厄拉科斯", "阿拉基斯", "Arrakis",
-     "profile: Arrakis=阿拉基斯; registry: Arrakis id=5"),
+    ("阿拉基斯", "厄拉科斯", "Arrakis",
+     "decision id=5 translation=厄拉科斯; registry id=6 canonical=厄拉科斯"),
     ("贝尼杰瑟里特", "贝尼·杰瑟里特", "Bene Gesserit",
      "profile: Bene Gesserit=贝尼·杰瑟里特; registry variant"),
     ("沙杜特梅普斯", "沙杜特·梅普斯", "Shadout Mapes",
@@ -26019,7 +41502,104 @@ _BR_CANONICAL_ALIAS_RULES: Tuple[Tuple[str, str, str, str], ...] = (
      "first-use ch01_chunk021; Feyd-Rautha; variants 费德-劳萨/菲德-劳萨/费德-？劳萨"),
     ("费德-？劳萨", "菲德-罗萨", "Feyd",
      "first-use ch01_chunk021; Feyd-Rautha; EPUB extraction artifact"),
+    # The corpus contains the isolated vocative "图菲尔" in 16 completed
+    # chunks, while the active registry owner and Decision 236 use
+    # "杜菲·哈瓦特".  Every affected chunk's source contains "Thufir", so the
+    # short-form repair remains source-gated and never applies to free prose.
+    ("图菲尔", "杜菲", "Thufir",
+     "registry id=31 canonical=杜菲·哈瓦特; decision id=236; source-gated Thufir"),
+    # Two legacy Decisions disagree on the Landsraad rendering.  The active
+    # registry owner and the book-wide Decisions use 兰兹拉德; the older
+    # 兰萨德 form survives in completed prose.  The source gate prevents this
+    # rule from touching unrelated CJK prose.
+    ("兰萨德", "兰兹拉德", "Landsraad",
+     "registry id=266 canonical=兰兹拉德; decision id=22/3442; source-gated Landsraad"),
 )
+
+# English glosses in parentheses and footnotes are evidence, not prose.  A
+# model can transcribe one letter incorrectly (``stiltent`` for ``stilltent``)
+# while the surrounding Chinese sentence remains correct.  Repair only when
+# the gloss is absent from this chunk's source and exactly one source token is
+# a close spelling variant; ambiguous candidates remain untouched.
+_BR_GLOSS_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9’'\-?]{4,}")
+_BR_GLOSS_PAREN_RE = re.compile(
+    r"[（(]\s*([A-Za-z][A-Za-z0-9’'\-?]{4,})\s*[）)]")
+_BR_GLOSS_QUOTE_RE = re.compile(
+    r"原文(?:作|为)\s*[“\"]([A-Za-z][A-Za-z0-9’'\-?]{4,})[”\"]")
+
+
+def _br_normalize_gloss_token(token: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", token.casefold())
+
+
+def _br_plan_source_gloss_spelling(
+    text: str, source: str,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """Restore a single-letter source-term typo inside an explicit gloss.
+
+    The pass is deliberately narrow: it considers only ASCII tokens enclosed
+    in parentheses or quoted by ``原文作/原文为``.  It never rewrites the
+    translated prose around the gloss and never guesses when more than one
+    source spelling is close enough.
+    """
+    if not text or not source:
+        return text, []
+    source_tokens = _BR_GLOSS_TOKEN_RE.findall(source)
+    source_norm = {_br_normalize_gloss_token(token): token
+                   for token in source_tokens}
+    candidates = set(_BR_GLOSS_PAREN_RE.findall(text))
+    candidates.update(_BR_GLOSS_QUOTE_RE.findall(text))
+    working = text
+    changes: List[Dict[str, Any]] = []
+    for candidate in sorted(candidates):
+        norm = _br_normalize_gloss_token(candidate)
+        if not norm or norm in source_norm:
+            continue
+        scored = sorted(
+            ((difflib.SequenceMatcher(None, norm, source_norm_key).ratio(),
+              source_token)
+             for source_norm_key, source_token in source_norm.items()),
+            reverse=True,
+        )
+        if not scored:
+            continue
+        best_ratio, best_token = scored[0]
+        second_ratio = scored[1][0] if len(scored) > 1 else 0.0
+        best_norm = _br_normalize_gloss_token(best_token)
+        if (best_ratio < 0.90
+                or best_ratio - second_ratio < 0.12
+                or abs(len(norm) - len(best_norm)) > 2):
+            continue
+        # A singular gloss such as Messiah versus source messiahs is a valid
+        # lexical form, not a transcription typo.  Prefix-only differences are
+        # therefore left untouched; the stiltent/stilltent case is a true
+        # internal substitution and still passes this guard.
+        if norm.startswith(best_norm) or best_norm.startswith(norm):
+            continue
+        before = working.count(candidate)
+        if not before:
+            continue
+        # Restrict the substitution to the two recognised gloss contexts.
+        working = _BR_GLOSS_PAREN_RE.sub(
+            lambda match: match.group(0).replace(candidate, best_token), working)
+        working = _BR_GLOSS_QUOTE_RE.sub(
+            lambda match: match.group(0).replace(candidate, best_token), working)
+        count = before - working.count(candidate)
+        if count <= 0:
+            continue
+        changes.append({
+            "rule": "source_gloss_typo_restore",
+            "from": candidate,
+            "to": best_token,
+            "count": count,
+            "context": "source_term_gloss",
+            "evidence": {
+                "source_term": best_token,
+                "similarity": round(best_ratio, 3),
+                "runner_up_similarity": round(second_ratio, 3),
+            },
+        })
+    return working, changes
 
 _BR_MD_DEF_RE = re.compile(r"^\s*\[\^([^\]]+)\]:\s?")
 _BR_MALFORMED_MD_DEF_RE = re.compile(
@@ -26944,6 +42524,10 @@ def _br_plan_text(
 
     working, footnote_changes = _br_plan_malformed_footnotes(working)
     changes.extend(footnote_changes)
+
+    working, gloss_changes = _br_plan_source_gloss_spelling(
+        working, source=source)
+    changes.extend(gloss_changes)
 
     working, omission_changes, omission_blocking = _br_plan_omissions(
         working, raw=raw, source=source, literary=literary)
@@ -29352,11 +44936,20 @@ def aggregate_per_entity_nouls(
 # Round 102 P1: compute_cjk_ratio 按 id(text) 缓存. 与散装 src/utils/text_match.py 同步.
 # 简化版: cache 直接持有 str 强引用 (key=id(text)). 见散装版注释了解 id 复用 trade-off.
 _cjk_ratio_cache: "dict[int, float]" = {}
+_cjk_ratio_cache_refs: "dict[int, str]" = {}
 _CJK_RATIO_CACHE_MAX = 512
 
 
 def _cjk_ratio_cache_get(text):
-    return _cjk_ratio_cache.get(id(text))
+    ratio = _cjk_ratio_cache.get(id(text))
+    if ratio is None:
+        return None
+    cached_text = _cjk_ratio_cache_refs.get(id(text))
+    if cached_text is not text:
+        _cjk_ratio_cache.pop(id(text), None)
+        _cjk_ratio_cache_refs.pop(id(text), None)
+        return None
+    return ratio
 
 
 def _cjk_ratio_cache_put(text, ratio):
@@ -29364,14 +44957,17 @@ def _cjk_ratio_cache_put(text, ratio):
         try:
             oldest_key = next(iter(_cjk_ratio_cache))
             _cjk_ratio_cache.pop(oldest_key, None)
+            _cjk_ratio_cache_refs.pop(oldest_key, None)
         except StopIteration:
             pass
     _cjk_ratio_cache[id(text)] = ratio
+    _cjk_ratio_cache_refs[id(text)] = text
 
 
 def reset_cjk_ratio_cache() -> None:
     """Chapter 切换时清空 cjk_ratio 缓存 (整合模式 shim 入口)."""
     _cjk_ratio_cache.clear()
+    _cjk_ratio_cache_refs.clear()
 
 
 def compute_cjk_ratio(text: str) -> float:
@@ -29557,7 +45153,16 @@ for _sub in ("src.utils", "src.config", "src.agents", "src.core", "src.consisten
              # Round 131: prefer the real modules in repo mode.  A pre-created
              # fake module otherwise hides private helpers (e.g. pun_audit's
              # _split_anchors) from later imports in the same interpreter.
-             "src.judgment_layer", "src.rescue", "src.story_graph", "src.story_graph_query",
+             "src.judgment_layer", "src.artifact_freshness",
+             "src.rescue", "src.story_graph", "src.story_graph_query",
+             "src.book_linker",
+             "src.pending_backtrack_reconcile", "src.name_only_fastpath",
+             "src.name_authority_audit", "src.name_authority_align",
+             "src.decision_authority_align",
+             "src.term_form_audit",
+             "src.locked_target_authority_audit",
+             "src.term_form_contracts",
+             "src.query_gold_set",
              "src.setup_payoff_audit",
              "src.style_profiler", "src.recalibrate", "src.proofread",
              "src.book_repair"):
@@ -29620,7 +45225,8 @@ _SRC_SUBMODULES = {
     "src.utils.llm_adapter": [
         "get_llm_client", "get_llm_client_for_task", "get_role_model_name", "get_task_extra_body",
         "robust_json_loads", "_build_role_client", "_client_instances",
-        "ContentSensitiveError",
+        "ContentSensitiveError", "UpstreamUnavailableError",
+        "_is_upstream_unavailable_error",
     ],
     # Round 96: 加 text_match shim 让 CJK 比例原语可在整合模式下访问
     # Round 102 P1: 增加 cjk_ratio 缓存相关符号, 让整合模式下也可访问.
@@ -29670,6 +45276,16 @@ _SRC_SUBMODULES = {
     "src.agents.critic_agent": ["CriticAgent"],
     "src.agents.judge_agent": ["JudgeAgent"],
     "src.pipeline": ["TranslationPipeline", "consolidate_dirty_chapters", "run_final_gate"],
+    "src.task_logging": [
+        "CST", "RUN_ID_ENV", "LOG_ENABLED_ENV", "LOG_DIR_ENV", "DEFAULT_LOG_DIR",
+        "TaskLoggingError", "TaskLogger", "now_iso", "new_run_id", "sha256_file",
+        "make_logger", "set_active_logger", "get_active_logger", "log_event",
+        "log_artifact", "validate_jsonl", "prune_runs",
+    ],
+    "src.inflight_recovery": [
+        "RECOVERY_DIR", "NONTERMINAL_STATES", "RESUME_STAGE",
+        "scan_inflight", "write_recovery_report", "audit_and_write",
+    ],
     # Round 119 (T5): 成书样式/lint 单源（散装 src/book_lint.py）
     "src.book_lint": ["normalize_final_style", "finalize_outputs", "lint_texts",
                       "lint_book", "postprocess_chunk_text", "chapter_heading",
@@ -29684,7 +45300,8 @@ _SRC_SUBMODULES = {
                       "_note_key_parts", "_note_mentions_alias",
                       "_note_keys_compatible"],
     "src.consistency": ["run_consistency_check", "_load_glossary", "_load_decisions",
-                        "_scan_finals", "_find_slash_aliases", "_in_quote_or_note",
+                        "_scan_finals", "_chunk_id_from_final", "_load_dirty_chunk_ids",
+                        "_find_slash_aliases", "_in_quote_or_note",
                         "_NOTE_MARKER_RE",
                         "_detect_issues", "_generate_report", "_apply_issues",
                         "run_consistency_check_for_chapter",
@@ -29755,11 +45372,67 @@ _SRC_SUBMODULES = {
         "save_story_graph", "load_story_graph", "build_and_save_story_graph",
         "story_graph_context_for_chapter",
     ],
+    "src.artifact_freshness": [
+        "EVAL_SCHEMA_VERSION", "chapter_manifest", "chapter_hash_map",
+        "profile_notes_hash", "profile_fingerprint", "registry_rows",
+        "rows_fingerprint", "decision_db_fingerprint",
+        "profile_source_freshness", "graph_freshness", "eval_freshness",
+        "load_story_graph_checked",
+    ],
     "src.story_graph_query": [
         "QUERY_VERSION", "DEFAULT_TOP_K", "DEFAULT_MAX_HOPS",
         "StoryGraphQueryIndex", "query_story_graph",
         "default_story_graph_query_generate", "evaluate_story_graph_query",
         "format_query_result",
+    ],
+    "src.book_linker": [
+        "MANIFEST_SCHEMA_VERSION", "DEFAULT_MANIFEST_PATH",
+        "DEFAULT_AUDIT_JSON", "DEFAULT_AUDIT_MD", "build_manifest",
+        "write_manifest", "update_manifest_run_evidence",
+        "update_manifest_merged", "audit_book_links",
+        "format_book_link_audit_md", "write_book_link_audit",
+    ],
+    "src.pending_backtrack_reconcile": [
+        "load_pending_context", "classify_pending_row",
+        "classify_pending_snapshot", "pending_report_markdown",
+        "audit_pending_backtracks", "apply_pending_backtrack_reconcile",
+    ],
+    "src.name_only_fastpath": [
+        "audit_name_only_fastpath", "apply_name_only_fastpath",
+        "audit_completed_name_repair", "apply_completed_name_repair",
+        "audit_confirmed_term_drift_repair",
+        "apply_confirmed_term_drift_repair",
+    ],
+    "src.name_authority_audit": [
+        "audit_name_authorities",
+    ],
+    "src.name_authority_align": [
+        "ALIGNMENT_SCHEMA_VERSION", "build_name_authority_alignment",
+        "align_name_authorities",
+    ],
+    "src.decision_authority_align": [
+        "AUTHORITY_ALIGN_SCHEMA_VERSION", "audit_decision_authorities",
+        "apply_decision_authority_alignment",
+        "audit_article_shadow_decisions",
+        "apply_article_shadow_alias_repairs",
+        "audit_locked_target_authority_repairs",
+        "apply_locked_target_authority_repairs",
+    ],
+    "src.term_form_audit": [
+        "TERM_FORM_AUDIT_SCHEMA_VERSION", "audit_term_forms",
+    ],
+    "src.locked_target_authority_audit": [
+        "LOCKED_TARGET_AUDIT_SCHEMA_VERSION",
+        "audit_locked_target_authorities",
+    ],
+    "src.term_form_contracts": [
+        "TERM_CONTRACT_SCHEMA_VERSION", "DEFAULT_CONTRACT_PATH",
+        "build_term_form_contracts", "apply_term_form_contracts",
+    ],
+    "src.query_gold_set": [
+        "BUILDER_VERSION", "DEFAULT_OUTPUT_PATH", "DEFAULT_REPORT_PATH",
+        "DEFAULT_MIN_SETUP", "DEFAULT_MIN_ARC", "DEFAULT_MIN_VOICE",
+        "DEFAULT_MIN_NEGATIVE", "DEFAULT_MAX_CASES", "build_query_gold_set",
     ],
     "src.setup_payoff_audit": [
         "AUDIT_VERSION", "DEFAULT_TOP_N", "DEFAULT_SELECTION_BATCH",
@@ -29778,6 +45451,7 @@ _SRC_SUBMODULES = {
         "load_chapter_documents", "segment_chapter_text",
         "build_deep_extract_prompt", "parse_deep_extract_response",
         "build_deep_merge_prompt", "parse_deep_merge_response",
+        "build_chapter_digests", "derive_profile_digests",
         "build_deep_profile", "profile_to_style_guide", "save_profile",
         "load_profile", "profile_is_deep", "summary_line", "generate_book_profile",
     ],

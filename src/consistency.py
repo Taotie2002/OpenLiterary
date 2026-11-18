@@ -176,6 +176,33 @@ def _scan_finals(output_dir: str, flat: bool = False) -> list:
     return finals
 
 
+def _chunk_id_from_final(item: dict) -> str:
+    name = Path(str(item.get("path") or item.get("file") or "")).name
+    return name[:-len("_final.json")] if name.endswith("_final.json") else ""
+
+
+def _load_dirty_chunk_ids(workflow_db: Path) -> Optional[set]:
+    """Read-only DIRTY set; absent/legacy DB means no chunks are exempt."""
+    path = Path(workflow_db)
+    if not path.exists():
+        return set()
+    try:
+        con = sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True)
+        try:
+            return {
+                str(row[0]) for row in con.execute(
+                    "SELECT chunk_id FROM chunk_tasks WHERE state='DIRTY'")
+            }
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        if "no such table" in str(exc).lower():
+            return set()
+        print(f"  ⚠️ [Consistency] 无法读取 DIRTY 状态，暂缓所有正文写入: {exc}",
+              file=sys.stderr)
+        return None
+
+
 def _find_slash_aliases(canonical: str) -> list:
     """'省长/地方市长' → ['省长', '地方市长']"""
     parts = [p.strip() for p in canonical.split("/")]
@@ -369,7 +396,8 @@ def _generate_report(finals: list, issues: list, dry_run: bool) -> str:
     return "\n".join(lines)
 
 
-def _apply_issues(finals: list, issues: list) -> int:
+def _apply_issues(finals: list, issues: list,
+                  skip_paths: Optional[set] = None) -> int:
     """应用修正到 final.json，返回实际修改的文件数"""
     by_file: dict = {}
     for iss in issues:
@@ -378,6 +406,9 @@ def _apply_issues(finals: list, issues: list) -> int:
 
     patched_files = 0
     for filepath, reps in by_file.items():
+        if skip_paths and str(filepath) in skip_paths:
+            print(f"  ⏭️ {Path(filepath).name}: DIRTY，名称修正留给 consolidate 重审闭环")
+            continue
         p = Path(filepath)
         # P2-1: 统一走 robust_json_loads 抗损坏 final.json
         data = robust_json_loads(p.read_text(encoding="utf-8"), expected_type=dict)
@@ -541,6 +572,7 @@ def _apply_name_unification_pass(
     cache_path: Path,
     scope_label: str = "",
     dry_run: bool = False,
+    skip_chunk_ids: Optional[set] = None,
 ) -> dict:
     """Round 134: 章节/全书级名称统一（登记表归一 + 别名整形 + 漂移 token 统一）。
 
@@ -559,7 +591,8 @@ def _apply_name_unification_pass(
                 "dry_run": bool(dry_run), "skipped": True}
     out = {"files": 0, "files_pending": 0, "sep_restore": 0, "forms": 0, "tokens": 0,
            "approved": [], "rejected": [], "pending": [], "clusters": 0,
-           "dry_run": bool(dry_run)}
+           "dry_run": bool(dry_run), "skipped_dirty": 0,
+           "skipped_dirty_chunks": []}
     tmp_path = None
     conn = None
     try:
@@ -617,6 +650,12 @@ def _apply_name_unification_pass(
             out["rejected"] = sorted(f"{c}→{i.get('to')}" for c, i in cands.items()
                                      if c not in approved)
         for fin in finals:
+            chunk_id = _chunk_id_from_final(fin)
+            if (not dry_run and skip_chunk_ids
+                    and chunk_id in skip_chunk_ids):
+                out["skipped_dirty"] += 1
+                out["skipped_dirty_chunks"].append(chunk_id)
+                continue
             new_text, st = apply_name_unification(fin.get("text", ""), maps)
             if new_text and new_text != fin.get("text", ""):
                 if dry_run:
@@ -660,6 +699,9 @@ def _apply_name_unification_pass(
                 lines.append(f"- 待写入文件: {out['files_pending']} / {len(finals)}")
             else:
                 lines.append(f"- 受影响文件: {out['files']} / {len(finals)}")
+                if out["skipped_dirty"]:
+                    lines.append(
+                        f"- DIRTY 暂缓写入: {out['skipped_dirty']} 个（等待 consolidate 重审闭环）")
             lines.append("")
             lines.append("## 统一映射（音译漂移 → 规范形）")
             for v, t, w in maps.get("forms", [])[:40]:
@@ -745,6 +787,13 @@ def run_consistency_check(dry_run: bool = True, check_only: bool = False,
     print("\n🔎 检测名称不一致...")
     issues = _detect_issues(finals, entities, decisions)
     print(f"    发现 {len(issues)} 处")
+    dirty_ids = _load_dirty_chunk_ids(Path(db_path).with_name("workflow.db"))
+    if dirty_ids is None:
+        dirty_ids = {_chunk_id_from_final(item) for item in finals}
+    skip_paths = {
+        str(item["path"]) for item in finals
+        if _chunk_id_from_final(item) in dirty_ids
+    }
 
     if check_only:
         return len(issues)
@@ -757,7 +806,7 @@ def run_consistency_check(dry_run: bool = True, check_only: bool = False,
 
     if not dry_run and issues:
         print("\n✏️ 执行修正...")
-        patched = _apply_issues(finals, issues)
+        patched = _apply_issues(finals, issues, skip_paths=skip_paths)
         print(f"    修改了 {patched} 个文件")
     elif dry_run and issues:
         print("\n⏸️  DRY RUN 模式：未修改任何文件（--apply 以执行修正）")
@@ -770,6 +819,7 @@ def run_consistency_check(dry_run: bool = True, check_only: bool = False,
             cache_path=Path(output_dir) / "_name_drift_vetting.json",
             scope_label="(global)",
             dry_run=dry_run,
+            skip_chunk_ids=dirty_ids,
         )
         if not nu.get("skipped"):
             n_repl = nu["sep_restore"] + nu["forms"] + nu["tokens"]
@@ -829,6 +879,13 @@ def run_consistency_check_for_chapter(
 
     issues = _detect_issues(finals, entities, decisions)
     print(f"    发现 {len(issues)} 处不一致")
+    dirty_ids = _load_dirty_chunk_ids(Path(db_path).with_name("workflow.db"))
+    if dirty_ids is None:
+        dirty_ids = {_chunk_id_from_final(item) for item in finals}
+    skip_paths = {
+        str(item["path"]) for item in finals
+        if _chunk_id_from_final(item) in dirty_ids
+    }
 
     # 报告写到 chapter 目录内（避免污染全局报告）
     report = _generate_report(finals, issues, dry_run=dry_run)
@@ -837,7 +894,7 @@ def run_consistency_check_for_chapter(
     print(f"    → 报告: {report_path}")
 
     if not dry_run and issues:
-        patched = _apply_issues(finals, issues)
+        patched = _apply_issues(finals, issues, skip_paths=skip_paths)
         print(f"    ✏️ 已修正 {patched} 个文件")
     elif dry_run and issues:
         print(f"    ⏸️ DRY RUN：未修改文件")
@@ -853,6 +910,7 @@ def run_consistency_check_for_chapter(
             cache_path=Path(output_root) / "_name_drift_vetting.json",
             scope_label=f"{chapter_id} → 全文 output/**",
             dry_run=False,
+            skip_chunk_ids=dirty_ids,
         )
         if not nu.get("skipped"):
             n_repl = nu["sep_restore"] + nu["forms"] + nu["tokens"]

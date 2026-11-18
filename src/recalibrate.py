@@ -275,11 +275,19 @@ def _select_targets(root: Path, scheduler, chapters: Iterable[str],
                 continue
             report = _read_json(report_path) if report_path.exists() else None
             old_backend = str((report or {}).get("_backend_path") or "missing")
-            stale = report is not None and not _report_matches_final(report, final_path)
+            # Round 158: a normal pipeline report carries
+            # ``_audit_target.literary_sha256`` but no ``_reaudit.final_sha256``.
+            # The old helper therefore treated a report from before finalize /
+            # name-unification as current.  Use the same evidence contract as
+            # the delivery gate so stale reports are selected without --force.
+            evidence = (critic_evidence_state(report, final_path, project_root=root)
+                        if report is not None else {})
+            evidence_status = str(evidence.get("status") or "")
+            stale = evidence_status in {"stale", "missing_final"}
             if report is not None and old_backend in calibrated and not force and not stale:
                 continue
             reason = "missing_report" if report is None else "uncalibrated_report"
-            if stale and old_backend in calibrated:
+            if stale:
                 reason = "stale_report"
             targets.append({
                 "chapter": chapter_id,
@@ -289,6 +297,7 @@ def _select_targets(root: Path, scheduler, chapters: Iterable[str],
                 "old_avg": _score_average(report),
                 "report_path": str(report_path),
                 "final_path": str(final_path),
+                "evidence_status": evidence_status,
             })
     return targets
 
@@ -474,7 +483,16 @@ def run_recalibrate_critic(
     if not all_chapters and not chapter_id:
         raise ValueError("recalibrate-critic 需要 --chapter 或 --all")
 
-    from src.core.scheduler import TaskScheduler
+    # In the generated single-file snapshot, ``src.core`` is a shim that the
+    # build script intentionally removes when probing for the real scheduler.
+    # The scheduler is already inlined in that deployment; fall back to the
+    # inlined class when the import cannot resolve.
+    try:
+        from src.core.scheduler import TaskScheduler
+    except ImportError:
+        TaskScheduler = globals().get("TaskScheduler")
+        if TaskScheduler is None:
+            raise
     scheduler = TaskScheduler(db_path=str(root / "db" / "workflow.db"))
     try:
         chapters = _iter_chapter_ids(scheduler) if all_chapters else [str(chapter_id)]

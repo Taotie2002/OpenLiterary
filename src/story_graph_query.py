@@ -849,9 +849,9 @@ class StoryGraphQueryIndex:
                 "hop": float(candidate.get("hop") or 1),
             }
             score = hop_factor * (
-                0.30 * seed_ratio + 0.40 * note_bonus + 0.10 * cert_ratio
-                + 0.06 * density + 0.06 * lexical + 0.05 * proximity
-                + 0.03 * expansion_ratio
+                0.28 * seed_ratio + 0.50 * note_bonus + 0.08 * cert_ratio
+                + 0.05 * density + 0.05 * lexical + 0.03 * proximity
+                + 0.01 * expansion_ratio
             )
             rows.append({
                 "scene_id": sid,
@@ -1270,8 +1270,14 @@ def evaluate_story_graph_query(index: StoryGraphQueryIndex,
                              max_hops=max_hops, use_dpp=use_dpp,
                              use_note_similarity=use_note_similarity,
                              llm_generate=llm_generate)
-        note_matches = (result.get("trace") or {}).get("note_matches") or []
+        trace = result.get("trace") or {}
+        result_metrics = result.get("metrics") or {}
+        note_matches = trace.get("note_matches") or []
         results = result.get("results") or []
+        answerable = (case.get("answerable") is not False
+                      and not bool(case.get("negative")))
+        no_seed = not bool(trace.get("seeds") or [])
+        no_candidate = int(result_metrics.get("candidate_scenes") or 0) <= 0
         result_spans: List[Dict[str, Any]] = []
         for row in results:
             anchor = row.get("anchor") or {}
@@ -1295,6 +1301,14 @@ def evaluate_story_graph_query(index: StoryGraphQueryIndex,
             top = result_spans[:max(0, k)]
             return any(_span_overlap(r["anchor"], gold_span)
                        for r in top for gold_span in gold)
+
+        def evidence_hit_at(k: int, require_all: bool = False) -> bool:
+            if not gold:
+                return False
+            top = result_spans[:max(0, k)]
+            hits = [any(_span_overlap(r["span"], gold_span) for r in top)
+                    for gold_span in gold]
+            return all(hits) if require_all else any(hits)
 
         def precision_at(k: int) -> float:
             top = result_spans[:max(0, k)]
@@ -1321,55 +1335,84 @@ def evaluate_story_graph_query(index: StoryGraphQueryIndex,
             "R@10": round(recall_at(10), 4),
             "AE@5": anchor_hit_at(5),
             "AE@10": anchor_hit_at(10),
+            "any_evidence@5": evidence_hit_at(5),
+            "any_evidence@10": evidence_hit_at(10),
+            "all_evidence@5": evidence_hit_at(5, require_all=True),
+            "all_evidence@10": evidence_hit_at(10, require_all=True),
             "precision@1": round(precision_at(1), 4),
+            "precision@2": round(precision_at(2), 4),
             "precision@3": round(precision_at(3), 4),
             "precision@5": round(precision_at(5), 4),
             "precision@10": round(precision_at(10), 4),
             "matched@10": matched_at_10,
             "returned": len(results),
+            "answerable": bool(answerable),
+            "negative": not bool(answerable),
+            "no_seed": bool(no_seed),
+            "no_candidate": bool(no_candidate),
             "top_scene": str((results[0] if results else {}).get("scene_id") or ""),
-            "reason": str((result.get("trace") or {}).get("reason") or ""),
+            "reason": str(trace.get("reason") or ""),
         })
     if not rows:
         return {"cases": 0, "metrics": {}, "rows": []}
 
-    def mean(key: str) -> float:
-        return round(sum(float(r.get(key) or 0.0) for r in rows) / len(rows), 4)
+    evidence_rows = [r for r in rows if r.get("gold_spans")]
+    answerable_rows = [r for r in rows if r.get("answerable")]
+    negative_rows = [r for r in rows if r.get("negative")]
 
-    def subset_mean(items: Sequence[Dict[str, Any]], key: str) -> float:
+    def mean(items: Sequence[Dict[str, Any]], key: str) -> float:
         if not items:
             return 0.0
         return round(sum(float(r.get(key) or 0.0) for r in items) / len(items), 4)
 
+    def rate(items: Sequence[Dict[str, Any]], key: str) -> float:
+        if not items:
+            return 0.0
+        return round(sum(1 for r in items if r.get(key)) / float(len(items)), 4)
+
     metrics = {
         "cases": len(rows),
-        "R@5": mean("R@5"),
-        "R@10": mean("R@10"),
-        "AE@5": round(sum(1 for r in rows if r["AE@5"]) / float(len(rows)), 4),
-        "AE@10": round(sum(1 for r in rows if r["AE@10"]) / float(len(rows)), 4),
-        "anchor_precision@1": mean("precision@1"),
-        "anchor_precision@3": mean("precision@3"),
-        "anchor_precision@5": mean("precision@5"),
-        "anchor_precision@10": mean("precision@10"),
+        "answerable_cases": len(answerable_rows),
+        "negative_cases": len(negative_rows),
+        "gold_cases": len(evidence_rows),
+        "R@5": mean(evidence_rows, "R@5"),
+        "R@10": mean(evidence_rows, "R@10"),
+        "AE@5": rate(evidence_rows, "AE@5"),
+        "AE@10": rate(evidence_rows, "AE@10"),
+        "any_evidence_R@5": rate(evidence_rows, "any_evidence@5"),
+        "any_evidence_R@10": rate(evidence_rows, "any_evidence@10"),
+        "all_evidence_R@5": rate(evidence_rows, "all_evidence@5"),
+        "all_evidence_R@10": rate(evidence_rows, "all_evidence@10"),
+        "evidence_precision@1": mean(evidence_rows, "precision@1"),
+        "evidence_precision@2": mean(evidence_rows, "precision@2"),
+        "anchor_precision@1": mean(evidence_rows, "precision@1"),
+        "anchor_precision@3": mean(evidence_rows, "precision@3"),
+        "anchor_precision@5": mean(evidence_rows, "precision@5"),
+        "anchor_precision@10": mean(evidence_rows, "precision@10"),
+        "no_seed_rate": rate(answerable_rows, "no_seed"),
+        "no_candidate_rate": rate(answerable_rows, "no_candidate"),
+        "negative_empty_rate": (
+            round(sum(1 for r in negative_rows
+                      if int(r.get("returned") or 0) == 0)
+                  / float(len(negative_rows)), 4)
+            if negative_rows else 0.0),
     }
     # Micro precision across the first ten returned scenes: this is the
     # "anchor precision" audit number, not a relevance judgement for a book.
-    total_returned = sum(min(10, int(r.get("returned") or 0)) for r in rows)
-    total_matched = sum(int(r.get("matched@10") or 0) for r in rows)
+    total_returned = sum(min(10, int(r.get("returned") or 0)) for r in evidence_rows)
+    total_matched = sum(int(r.get("matched@10") or 0) for r in evidence_rows)
     metrics["anchor_precision"] = round(
         total_matched / float(total_returned or 1), 4)
     for mode in ("alias_only", "note_similarity", "note_evidence"):
-        subset = [r for r in rows if r.get("mode") == mode]
+        subset = [r for r in evidence_rows if r.get("mode") == mode]
         if not subset:
             continue
         metrics[mode + "_cases"] = len(subset)
-        metrics[mode + "_R@5"] = subset_mean(subset, "R@5")
-        metrics[mode + "_R@10"] = subset_mean(subset, "R@10")
-        metrics[mode + "_AE@5"] = round(
-            sum(1 for r in subset if r["AE@5"]) / float(len(subset)), 4)
-        metrics[mode + "_AE@10"] = round(
-            sum(1 for r in subset if r["AE@10"]) / float(len(subset)), 4)
-        metrics[mode + "_anchor_precision@1"] = subset_mean(subset, "precision@1")
+        metrics[mode + "_R@5"] = mean(subset, "R@5")
+        metrics[mode + "_R@10"] = mean(subset, "R@10")
+        metrics[mode + "_AE@5"] = rate(subset, "AE@5")
+        metrics[mode + "_AE@10"] = rate(subset, "AE@10")
+        metrics[mode + "_anchor_precision@1"] = mean(subset, "precision@1")
     return {"cases": len(rows), "metrics": metrics, "rows": rows}
 
 

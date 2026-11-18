@@ -34,6 +34,9 @@ models:
     api_base: https://token.ai-hf.cn/v1
     api_key: ${QWEN_API_KEY}
     model_name: Qwen3.8-Flash-Next-SS
+    # Qwen 路由持续 5xx 时，本进程单向切到可用的 DeepSeek 角色；不改变
+    # 配置文件里的主力定义，重启后自动再试 Qwen。
+    fallback_role: secondary
 
   primary:
     api_base: https://api.minimax.cn/v1
@@ -247,6 +250,35 @@ pipeline:
     min_calibrated_ratio: 0.95
     calibrated_backends: ["jev"]
 
+  # 纯专名修复的受控闭环：只有 Decision DB 与 entity_registry 权威审计
+  # 清零后，consolidate 才允许对严格候选重审 critic，并把 DIRTY 闭回 COMPLETED。
+  # 关闭时回退现有的整块 DIRTY 重跑路径。
+  name_only_fastpath:
+    enabled: true
+    require_authority_audit: true
+    max_chunks_per_run: 50
+
+  # COMPLETED 专名的确定性漂移修复：只允许“单一活跃权威专名 + 恰好
+  # 一字 CJK 漂移”的块进入真实 critic 重审；修复后状态仍为 COMPLETED，
+  # pending 必须被 CAS 消费、decision 必须锁定。它不替代 DIRTY fast path。
+  completed_name_repair:
+    enabled: true
+    require_authority_audit: true
+    max_chunks_per_run: 50
+    min_cjk_chars: 4
+    # 同一 final/critic/Decision/policy 指纹被 calibrated critic 稳定拒绝后，
+    # 后续 audit/consolidate 直接跳过，避免每轮重复付费重审。任一证据变化即失效。
+    reject_memo_path: output/completed_name_repair_rejects.json
+
+  # 更具体术语的已确认漂移修复：只接受 locked-target-authority-audit 的
+  # confirmed + specific 组，例如 Shield Wall→屏蔽墙 的 2 字错误形“盾墙”。
+  # 不跑通用短词替换；错误形必须在每个 source-positive COMPLETED 块中与
+  # source 出现次数完全一致，组内全部通过 calibrated critic 重审才写盘。
+  confirmed_term_drift_repair:
+    enabled: true
+    require_authority_audit: true
+    max_groups_per_run: 10
+
   # 章级语域漂移审计的统计窗口与告警阈值。
   drift_audit:
     window: 5
@@ -408,6 +440,7 @@ decision_engine:
   terminology_triggers_backtrack: true
   reference_triggers_backtrack: true
   style_triggers_backtrack: false       # 风格规则只供后续 chunk 继承
+  contextual_terms_trigger_backtrack: false  # 陛下/大人/my Lord 等语境称谓只供后续继承
   max_affected_chunks_per_decision: 50
   backtrack_scope: book                 # book | chapter
   backtrack_mode: deferred              # deferred | immediate
@@ -507,6 +540,13 @@ book:
   chapter_titles: bilingual
   # 留空自动推断；可显式填写，决定 output/<中文书名>.md 的文件名。
   title_zh: ""
+
+# ── 交付门禁 ───────────────────────────────────────────────────────
+gate:
+  # Round 158: 要求 output/build_manifest.json 证明 source→chunk→final→merged
+  # 与任务日志封存证据。manifest 一旦存在，任何哈希/顺序不一致都会判红；
+  # 此开关只决定“manifest 完全缺失”是否也阻断交付。
+  book_link_required: true
 
 # ── 韵文通道 ───────────────────────────────────────────────────────
 verse:

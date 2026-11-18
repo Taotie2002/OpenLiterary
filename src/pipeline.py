@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.config import config as _config
+from src.task_logging import log_artifact, log_event
 
 from src.core.scheduler import TaskScheduler, TaskState
 from src.core.decision_engine import (
@@ -81,21 +82,33 @@ class TranslationPipeline:
         self.book_profile = None
         self.judgment_cfg = dict(_config.get("judgment_injection", {}) or {})
         try:
+            from src.artifact_freshness import profile_source_freshness
             from src.style_profiler import load_profile, profile_to_style_guide
             _prof_path = self._root_dir / "input" / "book_profile.json"
             _prof = load_profile(_prof_path)
             if _prof:
-                self.book_profile = _prof
-                _config.set_runtime_style_guide(profile_to_style_guide(_prof, chapter_id=chapter_id))
-                print(f"🎨 [StyleProfiler] 已加载作品风格剖面 ← {_prof_path.name} "
-                      f"(source={_prof.get('source')}, confidence={_prof.get('confidence')})")
-                try:
-                    from src.judgment_layer import active_notes
-                    _active = active_notes(_prof, float(self.judgment_cfg.get("min_confidence", 0.55)))
-                    if _active:
-                        print(f"🧭 [Judgment] 已加载 {len(_active)} 条 active 注记（L1∧L2 通过）")
-                except Exception:
-                    pass
+                _fresh = profile_source_freshness(
+                    _prof, self._root_dir, chapters=[chapter_id])
+                if _fresh.get("status") == "stale":
+                    print(f"⚠️ [StyleProfiler] 剖面与 {chapter_id} 章源不匹配"
+                          f"（{', '.join(_fresh.get('reasons') or [])}）；"
+                          "本次回退中性基线，不注入作品特定注记。", file=sys.stderr)
+                else:
+                    if _fresh.get("status") != "fresh":
+                        print(f"⚠️ [StyleProfiler] 剖面缺少章源血缘"
+                              f"（{_fresh.get('status')}）；按 legacy 语义读取，"
+                              "但不能作为当前源文已理解的证据。", file=sys.stderr)
+                    self.book_profile = _prof
+                    _config.set_runtime_style_guide(profile_to_style_guide(_prof, chapter_id=chapter_id))
+                    print(f"🎨 [StyleProfiler] 已加载作品风格剖面 ← {_prof_path.name} "
+                          f"(source={_prof.get('source')}, confidence={_prof.get('confidence')})")
+                    try:
+                        from src.judgment_layer import active_notes
+                        _active = active_notes(_prof, float(self.judgment_cfg.get("min_confidence", 0.55)))
+                        if _active:
+                            print(f"🧭 [Judgment] 已加载 {len(_active)} 条 active 注记（L1∧L2 通过）")
+                    except Exception:
+                        pass
         except Exception as _prof_err:
             print(f"⚠️ [StyleProfiler] 剖面加载失败，忽略: {_prof_err}", file=sys.stderr)
 
@@ -487,6 +500,11 @@ class TranslationPipeline:
         # Invalidate 缓存 — 下次加载走文件, 反映最新内容
         if hasattr(self, "_intermediate_cache") and self._intermediate_cache is not None:
             self._intermediate_cache.pop((chunk_id, step), None)
+        try:
+            log_artifact(file_path, stage=step, chunk_id=chunk_id, kind="intermediate")
+        except Exception as _log_exc:
+            print(f"⚠️ [TaskLog] 制品日志写入失败（不阻塞主流程）: {_log_exc}",
+                  file=sys.stderr)
 
     def _load_intermediate(self, chunk_id: str, step: str):
         """加载 chunk intermediate 文件 (raw / literary / critic_report 等).
@@ -1520,6 +1538,10 @@ class TranslationPipeline:
 
     def run(self) -> bool:
         print(f"🚀 [Pipeline] 启动批处理模式处理章节: {self.chapter_id}")
+        try:
+            log_event("pipeline_started", stage="PIPELINE", chapter=self.chapter_id)
+        except Exception as _log_exc:
+            print(f"⚠️ [TaskLog] pipeline_started 写入失败: {_log_exc}", file=sys.stderr)
         self._run_started_at = time.monotonic()
         self._rescue_started_at = None
 
@@ -1575,7 +1597,19 @@ class TranslationPipeline:
                     continue
 
                 print(f"📦 [Batch] {stage_name} 阶段: 处理 {len(tasks)} 个任务")
+                try:
+                    log_event("stage_started", stage=state.value,
+                              chapter=self.chapter_id, batch=len(tasks))
+                except Exception as _log_exc:
+                    print(f"⚠️ [TaskLog] stage_started 写入失败: {_log_exc}",
+                          file=sys.stderr)
                 handler(tasks)
+                try:
+                    log_event("stage_finished", stage=state.value,
+                              chapter=self.chapter_id, batch=len(tasks))
+                except Exception as _log_exc:
+                    print(f"⚠️ [TaskLog] stage_finished 写入失败: {_log_exc}",
+                          file=sys.stderr)
                 any_progress = True
 
             if not any_progress:
@@ -1688,7 +1722,14 @@ class TranslationPipeline:
             print(f"⚠️ [Rescue] 账本收尾异常（不影响主流程）: {e}")
 
         # 完成后交叉验证：final.json 落盘数应与任务数一致，否则视为假阳性完成
-        return self._verify_final_outputs(len(existing_tasks))
+        _verify_ok = self._verify_final_outputs(len(existing_tasks))
+        try:
+            log_event("pipeline_finished", stage="PIPELINE",
+                      status="ok" if _verify_ok else "failed",
+                      chapter=self.chapter_id, task_count=len(existing_tasks))
+        except Exception as _log_exc:
+            print(f"⚠️ [TaskLog] pipeline_finished 写入失败: {_log_exc}", file=sys.stderr)
+        return _verify_ok
 
     def _run_post_consistency(self, chapter_scoped: bool = True) -> None:
         """Round 7: 章节完成后自动跑 consistency（章节级 scope）
@@ -2781,11 +2822,37 @@ class TranslationPipeline:
         new_score = self._critic_avg_from_file(critic_new)
         if old_score <= 0 or new_score <= 0:
             return False
+
+        # Round 158: critic mean must not overrule a locked terminology
+        # authority.  An old draft can score higher while still carrying the
+        # wrong locked name (or a false-positive target that the source never
+        # licensed).  Compare deterministic authority violations first and let
+        # the cleaner draft win; score only breaks authority ties.
+        old_text = self._final_text_from_path(backup)
+        new_text = self._final_text_from_path(final_path)
+        old_violations, old_reasons = self._decision_authority_violations(
+            chunk_id, old_text)
+        new_violations, new_reasons = self._decision_authority_violations(
+            chunk_id, new_text)
         try:
             tolerance = float(vm_cfg.get("tolerance", 0.0) or 0.0)
         except (TypeError, ValueError):
             tolerance = 0.0
-        if new_score >= old_score - tolerance:
+        keep_new = new_score >= old_score - tolerance
+        if old_violations > new_violations:
+            keep_new = True
+            print(
+                f"🛡️ [Version Merit] {chunk_id} 旧版违反锁定决策 "
+                f"{old_violations} 项 > 新版 {new_violations} 项，"
+                f"保留新版（旧分 {old_score:.2f} / 新分 {new_score:.2f}）"
+            )
+        elif new_violations > old_violations:
+            keep_new = False
+            print(
+                f"🛡️ [Version Merit] {chunk_id} 新版违反锁定决策 "
+                f"{new_violations} 项 > 旧版 {old_violations} 项，回退旧版"
+            )
+        if keep_new:
             return False
         try:
             final_path.write_text(backup.read_text(encoding="utf-8"), encoding="utf-8")
@@ -2797,6 +2864,128 @@ class TranslationPipeline:
             return False
         print(f"🛡️ [Version Merit] {chunk_id} 新版均分 {new_score:.2f} < 旧版 {old_score:.2f}，保留旧版")
         return True
+
+    @staticmethod
+    def _decision_text_body(text: str) -> str:
+        """Strip translator-note definitions before authority presence checks."""
+        raw = str(text or "")
+        patterns = (
+            re.compile(r"(?m)^\[\^[^\]]+\]:"),
+            re.compile(
+                r"(?ms)^[ \t]*---[ \t]*\r?\n(?:[ \t]*\r?\n)*"
+                r"[ \t]*\[\d+\][ \t]+"),
+        )
+        cuts = [match.start() for pattern in patterns
+                for match in [pattern.search(raw)] if match]
+        return raw[:min(cuts)] if cuts else raw
+
+    @staticmethod
+    def _decision_target_core(value: str) -> str:
+        """Extract the executable CJK/name portion of a Decision target."""
+        raw = str(value or "").strip()
+        instructed = re.findall(
+            r"(?:首次写作|此后统一|统一为|统一)[^“]*“([^”]+)”", raw)
+        if instructed:
+            raw = instructed[-1].strip()
+        raw = raw.strip("《》“”\"'‘’「」『』").strip()
+        core = re.sub(r"[（(][^（()）]*[）)]", "", raw).strip()
+        return core or raw
+
+    def _decision_target_entity_forms(self, source: str) -> List[str]:
+        """Trusted registry forms for a Decision source, full names included.
+
+        A locked Decision can deliberately store the short form (``Piter`` ->
+        ``皮特``) while the prose uses the established full canonical
+        (``彼得·德弗里斯``).  The short form is not a literal substring of the
+        full name, so a raw ``in`` check wrongly marks a correct draft as an
+        authority violation.  Only high-confidence, reviewed registry rows
+        may satisfy this bridge; pending/legacy rows cannot erase a real
+        mismatch.
+        """
+        engine = getattr(self, "decision_engine", None)
+        if engine is None or not source:
+            return []
+        try:
+            rows = engine.conn.execute(
+                "SELECT canonical_name, source_names, variant_names, confidence, "
+                "COALESCE(pending_review, 0) FROM entity_registry"
+            ).fetchall()
+        except Exception:
+            return []
+
+        def norm(value: str) -> str:
+            return re.sub(r"\s+", " ", str(value or "")).strip().lower()
+
+        wanted = norm(source)
+        forms: List[str] = []
+        for canonical, sources_json, variants_json, confidence, pending in rows:
+            if str(confidence or "") != "high" or int(pending or 0):
+                continue
+            sources = robust_json_loads(sources_json, expected_type=list) or []
+            if not any(norm(item) == wanted for item in sources if isinstance(item, str)):
+                continue
+            if isinstance(canonical, str) and canonical.strip():
+                forms.append(canonical.strip())
+            variants = robust_json_loads(variants_json, expected_type=list) or []
+            forms.extend(str(item).strip() for item in variants
+                         if isinstance(item, str) and item.strip())
+        return list(dict.fromkeys(forms))
+
+    def _decision_authority_violations(
+        self,
+        chunk_id: str,
+        text: str,
+    ) -> Tuple[int, List[str]]:
+        """Count deterministic locked-Decision violations in one final text.
+
+        Two directions matter for version merit:
+        * the source contains the locked key but the prose omits its target;
+        * an article-led capitalised title target appears even though the
+          source does not contain that exact-case key (false positive from
+          the old case-insensitive prompt fill).
+        """
+        engine = getattr(self, "decision_engine", None)
+        scheduler = getattr(self, "scheduler", None)
+        if engine is None or scheduler is None:
+            return 0, []
+        try:
+            task = scheduler.get_task(chunk_id)
+        except Exception:
+            task = None
+        if not isinstance(task, dict):
+            return 0, []
+        source_text = str(task.get("text_content") or "")
+        if not source_text:
+            return 0, []
+        body = self._decision_text_body(text)
+        try:
+            rows = engine.conn.execute(
+                "SELECT source_key, translation FROM decision_db "
+                "WHERE locked=1 ORDER BY id"
+            ).fetchall()
+        except Exception:
+            return 0, []
+        count = 0
+        reasons: List[str] = []
+        for source, translation in rows:
+            source = str(source or "")
+            core = self._decision_target_core(str(translation or ""))
+            if not source or not core:
+                continue
+            source_hit = DecisionEngine._decision_source_hit(source, source_text)
+            target_present = core in body
+            if source_hit and not target_present:
+                target_present = any(
+                    form in body for form in self._decision_target_entity_forms(source))
+            if source_hit and not target_present:
+                count += 1
+                reasons.append(f"missing:{source}->{core}")
+            elif (not source_hit
+                  and DecisionEngine._decision_source_case_sensitive(source)
+                  and target_present):
+                count += 1
+                reasons.append(f"false_positive:{source}->{core}")
+        return count, reasons[:8]
 
     def _critic_avg_from_file(self, path: Path) -> float:
         """读取 critic_report json 的数值维度均分; 缺失/损坏返回 0.0。"""
@@ -3017,6 +3206,14 @@ class TranslationPipeline:
                 print(f"🧊 [Backtrack] 本章合并预算已用尽（{max_sweeps} 轮），"
                       f"冻结 {pending} 项待回溯登记（保留至下次运行）")
             return False
+
+        # Round 158: deferred 回溯不是"所有登记都必须重跑"。新 decision 登记后，
+        # 很多已完成的 final 可能已经满足目标（例如同一术语早已采用该译名），
+        # 或者已被更具体 decision 完全覆盖。先做一次机械核销，避免章末把
+        # 满足项也打成 DIRTY，造成整章复译。这里只消费 satisfied；covered
+        # 仍交给真实状态机处理，blocked/orphan 保留给 gate。
+        self._consume_satisfied_pending_backtracks(task_ids)
+
         entries = self.decision_engine.take_pending_backtracks(task_ids)
         if not entries:
             return False
@@ -3034,6 +3231,71 @@ class TranslationPipeline:
         if over_cap:
             self._write_backtrack_frozen_report(over_cap, entries)
         return bool(dirty)
+
+    def _consume_satisfied_pending_backtracks(self, task_ids: List[str]) -> int:
+        """Consume only evidence-backed satisfied outbox rows before a sweep.
+
+        The deferred queue is an intent log, not a retranslation order.  A row
+        whose current final already satisfies the latest decision must not be
+        turned into DIRTY merely because it was registered before the final was
+        audited.  Deletion uses the snapshot CAS from the global reconciler; a
+        changed row is retained, and any classification failure is fail-open so
+        the normal deferred path still runs.
+        """
+        if not task_ids or not getattr(self, "decision_engine", None):
+            return 0
+        try:
+            from src.pending_backtrack_reconcile import (
+                _delete_pending_row_if_unchanged,
+                classify_pending_snapshot,
+                load_pending_context,
+            )
+
+            root = getattr(self, "_root_dir", None)
+            if root is None:
+                root = getattr(self, "output_dir", None)
+            if root is None:
+                return 0
+            context = load_pending_context(
+                Path(root),
+                decision_db=Path(self.decision_engine.db_path),
+                workflow_db=Path(getattr(self.scheduler, "db_path",
+                                        Path(root) / "db" / "workflow.db")),
+                output_dir=Path(root) / "output",
+            )
+            snapshot = classify_pending_snapshot(context)
+            wanted = set(str(cid) for cid in task_ids)
+            satisfied = {
+                str(entry.get("chunk_id") or "")
+                for entry in (snapshot.get("entries") or [])
+                if str(entry.get("chunk_id") or "") in wanted
+                and str(entry.get("status") or "") == "satisfied"
+            }
+            if not satisfied:
+                return 0
+            outbox = {
+                str(row.get("chunk_id") or ""): row
+                for row in (context.get("pending") or [])
+            }
+            con = self.decision_engine.conn
+            consumed = 0
+            con.execute("BEGIN IMMEDIATE")
+            for chunk_id in sorted(satisfied):
+                row = outbox.get(chunk_id)
+                if row and _delete_pending_row_if_unchanged(con, row):
+                    consumed += 1
+            con.commit()
+            if consumed:
+                print(f"🧾 [Backtrack] 章末核销 {consumed} 条已满足登记；"
+                      f"不触发复译")
+            return consumed
+        except Exception as exc:  # noqa: BLE001 - fail-open, queue remains auditable
+            try:
+                self.decision_engine.conn.rollback()
+            except Exception:
+                pass
+            print(f"⚠️ [Backtrack] 章末满足项核销失败（保留登记）: {exc}")
+            return 0
 
     def _write_backtrack_frozen_report(self, frozen_ids: List[str], entries: List[Dict]) -> None:
         """把治理冻结的 chunk 写入 output/<chapter>/backtrack_frozen.md（诊断用）。"""
@@ -4687,6 +4949,59 @@ class TranslationPipeline:
                 effective.append(sn)
         return effective, swallowed
 
+    def _entity_source_name_residue_forms(
+        self,
+        lit_text: str,
+        source_name: str,
+        canonical: str,
+    ) -> List[str]:
+        """Return source-name residues that are not legitimate translator glosses.
+
+        Reference Agent footnotes commonly preserve the English term, and the
+        literary body may legitimately write ``厄拉科斯（Arrakis）`` once to
+        introduce it.  Treating either as an untranslated entity residue makes
+        a perfectly valid final impossible to pass: the Jev entity score falls
+        below 6 while the local checker simultaneously reports
+        ``variant_instead_of_canonical``.  This helper removes only those two
+        evidence-backed cases; an English name elsewhere in the prose remains a
+        violation.
+        """
+        text = str(lit_text or "")
+        source_name = str(source_name or "").strip()
+        canonical = str(canonical or "").strip()
+        if not text or not source_name:
+            return []
+        footnote = re.search(r"(?m)^\[\^[^\]]+\]:", text)
+        body = text[:footnote.start()] if footnote else text
+        base = self._strip_parenthetical(canonical) if canonical else ""
+        quote_chars = r"['\"“”‘’《》〈〉『』]*"
+        gloss_spans: List[Tuple[int, int]] = []
+        if base:
+            patterns = (
+                re.escape(base) + r"\s*[（(]\s*" + quote_chars
+                + r"\s*" + re.escape(source_name) + r"\s*" + quote_chars
+                + r"\s*[）)]",
+                re.escape(source_name) + r"\s*[（(]\s*" + quote_chars
+                + r"\s*" + re.escape(base) + r"\s*" + quote_chars
+                + r"\s*[）)]",
+            )
+            for pattern in patterns:
+                gloss_spans.extend(
+                    match.span()
+                    for match in re.finditer(pattern, body, re.IGNORECASE)
+                )
+        name_pattern = re.compile(
+            r"(?<![^\W\d_])" + re.escape(source_name) + r"(?![^\W\d_])",
+            re.IGNORECASE,
+        )
+        residues: List[str] = []
+        for match in name_pattern.finditer(body):
+            if any(start <= match.start() and match.end() <= end
+                   for start, end in gloss_spans):
+                continue
+            residues.append(match.group(0))
+        return residues
+
     def _check_entity_consistency(self, chunk_id: str, lit_text: str, source_text: str) -> List[Dict]:
         """实体一致性核查：检查译文中实体译名是否与 entity_registry 一致
 
@@ -4758,9 +5073,9 @@ class TranslationPipeline:
             # Round 21: 收集所有出现在 lit_text 中的 source_name
             matched_source_names = []
             for sn in source_names:
-                found_form = self._case_insensitive_find(sn, lit_text)
-                if found_form:
-                    matched_source_names.append(found_form)
+                matched_source_names.extend(
+                    self._entity_source_name_residue_forms(
+                        lit_text, sn, canonical))
 
             # 去重：source_name 命中后也算 variant_instead_of_canonical（英文残留）
             all_violations = list(matched_variants)
@@ -5712,6 +6027,20 @@ def consolidate_dirty_chapters(
     pipeline_factory=None,
     db_path=None,
     output_dir=None,
+    pending_applier=None,
+    name_only_applier=None,
+    run_pending_reconcile: bool = True,
+    run_name_only: bool = True,
+    run_confirmed_term_repair: bool = True,
+    confirmed_term_applier=None,
+    run_completed_name_repair: bool = True,
+    completed_name_applier=None,
+    run_term_contracts: bool = True,
+    term_contract_applier=None,
+    run_article_alias_repair: bool = True,
+    article_alias_applier=None,
+    run_name_authority_align: bool = True,
+    name_authority_applier=None,
 ) -> dict:
     """T2: 全书决策收敛闭环 — 重跑所有含 DIRTY chunk 的章节直到收敛。
 
@@ -5739,7 +6068,22 @@ def consolidate_dirty_chapters(
     db_file = Path(db_path) if db_path else root / "db" / "workflow.db"
     out_root = Path(output_dir) if output_dir else root / "output"
 
-    result = {"converged": True, "rounds": 0, "rerun": [], "remaining": {}, "diff_path": None}
+    result = {
+        "converged": True,
+        "rounds": 0,
+        "rerun": [],
+        "remaining": {},
+        "diff_path": None,
+        "pending_reconcile": [],
+        "name_only_fastpath": None,
+        "confirmed_term_drift_repair": None,
+        "completed_name_repair": None,
+        "term_form_contracts": None,
+        "article_alias_repair": None,
+        "article_alias_requeue": None,
+        "article_alias_repair_after_rerun": None,
+        "name_authority_align": None,
+    }
     if not db_file.exists():
         print(f"⚠️ [Consolidate] workflow.db 不存在（{db_file}），跳过收敛检查")
         return result
@@ -5748,12 +6092,229 @@ def consolidate_dirty_chapters(
         pipeline_factory = lambda ch: TranslationPipeline(chapter_id=ch)
 
     scheduler = TaskScheduler(db_path=str(db_file))
+    decision_file = root / "db" / "decision_db.sqlite"
 
-    def _dirty_rows():
+    # Article-led aliases such as ``the Lady Jessica`` must be folded back into
+    # their exact-key Decision before pending reconciliation runs.  This is a
+    # no-prose repair: it deletes only a shadow row whose completed evidence
+    # already uses the canonical target.
+    if run_article_alias_repair and decision_file.exists():
+        if article_alias_applier is None:
+            from src.decision_authority_align import (
+                apply_article_shadow_alias_repairs,
+            )
+            article_alias_applier = lambda: apply_article_shadow_alias_repairs(
+                root, apply=True)
+        try:
+            article_alias_result = article_alias_applier()
+        except Exception as exc:  # noqa: BLE001
+            article_alias_result = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "counts": {},
+            }
+        result["article_alias_repair"] = article_alias_result
+        print(
+            "🧷 [Consolidate] article-alias repair: "
+            f"ok={article_alias_result.get('ok')} "
+            f"counts={article_alias_result.get('counts') or {}}")
+
+        # An article-led alias can be blocked by a COMPLETED chunk that is
+        # source-positive but absent from ``pending_backtrack`` (for example
+        # ``the Lady Jessica`` in ch04_chunk054).  Such a chunk must enter the
+        # same DIRTY repair path as an outbox row; otherwise the alias audit
+        # remains blocked forever and the wrong variant survives to delivery.
+        # Queue only the exact chunk named by an ``alias_target_still_present``
+        # blocker after re-verifying its source phrase and COMPLETED state.
+        blocked_alias_chunks = []
+        for blocked in (article_alias_result.get("blocked_candidates") or []):
+            reason = str(blocked.get("reason") or "")
+            named_chunks = [
+                str(value).strip()
+                for value in (blocked.get("blocked_chunks") or [])
+                if str(value).strip()
+            ]
+            if not named_chunks and reason.startswith(
+                    "alias_target_still_present:"):
+                named_chunks = [reason.split(":", 1)[1].strip()]
+            source_key = str(blocked.get("source_key") or "").strip()
+            if not source_key:
+                continue
+            from src.pending_backtrack_reconcile import _source_phrase_spans
+            for chunk_id in named_chunks:
+                task = scheduler.get_task(chunk_id)
+                if not task:
+                    continue
+                if str(task.get("state") or "") != TaskState.COMPLETED.value:
+                    continue
+                if not _source_phrase_spans(
+                        str(task.get("text_content") or ""), source_key):
+                    continue
+                alias_target_present = str(
+                    blocked.get("alias_translation") or "")
+                if alias_target_present:
+                    final_path = (
+                        out_root / str(task.get("chapter_id") or chunk_id[:4]) /
+                        f"{chunk_id}_final.json")
+                    try:
+                        final_payload = json.loads(
+                            final_path.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if alias_target_present not in str(
+                            final_payload.get("text") or ""):
+                        continue
+                blocked_alias_chunks.append(chunk_id)
+        blocked_alias_chunks = sorted(set(blocked_alias_chunks))
+        if blocked_alias_chunks:
+            transition = scheduler.trigger_backtrack(blocked_alias_chunks)
+            requeue = {
+                "chunk_ids": blocked_alias_chunks,
+                "transition": transition,
+                "ok": all(cid in set(transition.get("dirty") or [])
+                          for cid in blocked_alias_chunks),
+            }
+            result["article_alias_requeue"] = requeue
+            print(
+                "🔁 [Consolidate] article-alias blocked chunks: "
+                f"queued={requeue['chunk_ids']} ok={requeue['ok']}")
+
+    # Registry aliases are a derived index, so conflicting aliases must be
+    # quarantined before name-only and completed-name repair consume them.
+    if run_name_authority_align and decision_file.exists():
+        if name_authority_applier is None:
+            from src.name_authority_align import align_name_authorities
+            name_authority_applier = lambda: align_name_authorities(
+                root, apply=True)
+        try:
+            name_authority_result = name_authority_applier()
+        except Exception as exc:  # noqa: BLE001
+            name_authority_result = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "counts": {},
+            }
+        result["name_authority_align"] = name_authority_result
+        print(
+            "🧭 [Consolidate] name-authority align: "
+            f"ok={name_authority_result.get('ok')} "
+            f"counts={name_authority_result.get('counts') or {}}")
+
+    # Confirmed specific-term drift (Shield Wall→屏蔽墙) and completed-name
+    # drift must both run before the outbox consumer.  Otherwise a COMPLETED
+    # chunk whose only defect is a name spelling would be marked DIRTY and
+    # re-translated instead of being repaired under a calibrated re-audit.
+    if run_confirmed_term_repair and decision_file.exists():
+        if confirmed_term_applier is None:
+            from src.name_only_fastpath import apply_confirmed_term_drift_repair
+            confirmed_term_applier = lambda: apply_confirmed_term_drift_repair(
+                root, apply=True)
+        try:
+            confirmed_term_result = confirmed_term_applier()
+        except Exception as exc:  # noqa: BLE001
+            confirmed_term_result = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "counts": {},
+            }
+        result["confirmed_term_drift_repair"] = confirmed_term_result
+        print(
+            "🧭 [Consolidate] confirmed-term drift repair: "
+            f"ok={confirmed_term_result.get('ok')} "
+            f"counts={confirmed_term_result.get('counts') or {}}")
+
+    # Completed-name drift must run before the outbox consumer: otherwise a
+    # COMPLETED chunk whose only defect is one CJK character in a canonical
+    # name would be marked DIRTY and re-translated instead of being repaired.
+    if run_completed_name_repair and decision_file.exists():
+        if completed_name_applier is None:
+            from src.name_only_fastpath import apply_completed_name_repair
+            completed_name_applier = lambda: apply_completed_name_repair(
+                root, apply=True)
+        try:
+            completed_result = completed_name_applier()
+        except Exception as exc:  # noqa: BLE001
+            completed_result = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "counts": {},
+            }
+        result["completed_name_repair"] = completed_result
+        print(
+            "🧹 [Consolidate] completed-name repair: "
+            f"ok={completed_result.get('ok')} "
+            f"counts={completed_result.get('counts') or {}}")
+
+    # Term/form contracts are evidence-bound exemptions for legitimate short
+    # forms and explicit source glosses.  Build/apply them only after all
+    # completed-text repairs, and before the outbox consumer, so the pending
+    # classifier sees the same artifact that a standalone command would write.
+    if run_term_contracts and decision_file.exists():
+        if term_contract_applier is None:
+            from src.term_form_contracts import apply_term_form_contracts
+            term_contract_applier = lambda: apply_term_form_contracts(root)
+        try:
+            term_contract_result = term_contract_applier()
+        except Exception as exc:  # noqa: BLE001
+            term_contract_result = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "counts": {},
+            }
+        result["term_form_contracts"] = term_contract_result
+        print(
+            "🧩 [Consolidate] term/form contracts: "
+            f"ok={term_contract_result.get('ok')} "
+            f"counts={term_contract_result.get('counts') or {}}")
+
+    if run_pending_reconcile and decision_file.exists():
+        if pending_applier is None:
+            from src.pending_backtrack_reconcile import (
+                apply_pending_backtrack_reconcile,
+            )
+            pending_applier = lambda: apply_pending_backtrack_reconcile(
+                root, workflow_db=db_file, output_dir=out_root,
+                scheduler=scheduler, apply=True)
+        for stage in ("before_name_only",):
+            try:
+                pending_result = pending_applier()
+            except Exception as exc:  # noqa: BLE001
+                pending_result = {
+                    "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                    "after_counts": {}, "actions": [],
+                }
+            pending_result["stage"] = stage
+            result["pending_reconcile"].append(pending_result)
+            print(
+                f"🧾 [Consolidate] pending reconcile({stage}): "
+                f"ok={pending_result.get('ok')} "
+                f"after={pending_result.get('after_counts') or {}}")
+
+    if run_name_only and decision_file.exists():
+        if name_only_applier is None:
+            from src.name_only_fastpath import apply_name_only_fastpath
+            name_only_applier = lambda: apply_name_only_fastpath(
+                root, apply=True, scheduler=scheduler)
+        try:
+            name_only_result = name_only_applier()
+        except Exception as exc:  # noqa: BLE001
+            name_only_result = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "counts": {},
+            }
+        result["name_only_fastpath"] = name_only_result
+        print(
+            "🧪 [Consolidate] name-only fastpath: "
+            f"ok={name_only_result.get('ok')} "
+            f"counts={name_only_result.get('counts') or {}}")
+
+    def _work_rows():
+        # Round 158: an interrupted run can leave chunks in an active stage
+        # (TRANSLATING_RAW / REWRITING_LITERARY / ...), not only DIRTY.  The
+        # old DIRTY-only scan declared "converged" while those chunks were
+        # still unfinished and then merged stale/missing finals.  Consolidate
+        # must own every resumable state; PERMANENTLY_FAILED stays isolated
+        # for the explicit rescue channel.
         cursor = scheduler.conn.execute(
-            "SELECT chapter_id, chunk_id FROM chunk_tasks WHERE state = ? "
+            "SELECT chapter_id, chunk_id FROM chunk_tasks "
+            "WHERE state NOT IN (?, ?) "
             "ORDER BY chapter_id ASC, chunk_id ASC",
-            (TaskState.DIRTY.value,),
+            (TaskState.COMPLETED.value, TaskState.PERMANENTLY_FAILED.value),
         )
         return [tuple(row) for row in cursor.fetchall()]
 
@@ -5769,7 +6330,7 @@ def consolidate_dirty_chapters(
 
     diff_records = []
     while result["rounds"] < rounds_cap:
-        rows = _dirty_rows()
+        rows = _work_rows()
         if not rows:
             break
         result["rounds"] += 1
@@ -5778,7 +6339,7 @@ def consolidate_dirty_chapters(
         for chapter_id, chunk_id in rows:
             by_chapter.setdefault(chapter_id, []).append(chunk_id)
         print(f"🔁 [Consolidate] 第 {round_no}/{rounds_cap} 轮: "
-              f"{len(rows)} 个 DIRTY chunk, {len(by_chapter)} 章待收敛")
+              f"{len(rows)} 个待续跑 chunk, {len(by_chapter)} 章待收敛")
         for chapter_id in sorted(by_chapter):
             chunk_ids = by_chapter[chapter_id]
             pre_texts = {cid: _read_final_text(chapter_id, cid) for cid in chunk_ids}
@@ -5799,8 +6360,59 @@ def consolidate_dirty_chapters(
                 })
                 result["rerun"].append(cid)
 
-    remaining_rows = _dirty_rows()
-    result["converged"] = len(remaining_rows) == 0
+    # The first alias pass can be blocked by exactly one still-wrong COMPLETED
+    # final.  Pending reconciliation turns that row into DIRTY and the rerun
+    # above repairs it; retry the no-prose shadow merge before the final
+    # outbox scan so the shadow Decision cannot survive into delivery.
+    if run_article_alias_repair and decision_file.exists():
+        if article_alias_applier is None:
+            from src.decision_authority_align import (
+                apply_article_shadow_alias_repairs,
+            )
+            article_alias_applier = lambda: apply_article_shadow_alias_repairs(
+                root, apply=True)
+        try:
+            article_alias_after = article_alias_applier()
+        except Exception as exc:  # noqa: BLE001
+            article_alias_after = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "counts": {},
+            }
+        result["article_alias_repair_after_rerun"] = article_alias_after
+        print(
+            "🧷 [Consolidate] article-alias repair(after_rerun): "
+            f"ok={article_alias_after.get('ok')} "
+            f"counts={article_alias_after.get('counts') or {}}")
+
+    remaining_rows = _work_rows()
+    pending_final = None
+    if run_pending_reconcile and decision_file.exists():
+        if pending_applier is None:
+            from src.pending_backtrack_reconcile import (
+                apply_pending_backtrack_reconcile,
+            )
+            pending_applier = lambda: apply_pending_backtrack_reconcile(
+                root, workflow_db=db_file, output_dir=out_root,
+                scheduler=scheduler, apply=True)
+        try:
+            pending_final = pending_applier()
+        except Exception as exc:  # noqa: BLE001
+            pending_final = {
+                "ok": False, "errors": [f"{type(exc).__name__}: {exc}"],
+                "after_counts": {}, "actions": [],
+            }
+        pending_final["stage"] = "after_rerun"
+        result["pending_reconcile"].append(pending_final)
+        print(
+            "🧾 [Consolidate] pending reconcile(after_rerun): "
+            f"ok={pending_final.get('ok')} "
+            f"after={pending_final.get('after_counts') or {}}")
+    pending_ok = True if pending_final is None else bool(pending_final.get("ok"))
+    article_alias_ok = not bool(
+        (result.get("article_alias_repair_after_rerun") or {}).get(
+            "blocked_candidates") or [])
+    result["converged"] = (
+        len(remaining_rows) == 0 and pending_ok and article_alias_ok)
     for chapter_id, chunk_id in remaining_rows:
         result["remaining"].setdefault(chapter_id, []).append(chunk_id)
 
@@ -5810,7 +6422,7 @@ def consolidate_dirty_chapters(
         f"- 生成时间: {datetime.now().isoformat(timespec='seconds')}",
         f"- 轮次: {result['rounds']} / max_rounds={rounds_cap}",
         f"- 重跑 chunk: {len(result['rerun'])} 个",
-        f"- 最终状态: {'✅ 收敛 (DIRTY=0)' if result['converged'] else '❌ 未收敛'}",
+        f"- 最终状态: {'✅ 收敛 (待处理=0)' if result['converged'] else '❌ 未收敛'}",
         "",
     ]
     if result["remaining"]:
@@ -5820,7 +6432,7 @@ def consolidate_dirty_chapters(
             lines.append(f"- {chapter_id}: {', '.join(result['remaining'][chapter_id])}")
         lines.append("")
     if not diff_records:
-        lines.append("（本次扫描 DIRTY=0，无重跑）")
+        lines.append("（本次扫描待处理=0，无重跑）")
         lines.append("")
     else:
         lines.append("## 重跑明细")
@@ -5870,11 +6482,11 @@ def consolidate_dirty_chapters(
         print(f"⚠️ [Consolidate] 报告写入失败: {exc}")
 
     if result["converged"]:
-        print(f"✅ [Consolidate] 收敛完成: DIRTY=0 "
+        print(f"✅ [Consolidate] 收敛完成: 待处理=0 "
               f"(重跑 {len(result['rerun'])} chunk, {result['rounds']} 轮)")
     else:
         total_left = sum(len(v) for v in result["remaining"].values())
-        print(f"❌ [Consolidate] 未收敛: 仍余 {total_left} 个 DIRTY chunk"
+        print(f"❌ [Consolidate] 未收敛: 仍余 {total_left} 个待处理 chunk"
               f"（max_rounds={rounds_cap} 已用尽）")
         for chapter_id in sorted(result["remaining"]):
             print(f"   {chapter_id}: {', '.join(result['remaining'][chapter_id])}")
@@ -5904,6 +6516,8 @@ def run_final_gate(
     ⑪ 全书修复闭环：每个 final 都有源文证据且可解析；当前 final 不再有
        待修项、未决高危姓名错位或正文段漏译/插入歧义；若存在 book_repair
        manifest，其 final 哈希必须与当前文件一致
+    ⑫ 全书交付链接：build manifest 的章序、DB chunk、final/merged 哈希、
+       运行日志封存证据均可从当前磁盘复算一致
     任一为红 → ok=False（translate_book.sh 以非零退出中止 / ⛔）。
     """
     root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
@@ -6314,10 +6928,112 @@ def run_final_gate(
         stats["book_repair"] = {"error": str(_br_exc)}
         failures.append(f"⑪ 全书修复复核异常: {_br_exc}")
 
+    # ⑫ 全书交付链接：source → DB chunk → final → merged → 运行日志。
+    # manifest 缺失时默认 advisory；一旦存在，任何哈希/顺序/日志不一致都判红。
+    try:
+        from src.book_linker import audit_book_links
+        _manifest_path = out_root / "build_manifest.json"
+        _required = False
+        _cfg_path = root / "config.yaml"
+        if _cfg_path.exists():
+            try:
+                import yaml as _yaml_gate
+                _gate_cfg = _yaml_gate.safe_load(
+                    _cfg_path.read_text(encoding="utf-8")) or {}
+                _required = bool(((_gate_cfg.get("gate") or {}).get(
+                    "book_link_required")))
+            except Exception:
+                _required = False
+        if not _manifest_path.exists():
+            stats["book_link"] = {"status": "missing", "required": _required}
+            if _required:
+                failures.append(
+                    "⑫ 缺少 output/build_manifest.json（交付链接证据缺失）")
+            else:
+                warnings.append(
+                    "⑫ 缺少 output/build_manifest.json（advisory；"
+                    "生产已要求 merge 后写 manifest）")
+        else:
+            _bla = audit_book_links(
+                root, manifest_path=_manifest_path,
+                require_current=False, require_sealed=False)
+            stats["book_link"] = {
+                "status": _bla.get("status"),
+                "passed": len(_bla.get("passed") or []),
+                "warnings": len(_bla.get("warnings") or []),
+                "failed": len(_bla.get("failed") or []),
+            }
+            if _bla.get("failed"):
+                failures.append(
+                    f"⑫ book-link-audit 失败 {len(_bla.get('failed') or [])} 项: "
+                    f"{(_bla.get('failed') or [])[:8]}")
+            elif _bla.get("warnings"):
+                warnings.append(
+                    f"⑫ book-link-audit 警告 {len(_bla.get('warnings') or [])} 项: "
+                    f"{(_bla.get('warnings') or [])[:8]}")
+    except Exception as _bl_exc:
+        stats["book_link"] = {"error": str(_bl_exc)}
+        failures.append(f"⑫ 全书链接审计异常: {_bl_exc}")
+
+    # ⑬ 全书 pending_backtrack 不变量：队列中不得存在未解释的
+    # outstanding/blocked/orphan。satisfied 与 covered 是可解释项，但仍应由
+    # Phase 1.5 的受控 apply 路径在状态迁移成功后消费，不能由 gate 直接删除。
+    try:
+        from src.pending_backtrack_reconcile import (
+            classify_pending_snapshot,
+            load_pending_context,
+        )
+        _pb_context = load_pending_context(
+            root,
+            decision_db=root / "db" / "decision_db.sqlite",
+            workflow_db=db_file,
+            output_dir=out_root,
+        )
+        _pb = classify_pending_snapshot(_pb_context)
+        stats["pending_backtrack"] = {
+            "available": bool(_pb.get("available")),
+            "reason": _pb.get("reason"),
+            "total": int(_pb.get("total") or 0),
+            "pending_rows": int(_pb.get("pending_rows") or 0),
+            "counts": _pb.get("counts") or {},
+            "by_chapter": _pb.get("by_chapter") or {},
+            "blocking": len(_pb.get("blocking") or []),
+        }
+        if not _pb.get("available"):
+            _pending_rows = int(_pb.get("pending_rows") or 0)
+            _msg = (f"⑬ pending_backtrack 审计不可用: "
+                    f"{_pb.get('reason') or 'unknown'}")
+            if _pending_rows:
+                failures.append(_msg + f"（仍有 {_pending_rows} 行队列无法核对）")
+            else:
+                warnings.append(_msg + "（空队列）")
+        elif _pb.get("blocking"):
+            _samples = [
+                f"{e.get('chunk_id')}:{e.get('status')}/{e.get('reason')}"
+                for e in (_pb.get("blocking") or [])[:8]
+            ]
+            failures.append(
+                f"⑬ pending_backtrack 未决 {len(_pb.get('blocking') or [])} 条: "
+                f"{_samples}")
+    except Exception as _pb_exc:
+        stats["pending_backtrack"] = {"error": str(_pb_exc)}
+        failures.append(f"⑬ pending_backtrack 审计异常: {_pb_exc}")
+
     if stats["tasks"] == 0 and db_file.exists():
         failures.append("① workflow.db 无任务行（未 init？）")
 
     result = {"ok": not failures, "failures": failures, "warnings": warnings, "stats": stats}
+    try:
+        log_event(
+            "gate_passed" if not failures else "gate_failed",
+            stage="GATE", status="ok" if not failures else "failed",
+            message=("delivery gate passed" if not failures
+                     else "delivery gate rejected"),
+            failures=failures[:20], warnings=warnings[:20],
+            task_count=stats.get("tasks", 0),
+        )
+    except Exception as _gate_log_exc:
+        print(f"⚠️ [TaskLog] gate 事件写入失败: {_gate_log_exc}", file=sys.stderr)
     print("🎯 [Gate] 交付门禁检查：")
     print(f"  ① 状态机: {stats['tasks']} 个任务, states={by_state}")
     print(f"  ② 产物: {stats['chapters']} 章, final_backup={len(backups)}")
@@ -6356,6 +7072,24 @@ def run_final_gate(
         print(f"  ⑪ 全书修复: pending={_br_stats.get('pending_chunks', 0)}, "
               f"blocking={_br_stats.get('blocking_issues', 0)}, "
               f"manifest={_br_stats.get('manifest_current', False)}")
+    _bl_stats = stats.get("book_link") or {}
+    if _bl_stats.get("error"):
+        print(f"  ⑫ 全书链接: 异常 {_bl_stats['error']}")
+    else:
+        print(f"  ⑫ 全书链接: status={_bl_stats.get('status')}, "
+              f"passed={_bl_stats.get('passed', 0)}, "
+              f"warn={_bl_stats.get('warnings', 0)}, "
+              f"failed={_bl_stats.get('failed', 0)}, "
+              f"required={_bl_stats.get('required', False)}")
+    _pb_stats = stats.get("pending_backtrack") or {}
+    if _pb_stats.get("error"):
+        print(f"  ⑬ 回溯队列: 异常 {_pb_stats['error']}")
+    elif _pb_stats.get("available"):
+        print(f"  ⑬ 回溯队列: total={_pb_stats.get('total', 0)}, "
+              f"counts={_pb_stats.get('counts')}, "
+              f"blocking={_pb_stats.get('blocking', 0)}")
+    else:
+        print(f"  ⑬ 回溯队列: 不可用 ({_pb_stats.get('reason') or 'unknown'})")
     for f in failures:
         print(f"  ❌ {f}")
     if result["ok"]:

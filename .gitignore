@@ -41,6 +41,8 @@ src/db/*.sqlite
 input/ch*.md
 input/_chapters_summary.txt
 output/ch*/
+output/logs/
+output/recovery/
 output/repair_backups/
 output/rescue/
 output/*_cache.jsonl
@@ -70,6 +72,7 @@ Thumbs.db
 # 翻译工作文件/临时文件（不上传到 GitHub，仅保留在本地）
 docs/*.md
 docs/ROUND142_PHASE_B_EVAL*.json
+docs/ROUND158_PHASE2_EVAL*.json
 input/README.md
 input/chaos/
 input/golden/
@@ -85,11 +88,14 @@ db/chunk_tags.json
 # 判断层/图谱运行产物（可按源文与 DB 重建）
 input/book_profile*.json
 input/story_graph.json
+input/term_form_contracts.json*
 input/_conversion_audit.md
 input/entity_variants.yaml
 input/verse_manifest.json
 output/*.md
 output/*.json
+# 所有 output 子目录均为运行产物/证据备份，不入库
+output/
 # 稳定的测试夹具：test_round119_guard_registry.py 硬依赖，其他基线仍忽略
 docs/baselines/*
 !docs/baselines/literary_metrics_2026-10-14.json

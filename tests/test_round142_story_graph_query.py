@@ -67,6 +67,13 @@ def _make_project(tmp_path: Path):
             "evidence": [{"chapter": "ch01", "quote": GURNEY_QUOTE,
                           "offset": CH01.index(GURNEY_QUOTE),
                           "match_kind": "exact", "match_score": 1.0}],
+        }, {
+            "id": "voice-quiet", "type": "voice", "chapters": ["ch01"],
+            "claim": "无人物场景保持安静克制的叙述语气。", "confidence": 0.9,
+            "status": "active", "l2_verdict": "confirmed",
+            "evidence": [{"chapter": "ch01", "quote": "A quiet room with no names.",
+                          "offset": CH01.index("A quiet room with no names."),
+                          "match_kind": "exact", "match_score": 1.0}],
         }],
     }
     return tmp_path, profile
@@ -109,6 +116,17 @@ def test_note_evidence_seeds_gold_scene_and_second_hop_is_bounded(tmp_path: Path
     assert hops[1]["scenes"]
     assert len(hops[2]["entities"]) <= 40
     assert result["trace"]["candidates"]["hop1"] >= 1
+
+
+def test_explicit_note_evidence_outranks_generic_entity_seed(tmp_path: Path):
+    graph = _graph(tmp_path)
+    index = StoryGraphQueryIndex(graph, input_dir=tmp_path / "input")
+
+    result = index.query(query="格尼如何训练保罗？",
+                         note_id="note:voice-quiet", top_k=3)
+
+    assert result["results"][0]["scene_id"] == "scene:ch01:0004"
+    assert result["results"][0]["score_components"]["note_evidence"] == 1.0
 
 
 def test_query_without_seed_match_is_explicit_and_fail_open(tmp_path: Path):
@@ -185,6 +203,37 @@ def test_evaluation_reports_recall_and_anchor_metrics(tmp_path: Path):
     assert metrics["R@5"] >= 0.5
     assert 0.0 <= metrics["anchor_precision@1"] <= 1.0
     assert report["rows"][0]["top_scene"] == "scene:ch01:0003"
+
+
+def test_evaluation_separates_all_evidence_from_negative_cases(tmp_path: Path):
+    graph = _graph(tmp_path)
+    index = StoryGraphQueryIndex(graph, input_dir=tmp_path / "input")
+    cases = [{
+        "id": "q-pair",
+        "question": "保罗与格尼在训练前后分别发生了什么？",
+        "gold": [
+            {"chapter": "ch01", "quote": "Paul met Jessica in the hall."},
+            {"chapter": "ch01", "quote": GURNEY_QUOTE},
+        ],
+    }, {
+        "id": "q-negative",
+        "question": "完全不存在的陌生人",
+        "gold": [],
+        "answerable": False,
+        "negative": True,
+    }]
+
+    report = evaluate_story_graph_query(index, cases, top_k=10)
+    metrics = report["metrics"]
+
+    assert metrics["cases"] == 2
+    assert metrics["gold_cases"] == 1
+    assert metrics["negative_cases"] == 1
+    assert metrics["any_evidence_R@10"] == 1.0
+    assert metrics["all_evidence_R@10"] == 1.0
+    assert 0.0 <= metrics["evidence_precision@2"] <= 1.0
+    assert metrics["no_seed_rate"] == 0.0
+    assert metrics["negative_empty_rate"] == 1.0
 
 
 def test_note_similarity_can_be_disabled_for_strict_alias_mode(tmp_path: Path):

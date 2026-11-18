@@ -25,6 +25,7 @@ from src.core.decision_engine import (
     DecisionEngine,
     DecisionLevel,
     alias_attested_in_text,
+    canonical_is_title_only,
     classify_entity_source_name,
     decision_alias_belongs_to_owner,
     decision_alias_conflicts_with_owner,
@@ -58,6 +59,26 @@ class ReferenceAgent:
         self.chapter_id = chapter_id
         # 获取 scheduler 用于全库扫描
         self._scheduler = decision_engine._scheduler_factory() if decision_engine._scheduler_factory else None
+
+    @staticmethod
+    def _reference_decision_level(ref: Dict[str, Any]) -> DecisionLevel:
+        """Classify an extracted reference by how hard its surface form is.
+
+        ``RETAIN_AND_ANNOTATE`` / transliteration entries and capitalised
+        proper titles are terminology: future chunks should inherit the exact
+        form.  Generic lower-case literary phrases (``shadows``, ``cells``)
+        stay references, whose prompt treatment is advisory and never forces a
+        historical chunk to re-translate on a synonym.
+        """
+        source = str(ref.get("source_text") or "").strip()
+        strategy = str(ref.get("strategy") or "").strip().upper()
+        if strategy in {"RETAIN_AND_ANNOTATE", "TRANSLITERATION", "TERMINOLOGY"}:
+            return DecisionLevel.TERMINOLOGY
+        if source and not re.search(r"[“”\"‘’]", source):
+            tokens = re.findall(r"[A-Za-z0-9]+", source)
+            if tokens and any(token and token[0].isupper() for token in tokens):
+                return DecisionLevel.TERMINOLOGY
+        return DecisionLevel.REFERENCE
 
     def _find_chunks_containing(self, source_text: str) -> List[str]:
         """从 workflow DB 全文搜索包含 source_text 的 chunk_id。
@@ -294,13 +315,19 @@ Schema 如下：
                 all_affected = self._find_chunks_containing(source)
                 if affected_chunks:
                     all_affected = list(set(all_affected) | set(affected_chunks))
+                # The current chunk is still at EXTRACTING_TERMS and will use
+                # this Decision in its own translation later in the same run.
+                # Queueing it now guarantees a redundant DIRTY rerun after it
+                # completes.  Only *other* completed chunks need backtracking.
+                all_affected = [cid for cid in all_affected
+                                if str(cid) != str(chunk_id)]
 
                 self.db.add_decision(
-                    level=DecisionLevel.REFERENCE,
+                    level=self._reference_decision_level(ref),
                     source=source,
                     translation=translation,
                     reason=reason,
-                    affected_chunks=all_affected or [chunk_id]
+                    affected_chunks=all_affected,
                 )
 
         # 4. 登记实体到 entity_registry (增量构建全书实体知识库)
@@ -426,8 +453,34 @@ Schema 如下：
             proper_candidates = [s for s in aliases if classify_entity_source_name(s) == "proper"]
             context_candidates = [s for s in aliases if classify_entity_source_name(s) != "proper"]
 
+            # Round 158: a locked Decision is already the authority for a
+            # title-like alias.  If the extractor proposes a rejected title
+            # form (Judge of the Change -> "变更裁决官"), do not create a new
+            # entity alongside the locked "变革仲裁官".  Remapping here is
+            # limited to title aliases; personal names keep their full/short
+            # form distinction.
+            if not proper_candidates and canonical_is_title_only(canonical):
+                for alias in context_candidates:
+                    if classify_entity_source_name(alias) != "title":
+                        continue
+                    locked_targets = decision_targets.get(_norm(alias)) or set()
+                    if len(locked_targets) == 1:
+                        authorised = next(iter(locked_targets))
+                        if authorised and authorised != canonical:
+                            print(f"  🔒 实体主名服从既有决策: {canonical} -> {authorised} ({alias})")
+                            canonical = authorised
+                        break
+
             existing = registry.get(canonical)
             existing_qt = {_norm(x) for x in (existing or {}).get("quarantine", [])}
+
+            # A context-only alias has no executable source form.  Creating a
+            # fresh canonical row from it merely pollutes the registry (Dune
+            # accumulated several "变更/更替法官" rows this way).  Merge into
+            # an already established canonical, but never mint a new one.
+            if existing is None and not proper_candidates:
+                print(f"  ℹ️ 上下文指称不新建实体: {canonical} <- {context_candidates[:2]}")
+                continue
 
             accepted: List[str] = []
             quarantined: List[str] = []
@@ -516,6 +569,11 @@ Schema 如下：
                     ]
                 accepted.append(sn)
                 owners.setdefault(key, set()).add(canonical)
+
+            if existing is None and not accepted:
+                print(f"  ℹ️ 无可执行专名不新建实体: {canonical} "
+                      f"(候选={proper_candidates[:2]}, 上下文={context_candidates[:2]})")
+                continue
 
             if existing is not None:
                 existing["source"] = _dedupe(existing["source"] + accepted)

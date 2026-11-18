@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 
 import pytest
 
@@ -74,7 +75,8 @@ class TestDeferredQueue:
         engine.add_decision(engine_mod.DecisionLevel.REFERENCE, "Mock Turtle", "假海龟",
                             "r1", affected_chunks=["ch10_c000"])
         engine.add_decision(engine_mod.DecisionLevel.REFERENCE, "Mock Turtle", "素甲鱼",
-                            "r2", affected_chunks=["ch10_c000", "ch10_c002"])
+                            "r2", affected_chunks=["ch10_c000", "ch10_c002"],
+                            allow_revision=True)
         # 未即时回溯（deferred 模式）
         assert sched.calls == []
 
@@ -86,6 +88,25 @@ class TestDeferredQueue:
         # take 后队列清空
         assert engine.count_pending_backtracks(["ch10_c000", "ch10_c002"]) == 0
 
+    def test_contextual_title_is_recorded_without_backtrack(
+            self, engine_mod, tmp_path, set_de_cfg):
+        """A context-dependent address term must not re-translate history."""
+        set_de_cfg(backtrack_mode="deferred",
+                   contextual_terms_trigger_backtrack=False)
+        sched = _FakeScheduler()
+        engine = engine_mod.DecisionEngine(
+            db_path=str(tmp_path / "d.sqlite"), scheduler_factory=lambda: sched)
+        engine.add_decision(
+            engine_mod.DecisionLevel.REFERENCE, "Sire", "陛下", "address",
+            affected_chunks=["ch10_c000", "ch10_c001"])
+
+        assert sched.calls == []
+        assert engine.count_pending_backtracks() == 0
+        row = engine.conn.execute(
+            "SELECT translation FROM decision_db WHERE source_key='Sire'"
+        ).fetchone()
+        assert row[0] == "陛下"
+
     def test_immediate_mode_triggers_directly(self, engine_mod, tmp_path, set_de_cfg):
         set_de_cfg(backtrack_mode="immediate")
         sched = _FakeScheduler()
@@ -94,7 +115,8 @@ class TestDeferredQueue:
         engine.add_decision(engine_mod.DecisionLevel.REFERENCE, "Gryphon", "狮鹫",
                             "r1", affected_chunks=["ch10_c001"])
         engine.add_decision(engine_mod.DecisionLevel.REFERENCE, "Gryphon", "鹰头狮",
-                            "r2", affected_chunks=["ch10_c001"])
+                            "r2", affected_chunks=["ch10_c001"],
+                            allow_revision=True)
         assert sched.calls == [["ch10_c001"], ["ch10_c001"]]
         assert engine.count_pending_backtracks() == 0
 
@@ -218,3 +240,49 @@ class TestChapterConsolidation:
         engine._queue_backtrack(["ch09_chunk000"], 1, "institutions")
         assert pipe._consolidate_deferred_backtracks() is False
         assert sched.get_task("ch09_chunk000")["state"] == "COMPLETED"
+
+    def test_satisfied_pending_is_consumed_before_dirty_sweep(self, tmp_path, set_de_cfg):
+        """Round 158: a registered intent already present in final must not re-translate."""
+        set_de_cfg(backtrack_mode="deferred",
+                   max_backtrack_sweeps_per_chapter=1,
+                   max_backtrack_rounds_per_chunk=2)
+        from src.pipeline import TranslationPipeline
+        from src.core import scheduler as sched_module
+        from src.core.decision_engine import DecisionEngine, DecisionLevel
+
+        sched = _seed_completed(
+            sched_module, tmp_path / "w.db",
+            ["ch09_chunk000", "ch09_chunk001"])
+        engine = DecisionEngine(
+            db_path=str(tmp_path / "d.sqlite"), scheduler_factory=lambda: sched)
+        sched.conn.execute(
+            "UPDATE chunk_tasks SET text_content='Yueh spoke.' "
+            "WHERE chunk_id IN ('ch09_chunk000','ch09_chunk001')")
+        sched.conn.commit()
+        engine.add_decision(
+            DecisionLevel.REFERENCE, "Yueh", "岳氏医师", "r1",
+            affected_chunks=["ch09_chunk000", "ch09_chunk001"])
+        out_dir = tmp_path / "output" / "ch09"
+        out_dir.mkdir(parents=True)
+        (out_dir / "ch09_chunk000_final.json").write_text(
+            json.dumps({"text": "岳氏医师开口。"}, ensure_ascii=False),
+            encoding="utf-8")
+        (out_dir / "ch09_chunk001_final.json").write_text(
+            json.dumps({"text": "医生开口。"}, ensure_ascii=False),
+            encoding="utf-8")
+
+        pipe = TranslationPipeline.__new__(TranslationPipeline)
+        pipe.chapter_id = "ch09"
+        pipe._root_dir = tmp_path
+        pipe.output_dir = tmp_path / "output"
+        pipe.scheduler = sched
+        pipe.decision_engine = engine
+        pipe._backtrack_sweeps_done = 0
+
+        assert pipe._consolidate_deferred_backtracks() is True
+        assert sched.get_task("ch09_chunk000")["state"] == "COMPLETED"
+        assert sched.get_task("ch09_chunk001")["state"] == "DIRTY"
+        # The satisfied row is gone; the outstanding row was consumed only
+        # after the state transition, just like the global outbox contract.
+        assert engine.count_pending_backtracks(
+            ["ch09_chunk000", "ch09_chunk001"]) == 0

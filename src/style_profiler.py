@@ -33,9 +33,11 @@ import datetime as _dt
 import hashlib
 import json
 import re
+import sqlite3
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
+from src.core.decision_engine import _NAME_SEP_CHARS, canonical_tokens
 from src.judgment_layer import (
     JUDGMENT_SCHEMA_VERSION,
     atomic_write_json,
@@ -48,6 +50,7 @@ from src.judgment_layer import (
     normalize_notes,
     restrict_notes_to_candidate_quotes,
     replace_notes_in_profile,
+    sha256_text,
     validate_note_evidence,
     verify_notes_l2,
     write_judgment_audit,
@@ -401,6 +404,16 @@ def normalize_profile(data: Dict[str, Any]) -> Dict[str, Any]:
     # profile does not lose its provenance and coverage story on every load.
     if isinstance(data.get("deep_read"), dict):
         prof["deep_read"] = dict(data["deep_read"])
+    # Round 158: derived chapter digests are top-level artifacts.  Without
+    # this preservation every load_profile() would silently erase them, making
+    # a freshly backfilled profile look untracked again.
+    if isinstance(data.get("chapter_digests"), list):
+        prof["chapter_digests"] = [dict(d) for d in data["chapter_digests"]
+                                   if isinstance(d, dict)]
+    if isinstance(data.get("chapter_digests_summary"), dict):
+        prof["chapter_digests_summary"] = dict(data["chapter_digests_summary"])
+    if "chapter_digests_complete" in data:
+        prof["chapter_digests_complete"] = bool(data.get("chapter_digests_complete"))
     # L2: translation_hints 中提及双关/谐音/戏拟的条目并入 pun_watchlist（LLM 漏报兜底；
     #     与既有条目同词（结构化已登记）时不重复合成）
     _GENERIC_EN = {
@@ -909,6 +922,191 @@ def apply_setup_pairs(
     return out
 
 
+def _coverage_union(spans: Sequence[Sequence[int]], total: int) -> float:
+    """Fraction of ``[0, total)`` covered by possibly overlapping spans."""
+    if total <= 0:
+        return 1.0
+    intervals = []
+    for span in spans:
+        try:
+            start = max(0, int(span[0]))
+            end = min(total, int(span[1]))
+        except (TypeError, ValueError, IndexError):
+            continue
+        if end > start:
+            intervals.append((start, end))
+    if not intervals:
+        return 0.0
+    intervals.sort()
+    covered = 0
+    cur_start, cur_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= cur_end:
+            cur_end = max(cur_end, end)
+        else:
+            covered += cur_end - cur_start
+            cur_start, cur_end = start, end
+    covered += cur_end - cur_start
+    return round(covered / float(total), 6)
+
+
+def build_chapter_digests(
+    chapter_texts: Dict[str, str],
+    segment_payloads: Sequence[Dict[str, Any]],
+    model: str = "",
+    params: Optional[Dict[str, Any]] = None,
+    generated_at: str = "",
+) -> Dict[str, Any]:
+    """Deterministically derive one digest per chapter from audit payloads.
+
+    A digest is ``complete`` only when every source character is covered by a
+    segment, every segment parsed, and every segment produced a non-empty
+    synopsis.  Incomplete chapters publish explicit ``complete=false`` and
+    reasons instead of a plausible-looking partial digest.
+    """
+    by_chapter: Dict[str, List[Dict[str, Any]]] = {}
+    orphan_parts: List[str] = []
+    for payload in segment_payloads:
+        if not isinstance(payload, dict):
+            continue
+        cid = str(payload.get("chapter_id") or "")
+        if cid in chapter_texts:
+            by_chapter.setdefault(cid, []).append(payload)
+        elif cid:
+            orphan_parts.append(str(payload.get("part_id") or cid))
+
+    digests: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    for cid, text in sorted(chapter_texts.items()):
+        payloads = sorted(
+            by_chapter.get(cid, []),
+            key=lambda p: (int(p.get("char_start") or 0),
+                           int(p.get("char_end") or 0)),
+        )
+        parts: List[str] = []
+        synopses: List[str] = []
+        registers: List[str] = []
+        parse_errors: List[str] = []
+        synopsis_missing: List[str] = []
+        spans: List[Sequence[int]] = []
+        for payload in payloads:
+            part_id = str(payload.get("part_id") or f"{cid}:?")
+            parts.append(part_id)
+            spans.append((payload.get("char_start") or 0, payload.get("char_end") or 0))
+            parse_error = str(payload.get("parse_error") or "").strip()
+            if parse_error:
+                parse_errors.append(f"{part_id}:{parse_error}")
+            synopsis = str(payload.get("synopsis") or "").strip()
+            if synopsis:
+                synopses.append(synopsis)
+            else:
+                synopsis_missing.append(part_id)
+            register = str(payload.get("register_summary") or "").strip()
+            if register and register not in registers:
+                registers.append(register)
+
+        coverage = _coverage_union(spans, len(text))
+        reasons: List[str] = []
+        if not text.strip():
+            reasons.append("empty_source")
+        if not payloads:
+            reasons.append("no_segments")
+        if parse_errors:
+            reasons.append("segment_parse_error")
+        if synopsis_missing:
+            reasons.append("segment_synopsis_missing")
+        if coverage < 0.999999:
+            reasons.append("segment_coverage_incomplete")
+        complete = not reasons
+        digest = "\n\n".join(synopses) if complete else ""
+        entry = {
+            "chapter_id": cid,
+            "source_sha256": sha256_text(text),
+            "source_chars": len(text),
+            "segment_ids": parts,
+            "segment_coverage": coverage,
+            "digest": digest,
+            "register_summary": "；".join(registers),
+            "complete": complete,
+            "generation": {
+                "model": model,
+                "params": dict(params or {}),
+                "time": generated_at or _now(),
+            },
+        }
+        if not complete:
+            entry["missing_reason"] = ";".join(reasons)
+            entry["parse_errors"] = parse_errors[:10]
+            entry["synopsis_missing_parts"] = synopsis_missing[:10]
+            missing.append(cid)
+        digests.append(entry)
+
+    complete_all = bool(digests) and not missing
+    summary = {
+        "complete": complete_all,
+        "chapters_total": len(digests),
+        "chapters_complete": len(digests) - len(missing),
+        "missing": missing,
+        "orphan_parts": orphan_parts[:20],
+    }
+    return {"ok": bool(digests), "complete": complete_all,
+            "digests": digests, "summary": summary}
+
+
+def derive_profile_digests(
+    project_root: Path,
+    profile: Dict[str, Any],
+    audit: Dict[str, Any],
+    input_dir: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Bind an existing deep profile to current chapter bytes and audit payloads.
+
+    This is the Round-158 no-LLM path for the current Dune profile: the deep
+    read is not repeated; the audit's segment ranges and synopses are the
+    provenance, and the coverage check proves every character was read.
+    """
+    root = Path(project_root)
+    in_dir = Path(input_dir) if input_dir else root / "input"
+    docs = load_chapter_documents(in_dir)
+    chapter_texts = {d["chapter_id"]: d["text"] for d in docs}
+    payloads = audit.get("segment_payloads") if isinstance(audit, dict) else None
+    if not isinstance(payloads, list) or not payloads:
+        return {"ok": False, "error": "audit_segment_payloads_missing",
+                "digests": [], "summary": {"complete": False}}
+
+    generation = profile.get("generation") if isinstance(profile.get("generation"), dict) else {}
+    audit_generation = audit.get("generation") if isinstance(audit.get("generation"), dict) else {}
+    model = str(audit_generation.get("model") or generation.get("model") or "")
+    params = audit_generation.get("params") if isinstance(audit_generation.get("params"), dict) else {}
+    generated_at = str(audit.get("generated_at") or generation.get("time") or _now())
+    res = build_chapter_digests(chapter_texts, payloads, model=model,
+                                params=params, generated_at=generated_at)
+    if not res.get("ok"):
+        return {"ok": False, "error": "no_chapter_digests",
+                "digests": [], "summary": res.get("summary") or {}}
+
+    out = dict(profile)
+    out["generation"] = dict(generation)
+    inputs = dict(out["generation"].get("inputs") or {})
+    inputs["chapters"] = {d["chapter_id"]: d["source_sha256"]
+                          for d in res["digests"]}
+    inputs["profile_version"] = PROFILE_VERSION
+    inputs["prompt_version"] = str(
+        out["generation"].get("prompt_version") or "r131.deep.v3")
+    out["generation"]["inputs"] = inputs
+    out["generation"]["digest_source"] = {
+        "artifact": "output/style_profile_audit.json",
+        "audit_generated_at": generated_at,
+        "derived_at": _now(),
+        "method": "audit_segment_payloads+chapter_sha256",
+    }
+    out["chapter_digests"] = res["digests"]
+    out["chapter_digests_summary"] = res["summary"]
+    out["chapter_digests_complete"] = bool(res["complete"])
+    return {"ok": True, "complete": bool(res["complete"]), "profile": out,
+            "digests": res["digests"], "summary": res["summary"]}
+
+
 def pair_setup_candidates(
     chapter_ids: Sequence[str],
     setup_candidates: Sequence[Dict[str, Any]],
@@ -1363,6 +1561,21 @@ def build_deep_profile(
         "time": _now(),
         "prompt_version": "r131.deep.v3",
     }
+    _chapter_hashes = {cid: sha256_text(text)
+                       for cid, text in sorted(chapter_texts.items())}
+    profile["generation"]["inputs"] = {
+        "chapters": _chapter_hashes,
+        "profile_version": PROFILE_VERSION,
+        "prompt_version": "r131.deep.v3",
+    }
+    _digest_res = build_chapter_digests(
+        chapter_texts, payloads, model=_deep_model,
+        params=profile["generation"]["params"],
+        generated_at=profile["generation"]["time"],
+    )
+    profile["chapter_digests"] = _digest_res["digests"]
+    profile["chapter_digests_summary"] = _digest_res["summary"]
+    profile["chapter_digests_complete"] = bool(_digest_res["complete"])
     profile["generated_at"] = _now()
     active_notes_out = [n for n in l2["notes"] if n.get("status") == "active"]
     covered_chapters = set()
@@ -1450,10 +1663,234 @@ def build_deep_profile(
 # 剖面 → 运行时 style_guide 覆盖层
 # ────────────────────────────────────────────────────────────────────
 
+def _json_string_list(value: Any) -> List[str]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _pure_cjk_name_form(name: str) -> tuple:
+    base = re.sub(r"（[^）]*）|\([^)]*\)", "", str(name or "")).strip()
+    tokens = canonical_tokens(base)
+    if not tokens:
+        return base, tokens, ""
+    key = "".join(tokens)
+    if len(key) < 4 or not re.fullmatch(r"[\u4e00-\u9fff]+", key):
+        return base, tokens, ""
+    return base, tokens, key
+
+
+def _one_char_name_drift_spans(text: str, canonical: str) -> List[Dict[str, Any]]:
+    """Find one-character CJK spelling drift for a registered canonical name."""
+    base, tokens, canonical_key = _pure_cjk_name_form(canonical)
+    # A single-token CJK phrase is too close to ordinary prose.  Only names
+    # with real token structure participate in hint rewriting; single-token
+    # canonicals and variants still enter the protection set in the loader.
+    if not canonical_key or len(tokens) < 2 or not text:
+        return []
+    sep = r"[\s" + re.escape(_NAME_SEP_CHARS) + r"]*"
+    patterns: List[str] = []
+    for changed in range(len(canonical_key)):
+        pieces: List[str] = []
+        char_index = 0
+        for token_index, token in enumerate(tokens):
+            if token_index:
+                pieces.append(sep)
+            for char in token:
+                pieces.append(
+                    r"[\u4e00-\u9fff]" if char_index == changed
+                    else re.escape(char))
+                char_index += 1
+        patterns.append("(?:%s)" % "".join(pieces))
+    matcher = re.compile("|".join(patterns))
+    out: List[Dict[str, Any]] = []
+    seen = set()
+    for match in matcher.finditer(str(text)):
+        form = match.group(0)
+        found_key = re.sub(
+            r"[\s" + re.escape(_NAME_SEP_CHARS) + r"]+", "", form)
+        if len(found_key) != len(canonical_key) or found_key == canonical_key:
+            continue
+        if sum(a != b for a, b in zip(canonical_key, found_key)) != 1:
+            continue
+        signature = (match.start(), match.end(), found_key)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        out.append({
+            "start": match.start(),
+            "end": match.end(),
+            "found": form,
+            "found_key": found_key,
+            "canonical": base,
+            "canonical_key": canonical_key,
+        })
+    return out
+
+
+def _load_active_name_authorities(
+    decision_db: Optional[Path] = None,
+) -> tuple:
+    """Load strict canonical names without mutating the Decision DB.
+
+    Active high-confidence registry rows are primary authority.  A locked
+    decision may add a canonical only when its source key is not already owned
+    by that registry, and when it is not a one-character drift of an active
+    canonical.  This deliberately never trusts an unlocked or superseded
+    decision translation as a new spelling authority.
+    """
+    if decision_db is None:
+        decision_db = Path(__file__).resolve().parent.parent / "db" / "decision_db.sqlite"
+    path = Path(decision_db)
+    if not path.exists():
+        return [], set(), {}
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % path.resolve(), uri=True)
+        con.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return [], set(), {}
+    canonicals: List[str] = []
+    allowed_keys = set()
+    active_by_source: Dict[str, str] = {}
+    try:
+        tables = {
+            str(row[0]) for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        if "entity_registry" in tables:
+            cols = {str(row[1]) for row in con.execute(
+                "PRAGMA table_info(entity_registry)")}
+            if {"canonical_name", "confidence"} <= cols:
+                source_col = "source_names" if "source_names" in cols else "''"
+                variant_col = "variant_names" if "variant_names" in cols else "''"
+                pending_col = "pending_review" if "pending_review" in cols else "0"
+                query = (
+                    "SELECT canonical_name, %s AS source_names, %s AS variant_names, "
+                    "confidence, %s AS pending_review FROM entity_registry"
+                    % (source_col, variant_col, pending_col)
+                )
+                for row in con.execute(query):
+                    if str(row["confidence"] or "").casefold() != "high":
+                        continue
+                    if int(row["pending_review"] or 0):
+                        continue
+                    canonical, _tokens, key = _pure_cjk_name_form(
+                        str(row["canonical_name"] or ""))
+                    if not canonical:
+                        continue
+                    if key:
+                        allowed_keys.add(key)
+                        if len(_tokens) >= 2:
+                            canonicals.append(canonical)
+                    for source in _json_string_list(row["source_names"]):
+                        active_by_source[source.casefold()] = canonical
+                    for variant in _json_string_list(row["variant_names"]):
+                        _variant, _v_tokens, variant_key = _pure_cjk_name_form(variant)
+                        if variant_key:
+                            allowed_keys.add(variant_key)
+        if "decision_db" in tables:
+            cols = {str(row[1]) for row in con.execute(
+                "PRAGMA table_info(decision_db)")}
+            if {"source_key", "translation"} <= cols:
+                locked_expr = "locked" if "locked" in cols else "0"
+                query = (
+                    "SELECT source_key, translation, %s AS locked "
+                    "FROM decision_db WHERE %s=1" % (locked_expr, locked_expr)
+                )
+                for row in con.execute(query):
+                    source = str(row["source_key"] or "").strip().casefold()
+                    if source and source in active_by_source:
+                        continue
+                    canonical, _tokens, key = _pure_cjk_name_form(
+                        str(row["translation"] or ""))
+                    if not canonical or not key or len(_tokens) < 2:
+                        continue
+                    if any(_one_char_name_drift_spans(canonical, existing)
+                           for existing in canonicals
+                           if key != _pure_cjk_name_form(existing)[2]):
+                        continue
+                    canonicals.append(canonical)
+                    allowed_keys.add(key)
+    except sqlite3.Error:
+        return [], set(), {}
+    finally:
+        con.close()
+    return list(dict.fromkeys(canonicals)), allowed_keys, active_by_source
+
+
+def _canonicalize_hint_source_form(
+    hint: str, active_by_source: Dict[str, str]
+) -> Tuple[str, Optional[Dict[str, str]]]:
+    """Replace the leading form of an exact-source profile hint when safe."""
+    if "=" not in hint:
+        return hint, None
+    left, right = hint.split("=", 1)
+    canonical = active_by_source.get(left.strip().casefold())
+    if not canonical:
+        return hint, None
+    match = re.match(
+        r"(?P<lead>\s*)(?P<form>[\u4e00-\u9fff·・－\-]{1,24})"
+        r"(?P<tail>[：:／/;；，,]|$)", right)
+    if not match:
+        return hint, None
+    found = match.group("form")
+    if found == canonical:
+        return hint, None
+    return (
+        left + "=" + match.group("lead") + canonical + right[match.end("form"):],
+        {"wrong": found, "canonical": canonical},
+    )
+
+
+def _sanitize_translation_hints(
+    hints: Sequence[Any],
+    decision_db: Optional[Path] = None,
+) -> tuple:
+    canonicals, allowed_keys, active_by_source = _load_active_name_authorities(
+        decision_db)
+    if not hints or not (canonicals or active_by_source):
+        return list(hints or []), []
+    repairs: List[Dict[str, str]] = []
+    out: List[str] = []
+    ordered = sorted(canonicals, key=len, reverse=True)
+    for raw_hint in hints:
+        hint = str(raw_hint)
+        hint, source_repair = _canonicalize_hint_source_form(
+            hint, active_by_source)
+        if source_repair:
+            found_key = _pure_cjk_name_form(source_repair["wrong"])[2]
+            if not found_key or found_key not in allowed_keys:
+                repairs.append(source_repair)
+            else:
+                hint = str(raw_hint)
+        for canonical in ordered:
+            spans = [
+                span for span in _one_char_name_drift_spans(hint, canonical)
+                if span["found_key"] not in allowed_keys
+            ]
+            for span in sorted(spans, key=lambda item: item["start"], reverse=True):
+                hint = (
+                    hint[:int(span["start"])] + str(span["canonical"])
+                    + hint[int(span["end"]):]
+                )
+                repairs.append({
+                    "wrong": str(span["found"]),
+                    "canonical": str(span["canonical"]),
+                })
+        out.append(hint)
+    return out, repairs
+
+
 def profile_to_style_guide(
     profile: Optional[Dict[str, Any]],
     chapter_id: Optional[str] = None,
     base: Optional[Dict[str, Any]] = None,
+    decision_db: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """把剖面映射为 config.style_guide 覆盖 dict（与 config.yaml 基线合并）。
 
@@ -1482,7 +1919,11 @@ def profile_to_style_guide(
     guide["register_default"] = reg
 
     guide["forbidden_modernisms"] = list(profile.get("forbidden_modernisms") or [])
-    guide["translation_hints"] = list(profile.get("translation_hints") or [])
+    hints, hint_repairs = _sanitize_translation_hints(
+        profile.get("translation_hints") or [], decision_db=decision_db)
+    guide["translation_hints"] = hints
+    if hint_repairs:
+        guide["_translation_hint_name_repairs"] = hint_repairs
     guide["pun_watchlist"] = list(profile.get("pun_watchlist") or [])
 
     era_region = "，".join(x for x in (profile.get("era"), profile.get("region")) if x)

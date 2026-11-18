@@ -512,15 +512,23 @@ def main(argv=None, generate=None) -> int:
     if args.retrieval:
         try:
             from src.config import get_config
-            from src.story_graph import load_story_graph
+            from src.artifact_freshness import load_story_graph_checked
+            from src.style_profiler import load_profile
             from src.story_graph_query import StoryGraphQueryIndex
             cfg = get_config()
             rel = str((cfg.get("story_graph", {}) or {}).get("path")
                       or "input/story_graph.json")
             graph_path = Path(args.graph_path) if args.graph_path else root / rel
-            graph = load_story_graph(graph_path)
+            prof = load_profile(root / "input" / "book_profile.json")
+            checked = load_story_graph_checked(
+                root, graph_path, prof, require_current=True,
+                input_dir=root / "input")
+            graph = checked.get("graph")
             if not graph:
                 raise ValueError(f"graph not readable: {graph_path}")
+            if not checked.get("ok"):
+                raise ValueError(
+                    "stale graph rejected: " + ",".join(checked.get("reasons") or []))
             retrieval_index = StoryGraphQueryIndex(graph, input_dir=root / "input")
             print(f"🔎 [editor_review] cross-chapter retrieval on ({graph_path})")
         except Exception as exc:  # noqa: BLE001 - retrieval is fail-open

@@ -138,6 +138,16 @@ class QuotaExhaustedError(RuntimeError):
     """
 
 
+class UpstreamUnavailableError(RuntimeError):
+    """A provider repeatedly returned 5xx or could not be reached.
+
+    Unlike a content-specific client error, this says nothing about the prompt's
+    quality.  The role-level fallback wrapper may therefore move subsequent
+    calls to a configured backup provider instead of burning the whole chapter
+    on the same broken upstream route.
+    """
+
+
 class ContentSensitiveError(RuntimeError):
     """Round 148: 上游内容审核拒绝（HTTP 422，典型为 input new_sensitive）。
 
@@ -146,6 +156,20 @@ class ContentSensitiveError(RuntimeError):
     """
 
     status_code = 422
+
+
+def _is_upstream_unavailable_error(exc: BaseException) -> bool:
+    """Return True only for transport failures and persistent 5xx responses."""
+    if not isinstance(exc, requests.RequestException):
+        return False
+    response = getattr(exc, "response", None)
+    if response is None:
+        return True
+    try:
+        status = int(response.status_code)
+    except (TypeError, ValueError):
+        return True
+    return status >= 500 or status in (408, 425)
 
 
 class LLMAdapter(ABC):
@@ -455,6 +479,7 @@ class OpenAICompatibleAdapter(LLMAdapter):
                 time.sleep(limiter["interval"] - elapsed)
             limiter["last"] = time.time()
         last_error = None
+        upstream_unavailable = False
         for attempt in range(self.max_retries):
             try:
                 response = self._requests.post(
@@ -553,11 +578,15 @@ class OpenAICompatibleAdapter(LLMAdapter):
                 raise
             except Exception as e:
                 last_error = e
+                upstream_unavailable = _is_upstream_unavailable_error(e)
                 if attempt < self.max_retries - 1:
                     wait_time = self.retry_delay * (2 ** attempt) + random.uniform(0, 1)
                     print(f"⚠️ API 调用失败 (尝试 {attempt + 1}/{self.max_retries}): {e}, {wait_time:.1f}s 后重试...")
                     time.sleep(wait_time)
 
+        if upstream_unavailable:
+            raise UpstreamUnavailableError(
+                f"上游服务连续不可用，已重试 {self.max_retries} 次: {last_error}")
         raise RuntimeError(f"API 调用失败，已重试 {self.max_retries} 次: {last_error}")
 
     def unload_model(self):
@@ -637,12 +666,15 @@ class FallbackRoleAdapter(LLMAdapter):
                 )
                 self._sync_audit(self._primary)
                 return out
-            except QuotaExhaustedError as e:
+            except (QuotaExhaustedError, UpstreamUnavailableError) as e:
                 self._degraded = True
+                reason = ("配额/限流耗尽"
+                          if isinstance(e, QuotaExhaustedError)
+                          else "上游服务持续不可用")
                 print(
-                    f"⛔ [Quota Fallback] {self._primary_model_name} 配额/限流耗尽 → "
+                    f"⛔ [Role Fallback] {self._primary_model_name} {reason} → "
                     f"永久降级到 {self._fallback_model_name}（role={self._fallback_role}；"
-                    f"配额重置后重启进程恢复主力） | {e}",
+                    f"恢复后重启进程回到主力） | {e}",
                     file=sys.stderr, flush=True,
                 )
         kwargs = dict(kwargs)

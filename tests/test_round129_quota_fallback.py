@@ -49,6 +49,31 @@ class _FakeHTTPError(Exception):
 
 
 class Test429Handling:
+    def test_persistent_500_raises_upstream_unavailable(self):
+        from src.utils.llm_adapter import (
+            OpenAICompatibleAdapter,
+            UpstreamUnavailableError,
+        )
+        import requests
+
+        class _Resp500(_Resp):
+            def raise_for_status(self):
+                error = requests.HTTPError("500 Server Error")
+                error.response = self
+                raise error
+
+        adapter = _mk_adapter("https://token.ai-hf.cn/v1")
+        state = {"calls": 0}
+
+        def _post(url, **kwargs):
+            state["calls"] += 1
+            return _Resp500(500)
+
+        adapter._requests = types.SimpleNamespace(post=_post)
+        with pytest.raises(UpstreamUnavailableError):
+            adapter.generate("p", model_name="Qwen3.8-Flash-Next-SS")
+        assert state["calls"] == 3
+
     def test_single_429_then_success(self):
         """首次 429 属瞬时限流 → 退避重试后成功，不判配额耗尽。"""
         from src.utils.llm_adapter import OpenAICompatibleAdapter
@@ -138,6 +163,19 @@ class TestFallbackRoleAdapter:
         assert out2 == "兜底译文"
         assert len(primary.calls) == 1
         assert fallback.calls[1]["kwargs"]["effort"] == "max", "max 在两家均合法，原样透传"
+
+    def test_degrades_on_persistent_upstream_500(self):
+        from src.utils.llm_adapter import UpstreamUnavailableError
+        primary = _StubClient(exc=UpstreamUnavailableError("upstream 500"))
+        fallback = _StubClient(out="兜底译文")
+        adapter = self._mk(primary, fallback)
+
+        out = adapter.generate("p", model_name="Qwen3.8-Flash-Next-SS",
+                               effort="none")
+
+        assert out == "兜底译文"
+        assert adapter.degraded is True
+        assert fallback.calls[0]["model_name"] == "Deepseek-V4.1-Flash-1017-SS"
 
     def test_non_quota_error_not_degraded(self):
         primary = _StubClient(exc=RuntimeError("网络超时"))
@@ -230,6 +268,9 @@ class TestConfigRound129:
     def test_primary_fallback_role_configured(self, cfg):
         assert cfg.models["primary"].get("fallback_role") == "secondary"
 
+    def test_literal_translator_fallback_role_configured(self, cfg):
+        assert cfg.models["literal_translator"].get("fallback_role") == "secondary"
+
     def test_rewrite_moved_to_secondary_max(self, cfg):
         assert cfg.get_task_role("literary_rewrite") == "secondary"
         _, params = cfg.resolve_task_model("literary_rewrite")
@@ -243,7 +284,9 @@ class TestConfigRound129:
 
     def test_monolith_mirrors(self):
         src = (PROJECT / "src" / "translator_agent.py").read_text(encoding="utf-8")
-        for sym in ("class QuotaExhaustedError", "class FallbackRoleAdapter",
+        for sym in ("class QuotaExhaustedError",
+                    "class UpstreamUnavailableError",
+                    "class FallbackRoleAdapter",
                     "def _build_single_client", "def _map_effort_for_fallback",
                     "_QUOTA_HINT_RE"):
             assert sym in src, f"单体须镜像 {sym}（需重建 build_integrated）"
