@@ -51,6 +51,13 @@ NO_NORMALIZE=false
 SKIP_DEEP_PROFILE=false
 CHAPTERS_DIR="input"
 
+# 单实例锁状态（Round 158 事故硬化）。主锁与 Python CLI 共用；运行期副锁
+# 放在仓库外，防止主锁路径被删除/替换后新旧两个进程各锁一个 inode。
+LOCK_FILE=""
+LOCK_GUARD_FILE=""
+LOCK_PRIMARY_HELD=0
+LOCK_GUARD_HELD=0
+
 # 颜色输出
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -98,6 +105,7 @@ handle_sigint() {
 run_cmd() {
     # 长时间 Python 子命令统一走这里：rc=130 表示用户第二次 Ctrl+C，
     # 必须立即终止整个批次，不能把该章当普通失败后继续下一章。
+    assert_instance_lock_intact
     PY_CHILD_ACTIVE=1
     set +e
     local rc=0
@@ -117,6 +125,8 @@ run_cmd() {
     fi
     set -e
     PY_CHILD_ACTIVE=0
+    # 长子进程期间若锁路径被删除/替换，下一处写操作前必须 fail-closed。
+    assert_instance_lock_intact
     if [[ $rc -eq 130 ]]; then
         log_err "Python 任务已确认中止（exit=130）；已完成进度已保存，可断点续跑。"
         exit 130
@@ -344,6 +354,7 @@ PY
 # ===========================
 convert_epub() {
     log_info "切分输入 -> 章节 Markdown..."
+    assert_instance_lock_intact
     mkdir -p "$PROJECT_ROOT/$CHAPTERS_DIR"
 
     # 使用聚合脚本的 split 子命令（支持 EPUB/TXT/MD 自动识别）
@@ -773,6 +784,7 @@ print()
 # ===========================
 clean_intermediate() {
     log_info "清理中间产物（保守策略）..."
+    assert_instance_lock_intact
 
     local deleted_count=0
     local saved_count=0
@@ -808,6 +820,7 @@ clean_intermediate() {
 # 清空历史状态（--reset）
 # ===========================
 reset_state() {
+    assert_instance_lock_intact
     local confirm_msg="即将清空所有历史翻译数据：\n  - 任务数据库 (db/workflow.db)\n  - 决策数据库 (db/decision_db.sqlite)\n  - 全部输出文件 (output/)\n  - 章节源文件 (input/ —— 下次运行时会从 EPUB 重新生成)"
     
     if [[ -t 0 ]]; then
@@ -848,22 +861,85 @@ reset_state() {
 # 共用同一把 flock 文件（flock(1) 与 fcntl.flock 底层同源，互相阻塞）。
 # 应急绕过：SAGATRANS_ALLOW_CONCURRENT=1（会打警告，风险自担）。
 # ────────────────────────────────────────────────────────────────────
+_lock_guard_path() {
+    local primary="$1"
+    if [[ -n "${SAGATRANS_GUARD_LOCK_PATH:-}" ]]; then
+        printf '%s\n' "$SAGATRANS_GUARD_LOCK_PATH"
+        return 0
+    fi
+    local runtime_dir="${SAGATRANS_LOCK_RUNTIME_DIR:-/tmp}"
+    local canonical digest uid
+    canonical=$(realpath -m -- "$primary")
+    digest=$(printf '%s' "$canonical" | sha256sum | awk '{print $1}')
+    uid="${UID:-$(id -u)}"
+    printf '%s/sagatrans-%s-%s.lock\n' "$runtime_dir" "$uid" "${digest:0:16}"
+}
+
+_assert_lock_fd_identity() {
+    local fd="$1" path="$2" label="$3"
+    local fd_id path_id
+    fd_id=$(stat -Lc '%d:%i' "/proc/$$/fd/$fd" 2>/dev/null) || {
+        log_err "⛔ [Lock] ${label} FD $fd 已失效；为防止双写，流程中止"
+        exit 1
+    }
+    path_id=$(stat -Lc '%d:%i' "$path" 2>/dev/null) || {
+        log_err "⛔ [Lock] ${label}路径不存在：$path；旧 FD 仍指向已删除 inode，流程中止"
+        exit 1
+    }
+    if [[ "$fd_id" != "$path_id" ]]; then
+        log_err "⛔ [Lock] ${label} inode 已被替换（fd=$fd_id path=$path_id）：$path"
+        log_err "   这会让新旧实例各自持锁并双写；已 fail-closed 中止。"
+        exit 1
+    fi
+}
+
+assert_instance_lock_intact() {
+    [[ "${SAGATRANS_LOCK_HELD:-0}" == "1" ]] || return 0
+    if [[ "$LOCK_PRIMARY_HELD" == "1" && -n "$LOCK_FILE" ]]; then
+        _assert_lock_fd_identity 9 "$LOCK_FILE" "主锁"
+    fi
+    if [[ "$LOCK_GUARD_HELD" == "1" && -n "$LOCK_GUARD_FILE" ]]; then
+        _assert_lock_fd_identity 8 "$LOCK_GUARD_FILE" "运行期副锁"
+    fi
+}
+
 acquire_instance_lock() {
-    local lock_file="${SAGATRANS_LOCK_PATH:-$PROJECT_ROOT/db/.sagatrans.lock}"
-    mkdir -p "$(dirname "$lock_file")"
-    exec 9>>"$lock_file"
+    LOCK_FILE="${SAGATRANS_LOCK_PATH:-$PROJECT_ROOT/db/.sagatrans.lock}"
+    mkdir -p "$(dirname "$LOCK_FILE")"
+    exec 9>>"$LOCK_FILE"
     if ! flock -n 9; then
         local holder
-        holder=$(head -c 200 "$lock_file" 2>/dev/null | tr '\n' ' ')
+        holder=$(head -c 200 "$LOCK_FILE" 2>/dev/null | tr '\n' ' ')
         if [[ "${SAGATRANS_ALLOW_CONCURRENT:-}" == "1" ]]; then
             log_warn "⚠️ [Lock] 已有 SagaTrans 实例在运行（${holder:-未知}）——SAGATRANS_ALLOW_CONCURRENT=1 放行"
         else
             log_err "⛔ [Lock] 已有 SagaTrans 实例在运行：${holder:-未知}"
-            log_err "   锁文件: $lock_file；确认无残留进程后可设 SAGATRANS_ALLOW_CONCURRENT=1 强制放行（风险自担）"
+            log_err "   锁文件: $LOCK_FILE；确认无残留进程后可设 SAGATRANS_ALLOW_CONCURRENT=1 强制放行（风险自担）"
             exit 1
         fi
     else
-        printf 'pid=%s started=%s cmd=translate_book.sh %s\n' "$$" "$(date '+%F %T')" "$*" >"$lock_file"
+        LOCK_PRIMARY_HELD=1
+        printf 'pid=%s started=%s cmd=translate_book.sh %s\n' "$$" "$(date '+%F %T')" "$*" >&9
+
+        LOCK_GUARD_FILE="$(_lock_guard_path "$LOCK_FILE")"
+        mkdir -p "$(dirname "$LOCK_GUARD_FILE")"
+        exec 8>>"$LOCK_GUARD_FILE"
+        if ! flock -n 8; then
+            local guard_holder
+            guard_holder=$(head -c 200 "$LOCK_GUARD_FILE" 2>/dev/null | tr '\n' ' ')
+            if [[ "${SAGATRANS_ALLOW_CONCURRENT:-}" == "1" ]]; then
+                log_warn "⚠️ [Lock] 运行期副锁已被持有（${guard_holder:-未知}）——SAGATRANS_ALLOW_CONCURRENT=1 放行"
+            else
+                log_err "⛔ [Lock] 运行期副锁已被持有：${guard_holder:-未知}"
+                log_err "   副锁: $LOCK_GUARD_FILE；主锁路径可能曾被替换，拒绝双写风险。"
+                exit 1
+            fi
+        else
+            LOCK_GUARD_HELD=1
+            printf 'pid=%s started=%s cmd=translate_book.sh %s\n' "$$" "$(date '+%F %T')" "$*" >&8
+        fi
+
+        assert_instance_lock_intact
         export SAGATRANS_LOCK_HELD=1
     fi
 }
@@ -1185,4 +1261,6 @@ except Exception:
     log_info "========================================"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

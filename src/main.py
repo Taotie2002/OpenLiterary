@@ -16,6 +16,7 @@ SagaTrans CLI 统一入口
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -191,6 +192,7 @@ def print_banner():
 # 历史事故：双进程让 MiniMax 配额瞬间打爆、chunk 状态互相覆盖、整章重译两遍。
 # ────────────────────────────────────────────────────────────────────
 _INSTANCE_LOCK_FD: Optional[int] = None
+_INSTANCE_GUARD_FD: Optional[int] = None
 
 _MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile", "story-graph",
                       "consolidate", "finalize", "notes-normalize", "requeue",
@@ -205,6 +207,64 @@ _MUTATING_COMMANDS = {"pipeline", "init", "split", "style-profile", "story-graph
 def _default_lock_path() -> Path:
     """Project-root lock path, independent of the caller's cwd."""
     return Path(__file__).resolve().parent.parent / "db" / ".sagatrans.lock"
+
+
+def _guard_lock_path(primary: Path) -> Path:
+    """Return the secondary runtime lock paired with ``primary``.
+
+    The primary path lives inside the repository and can be unlinked by a
+    cleanup/test command.  An old writer then keeps the deleted inode while a
+    new writer opens the replacement path, so both can pass ``flock``.  This
+    second lock lives outside the repository and is keyed by the absolute
+    primary path; it closes that split-brain window without breaking
+    interoperability with writers that still hold the primary lock.
+    """
+    override = os.environ.get("SAGATRANS_GUARD_LOCK_PATH")
+    if override:
+        return Path(override).expanduser()
+    runtime_dir = Path(os.environ.get("SAGATRANS_LOCK_RUNTIME_DIR") or "/tmp")
+    canonical = os.path.abspath(os.path.expanduser(str(primary)))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    uid = os.getuid() if hasattr(os, "getuid") else os.getpid()
+    return runtime_dir / f"sagatrans-{uid}-{digest}.lock"
+
+
+def _acquire_flock(path: Path, label: str) -> Optional[int]:
+    """Acquire one non-blocking flock; ``None`` means explicit bypass."""
+    import fcntl
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:
+        if os.environ.get("SAGATRANS_ALLOW_CONCURRENT") == "1":
+            print(f"⚠️ [Lock] 无法创建锁文件（{label}） {path}: {e}——"
+                  f"SAGATRANS_ALLOW_CONCURRENT=1 放行", file=sys.stderr)
+            return None
+        print(f"⛔ [Lock] 无法创建锁文件（{label}） {path}: {e}", file=sys.stderr)
+        print("   单实例保护不可用，拒绝执行；修复目录权限或设置 SAGATRANS_LOCK_PATH。",
+              file=sys.stderr)
+        return -1
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            holder = path.read_text(encoding="utf-8").strip().replace("\n", " ") or "(无持有者信息)"
+        except OSError:
+            holder = "(无持有者信息)"
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        if os.environ.get("SAGATRANS_ALLOW_CONCURRENT") == "1":
+            print(f"⚠️ [Lock] 已有 SagaTrans 实例持有锁文件（{label}）（{holder}）——"
+                  f"SAGATRANS_ALLOW_CONCURRENT=1 放行", file=sys.stderr)
+            return None
+        print(f"⛔ [Lock] 已有 SagaTrans 实例在运行：{holder}", file=sys.stderr)
+        print(f"   锁文件（{label}）: {path}；确认无残留进程后可设 "
+              f"SAGATRANS_ALLOW_CONCURRENT=1 强制放行（风险自担）", file=sys.stderr)
+        return -1
+    return fd
 
 
 def _command_needs_lock(command: str, args: object) -> bool:
@@ -258,44 +318,32 @@ def acquire_instance_lock(lock_path: Optional[Path] = None) -> bool:
         True  — 已持有（或由祖先进程持有 / 放行开关生效），可继续执行；
         False — 已有另一实例在运行，调用方应中止。
     """
-    global _INSTANCE_LOCK_FD
+    global _INSTANCE_LOCK_FD, _INSTANCE_GUARD_FD
     if os.environ.get("SAGATRANS_LOCK_HELD") == "1":
         return True
-    import fcntl
     import time as _time
     override = os.environ.get("SAGATRANS_LOCK_PATH")
     path = Path(lock_path or override) if (lock_path or override) else _default_lock_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
-    except OSError as e:
-        if os.environ.get("SAGATRANS_ALLOW_CONCURRENT") == "1":
-            print(f"⚠️ [Lock] 无法创建锁文件 {path}: {e}——"
-                  f"SAGATRANS_ALLOW_CONCURRENT=1 放行", file=sys.stderr)
-            return True
-        print(f"⛔ [Lock] 无法创建锁文件 {path}: {e}", file=sys.stderr)
-        print("   单实例保护不可用，拒绝执行；修复目录权限或设置 SAGATRANS_LOCK_PATH。",
-              file=sys.stderr)
+    fd = _acquire_flock(path, "主锁")
+    if fd == -1:
         return False
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        try:
-            holder = path.read_text(encoding="utf-8").strip().replace("\n", " ") or "(无持有者信息)"
-        except OSError:
-            holder = "(无持有者信息)"
+    if fd is None:  # explicit concurrent bypass
+        return True
+
+    guard_path = _guard_lock_path(path)
+    guard_fd = _acquire_flock(guard_path, "运行期副锁")
+    if guard_fd == -1:
         try:
             os.close(fd)
         except OSError:
             pass
-        if os.environ.get("SAGATRANS_ALLOW_CONCURRENT") == "1":
-            print(f"⚠️ [Lock] 已有 SagaTrans 实例在运行（{holder}）——"
-                  f"SAGATRANS_ALLOW_CONCURRENT=1 放行", file=sys.stderr)
-            return True
-        print(f"⛔ [Lock] 已有 SagaTrans 实例在运行：{holder}", file=sys.stderr)
-        print(f"   锁文件: {path}；确认无残留进程后可设 SAGATRANS_ALLOW_CONCURRENT=1 强制放行（风险自担）",
-              file=sys.stderr)
         return False
+    if guard_fd is None:  # explicit concurrent bypass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        return True
     try:
         os.ftruncate(fd, 0)
         os.lseek(fd, 0, os.SEEK_SET)
@@ -304,6 +352,7 @@ def acquire_instance_lock(lock_path: Optional[Path] = None) -> bool:
     except OSError:
         pass
     _INSTANCE_LOCK_FD = fd  # 进程存活期间保持打开；fd 随进程退出关闭 → 自动释放锁
+    _INSTANCE_GUARD_FD = guard_fd
     return True
 
 

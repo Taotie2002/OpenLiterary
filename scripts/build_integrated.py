@@ -1501,8 +1501,8 @@ def build_section_13() -> str:
         ]),
         # Round 130: 单实例守卫（main() 引用，须随 Section 10 一并进入单体）
         ("main.py", [
-            "_INSTANCE_LOCK_FD", "_MUTATING_COMMANDS", "_SIGINT_WARNED",
-            "_default_lock_path",
+            "_INSTANCE_LOCK_FD", "_INSTANCE_GUARD_FD", "_MUTATING_COMMANDS", "_SIGINT_WARNED",
+            "_default_lock_path", "_guard_lock_path", "_acquire_flock",
             "acquire_instance_lock", "_install_sigint_guard",
             "_command_needs_lock",
         ]),

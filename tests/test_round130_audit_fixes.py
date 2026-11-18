@@ -62,7 +62,8 @@ def _hold_lock(path: Path):
 # 审计① 单实例 flock 守卫
 # ────────────────────────────────────────────────────────────────────
 class TestInstanceLockGuard:
-    ENV_KEYS = ("SAGATRANS_LOCK_HELD", "SAGATRANS_ALLOW_CONCURRENT")
+    ENV_KEYS = ("SAGATRANS_LOCK_HELD", "SAGATRANS_ALLOW_CONCURRENT",
+                "SAGATRANS_GUARD_LOCK_PATH", "SAGATRANS_LOCK_RUNTIME_DIR")
 
     @pytest.fixture(autouse=True)
     def _clean(self, monkeypatch):
@@ -70,12 +71,14 @@ class TestInstanceLockGuard:
             monkeypatch.delenv(k, raising=False)
         yield
         import src.main as m
-        if m._INSTANCE_LOCK_FD is not None:
-            try:
-                os.close(m._INSTANCE_LOCK_FD)
-            except OSError:
-                pass
-            m._INSTANCE_LOCK_FD = None
+        for attr in ("_INSTANCE_LOCK_FD", "_INSTANCE_GUARD_FD"):
+            fd = getattr(m, attr, None)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                setattr(m, attr, None)
 
     def test_acquire_free_lock_and_write_holder(self, tmp_path):
         from src.main import acquire_instance_lock
