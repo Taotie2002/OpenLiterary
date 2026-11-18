@@ -41517,6 +41517,11 @@ _BR_CANONICAL_ALIAS_RULES: Tuple[Tuple[str, str, str, str], ...] = (
     # rule from touching unrelated CJK prose.
     ("兰萨德", "兰兹拉德", "Landsraad",
      "registry id=266 canonical=兰兹拉德; decision id=22/3442; source-gated Landsraad"),
+    ("埃斯马·图克", "埃斯玛·图克", "Esmar Tuek",
+     "decision id=3585 canonical=埃斯玛·图克; source-gated Esmar Tuek"),
+    ("杰西卡女士", "杰西卡夫人", "Lady Jessica",
+     "decision id=54/1107 canonical=杰西卡夫人; 15 completed chunks use 杰西卡夫人; "
+     "article id=3488 is a shadow; source-gated Lady Jessica"),
 )
 
 # English glosses in parentheses and footnotes are evidence, not prose.  A
