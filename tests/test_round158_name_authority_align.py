@@ -26,13 +26,19 @@ def _make_db(root: Path, decisions, registry) -> Path:
     try:
         con.execute(
             "CREATE TABLE decision_db (id INTEGER PRIMARY KEY, level INTEGER, "
-            "source_key TEXT UNIQUE, translation TEXT, locked INTEGER DEFAULT 0)"
+            "source_key TEXT UNIQUE, translation TEXT, locked INTEGER DEFAULT 0, "
+            "reason TEXT)"
         )
         con.execute(
             "CREATE TABLE entity_registry (id INTEGER PRIMARY KEY, canonical_name TEXT, "
             "source_names TEXT, context_names TEXT, quarantined_names TEXT, "
             "variant_names TEXT, entity_type TEXT, confidence TEXT, "
             "pending_review INTEGER DEFAULT 0, review_reason TEXT, updated_at TEXT)"
+        )
+        con.execute(
+            "CREATE TABLE pending_backtrack (chunk_id TEXT PRIMARY KEY, "
+            "decision_id INTEGER, source_key TEXT, queue_rounds INTEGER, "
+            "created_at TEXT, updated_at TEXT)"
         )
         con.executemany(
             "INSERT INTO decision_db (id, level, source_key, translation) "
@@ -145,6 +151,83 @@ def _locked_short_variant_db(root: Path, *, competing: bool = False) -> Path:
     return db
 
 
+def _duplicate_form_db(
+    root: Path,
+    *,
+    canonical: str = "法弗雷卢什",
+    pending_review: int = 0,
+    locked_decision: int = 0,
+) -> Path:
+    db = _make_db(
+        root,
+        [
+            (1, "Faufreluches", "福弗雷卢什"),
+            (2, "faufreluches", "法弗雷卢什"),
+        ],
+        [(9, canonical, ["Faufreluches"], pending_review)],
+    )
+    if locked_decision:
+        con = sqlite3.connect(str(db))
+        try:
+            con.execute(
+                "UPDATE decision_db SET locked=1 WHERE id=?",
+                (locked_decision,))
+            con.commit()
+        finally:
+            con.close()
+    return db
+
+
+def _resolved_pending_db(root: Path, *, canonical: str = "福弗雷卢什") -> Path:
+    db = _make_db(
+        root,
+        [(1, "Faufreluches", canonical)],
+        [(9, canonical, ["Faufreluches"], 1)],
+    )
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute(
+            "UPDATE entity_registry SET review_reason=? WHERE id=9",
+            (f"称谓差异大: 新实体 法弗雷卢什 与现有 {canonical} 可能指向同一对象 | "
+             f"Round158 duplicate source form consensus: 法弗雷卢什 -> {canonical}",))
+        con.commit()
+    finally:
+        con.close()
+    return db
+
+
+def _write_finals(root: Path, texts) -> None:
+    for chunk_id, text in texts.items():
+        chapter = chunk_id.split("_", 1)[0]
+        path = root / "output" / chapter / f"{chunk_id}_final.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"text": text}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+
+def _decision_translation(db: Path, decision_id: int) -> str:
+    con = sqlite3.connect(str(db))
+    try:
+        row = con.execute(
+            "SELECT translation FROM decision_db WHERE id=?",
+            (decision_id,)).fetchone()
+        return str(row[0]) if row else ""
+    finally:
+        con.close()
+
+
+def _pending_rows(db: Path) -> list[tuple]:
+    con = sqlite3.connect(str(db))
+    try:
+        return list(con.execute(
+            "SELECT chunk_id, decision_id, source_key, queue_rounds "
+            "FROM pending_backtrack ORDER BY chunk_id"))
+    finally:
+        con.close()
+
+
 def test_clean_fixture_plans_no_changes(tmp_path: Path):
     db = _clean_db(tmp_path)
     before = _digest(db)
@@ -159,7 +242,9 @@ def test_clean_fixture_plans_no_changes(tmp_path: Path):
     assert result["manual_review"] == []
     assert result["counts"] == {
         "quarantine_aliases": 0, "align_canonical": 0,
-        "register_locked_variant": 0, "manual_review": 0,
+        "align_decision_forms": 0, "clear_resolved_pending_review": 0,
+        "register_locked_variant": 0,
+        "manual_review": 0,
     }
     assert Path(result["json_path"]).exists()
     assert Path(result["md_path"]).exists()
@@ -460,3 +545,221 @@ def test_write_failure_rolls_back_every_applied_action(tmp_path: Path):
     first = _registry_row(db, 1)
     assert first["source_names"] == ["M’Lord Harkonnen"]
     assert first["quarantined_names"] == []
+
+
+def test_duplicate_form_corpus_majority_aligns_decision_and_registry(tmp_path: Path):
+    db = _duplicate_form_db(tmp_path)
+    _write_finals(tmp_path, {
+        "ch01_chunk001": "福弗雷卢什",
+        "ch02_chunk001": "福弗雷卢什",
+        "ch03_chunk001": "福弗雷卢什",
+        "ch04_chunk001": "福弗雷卢什",
+        "ch05_chunk001": "法弗雷卢什",
+    })
+
+    plan = align.build_name_authority_alignment(tmp_path, decision_db=db)
+
+    assert plan["ok"] is True
+    assert plan["counts"]["align_decision_forms"] == 1
+    action = plan["actions"][0]
+    assert action["action"] == "align_decision_forms"
+    assert action["decision_ids"] == [2]
+    assert action["new_translation"] == "福弗雷卢什"
+    assert action["queued_chunks"] == ["ch05_chunk001"]
+
+    result = align.align_name_authorities(
+        tmp_path, decision_db=db, apply=True, run_id="duplicate-form")
+
+    assert result["ok"] is True
+    assert result["applied_count"] == 1
+    assert _decision_translation(db, 1) == "福弗雷卢什"
+    assert _decision_translation(db, 2) == "福弗雷卢什"
+    assert _registry_row(db, 9)["canonical_name"] == "福弗雷卢什"
+    assert _pending_rows(db) == [("ch05_chunk001", 2, "faufreluches", 1)]
+
+
+def test_duplicate_form_allows_pending_row_when_canonical_is_winner(tmp_path: Path):
+    db = _duplicate_form_db(
+        tmp_path, canonical="福弗雷卢什", pending_review=1)
+    _write_finals(tmp_path, {
+        "ch01_chunk001": "福弗雷卢什",
+        "ch02_chunk001": "福弗雷卢什",
+        "ch03_chunk001": "福弗雷卢什",
+        "ch04_chunk001": "福弗雷卢什",
+        "ch05_chunk001": "法弗雷卢什",
+    })
+
+    plan = align.build_name_authority_alignment(tmp_path, decision_db=db)
+
+    assert plan["ok"] is True
+    assert plan["counts"]["align_decision_forms"] == 1
+
+
+def test_duplicate_form_rejects_locked_minority(tmp_path: Path):
+    db = _duplicate_form_db(tmp_path, locked_decision=2)
+    _write_finals(tmp_path, {
+        "ch01_chunk001": "福弗雷卢什",
+        "ch02_chunk001": "福弗雷卢什",
+        "ch03_chunk001": "福弗雷卢什",
+        "ch04_chunk001": "福弗雷卢什",
+        "ch05_chunk001": "法弗雷卢什",
+    })
+    before = _digest(db)
+
+    plan = align.build_name_authority_alignment(tmp_path, decision_db=db)
+
+    assert plan["actions"] == []
+    assert plan["manual_review"][0]["blocked_reason"] == "minority_decision_locked"
+    assert _digest(db) == before
+
+
+def test_duplicate_form_rejects_narrow_corpus_majority(tmp_path: Path):
+    db = _duplicate_form_db(tmp_path)
+    _write_finals(tmp_path, {
+        "ch01_chunk001": "福弗雷卢什",
+        "ch02_chunk001": "福弗雷卢什",
+        "ch03_chunk001": "福弗雷卢什",
+        "ch04_chunk001": "法弗雷卢什",
+        "ch05_chunk001": "法弗雷卢什",
+    })
+
+    plan = align.build_name_authority_alignment(tmp_path, decision_db=db)
+
+    assert plan["actions"] == []
+    assert plan["manual_review"][0]["blocked_reason"] == (
+        "corpus_majority_too_narrow")
+
+
+def test_duplicate_form_rejects_registry_canonical_third_form(tmp_path: Path):
+    db = _duplicate_form_db(tmp_path, canonical="福弗雷卢斯")
+    _write_finals(tmp_path, {
+        "ch01_chunk001": "福弗雷卢什",
+        "ch02_chunk001": "福弗雷卢什",
+        "ch03_chunk001": "福弗雷卢什",
+        "ch04_chunk001": "福弗雷卢什",
+        "ch05_chunk001": "法弗雷卢什",
+    })
+
+    plan = align.build_name_authority_alignment(tmp_path, decision_db=db)
+
+    assert plan["counts"]["align_decision_forms"] == 0
+    assert plan["manual_review"][0]["blocked_reason"] == (
+        "registry_canonical_is_third_form")
+
+
+def test_duplicate_form_rejects_winner_owned_by_another_registry_row(tmp_path: Path):
+    db = _make_db(
+        tmp_path,
+        [
+            (1, "Faufreluches", "福弗雷卢什"),
+            (2, "faufreluches", "法弗雷卢什"),
+        ],
+        [
+            (9, "法弗雷卢什", ["Faufreluches"]),
+            (10, "福弗雷卢什", ["Another source"]),
+        ],
+    )
+    _write_finals(tmp_path, {
+        "ch01_chunk001": "福弗雷卢什",
+        "ch02_chunk001": "福弗雷卢什",
+        "ch03_chunk001": "福弗雷卢什",
+        "ch04_chunk001": "福弗雷卢什",
+        "ch05_chunk001": "法弗雷卢什",
+    })
+
+    plan = align.build_name_authority_alignment(tmp_path, decision_db=db)
+
+    assert plan["actions"] == []
+    assert plan["manual_review"][0]["blocked_reason"] == (
+        "winner_registry_owned:10")
+
+
+def test_duplicate_form_with_no_stale_chunks_still_cleans_decision(tmp_path: Path):
+    db = _duplicate_form_db(tmp_path)
+    _write_finals(tmp_path, {
+        "ch01_chunk001": "福弗雷卢什",
+        "ch02_chunk001": "福弗雷卢什",
+        "ch03_chunk001": "福弗雷卢什",
+        "ch04_chunk001": "福弗雷卢什",
+    })
+
+    plan = align.build_name_authority_alignment(tmp_path, decision_db=db)
+
+    assert plan["counts"]["align_decision_forms"] == 1
+    assert plan["actions"][0]["queued_chunks"] == []
+
+    result = align.align_name_authorities(
+        tmp_path, decision_db=db, apply=True, run_id="no-stale")
+
+    assert result["ok"] is True
+    assert _decision_translation(db, 2) == "福弗雷卢什"
+    assert _pending_rows(db) == []
+
+
+def test_duplicate_form_read_only_plan_writes_no_db(tmp_path: Path):
+    db = _duplicate_form_db(tmp_path)
+    _write_finals(tmp_path, {
+        "ch01_chunk001": "福弗雷卢什",
+        "ch02_chunk001": "福弗雷卢什",
+        "ch03_chunk001": "福弗雷卢什",
+        "ch04_chunk001": "福弗雷卢什",
+        "ch05_chunk001": "法弗雷卢什",
+    })
+    before = _digest(db)
+
+    plan = align.build_name_authority_alignment(tmp_path, decision_db=db)
+
+    assert plan["counts"]["align_decision_forms"] == 1
+    assert _digest(db) == before
+
+
+def test_resolved_pending_review_clears_only_with_consensus_marker(tmp_path: Path):
+    db = _resolved_pending_db(tmp_path)
+    _write_finals(tmp_path, {
+        "ch01_chunk001": "福弗雷卢什",
+        "ch02_chunk001": "福弗雷卢什",
+        "ch03_chunk001": "福弗雷卢什",
+    })
+
+    plan = align.build_name_authority_alignment(tmp_path, decision_db=db)
+
+    assert plan["counts"]["clear_resolved_pending_review"] == 1
+    action = next(a for a in plan["actions"]
+                  if a["action"] == "clear_resolved_pending_review")
+    assert action["registry_id"] == 9
+    assert action["corpus_chunks"] == 3
+
+    result = align.align_name_authorities(
+        tmp_path, decision_db=db, apply=True, run_id="clear-review")
+
+    assert result["ok"] is True
+    assert result["applied_count"] == 1
+    row = _registry_row(db, 9)
+    assert row["pending_review"] == 0
+    assert "pending review resolved" in str(row["review_reason"])
+
+
+def test_resolved_pending_review_requires_corpus_and_exact_marker(tmp_path: Path):
+    db = _resolved_pending_db(tmp_path)
+    _write_finals(tmp_path, {
+        "ch01_chunk001": "福弗雷卢什",
+        "ch02_chunk001": "福弗雷卢什",
+    })
+
+    thin = align.build_name_authority_alignment(tmp_path, decision_db=db)
+    assert thin["counts"]["clear_resolved_pending_review"] == 0
+
+    con = sqlite3.connect(str(db))
+    try:
+        con.execute(
+            "UPDATE entity_registry SET review_reason=? WHERE id=9",
+            ("称谓差异大: 新实体 法弗雷卢什 与现有 福弗雷卢什 可能指向同一对象",))
+        con.commit()
+    finally:
+        con.close()
+    _write_finals(tmp_path, {
+        "ch03_chunk001": "福弗雷卢什",
+    })
+
+    unmarked = align.build_name_authority_alignment(tmp_path, decision_db=db)
+    assert unmarked["counts"]["clear_resolved_pending_review"] == 0

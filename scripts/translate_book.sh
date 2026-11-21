@@ -1228,6 +1228,10 @@ except Exception:
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "Dry-run: 跳过 gate"
     else
+        # Gate ⑫ validates a sealed run log.  Seal before gate so the
+        # evidence covers every pre-gate command; gate's own events are an
+        # append-only extension and remain valid under prefix-hash checking.
+        finalize_task_log
         log_info "运行交付门禁 (gate)..."
         if run_cmd "$PYTHON" -m src.translator_agent gate; then
             log_ok "gate 全绿"

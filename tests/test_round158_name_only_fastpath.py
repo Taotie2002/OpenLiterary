@@ -1194,6 +1194,32 @@ def test_completed_name_repair_reaudit_failure_leaves_everything_intact(
         con.close()
 
 
+def test_completed_name_repair_infrastructure_failure_is_not_success(
+        tmp_path: Path):
+    _make_completed_fixture(tmp_path)
+    final_path = tmp_path / "output" / "ch01" / "ch01_chunk000_final.json"
+    report_path = tmp_path / "output" / "ch01" / "ch01_chunk000_critic_report.json"
+    before_final = final_path.read_bytes()
+    before_report = report_path.read_bytes()
+
+    def unavailable(candidate, source_text, raw_text, proposed_text, pipeline):
+        raise RuntimeError("network unavailable")
+
+    result = nof.apply_completed_name_repair(
+        tmp_path,
+        apply=True,
+        critic_fn=unavailable,
+        require_authority_audit=False,
+        run_id="completed-unavailable-run",
+    )
+
+    assert result["ok"] is False
+    assert result["counts"] == {"failed": 1}
+    assert any("network unavailable" in error for error in result["errors"])
+    assert final_path.read_bytes() == before_final
+    assert report_path.read_bytes() == before_report
+
+
 def _bad_completed_critic(candidate, source_text, raw_text, proposed_text, pipeline):
     report = _good_critic(
         candidate, source_text, raw_text, proposed_text, pipeline)

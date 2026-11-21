@@ -1032,6 +1032,21 @@ def _normalize_chapter_notes_once(text: str, start_num: int = 1):
         cluster_keys.pop(rj, None)
         return True
 
+    def _force_union(ri, rj):
+        # A shared explicit headword is stronger evidence than the narrower
+        # merge-key bridge check below.  Without this, three paraphrases such
+        # as ``“穆阿迪布”…`` can be pairwise duplicates while the middle pair
+        # prevents any transitive merge, leaving lint failures after
+        # notes-normalize.
+        if ri == rj:
+            return False
+        parent[rj] = ri
+        merged = dict(cluster_keys.get(ri, {}))
+        merged.update(cluster_keys.get(rj, {}))
+        cluster_keys[ri] = merged
+        cluster_keys.pop(rj, None)
+        return True
+
     # 1a) 同词条合并：同一章内同一术语的多种注释写法只保留一条。
     # 分块翻译会在不同 chunk 各自加注；merge 后再按章归并，避免成书出现
     # "门泰特 ×17" 这类重复条目。跨章各留一条，保持章内自包含。
@@ -1060,12 +1075,20 @@ def _normalize_chapter_notes_once(text: str, start_num: int = 1):
             # the same explanation may have been emitted in two carriers.
             ki = _note_merge_key(cand[i]['content'])
             kj = _note_merge_key(cand[j]['content'])
+            same_headword = (
+                _note_key(cand[i]['content'])
+                and _note_key(cand[i]['content']) == _note_key(cand[j]['content'])
+            )
             if not _note_keys_compatible(
                     cand[i]['content'], cand[j]['content'], ki, kj):
-                continue
+                if not same_headword:
+                    continue
             if _note_is_dup(cand[i]['content'], cand[j]['content'], stop=_stop):
                 ri, rj = _root(i), _root(j)
-                _union(ri, rj)
+                if same_headword:
+                    _force_union(ri, rj)
+                else:
+                    _union(ri, rj)
     clusters = {}
     for i in range(len(cand)):
         clusters.setdefault(_root(i), []).append(i)

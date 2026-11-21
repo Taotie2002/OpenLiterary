@@ -106,3 +106,17 @@ def test_seed_pun_decisions_uses_src_anchors():
          "anchors": ["牙鳕", "白垩粉"], "strategy": "双关"}]}, engine)
     assert p._seed_pun_decisions("‘The whiting,’ said the Gryphon.") == 1
     assert engine.add_decision.call_args.args[1] == "whiting"
+
+
+def test_seed_pun_decisions_normalizes_source_line_breaks():
+    engine = MagicMock()
+    p = _pipeline({"pun_watchlist": [{
+        "source": "Power and fear",
+        "src_anchors": ["“Power and fear,” he said. “The tools of statecraft.”"],
+        "anchors": ["权力与恐惧"],
+    }]}, engine)
+
+    source = ("The Duke said: “Power and\nfear,” he said. "
+              "“The tools of statecraft. I must order new emphasis.")
+    assert p._seed_pun_decisions(source) == 1
+    assert engine.add_decision.call_args.args[1] == "Power and fear"

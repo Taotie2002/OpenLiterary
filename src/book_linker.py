@@ -26,7 +26,7 @@ from src.artifact_freshness import (
     profile_source_freshness,
 )
 from src.judgment_layer import atomic_write_json, sha256_text
-from src.task_logging import now_iso, sha256_file, validate_jsonl
+from src.task_logging import now_iso, sha256_file, sha256_prefix, validate_jsonl
 
 MANIFEST_SCHEMA_VERSION = 1
 DEFAULT_MANIFEST_PATH = "output/build_manifest.json"
@@ -127,7 +127,9 @@ def _run_evidence(root: Path, run_id: Optional[str]) -> Dict[str, Any]:
         "log_path": _rel(root, text) if text else "",
         "seal_path": _rel(root, seal) if seal else "",
         "jsonl_sha256": str((sealed or {}).get("jsonl_sha256") or ""),
+        "jsonl_bytes": int((sealed or {}).get("jsonl_bytes") or 0),
         "log_sha256": str((sealed or {}).get("log_sha256") or ""),
+        "log_bytes": int((sealed or {}).get("log_bytes") or 0),
         "sealed": bool(sealed),
         "sealed_at": str((sealed or {}).get("sealed_at") or ""),
         "seq_last": int((sealed or {}).get("seq_last") or 0),
@@ -277,7 +279,9 @@ def update_manifest_run_evidence(root: Path, manifest_path: Path,
         "log_path": _rel(root, log_dir / f"{run_id}.log"),
         "seal_path": _rel(root, log_dir / f"{run_id}.sha256"),
         "jsonl_sha256": str(seal.get("jsonl_sha256") or ""),
+        "jsonl_bytes": int(seal.get("jsonl_bytes") or 0),
         "log_sha256": str(seal.get("log_sha256") or ""),
+        "log_bytes": int(seal.get("log_bytes") or 0),
         "sealed": True,
         "sealed_at": str(seal.get("sealed_at") or ""),
         "seq_last": int(seal.get("seq_last") or 0),
@@ -563,15 +567,57 @@ def _check_run_evidence(root: Path, manifest: Dict[str, Any],
     if sealed:
         seal = _read_json(seal_path) or {}
         actual = sha256_file(jsonl)
-        if str(seal.get("jsonl_sha256") or "") != actual:
+        actual_bytes = jsonl.stat().st_size
+
+        def _seal_matches(record: Dict[str, Any], kind: str) -> Tuple[bool, str]:
+            expected = str(record.get("jsonl_sha256") or "")
+            if not expected:
+                return False, "missing_hash"
+            expected_bytes = int(record.get("jsonl_bytes") or 0)
+            if expected_bytes:
+                if actual_bytes < expected_bytes:
+                    return False, f"{kind}_truncated"
+                if sha256_prefix(jsonl, expected_bytes) != expected:
+                    return False, f"{kind}_prefix_changed"
+                return True, ("exact" if actual_bytes == expected_bytes
+                              else f"{kind}_append_only")
+            # Legacy seals have no byte count: require an exact match so a
+            # silently truncated or rewritten file can never pass.
+            return (actual == expected), ("exact" if actual == expected
+                                          else f"{kind}_hash_changed")
+
+        seal_ok, seal_kind = _seal_matches(seal, "seal")
+        evidence_ok, evidence_kind = (True, "absent")
+        if evidence.get("jsonl_sha256"):
+            evidence_ok, evidence_kind = _seal_matches(evidence, "manifest")
+        if not seal_ok:
             items.append(_item("run.seal", "fail", "封存哈希与 JSONL 不一致",
-                               expected=seal.get("jsonl_sha256"), actual=actual))
-        elif evidence.get("jsonl_sha256") and \
-                evidence.get("jsonl_sha256") != actual:
+                               expected=seal.get("jsonl_sha256"), actual=actual,
+                               expected_bytes=seal.get("jsonl_bytes"),
+                               actual_bytes=actual_bytes,
+                               reason=seal_kind))
+        elif not evidence_ok:
             items.append(_item("run.seal", "fail", "manifest 封存哈希已过期",
-                               expected=evidence.get("jsonl_sha256"), actual=actual))
+                               expected=evidence.get("jsonl_sha256"), actual=actual,
+                               expected_bytes=evidence.get("jsonl_bytes"),
+                               actual_bytes=actual_bytes,
+                               reason=evidence_kind))
         else:
-            items.append(_item("run.seal", "pass", "封存哈希一致"))
+            extended = seal_kind.endswith("_append_only") or evidence_kind.endswith("_append_only")
+            recorded_sizes = [
+                int(value) for value in
+                (seal.get("jsonl_bytes"), evidence.get("jsonl_bytes"))
+                if int(value or 0) > 0
+            ]
+            base_bytes = min(recorded_sizes) if recorded_sizes else 0
+            items.append(_item(
+                "run.seal", "pass",
+                ("封存哈希一致" if not extended
+                 else "封存前缀一致（封存后仅追加审计事件）"),
+                sealed_bytes=base_bytes,
+                actual_bytes=actual_bytes,
+                extension_bytes=max(0, actual_bytes - base_bytes),
+            ))
     else:
         status = "fail" if require_sealed else "warn"
         items.append(_item("run.seal", status,

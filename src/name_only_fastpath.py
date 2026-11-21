@@ -3016,7 +3016,11 @@ def apply_completed_name_repair(
             else:
                 report = critic_fn(fresh, source_text, raw_text, after, pipeline)
         except Exception as exc:  # noqa: BLE001 - no final has been written yet
-            action.update(status="kept", reason="critic_reaudit_failed:%s" % exc)
+            action.update(
+                status="failed",
+                reason="critic_reaudit_failed:%s" % exc,
+            )
+            result["errors"].append("%s:critic_reaudit_failed:%s" % (cid, exc))
             continue
         critic_reasons = _validate_reauthored_report(report, proposed_text=after)
         if critic_reasons:

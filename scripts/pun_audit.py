@@ -7,7 +7,12 @@
      （pipeline._seed_pun_decisions 命中 chunk 时强制落库；ReferenceAgent 机制复用）；
   2) landed     : merged / 各章 final 的正文或注释中出现 anchor 落点
                   （anchor = watchlist anchors ∪ 预注册决定译文片段）；
-  3) dup_free   : 同一 anchor 的注释未重复（同键、跨文件近似）。
+  3) dup_free   : 同一双关条目的注释未重复。
+                  同章不同 chunk 的同注是分块翻译的正常产物，由
+                  notes-normalize 在章内合并；同一 chunk 内重复，或跨章
+                  出现逐字相同的承载注，才算失败。仅在该注的标题头命中
+                  watchlist anchor 时参与判定，避免“行星学家”注因正文
+                  顺带提到 gom jabbar 而被误算成 gom 的双关注。
 
 产物：
   output/pun_audit.md   — 人读报告
@@ -116,6 +121,43 @@ def load_decision_renders(db_path) -> list:
 
 
 _ASCII_WORD_RE = re.compile(r"^[A-Za-z][A-Za-z'\- ]*$")
+_PUN_NOTE_RE = re.compile(r"双关|谐音|字面|双义|pun", re.IGNORECASE)
+
+
+def _note_subject_head(content: str) -> str:
+    """Return the headword/lead before the explanatory colon.
+
+    Footnote bodies often mention other watchlist terms in their explanation;
+    only the headword identifies which entry the note actually defines.
+    """
+    text = str(content or "").strip()
+    parts = re.split(r"[：:]", text, maxsplit=1)
+    if len(parts) == 2:
+        return parts[0].strip()
+    pred = re.match(r"^(.{1,60}?)(?:是|指|为|，|。)", text)
+    if pred:
+        return pred.group(1).strip()
+    return _def_key(text)
+
+
+def _normalized_note(content: str) -> str:
+    return re.sub(r"\s+", " ", str(content or "")).strip()
+
+
+def _is_pun_carrier_note(content: str, source: str) -> bool:
+    """Whether a note is specifically about the pun/source, not a glossary alias.
+
+    A note headed ``厄拉科斯（Arrakis）`` is a useful glossary entry for the
+    planet, but it is not evidence of the ``Dune`` polysemy.  Counting every
+    identical glossary note as a duplicate pun carrier makes the watchlist
+    unpassable even when every actual pun note is unique.
+    """
+    if _PUN_NOTE_RE.search(str(content or "")):
+        return True
+    source_head = re.sub(r"\s*[（(].*$", "", str(source or "")).strip()
+    head = _note_subject_head(content)
+    return bool(source_head) and (
+        _anchor_hit(source_head, head) or _anchor_hit(str(source or ""), head))
 
 
 def _anchor_hit(anchor: str, text: str) -> bool:
@@ -178,13 +220,21 @@ def audit(watchlist, texts, decision_texts, waivers, decision_renders=None) -> d
             _items, defs, _refs = _scan_lines(text)
             for d in defs:
                 content = d.get("content") or ""
-                if not any(_anchor_hit(a, content) for a in hit_anchors):
+                if not _is_pun_carrier_note(content, source):
                     continue
                 nk = _def_key(content)
-                if nk in notes_seen and notes_seen[nk][0] != label:
-                    dups.append(f"{nk} @ {notes_seen[nk][0]} / {label}")
-                else:
-                    notes_seen[nk] = (label, content)
+                prior = notes_seen.setdefault(nk, [])
+                chapter = label.split("/", 1)[0]
+                normalized = _normalized_note(content)
+                for prev_label, prev_content in prior:
+                    prev_chapter = prev_label.split("/", 1)[0]
+                    if prev_label == label:
+                        if _normalized_note(prev_content) == normalized:
+                            dups.append(f"{nk} @ {prev_label} / {label}")
+                    elif prev_chapter != chapter and (
+                            _normalized_note(prev_content) == normalized):
+                        dups.append(f"{nk} @ {prev_label} / {label}")
+                prior.append((label, content))
         covered = decision_ok and bool(landed_labels) and not dups
         items.append({
             "source": source,

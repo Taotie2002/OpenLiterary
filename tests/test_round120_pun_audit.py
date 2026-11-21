@@ -83,6 +83,73 @@ def test_dup_notes_across_chapter_finals_flagged():
     assert r2["items"][0]["covered"]
 
 
+def test_same_chapter_overlapping_final_notes_are_merged_not_failed():
+    watchlist = [{"source": "tale/tail", "anchors": ["tale", "tail"], "strategy": "落点"}]
+    note = "\n\n[^1]: tale/tail 双关：原文谐音‘尾巴’。"
+    texts = [
+        ("merged", "他讲了一个长长的故事[^1]。" + note),
+        ("ch03/ch03_chunk000", "他讲了一个长长的故事[^1]。" + note),
+        ("ch03/ch03_chunk001", "……故事还在继续[^1]。" + note),
+    ]
+    decisions = ["tale/tail [双关·保留笑点] 落点 pun_watchlist"]
+    item = pa.audit(watchlist, texts, decisions, set())["items"][0]
+    assert not item["dup_notes"]
+    assert item["covered"]
+
+
+def test_note_that_only_mentions_anchor_in_explanation_is_not_a_carrier():
+    watchlist = [{"source": "gom jabbar", "anchors": ["gom jabbar"], "strategy": "落点"}]
+    note = "\n\n[^1]: 行星学家（planetologist）：解释中顺带提到 gom jabbar。"
+    texts = [
+        ("merged", "行星学家[^1]。" + note),
+        ("ch03/ch03_chunk001", "行星学家[^1]。" + note),
+        ("ch04/ch04_chunk001", "行星学家[^1]。" + note),
+    ]
+    decisions = ["gom jabbar [双关·保留笑点] 落点 pun_watchlist"]
+    item = pa.audit(watchlist, texts, decisions, set())["items"][0]
+    assert not item["dup_notes"]
+    assert item["covered"]
+
+
+def test_copular_note_head_stops_before_anchor_in_explanation():
+    watchlist = [{"source": "Dune", "anchors": ["Dune", "厄拉科斯"], "strategy": "落点"}]
+    note = "\n\n[^1]: 弗雷曼人（Fremen）是厄拉科斯的原住民群体。"
+    texts = [
+        ("merged", "弗雷曼人[^1]。" + note),
+        ("ch05/ch05_chunk001", "弗雷曼人[^1]。" + note),
+        ("ch06/ch06_chunk001", "弗雷曼人[^2]。" + note),
+    ]
+    decisions = ["dune [双关] 落点 pun_watchlist"]
+    item = pa.audit(watchlist, texts, decisions, set())["items"][0]
+    assert not item["dup_notes"]
+
+
+def test_repeated_alias_glossary_note_is_not_a_duplicate_pun_carrier():
+    watchlist = [{"source": "Dune", "anchors": ["Dune", "厄拉科斯"], "strategy": "落点"}]
+    note = "\n\n[^1]: 厄拉科斯（Arrakis）：《沙丘》中的沙漠星球。"
+    texts = [
+        ("merged", "厄拉科斯[^1]。" + note),
+        ("ch04/ch04_chunk001", "厄拉科斯[^1]。" + note),
+        ("ch06/ch06_chunk001", "厄拉科斯[^2]。" + note),
+    ]
+    decisions = ["dune [双关] 落点 pun_watchlist"]
+    item = pa.audit(watchlist, texts, decisions, set())["items"][0]
+    assert not item["dup_notes"]
+
+
+def test_cross_chapter_same_head_different_definition_is_not_exact_duplicate():
+    watchlist = [{"source": "Muad’Dib", "anchors": ["穆阿迪布"], "strategy": "落点"}]
+    texts = [
+        ("merged", "穆阿迪布[^1]。\n\n[^1]: 穆阿迪布：保罗的尊号。"),
+        ("ch01/ch01_chunk001", "穆阿迪布[^1]。\n\n[^1]: 穆阿迪布：保罗的尊号。"),
+        ("ch02/ch02_chunk001", "穆阿迪布[^2]。\n\n[^2]: 穆阿迪布：与马赫迪相呼应。"),
+    ]
+    decisions = ["穆阿迪布 [双关·保留笑点] 落点 pun_watchlist"]
+    item = pa.audit(watchlist, texts, decisions, set())["items"][0]
+    assert not item["dup_notes"]
+    assert item["covered"]
+
+
 def test_landed_via_decision_render_fragments():
     watchlist = [{
         "source": "I see what I eat / I eat what I see",

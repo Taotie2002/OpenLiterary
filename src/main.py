@@ -1515,6 +1515,9 @@ def main():
                 if not args.apply:
                     print("❌ --reset-rescue-budget 需要与 --apply 同用", file=sys.stderr)
                     sys.exit(2)
+                _reset_chunk_ids = [
+                    c.strip() for c in (args.chunks or "").split(",") if c.strip()
+                ]
                 _reset_chapters = []
                 if args.all:
                     _reset_chapters = [row[0] for row in _rs_sched.conn.execute(
@@ -1522,7 +1525,16 @@ def main():
                 else:
                     _reset_chapters = [args.chapter]
                 for _rch in _reset_chapters:
-                    _reset_ids = _rs_sched.reset_rescue_budget(_rch)
+                    _reset_chapter_ids = None
+                    if _reset_chunk_ids:
+                        _reset_chapter_ids = [
+                            cid for cid in _reset_chunk_ids
+                            if str(cid).startswith(str(_rch) + "_")
+                        ]
+                        if not _reset_chapter_ids:
+                            continue
+                    _reset_ids = _rs_sched.reset_rescue_budget(
+                        _rch, chunk_ids=_reset_chapter_ids)
                     print(f"♻️ [Rescue] {_rch}: 已复位 {len(_reset_ids)} 个块的救援/重试预算")
             _rs_rows = _rs_sched.conn.execute(
                 "SELECT DISTINCT chapter_id, state, chunk_id FROM chunk_tasks "

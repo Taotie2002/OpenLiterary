@@ -19,7 +19,7 @@ from src.utils.llm_adapter import (
     get_role_model_name,
     robust_json_loads,
 )
-from src.core.decision_engine import DecisionEngine
+from src.core.decision_engine import DecisionEngine, DecisionLevel
 from src.judges.typesafe_spec import CompositeVerdict
 
 

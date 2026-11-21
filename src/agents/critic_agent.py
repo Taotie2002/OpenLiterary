@@ -54,7 +54,8 @@ def _classify_backend_error(exc: Exception) -> Dict[str, Any]:
     try:
         from src.judges.typesafe_backend import classify_backend_error as _shared_classify
         _shared = _shared_classify(exc, sdk_available=_TYPESAFE_EXC_AVAILABLE)
-        if _shared.get("category") in ("model_access", "request_schema"):
+        if _shared.get("category") in (
+                "model_access", "request_schema", "quota_exhausted"):
             return _shared
     except Exception:
         pass
@@ -269,11 +270,21 @@ Schema 要求：
             # 区分实际命中的 backend 类型（便于 _backend_path 标注）
             backend_path = "unknown"
             answers = {}
+            primary_error: Optional[Exception] = None
             # 非 FallbackBackend 路径（如注入的 stub/单 backend）不会填充 diagnostics，
             # 预先初始化为空 dict，避免末尾 `if backend_diagnostics:` UnboundLocalError
             backend_diagnostics: Dict[str, Any] = {}
             try:
                 if isinstance(backend, FallbackBackend):
+                    if getattr(backend, "_jev_quota_dead", False):
+                        backend_diagnostics["jev"] = {
+                            "category": "quota_exhausted",
+                            "retryable": False,
+                            "msg": backend._jev_disabled_reason or (
+                                "MoArk 资源包余额已耗尽 (quota_exhausted)"
+                            ),
+                            "action": "充值/切换 MoArk 资源包后重启",
+                        }
                     # 探测：哪个 backend 能用（A6 修复：异常不再静默吞，分类记录）
                     primary_ok = (
                         backend.primary_available()
@@ -294,12 +305,18 @@ Schema 要求：
                                 getattr(backend.primary, "last_diagnostics", {}) or {}
                             )
                         except Exception as e_jev:
+                            primary_error = e_jev
                             diag = _classify_backend_error(e_jev)
                             backend_diagnostics["jev"] = diag
                             if diag["category"] in ("auth", "dependency"):
                                 backend._jev_auth_dead = True
                             elif diag["category"] == "model_access":
                                 backend._jev_model_dead = True
+                            elif diag["category"] == "quota_exhausted":
+                                backend._jev_quota_dead = True
+                                backend._jev_disabled_reason = (
+                                    "MoArk 资源包余额已耗尽 (quota_exhausted)"
+                                )
                     if not answers and backend.allow_openai_fallback:
                         try:
                             answers = backend.fallback.evaluate(state, questions, timeout=backend.timeout)
@@ -351,6 +368,13 @@ Schema 要求：
                         "model": None,
                     })
                 else:
+                    _quota_diag = (backend_diagnostics.get("jev") or {})
+                    if _quota_diag.get("category") == "quota_exhausted":
+                        raise RuntimeError(
+                            "MoArk 资源包余额已耗尽 (quota_exhausted)"
+                        )
+                    if primary_error is not None:
+                        raise primary_error
                     raise RuntimeError("所有 backend 都未产出答案")
 
             # Round 110: per-entity 确定性护栏 — 规范名/变体确已出现时覆盖 LLM 假阳性

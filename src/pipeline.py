@@ -786,15 +786,28 @@ class TranslationPipeline:
         if seeded is None:
             seeded = set()
             self._pun_seeded_keys = seeded
-        src_lower = source_text.lower()
+        # EPUB extraction intentionally preserves hard line breaks.  A profile
+        # anchor such as "Power and fear" therefore still has to match
+        # "Power and\nfear" in the chapter source; otherwise the required
+        # Decision is silently never seeded and the delivery audit later sees
+        # an uncovered pun.  Normalize whitespace only for this
+        # substring probe -- the original source is passed to translation
+        # unchanged.
+        src_lower = re.sub(r"\s+", " ", str(source_text or "")).lower()
         n = 0
         for item in watch:
             if not isinstance(item, dict):
                 continue
-            candidates = [str(a).strip() for a in
-                          (list(item.get("src_anchors") or []) + list(item.get("anchors") or []))
-                          if str(a).strip()]
-            hits = [a for a in candidates if len(a) >= 2 and a.lower() in src_lower]
+            candidates = [str(a).strip() for a in (
+                [item.get("source")]
+                + list(item.get("src_anchors") or [])
+                + list(item.get("anchors") or [])
+            ) if str(a).strip()]
+            hits = [
+                a for a in candidates
+                if len(a) >= 2
+                and re.sub(r"\s+", " ", a).lower() in src_lower
+            ]
             if not hits:
                 continue
             strategy = str(item.get("strategy") or "").strip() or "双关需在译文保留笑点，必要时章末加注"
@@ -844,14 +857,17 @@ class TranslationPipeline:
             pass
         guide = getattr(self, "style_guide", None)
         if isinstance(guide, dict) and source_text:
-            src_lower = source_text.lower()
+            src_lower = re.sub(r"\s+", " ", str(source_text or "")).lower()
             for item in (guide.get("pun_watchlist") or []):
                 if not isinstance(item, dict):
                     continue
-                anchors = list(item.get("src_anchors") or []) + list(item.get("anchors") or [])
+                anchors = ([item.get("source")]
+                           + list(item.get("src_anchors") or [])
+                           + list(item.get("anchors") or []))
                 for anchor in anchors:
                     a = str(anchor).strip()
-                    if len(a) >= 2 and a.lower() in src_lower:
+                    if (len(a) >= 2
+                            and re.sub(r"\s+", " ", a).lower() in src_lower):
                         return "pun"
         return ""
 

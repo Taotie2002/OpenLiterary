@@ -13,7 +13,7 @@ PROJECT = Path(__file__).resolve().parent.parent
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 
-from src.task_logging import now_iso, sha256_file, validate_jsonl  # noqa: E402
+from src.task_logging import now_iso, sha256_prefix, validate_jsonl  # noqa: E402
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -38,6 +38,8 @@ def main() -> int:
         print(f"ℹ️ [TaskLog] 未找到运行日志，跳过封存: {args.run_id}")
         return 0
     validation = validate_jsonl(jsonl, expected_run_id=args.run_id)
+    jsonl_bytes = jsonl.stat().st_size if jsonl.exists() else 0
+    log_bytes = text.stat().st_size if text.exists() else 0
     payload = {
         "run_id": args.run_id,
         "sealed_at": now_iso(),
@@ -45,8 +47,10 @@ def main() -> int:
         "status": "validated" if validation.get("ok") else "partial",
         "jsonl": str(jsonl),
         "log": str(text),
-        "jsonl_sha256": sha256_file(jsonl) if jsonl.exists() else "",
-        "log_sha256": sha256_file(text) if text.exists() else "",
+        "jsonl_sha256": sha256_prefix(jsonl, jsonl_bytes) if jsonl.exists() else "",
+        "jsonl_bytes": jsonl_bytes,
+        "log_sha256": sha256_prefix(text, log_bytes) if text.exists() else "",
+        "log_bytes": log_bytes,
         "seq_last": int(validation.get("seq_last") or 0),
         "validation": validation,
     }

@@ -16,7 +16,7 @@ from src.book_linker import (
 from src.judgment_layer import sha256_text
 from src.story_graph import build_story_graph
 from src.style_profiler import load_profile
-from src.task_logging import sha256_file
+from src.task_logging import sha256_file, sha256_prefix
 
 
 RUN_ID = "20261116T120000-12345"
@@ -95,7 +95,9 @@ def _make_run_log(root: Path) -> None:
         "run_id": RUN_ID,
         "sealed_at": "2026-11-16T12:00:03.000+08:00",
         "jsonl_sha256": sha256_file(jsonl),
+        "jsonl_bytes": jsonl.stat().st_size,
         "log_sha256": sha256_file(log_dir / f"{RUN_ID}.log"),
+        "log_bytes": (log_dir / f"{RUN_ID}.log").stat().st_size,
         "seq_last": 3,
     }
     _write_json(log_dir / f"{RUN_ID}.sha256", seal)
@@ -237,6 +239,59 @@ def test_book_link_detects_log_loss_seq_gap_and_seal_tamper(tmp_path: Path):
     seal = json.loads(seal_path.read_text(encoding="utf-8"))
     seal["jsonl_sha256"] = "0" * 64
     _write_json(seal_path, seal)
+    res = audit_book_links(root, manifest_path, require_sealed=True)
+    assert res["ok"] is False and "run.seal" in res["failed"]
+
+
+def test_book_link_accepts_append_only_extension_but_rejects_truncation(
+        tmp_path: Path):
+    root = _make_fixture(tmp_path)
+    manifest_path = _build(root)
+    jsonl = root / "output" / "logs" / "runs" / f"{RUN_ID}.jsonl"
+    seal_path = root / "output" / "logs" / "runs" / f"{RUN_ID}.sha256"
+    sealed_bytes = jsonl.stat().st_size
+    sealed_text = jsonl.read_text(encoding="utf-8")
+    extra = [
+        {"ts": "2026-11-16T12:00:04.000+08:00", "seq": 4, "run_id": RUN_ID,
+         "command": "gate", "stage": "RUN", "event": "run_start",
+         "status": "ok"},
+        {"ts": "2026-11-16T12:00:05.000+08:00", "seq": 5, "run_id": RUN_ID,
+         "command": "gate", "stage": "RUN", "event": "run_end",
+         "status": "ok"},
+    ]
+    appended = sealed_text + "".join(
+        json.dumps(event, ensure_ascii=False) + "\n" for event in extra)
+    jsonl.write_text(appended, encoding="utf-8")
+    current_bytes = jsonl.stat().st_size
+    seal = json.loads(seal_path.read_text(encoding="utf-8"))
+    seal.update({
+        "jsonl_sha256": sha256_prefix(jsonl, current_bytes),
+        "jsonl_bytes": current_bytes,
+        "sealed_at": "2026-11-16T12:00:06.000+08:00",
+        "seq_last": 5,
+    })
+    _write_json(seal_path, seal)
+
+    res = audit_book_links(root, manifest_path, require_sealed=True)
+    assert res["ok"] is True, res
+    item = next(item for item in res["checks"] if item["name"] == "run.seal")
+    assert item["details"]["extension_bytes"] == current_bytes - sealed_bytes
+
+    jsonl.write_bytes(jsonl.read_bytes()[:sealed_bytes - 1])
+    res = audit_book_links(root, manifest_path, require_sealed=True)
+    assert res["ok"] is False and "run.seal" in res["failed"]
+
+    tampered = sealed_text.replace('"merge"', '"mergX"', 1) + "".join(
+        json.dumps(event, ensure_ascii=False) + "\n" for event in extra)
+    jsonl.write_text(tampered, encoding="utf-8")
+    res = audit_book_links(root, manifest_path, require_sealed=True)
+    assert res["ok"] is False and "run.seal" in res["failed"]
+
+
+def test_book_link_requires_seal_when_requested(tmp_path: Path):
+    root = _make_fixture(tmp_path)
+    manifest_path = _build(root)
+    (root / "output" / "logs" / "runs" / f"{RUN_ID}.sha256").unlink()
     res = audit_book_links(root, manifest_path, require_sealed=True)
     assert res["ok"] is False and "run.seal" in res["failed"]
 

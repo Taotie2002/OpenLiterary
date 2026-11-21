@@ -141,6 +141,23 @@ class TestRescueQueue:
         assert row["rescue_stage"] == "TRANSLATING_RAW"
         assert row["rescue_attempts"] == 1
 
+    def test_exhausted_completed_fallback_can_be_reset_by_chunk(self, pipeline):
+        _insert_task(pipeline, "ch01_chunk004", "COMPLETED",
+                     rescue_attempts=2, pf_requeues=1)
+        _write_final(pipeline, "ch01_chunk004", "仍为降级稿", fallback=True,
+                     reason="API_FAILURE_FALLBACK_FROM_LITERARY")
+
+        assert pipeline._auto_rescue_existing_failures() == 0
+        reset = pipeline.scheduler.reset_rescue_budget(
+            "ch01", chunk_ids=["ch01_chunk004"])
+        assert reset == ["ch01_chunk004"]
+
+        assert pipeline._auto_rescue_existing_failures() == 1
+        row = pipeline.scheduler.get_task("ch01_chunk004")
+        assert row["state"] == "DIRTY"
+        assert row["rescue_attempts"] == 1
+        assert row["pf_requeues"] == 0
+
     def test_targeted_and_full_budget_then_quarantine(self, pipeline):
         _insert_task(pipeline, "ch01_chunk002", "FAILED",
                      "[AUDITING] timeout", rescue_attempts=2, pf_requeues=1)

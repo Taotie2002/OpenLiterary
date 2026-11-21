@@ -70,6 +70,25 @@ def test_packed_defs_same_key_merged_and_remapped():
     assert new.count("[^1]") == 3
 
 
+def test_same_explicit_headword_transitively_merges_paraphrases():
+    body = (
+        "正文甲[^a]、正文乙[^b]、正文丙[^c]。\n\n"
+        "---\n\n"
+        "[^a]: “穆阿迪布”（Muad’Dib）有“传道者”之意；在弗雷曼宗教语境中，"
+        "其名字又与“马赫迪”（Mahdi，伊斯兰传统中的末世弥赛亚称号）形成宗教回声。"
+        "其名与下文“我在这里”亦有语义呼应。\n"
+        "[^b]: “穆阿迪布”在此为尊号，含“指引道路者”或“传道者”之意；"
+        "其宗教回声与“马赫迪（Mahdi）”这一末世弥赛亚称号相关。\n"
+        "[^c]: “穆阿迪布”带有“传道者”的含义，并与“马赫迪”"
+        "（Mahdi，伊斯兰传统中的末世弥赛亚称号）形成宗教回声。\n"
+    )
+    new, stats, _ = normalize_chapter_notes(body, 1)
+    _, defs, refs = _scan_lines(new)
+    assert stats["same_key_merges"] + stats["merged_dups"] >= 2
+    assert len(defs) == 1
+    assert refs == {"1"}
+
+
 def test_dangling_ref_removed_and_orphan_relocated():
     body = (
         "正文提到[^missing]，但没有对应定义；另一处正文足够长以通过扫描。\n\n"

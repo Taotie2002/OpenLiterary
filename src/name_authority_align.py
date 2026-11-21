@@ -8,6 +8,10 @@ conflicting registry alias is either:
   mapping remains untouched, or
 * when the registry's canonical form itself is the only drift and the target
   form has no competing owner, renamed to the Decision DB translation.
+* when two case/spacing-equivalent Decision rows disagree, a book-wide corpus
+  consensus may align the minority Decision and registry canonical.  This is
+  deliberately limited to plain CJK targets with a >=3-chunk majority and no
+  locked decision or competing registry canonical.
 
 Ambiguous multi-decision aliases, multi-owner aliases and conflicting target
 canonicals are emitted as ``manual_review`` and never applied.
@@ -24,6 +28,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from src.name_authority_audit import (
+    FORM_ALIGN_SIMILARITY,
+    _similarity,
     _decision_for_alias,
     _decision_rows,
     audit_name_authorities,
@@ -34,11 +40,15 @@ from src.pending_backtrack_reconcile import (
     _name_key,
     _phrase_key,
     _target_core,
+    body_before_footnotes,
 )
 
 
 ALIGNMENT_SCHEMA_VERSION = 1
 _ALIGN_ANNOTATION_RE = re.compile(r"[（(][^（()）]*[）)]")
+_ALIGN_PLAIN_TARGET_RE = re.compile(r"^[\u4e00-\u9fff·]+$")
+_ALIGN_CONSENSUS_MARKER_RE = re.compile(
+    r"Round158 duplicate source form consensus:\s*([^|]+?)\s*->\s*([^|]+?)(?:\s*\||$)")
 
 
 def _align_now_iso() -> str:
@@ -95,6 +105,187 @@ def _align_json_dump(values: Iterable[str]) -> str:
             seen.add(key)
             deduped.append(text)
     return json.dumps(deduped, ensure_ascii=False)
+
+
+def _align_plain_target(value: str) -> bool:
+    return bool(_ALIGN_PLAIN_TARGET_RE.fullmatch(str(value or "").strip()))
+
+
+def _align_form_corpus_evidence(output_dir: Path, targets: Iterable[str]) -> Dict[str, dict]:
+    """Count each candidate form in delivered finals (footnote definitions excluded)."""
+    wanted = [str(value).strip() for value in targets if str(value).strip()]
+    evidence = {
+        target: {"chunks": [], "occurrences": 0}
+        for target in wanted
+    }
+    for path in sorted(Path(output_dir).glob("ch*/*_final.json")):
+        payload = _align_read_json(path) or {}
+        text = body_before_footnotes(str(payload.get("text") or ""))
+        if not text:
+            continue
+        chunk_id = path.stem[:-6] if path.stem.endswith("_final") else path.stem
+        for target in wanted:
+            occurrences = text.count(target)
+            if not occurrences:
+                continue
+            evidence[target]["chunks"].append(chunk_id)
+            evidence[target]["occurrences"] += occurrences
+    return evidence
+
+
+def _align_duplicate_form_action(
+    *,
+    rows: List[dict],
+    registry_row: dict,
+    alias: str,
+    records: List[dict],
+    decisions: List[dict],
+    evidence: Dict[str, dict],
+    output_dir: Path,
+) -> Tuple[Optional[dict], str]:
+    """Plan a corpus-backed alignment for duplicate case/spacing Decisions."""
+    targets = sorted(evidence)
+    if len(targets) < 2 or not all(_align_plain_target(target) for target in targets):
+        return None, "non_plain_duplicate_targets"
+    for index, left in enumerate(targets):
+        for right in targets[index + 1:]:
+            if _similarity(left, right) < FORM_ALIGN_SIMILARITY:
+                return None, "non_form_equivalent_targets"
+    ranked = sorted(
+        targets,
+        key=lambda target: (
+            len(evidence[target]["chunks"]),
+            evidence[target]["occurrences"],
+            -len(target),
+        ),
+        reverse=True,
+    )
+    winner = ranked[0]
+    winner_chunks = len(evidence[winner]["chunks"])
+    if winner_chunks < 3 or evidence[winner]["occurrences"] < 3:
+        return None, "insufficient_corpus_majority"
+    minority_limit = max(1, winner_chunks // 4)
+    losers = ranked[1:]
+    if any(len(evidence[loser]["chunks"]) > minority_limit for loser in losers):
+        return None, "corpus_majority_too_narrow"
+
+    canonical = str(registry_row.get("canonical_name") or "")
+    if canonical not in targets:
+        return None, "registry_canonical_is_third_form"
+    conflicting = [
+        decision for decision in decisions
+        if str(decision.get("translation") or "").strip() in targets
+        and str(decision.get("translation") or "").strip() != winner
+    ]
+    if not conflicting:
+        return None, "no_stale_decision_form"
+    if any(int(decision.get("locked") or 0) for decision in conflicting):
+        return None, "minority_decision_locked"
+    if canonical != winner and int(registry_row.get("pending_review") or 0):
+        return None, "pending_registry_row_requires_review"
+    target_owner = _align_target_owner(
+        rows, winner, int(registry_row.get("id") or 0))
+    if target_owner is not None:
+        return None, f"winner_registry_owned:{target_owner}"
+
+    stale_chunks = sorted({
+        chunk_id
+        for loser in losers
+        for chunk_id in evidence[loser]["chunks"]
+    })
+    action = {
+        "action": "align_decision_forms",
+        "registry_id": int(registry_row.get("id") or 0),
+        "alias": alias,
+        "canonical_before": canonical,
+        "canonical_after": winner,
+        "decision_ids": [int(decision["id"]) for decision in conflicting],
+        "decisions_before": [
+            {"decision_id": int(decision["id"]),
+             "source_key": str(decision.get("source_key") or ""),
+             "translation": str(decision.get("translation") or "")}
+            for decision in conflicting
+        ],
+        "new_translation": winner,
+        "corpus_evidence": {
+            target: {
+                "chunks": len(evidence[target]["chunks"]),
+                "occurrences": evidence[target]["occurrences"],
+            }
+            for target in targets
+        },
+        "queued_chunks": stale_chunks,
+        "aliases_to_quarantine": ([canonical] if canonical != winner else []),
+        "reason": "duplicate_source_form_corpus_consensus",
+    }
+    return action, ""
+
+
+def _align_resolved_pending_review_actions(
+    *,
+    rows: List[dict],
+    decision_index: Dict[str, List[dict]],
+    output_dir: Path,
+) -> List[dict]:
+    """Clear a pending registry review only when a prior consensus fixed it.
+
+    This does not infer that arbitrary ``pending_review`` rows are safe.  It
+    trusts only the machine-readable marker written by
+    ``align_decision_forms`` and rechecks the Decision translations and the
+    delivered corpus at the current turn.
+    """
+    candidates: List[tuple[dict, str]] = []
+    canonicals: List[str] = []
+    canonical_keys: Counter = Counter(
+        _name_key(str(row.get("canonical_name") or "")) for row in rows)
+    for row in rows:
+        if not int(row.get("pending_review") or 0):
+            continue
+        canonical = str(row.get("canonical_name") or "").strip()
+        if not canonical or not _align_plain_target(canonical):
+            continue
+        if canonical_keys.get(_name_key(canonical), 0) != 1:
+            continue
+        markers = _ALIGN_CONSENSUS_MARKER_RE.findall(
+            str(row.get("review_reason") or ""))
+        if not markers:
+            continue
+        _old_form, aligned = markers[-1]
+        if _name_key(aligned) != _name_key(canonical):
+            continue
+        sources = [str(value) for value in row.get("source_names") or []]
+        if not sources:
+            continue
+        matched: List[dict] = []
+        for source in sources:
+            matched.extend(_decision_for_alias(source, decision_index))
+        translations = {
+            str(decision.get("translation") or "").strip()
+            for decision in matched
+            if str(decision.get("translation") or "").strip()
+        }
+        if not translations or any(
+                not _name_compatible(canonical, translation)
+                for translation in translations):
+            continue
+        candidates.append((row, canonical))
+        canonicals.append(canonical)
+    evidence = _align_form_corpus_evidence(output_dir, canonicals)
+    actions: List[dict] = []
+    for row, canonical in candidates:
+        chunks = len((evidence.get(canonical) or {}).get("chunks") or [])
+        if chunks < 3:
+            continue
+        actions.append({
+            "action": "clear_resolved_pending_review",
+            "registry_id": int(row.get("id") or 0),
+            "canonical_before": canonical,
+            "pending_review_before": 1,
+            "review_reason_before": str(row.get("review_reason") or ""),
+            "corpus_chunks": chunks,
+            "reason": "duplicate_source_form_consensus_resolved",
+        })
+    return actions
 
 
 def _align_table_exists(con: sqlite3.Connection, name: str) -> bool:
@@ -229,6 +420,7 @@ def build_name_authority_alignment(
     by_id = {int(row["id"]): row for row in rows}
     quarantine: Dict[int, Dict[str, Any]] = {}
     form_groups: Dict[Tuple[int, str], List[dict]] = {}
+    decision_form_actions: List[dict] = []
     manual: List[dict] = []
 
     def add_quarantine(registry_id: int, alias: str, record: dict,
@@ -277,20 +469,36 @@ def build_name_authority_alignment(
             manual.append({"registry_id": registry_id, "alias": alias,
                            "reason": "registry_row_missing"})
             continue
+        matched_decisions = _decision_for_alias(alias, decision_index)
         translations = {
-            str(record.get("decision_translation") or "").strip()
-            for record in records
-            if str(record.get("decision_translation") or "").strip()
+            str(decision.get("translation") or "").strip()
+            for decision in matched_decisions
+            if str(decision.get("translation") or "").strip()
         }
         owners = set()
         for record in records:
             owners.update(record.get("alias_registry_owners") or [])
         if len(translations) != 1:
-            manual.append({
-                "registry_id": registry_id, "alias": alias,
-                "reason": "ambiguous_decision_forms",
-                "decision_translations": sorted(translations),
-            })
+            evidence = _align_form_corpus_evidence(out_dir, translations)
+            action, reason = _align_duplicate_form_action(
+                rows=rows,
+                registry_row=row,
+                alias=alias,
+                records=records,
+                decisions=matched_decisions,
+                evidence=evidence,
+                output_dir=out_dir,
+            )
+            if action is not None:
+                decision_form_actions.append(action)
+            else:
+                manual.append({
+                    "registry_id": registry_id, "alias": alias,
+                    "reason": "ambiguous_decision_forms",
+                    "decision_translations": sorted(translations),
+                    "corpus_evidence": evidence,
+                    "blocked_reason": reason,
+                })
             continue
         target = next(iter(translations))
         if _name_key(target) == _name_key(row.get("canonical_name") or ""):
@@ -445,6 +653,12 @@ def build_name_authority_alignment(
             "reasons": list(dict.fromkeys(slot["reasons"])),
         })
     actions.extend(align_by_id.values())
+    actions.extend(decision_form_actions)
+    actions.extend(_align_resolved_pending_review_actions(
+        rows=rows,
+        decision_index=decision_index,
+        output_dir=out_dir,
+    ))
     actions.extend(variant_actions)
     # Apply alias removals before canonical renames on the same row: the rename
     # is guarded by the pre-plan canonical value, while quarantine only touches
@@ -452,7 +666,9 @@ def build_name_authority_alignment(
     action_order = {
         "quarantine_aliases": 0,
         "align_canonical": 1,
-        "register_locked_variant": 2,
+        "align_decision_forms": 2,
+        "clear_resolved_pending_review": 2,
+        "register_locked_variant": 3,
     }
     actions.sort(key=lambda item: (
         int(item.get("registry_id", 0)),
@@ -465,6 +681,9 @@ def build_name_authority_alignment(
     result["counts"] = {
         "quarantine_aliases": counts.get("quarantine_aliases", 0),
         "align_canonical": counts.get("align_canonical", 0),
+        "align_decision_forms": counts.get("align_decision_forms", 0),
+        "clear_resolved_pending_review": counts.get(
+            "clear_resolved_pending_review", 0),
         "register_locked_variant": counts.get("register_locked_variant", 0),
         "manual_review": len(manual),
     }
@@ -659,7 +878,8 @@ def align_name_authorities(
     eligible = [
         action for action in (plan.get("actions") or [])
         if action.get("action") in {
-            "quarantine_aliases", "align_canonical", "register_locked_variant",
+            "quarantine_aliases", "align_canonical", "align_decision_forms",
+            "clear_resolved_pending_review", "register_locked_variant",
         }
     ]
     result["write_attempted"] = bool(eligible)
@@ -707,6 +927,149 @@ def align_name_authorities(
                 out_action["status"] = "stale_canonical_changed"
                 result["actions"].append(out_action)
                 continue
+
+            if action.get("action") == "align_decision_forms":
+                winner = str(action.get("new_translation") or "").strip()
+                before_rows = action.get("decisions_before") or []
+                if not winner or not before_rows:
+                    out_action["status"] = "invalid_decision_plan"
+                    result["actions"].append(out_action)
+                    continue
+                if canonical != winner:
+                    winner_key = _name_key(winner)
+                    duplicate = None
+                    for other_id, other_canonical in con.execute(
+                            "SELECT id, canonical_name FROM entity_registry "
+                            "WHERE id!=?", (rid,)):
+                        if _name_key(other_canonical or "") == winner_key:
+                            duplicate = other_id
+                            break
+                    if duplicate:
+                        raise RuntimeError(
+                            f"decision_form_target_registry_conflict:{duplicate}")
+                for before in before_rows:
+                    did = int(before.get("decision_id") or 0)
+                    decision = con.execute(
+                        "SELECT source_key, translation, locked, reason "
+                        "FROM decision_db WHERE id=?", (did,)).fetchone()
+                    if not decision:
+                        raise RuntimeError(f"decision_form_row_missing:{did}")
+                    if int(decision["locked"] or 0):
+                        raise RuntimeError(f"decision_form_locked:{did}")
+                    if str(decision["source_key"]) != str(
+                            before.get("source_key") or ""):
+                        raise RuntimeError(f"decision_form_source_changed:{did}")
+                    if str(decision["translation"]) != str(
+                            before.get("translation") or ""):
+                        raise RuntimeError(
+                            f"decision_form_translation_changed:{did}")
+                    reason = str(decision["reason"] or "")
+                    marker = (
+                        "Round 158 duplicate source form consensus: "
+                        f"{decision['translation']} -> {winner}"
+                    )
+                    if marker not in reason:
+                        reason = (reason.rstrip() + " | " + marker).strip(" |")
+                    con.execute(
+                        "UPDATE decision_db SET translation=?, reason=? WHERE id=?",
+                        (winner, reason, did))
+
+                sources = _align_json_list(row["source_names"])
+                variants = _align_json_list(row["variant_names"])
+                quarantined = _align_json_list(row["quarantined_names"])
+                aliases_to_quarantine = [
+                    str(value) for value in
+                    action.get("aliases_to_quarantine") or []
+                    if str(value).strip()
+                ]
+                if aliases_to_quarantine:
+                    sources = _align_remove_alias(sources, aliases_to_quarantine)
+                    variants = _align_remove_alias(variants, aliases_to_quarantine)
+                    qkeys = {_phrase_key(value) for value in quarantined}
+                    for alias in aliases_to_quarantine:
+                        key = _phrase_key(alias)
+                        if key and key not in qkeys:
+                            quarantined.append(alias)
+                            qkeys.add(key)
+                assignments = ["canonical_name=?",
+                               "source_names=?", "quarantined_names=?"]
+                params: List[Any] = [
+                    winner, _align_json_dump(sources),
+                    _align_json_dump(quarantined)]
+                if "variant_names" in cols:
+                    assignments.append("variant_names=?")
+                    params.append(_align_json_dump(variants))
+                if "review_reason" in cols:
+                    old_reason = str(row["review_reason"] or "")
+                    note = (
+                        "Round158 duplicate source form consensus: "
+                        f"{canonical} -> {winner}"
+                    )
+                    assignments.append("review_reason=?")
+                    params.append(
+                        (old_reason + " | " if old_reason else "") + note)
+                if "updated_at" in cols:
+                    assignments.append("updated_at=CURRENT_TIMESTAMP")
+                params.append(rid)
+                con.execute(
+                    "UPDATE entity_registry SET " + ", ".join(assignments)
+                    + " WHERE id=?", tuple(params))
+
+                queued = [str(value) for value in action.get("queued_chunks") or []]
+                first = before_rows[0]
+                did = int(first.get("decision_id") or 0)
+                source_key = str(first.get("source_key") or "")
+                for chunk_id in queued:
+                    existing = con.execute(
+                        "SELECT decision_id, source_key FROM pending_backtrack "
+                        "WHERE chunk_id=?", (chunk_id,)).fetchone()
+                    if existing and (
+                            int(existing["decision_id"] or 0) != did
+                            or str(existing["source_key"]) != source_key):
+                        raise RuntimeError(
+                            f"decision_form_pending_conflict:{chunk_id}")
+                    con.execute(
+                        "INSERT INTO pending_backtrack (chunk_id, decision_id, "
+                        "source_key, queue_rounds, created_at, updated_at) "
+                        "VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+                        "ON CONFLICT(chunk_id) DO UPDATE SET "
+                        "decision_id=excluded.decision_id, "
+                        "source_key=excluded.source_key, "
+                        "queue_rounds=COALESCE(pending_backtrack.queue_rounds,0)+1, "
+                        "updated_at=CURRENT_TIMESTAMP",
+                        (chunk_id, did, source_key))
+                out_action["status"] = "applied"
+                result["actions"].append(out_action)
+                continue
+
+            if action.get("action") == "clear_resolved_pending_review":
+                expected_reason = str(action.get("review_reason_before") or "")
+                if int(row["pending_review"] or 0) != 1:
+                    out_action["status"] = "stale_pending_review_changed"
+                    result["actions"].append(out_action)
+                    continue
+                if str(row["review_reason"] or "") != expected_reason:
+                    out_action["status"] = "stale_review_reason_changed"
+                    result["actions"].append(out_action)
+                    continue
+                note = (
+                    "Round158 duplicate source form consensus: "
+                    "pending review resolved by Decision and corpus evidence"
+                )
+                new_reason = (expected_reason.rstrip() + " | " + note).strip(" |")
+                assignments = ["pending_review=0", "review_reason=?"]
+                params: List[Any] = [new_reason]
+                if "updated_at" in cols:
+                    assignments.append("updated_at=CURRENT_TIMESTAMP")
+                params.append(rid)
+                con.execute(
+                    "UPDATE entity_registry SET " + ", ".join(assignments)
+                    + " WHERE id=? AND pending_review=1 AND review_reason=?",
+                    tuple(params + [expected_reason]))
+                out_action["status"] = "applied"
+                result["actions"].append(out_action)
+                continue
+
             if action.get("action") == "align_canonical":
                 target = str(action.get("canonical_after") or "")
                 target_key = _name_key(target)
@@ -874,6 +1237,16 @@ def _align_markdown(result: Dict[str, Any]) -> str:
                 detail = (
                     f"{action.get('variant')} ← decision "
                     f"{','.join(str(x) for x in action.get('decision_ids') or [])}")
+            elif action.get("action") == "align_decision_forms":
+                detail = (
+                    f"decision "
+                    f"{','.join(str(x) for x in action.get('decision_ids') or [])} "
+                    f"→ {action.get('new_translation')}; queued="
+                    f"{','.join(action.get('queued_chunks') or []) or '-'}")
+            elif action.get("action") == "clear_resolved_pending_review":
+                detail = (
+                    f"pending_review 1→0; corpus_chunks="
+                    f"{action.get('corpus_chunks')}")
             else:
                 detail = f"{action.get('canonical_before')} → {action.get('canonical_after')}"
             lines.append(
@@ -889,7 +1262,7 @@ def _align_markdown(result: Dict[str, Any]) -> str:
         lines.extend(f"- `{error}`" for error in result["errors"])
     lines.extend([
         "",
-        "本工具不改正文、不改 Decision DB；只隔离派生 registry 的冲突别名。",
+        "本工具不改正文；仅 corpus-consensus 动作会同步 Decision DB 与派生 registry。",
         "任何 ambiguous / multi-owner 项均保持原样。",
         "",
     ])

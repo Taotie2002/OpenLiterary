@@ -69,6 +69,26 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sha256_prefix(path: Path, size: int) -> str:
+    """Return the SHA-256 digest of the first ``size`` bytes of a file.
+
+    Run logs are append-only across the shell's child commands.  A seal written
+    by one command therefore remains valid when a later command appends more
+    events, as long as every sealed byte is unchanged.  Hashing an explicit
+    byte prefix makes that guarantee testable without trusting file mtimes.
+    """
+    digest = hashlib.sha256()
+    remaining = max(0, int(size))
+    with open(path, "rb") as handle:
+        while remaining > 0:
+            block = handle.read(min(1024 * 1024, remaining))
+            if not block:
+                break
+            digest.update(block)
+            remaining -= len(block)
+    return digest.hexdigest()
+
+
 def _redact_text(value: str, limit: int = 2000) -> str:
     text = str(value)
     for pattern in _SECRET_PATTERNS:
@@ -315,6 +335,8 @@ class TaskLogger:
         """Write the post-run hash envelope for both log streams."""
         if not self.jsonl_path.exists() and not self.text_path.exists():
             return None
+        jsonl_bytes = self.jsonl_path.stat().st_size if self.jsonl_path.exists() else 0
+        log_bytes = self.text_path.stat().st_size if self.text_path.exists() else 0
         payload = {
             "run_id": self.run_id,
             "command": self.command,
@@ -324,8 +346,10 @@ class TaskLogger:
             if self.jsonl_path.is_relative_to(self.root) else str(self.jsonl_path),
             "log": str(self.text_path.relative_to(self.root))
             if self.text_path.is_relative_to(self.root) else str(self.text_path),
-            "jsonl_sha256": sha256_file(self.jsonl_path) if self.jsonl_path.exists() else "",
-            "log_sha256": sha256_file(self.text_path) if self.text_path.exists() else "",
+            "jsonl_sha256": sha256_prefix(self.jsonl_path, jsonl_bytes) if self.jsonl_path.exists() else "",
+            "jsonl_bytes": jsonl_bytes,
+            "log_sha256": sha256_prefix(self.text_path, log_bytes) if self.text_path.exists() else "",
+            "log_bytes": log_bytes,
             "seq_last": self._seq or 0,
             "last_ts": self._last_ts,
         }
@@ -506,7 +530,7 @@ def prune_runs(log_dir: Path, keep_last: int = 30, keep_days: int = 90,
 __all__ = [
     "CST", "RUN_ID_ENV", "LOG_ENABLED_ENV", "LOG_DIR_ENV",
     "DEFAULT_LOG_DIR", "TaskLoggingError", "TaskLogger",
-    "now_iso", "new_run_id", "sha256_file", "make_logger",
+    "now_iso", "new_run_id", "sha256_file", "sha256_prefix", "make_logger",
     "set_active_logger", "get_active_logger", "log_event", "log_artifact",
     "validate_jsonl", "prune_runs",
 ]

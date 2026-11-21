@@ -4452,11 +4452,21 @@ Schema 要求：
             # 区分实际命中的 backend 类型（便于 _backend_path 标注）
             backend_path = "unknown"
             answers = {}
+            primary_error: Optional[Exception] = None
             # 非 FallbackBackend 路径（如注入的 stub/单 backend）不会填充 diagnostics，
             # 预先初始化为空 dict，避免末尾 `if backend_diagnostics:` UnboundLocalError
             backend_diagnostics: Dict[str, Any] = {}
             try:
                 if isinstance(backend, FallbackBackend):
+                    if getattr(backend, "_jev_quota_dead", False):
+                        backend_diagnostics["jev"] = {
+                            "category": "quota_exhausted",
+                            "retryable": False,
+                            "msg": backend._jev_disabled_reason or (
+                                "MoArk 资源包余额已耗尽 (quota_exhausted)"
+                            ),
+                            "action": "充值/切换 MoArk 资源包后重启",
+                        }
                     # 探测：哪个 backend 能用（A6 修复：异常不再静默吞，分类记录）
                     primary_ok = (
                         backend.primary_available()
@@ -4477,12 +4487,18 @@ Schema 要求：
                                 getattr(backend.primary, "last_diagnostics", {}) or {}
                             )
                         except Exception as e_jev:
+                            primary_error = e_jev
                             diag = _classify_backend_error(e_jev)
                             backend_diagnostics["jev"] = diag
                             if diag["category"] in ("auth", "dependency"):
                                 backend._jev_auth_dead = True
                             elif diag["category"] == "model_access":
                                 backend._jev_model_dead = True
+                            elif diag["category"] == "quota_exhausted":
+                                backend._jev_quota_dead = True
+                                backend._jev_disabled_reason = (
+                                    "MoArk 资源包余额已耗尽 (quota_exhausted)"
+                                )
                     if not answers and backend.allow_openai_fallback:
                         try:
                             answers = backend.fallback.evaluate(state, questions, timeout=backend.timeout)
@@ -4534,6 +4550,13 @@ Schema 要求：
                         "model": None,
                     })
                 else:
+                    _quota_diag = (backend_diagnostics.get("jev") or {})
+                    if _quota_diag.get("category") == "quota_exhausted":
+                        raise RuntimeError(
+                            "MoArk 资源包余额已耗尽 (quota_exhausted)"
+                        )
+                    if primary_error is not None:
+                        raise primary_error
                     raise RuntimeError("所有 backend 都未产出答案")
 
             # Round 110: per-entity 确定性护栏 — 规范名/变体确已出现时覆盖 LLM 假阳性
@@ -6149,15 +6172,28 @@ class TranslationPipeline:
         if seeded is None:
             seeded = set()
             self._pun_seeded_keys = seeded
-        src_lower = source_text.lower()
+        # EPUB extraction intentionally preserves hard line breaks.  A profile
+        # anchor such as "Power and fear" therefore still has to match
+        # "Power and\nfear" in the chapter source; otherwise the required
+        # Decision is silently never seeded and the delivery audit later sees
+        # an uncovered pun.  Normalize whitespace only for this
+        # substring probe -- the original source is passed to translation
+        # unchanged.
+        src_lower = re.sub(r"\s+", " ", str(source_text or "")).lower()
         n = 0
         for item in watch:
             if not isinstance(item, dict):
                 continue
-            candidates = [str(a).strip() for a in
-                          (list(item.get("src_anchors") or []) + list(item.get("anchors") or []))
-                          if str(a).strip()]
-            hits = [a for a in candidates if len(a) >= 2 and a.lower() in src_lower]
+            candidates = [str(a).strip() for a in (
+                [item.get("source")]
+                + list(item.get("src_anchors") or [])
+                + list(item.get("anchors") or [])
+            ) if str(a).strip()]
+            hits = [
+                a for a in candidates
+                if len(a) >= 2
+                and re.sub(r"\s+", " ", a).lower() in src_lower
+            ]
             if not hits:
                 continue
             strategy = str(item.get("strategy") or "").strip() or "双关需在译文保留笑点，必要时章末加注"
@@ -6207,14 +6243,17 @@ class TranslationPipeline:
             pass
         guide = getattr(self, "style_guide", None)
         if isinstance(guide, dict) and source_text:
-            src_lower = source_text.lower()
+            src_lower = re.sub(r"\s+", " ", str(source_text or "")).lower()
             for item in (guide.get("pun_watchlist") or []):
                 if not isinstance(item, dict):
                     continue
-                anchors = list(item.get("src_anchors") or []) + list(item.get("anchors") or [])
+                anchors = ([item.get("source")]
+                           + list(item.get("src_anchors") or [])
+                           + list(item.get("anchors") or []))
                 for anchor in anchors:
                     a = str(anchor).strip()
-                    if len(a) >= 2 and a.lower() in src_lower:
+                    if (len(a) >= 2
+                            and re.sub(r"\s+", " ", a).lower() in src_lower):
                         return "pun"
         return ""
 
@@ -13528,6 +13567,9 @@ def main():
                 if not args.apply:
                     print("❌ --reset-rescue-budget 需要与 --apply 同用", file=sys.stderr)
                     sys.exit(2)
+                _reset_chunk_ids = [
+                    c.strip() for c in (args.chunks or "").split(",") if c.strip()
+                ]
                 _reset_chapters = []
                 if args.all:
                     _reset_chapters = [row[0] for row in _rs_sched.conn.execute(
@@ -13535,7 +13577,16 @@ def main():
                 else:
                     _reset_chapters = [args.chapter]
                 for _rch in _reset_chapters:
-                    _reset_ids = _rs_sched.reset_rescue_budget(_rch)
+                    _reset_chapter_ids = None
+                    if _reset_chunk_ids:
+                        _reset_chapter_ids = [
+                            cid for cid in _reset_chunk_ids
+                            if str(cid).startswith(str(_rch) + "_")
+                        ]
+                        if not _reset_chapter_ids:
+                            continue
+                    _reset_ids = _rs_sched.reset_rescue_budget(
+                        _rch, chunk_ids=_reset_chapter_ids)
                     print(f"♻️ [Rescue] {_rch}: 已复位 {len(_reset_ids)} 个块的救援/重试预算")
             _rs_rows = _rs_sched.conn.execute(
                 "SELECT DISTINCT chapter_id, state, chunk_id FROM chunk_tasks "
@@ -17415,7 +17466,8 @@ def _classify_backend_error(exc: Exception) -> Dict[str, Any]:
     try:
         from src.judges.typesafe_backend import classify_backend_error as _shared_classify
         _shared = _shared_classify(exc, sdk_available=_TYPESAFE_EXC_AVAILABLE)
-        if _shared.get("category") in ("model_access", "request_schema"):
+        if _shared.get("category") in (
+                "model_access", "request_schema", "quota_exhausted"):
             return _shared
     except Exception:
         pass
@@ -20756,6 +20808,21 @@ def _normalize_chapter_notes_once(text: str, start_num: int = 1):
         cluster_keys.pop(rj, None)
         return True
 
+    def _force_union(ri, rj):
+        # A shared explicit headword is stronger evidence than the narrower
+        # merge-key bridge check below.  Without this, three paraphrases such
+        # as ``“穆阿迪布”…`` can be pairwise duplicates while the middle pair
+        # prevents any transitive merge, leaving lint failures after
+        # notes-normalize.
+        if ri == rj:
+            return False
+        parent[rj] = ri
+        merged = dict(cluster_keys.get(ri, {}))
+        merged.update(cluster_keys.get(rj, {}))
+        cluster_keys[ri] = merged
+        cluster_keys.pop(rj, None)
+        return True
+
     # 1a) 同词条合并：同一章内同一术语的多种注释写法只保留一条。
     # 分块翻译会在不同 chunk 各自加注；merge 后再按章归并，避免成书出现
     # "门泰特 ×17" 这类重复条目。跨章各留一条，保持章内自包含。
@@ -20784,12 +20851,20 @@ def _normalize_chapter_notes_once(text: str, start_num: int = 1):
             # the same explanation may have been emitted in two carriers.
             ki = _note_merge_key(cand[i]['content'])
             kj = _note_merge_key(cand[j]['content'])
+            same_headword = (
+                _note_key(cand[i]['content'])
+                and _note_key(cand[i]['content']) == _note_key(cand[j]['content'])
+            )
             if not _note_keys_compatible(
                     cand[i]['content'], cand[j]['content'], ki, kj):
-                continue
+                if not same_headword:
+                    continue
             if _note_is_dup(cand[i]['content'], cand[j]['content'], stop=_stop):
                 ri, rj = _root(i), _root(j)
-                _union(ri, rj)
+                if same_headword:
+                    _force_union(ri, rj)
+                else:
+                    _union(ri, rj)
     clusters = {}
     for i in range(len(cand)):
         clusters.setdefault(_root(i), []).append(i)
@@ -21321,6 +21396,26 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sha256_prefix(path: Path, size: int) -> str:
+    """Return the SHA-256 digest of the first ``size`` bytes of a file.
+
+    Run logs are append-only across the shell's child commands.  A seal written
+    by one command therefore remains valid when a later command appends more
+    events, as long as every sealed byte is unchanged.  Hashing an explicit
+    byte prefix makes that guarantee testable without trusting file mtimes.
+    """
+    digest = hashlib.sha256()
+    remaining = max(0, int(size))
+    with open(path, "rb") as handle:
+        while remaining > 0:
+            block = handle.read(min(1024 * 1024, remaining))
+            if not block:
+                break
+            digest.update(block)
+            remaining -= len(block)
+    return digest.hexdigest()
+
+
 def _redact_text(value: str, limit: int = 2000) -> str:
     text = str(value)
     for pattern in _SECRET_PATTERNS:
@@ -21567,6 +21662,8 @@ class TaskLogger:
         """Write the post-run hash envelope for both log streams."""
         if not self.jsonl_path.exists() and not self.text_path.exists():
             return None
+        jsonl_bytes = self.jsonl_path.stat().st_size if self.jsonl_path.exists() else 0
+        log_bytes = self.text_path.stat().st_size if self.text_path.exists() else 0
         payload = {
             "run_id": self.run_id,
             "command": self.command,
@@ -21576,8 +21673,10 @@ class TaskLogger:
             if self.jsonl_path.is_relative_to(self.root) else str(self.jsonl_path),
             "log": str(self.text_path.relative_to(self.root))
             if self.text_path.is_relative_to(self.root) else str(self.text_path),
-            "jsonl_sha256": sha256_file(self.jsonl_path) if self.jsonl_path.exists() else "",
-            "log_sha256": sha256_file(self.text_path) if self.text_path.exists() else "",
+            "jsonl_sha256": sha256_prefix(self.jsonl_path, jsonl_bytes) if self.jsonl_path.exists() else "",
+            "jsonl_bytes": jsonl_bytes,
+            "log_sha256": sha256_prefix(self.text_path, log_bytes) if self.text_path.exists() else "",
+            "log_bytes": log_bytes,
             "seq_last": self._seq or 0,
             "last_ts": self._last_ts,
         }
@@ -21758,7 +21857,7 @@ def prune_runs(log_dir: Path, keep_last: int = 30, keep_days: int = 90,
 __all__ = [
     "CST", "RUN_ID_ENV", "LOG_ENABLED_ENV", "LOG_DIR_ENV",
     "DEFAULT_LOG_DIR", "TaskLoggingError", "TaskLogger",
-    "now_iso", "new_run_id", "sha256_file", "make_logger",
+    "now_iso", "new_run_id", "sha256_file", "sha256_prefix", "make_logger",
     "set_active_logger", "get_active_logger", "log_event", "log_artifact",
     "validate_jsonl", "prune_runs",
 ]
@@ -26361,7 +26460,9 @@ def _run_evidence(root: Path, run_id: Optional[str]) -> Dict[str, Any]:
         "log_path": _rel(root, text) if text else "",
         "seal_path": _rel(root, seal) if seal else "",
         "jsonl_sha256": str((sealed or {}).get("jsonl_sha256") or ""),
+        "jsonl_bytes": int((sealed or {}).get("jsonl_bytes") or 0),
         "log_sha256": str((sealed or {}).get("log_sha256") or ""),
+        "log_bytes": int((sealed or {}).get("log_bytes") or 0),
         "sealed": bool(sealed),
         "sealed_at": str((sealed or {}).get("sealed_at") or ""),
         "seq_last": int((sealed or {}).get("seq_last") or 0),
@@ -26511,7 +26612,9 @@ def update_manifest_run_evidence(root: Path, manifest_path: Path,
         "log_path": _rel(root, log_dir / f"{run_id}.log"),
         "seal_path": _rel(root, log_dir / f"{run_id}.sha256"),
         "jsonl_sha256": str(seal.get("jsonl_sha256") or ""),
+        "jsonl_bytes": int(seal.get("jsonl_bytes") or 0),
         "log_sha256": str(seal.get("log_sha256") or ""),
+        "log_bytes": int(seal.get("log_bytes") or 0),
         "sealed": True,
         "sealed_at": str(seal.get("sealed_at") or ""),
         "seq_last": int(seal.get("seq_last") or 0),
@@ -26797,15 +26900,57 @@ def _check_run_evidence(root: Path, manifest: Dict[str, Any],
     if sealed:
         seal = _read_json(seal_path) or {}
         actual = sha256_file(jsonl)
-        if str(seal.get("jsonl_sha256") or "") != actual:
+        actual_bytes = jsonl.stat().st_size
+
+        def _seal_matches(record: Dict[str, Any], kind: str) -> Tuple[bool, str]:
+            expected = str(record.get("jsonl_sha256") or "")
+            if not expected:
+                return False, "missing_hash"
+            expected_bytes = int(record.get("jsonl_bytes") or 0)
+            if expected_bytes:
+                if actual_bytes < expected_bytes:
+                    return False, f"{kind}_truncated"
+                if sha256_prefix(jsonl, expected_bytes) != expected:
+                    return False, f"{kind}_prefix_changed"
+                return True, ("exact" if actual_bytes == expected_bytes
+                              else f"{kind}_append_only")
+            # Legacy seals have no byte count: require an exact match so a
+            # silently truncated or rewritten file can never pass.
+            return (actual == expected), ("exact" if actual == expected
+                                          else f"{kind}_hash_changed")
+
+        seal_ok, seal_kind = _seal_matches(seal, "seal")
+        evidence_ok, evidence_kind = (True, "absent")
+        if evidence.get("jsonl_sha256"):
+            evidence_ok, evidence_kind = _seal_matches(evidence, "manifest")
+        if not seal_ok:
             items.append(_item("run.seal", "fail", "封存哈希与 JSONL 不一致",
-                               expected=seal.get("jsonl_sha256"), actual=actual))
-        elif evidence.get("jsonl_sha256") and \
-                evidence.get("jsonl_sha256") != actual:
+                               expected=seal.get("jsonl_sha256"), actual=actual,
+                               expected_bytes=seal.get("jsonl_bytes"),
+                               actual_bytes=actual_bytes,
+                               reason=seal_kind))
+        elif not evidence_ok:
             items.append(_item("run.seal", "fail", "manifest 封存哈希已过期",
-                               expected=evidence.get("jsonl_sha256"), actual=actual))
+                               expected=evidence.get("jsonl_sha256"), actual=actual,
+                               expected_bytes=evidence.get("jsonl_bytes"),
+                               actual_bytes=actual_bytes,
+                               reason=evidence_kind))
         else:
-            items.append(_item("run.seal", "pass", "封存哈希一致"))
+            extended = seal_kind.endswith("_append_only") or evidence_kind.endswith("_append_only")
+            recorded_sizes = [
+                int(value) for value in
+                (seal.get("jsonl_bytes"), evidence.get("jsonl_bytes"))
+                if int(value or 0) > 0
+            ]
+            base_bytes = min(recorded_sizes) if recorded_sizes else 0
+            items.append(_item(
+                "run.seal", "pass",
+                ("封存哈希一致" if not extended
+                 else "封存前缀一致（封存后仅追加审计事件）"),
+                sealed_bytes=base_bytes,
+                actual_bytes=actual_bytes,
+                extension_bytes=max(0, actual_bytes - base_bytes),
+            ))
     else:
         status = "fail" if require_sealed else "warn"
         items.append(_item("run.seal", status,
@@ -31356,7 +31501,11 @@ def apply_completed_name_repair(
             else:
                 report = critic_fn(fresh, source_text, raw_text, after, pipeline)
         except Exception as exc:  # noqa: BLE001 - no final has been written yet
-            action.update(status="kept", reason="critic_reaudit_failed:%s" % exc)
+            action.update(
+                status="failed",
+                reason="critic_reaudit_failed:%s" % exc,
+            )
+            result["errors"].append("%s:critic_reaudit_failed:%s" % (cid, exc))
             continue
         critic_reasons = _validate_reauthored_report(report, proposed_text=after)
         if critic_reasons:
@@ -33158,6 +33307,9 @@ def _authority_markdown(result: Dict[str, Any]) -> str:
 
 ALIGNMENT_SCHEMA_VERSION = 1
 _ALIGN_ANNOTATION_RE = re.compile(r"[（(][^（()）]*[）)]")
+_ALIGN_PLAIN_TARGET_RE = re.compile(r"^[\u4e00-\u9fff·]+$")
+_ALIGN_CONSENSUS_MARKER_RE = re.compile(
+    r"Round158 duplicate source form consensus:\s*([^|]+?)\s*->\s*([^|]+?)(?:\s*\||$)")
 
 
 def _align_now_iso() -> str:
@@ -33214,6 +33366,187 @@ def _align_json_dump(values: Iterable[str]) -> str:
             seen.add(key)
             deduped.append(text)
     return json.dumps(deduped, ensure_ascii=False)
+
+
+def _align_plain_target(value: str) -> bool:
+    return bool(_ALIGN_PLAIN_TARGET_RE.fullmatch(str(value or "").strip()))
+
+
+def _align_form_corpus_evidence(output_dir: Path, targets: Iterable[str]) -> Dict[str, dict]:
+    """Count each candidate form in delivered finals (footnote definitions excluded)."""
+    wanted = [str(value).strip() for value in targets if str(value).strip()]
+    evidence = {
+        target: {"chunks": [], "occurrences": 0}
+        for target in wanted
+    }
+    for path in sorted(Path(output_dir).glob("ch*/*_final.json")):
+        payload = _align_read_json(path) or {}
+        text = body_before_footnotes(str(payload.get("text") or ""))
+        if not text:
+            continue
+        chunk_id = path.stem[:-6] if path.stem.endswith("_final") else path.stem
+        for target in wanted:
+            occurrences = text.count(target)
+            if not occurrences:
+                continue
+            evidence[target]["chunks"].append(chunk_id)
+            evidence[target]["occurrences"] += occurrences
+    return evidence
+
+
+def _align_duplicate_form_action(
+    *,
+    rows: List[dict],
+    registry_row: dict,
+    alias: str,
+    records: List[dict],
+    decisions: List[dict],
+    evidence: Dict[str, dict],
+    output_dir: Path,
+) -> Tuple[Optional[dict], str]:
+    """Plan a corpus-backed alignment for duplicate case/spacing Decisions."""
+    targets = sorted(evidence)
+    if len(targets) < 2 or not all(_align_plain_target(target) for target in targets):
+        return None, "non_plain_duplicate_targets"
+    for index, left in enumerate(targets):
+        for right in targets[index + 1:]:
+            if _similarity(left, right) < FORM_ALIGN_SIMILARITY:
+                return None, "non_form_equivalent_targets"
+    ranked = sorted(
+        targets,
+        key=lambda target: (
+            len(evidence[target]["chunks"]),
+            evidence[target]["occurrences"],
+            -len(target),
+        ),
+        reverse=True,
+    )
+    winner = ranked[0]
+    winner_chunks = len(evidence[winner]["chunks"])
+    if winner_chunks < 3 or evidence[winner]["occurrences"] < 3:
+        return None, "insufficient_corpus_majority"
+    minority_limit = max(1, winner_chunks // 4)
+    losers = ranked[1:]
+    if any(len(evidence[loser]["chunks"]) > minority_limit for loser in losers):
+        return None, "corpus_majority_too_narrow"
+
+    canonical = str(registry_row.get("canonical_name") or "")
+    if canonical not in targets:
+        return None, "registry_canonical_is_third_form"
+    conflicting = [
+        decision for decision in decisions
+        if str(decision.get("translation") or "").strip() in targets
+        and str(decision.get("translation") or "").strip() != winner
+    ]
+    if not conflicting:
+        return None, "no_stale_decision_form"
+    if any(int(decision.get("locked") or 0) for decision in conflicting):
+        return None, "minority_decision_locked"
+    if canonical != winner and int(registry_row.get("pending_review") or 0):
+        return None, "pending_registry_row_requires_review"
+    target_owner = _align_target_owner(
+        rows, winner, int(registry_row.get("id") or 0))
+    if target_owner is not None:
+        return None, f"winner_registry_owned:{target_owner}"
+
+    stale_chunks = sorted({
+        chunk_id
+        for loser in losers
+        for chunk_id in evidence[loser]["chunks"]
+    })
+    action = {
+        "action": "align_decision_forms",
+        "registry_id": int(registry_row.get("id") or 0),
+        "alias": alias,
+        "canonical_before": canonical,
+        "canonical_after": winner,
+        "decision_ids": [int(decision["id"]) for decision in conflicting],
+        "decisions_before": [
+            {"decision_id": int(decision["id"]),
+             "source_key": str(decision.get("source_key") or ""),
+             "translation": str(decision.get("translation") or "")}
+            for decision in conflicting
+        ],
+        "new_translation": winner,
+        "corpus_evidence": {
+            target: {
+                "chunks": len(evidence[target]["chunks"]),
+                "occurrences": evidence[target]["occurrences"],
+            }
+            for target in targets
+        },
+        "queued_chunks": stale_chunks,
+        "aliases_to_quarantine": ([canonical] if canonical != winner else []),
+        "reason": "duplicate_source_form_corpus_consensus",
+    }
+    return action, ""
+
+
+def _align_resolved_pending_review_actions(
+    *,
+    rows: List[dict],
+    decision_index: Dict[str, List[dict]],
+    output_dir: Path,
+) -> List[dict]:
+    """Clear a pending registry review only when a prior consensus fixed it.
+
+    This does not infer that arbitrary ``pending_review`` rows are safe.  It
+    trusts only the machine-readable marker written by
+    ``align_decision_forms`` and rechecks the Decision translations and the
+    delivered corpus at the current turn.
+    """
+    candidates: List[tuple[dict, str]] = []
+    canonicals: List[str] = []
+    canonical_keys: Counter = Counter(
+        _name_key(str(row.get("canonical_name") or "")) for row in rows)
+    for row in rows:
+        if not int(row.get("pending_review") or 0):
+            continue
+        canonical = str(row.get("canonical_name") or "").strip()
+        if not canonical or not _align_plain_target(canonical):
+            continue
+        if canonical_keys.get(_name_key(canonical), 0) != 1:
+            continue
+        markers = _ALIGN_CONSENSUS_MARKER_RE.findall(
+            str(row.get("review_reason") or ""))
+        if not markers:
+            continue
+        _old_form, aligned = markers[-1]
+        if _name_key(aligned) != _name_key(canonical):
+            continue
+        sources = [str(value) for value in row.get("source_names") or []]
+        if not sources:
+            continue
+        matched: List[dict] = []
+        for source in sources:
+            matched.extend(_decision_for_alias(source, decision_index))
+        translations = {
+            str(decision.get("translation") or "").strip()
+            for decision in matched
+            if str(decision.get("translation") or "").strip()
+        }
+        if not translations or any(
+                not _name_compatible(canonical, translation)
+                for translation in translations):
+            continue
+        candidates.append((row, canonical))
+        canonicals.append(canonical)
+    evidence = _align_form_corpus_evidence(output_dir, canonicals)
+    actions: List[dict] = []
+    for row, canonical in candidates:
+        chunks = len((evidence.get(canonical) or {}).get("chunks") or [])
+        if chunks < 3:
+            continue
+        actions.append({
+            "action": "clear_resolved_pending_review",
+            "registry_id": int(row.get("id") or 0),
+            "canonical_before": canonical,
+            "pending_review_before": 1,
+            "review_reason_before": str(row.get("review_reason") or ""),
+            "corpus_chunks": chunks,
+            "reason": "duplicate_source_form_consensus_resolved",
+        })
+    return actions
 
 
 def _align_table_exists(con: sqlite3.Connection, name: str) -> bool:
@@ -33348,6 +33681,7 @@ def build_name_authority_alignment(
     by_id = {int(row["id"]): row for row in rows}
     quarantine: Dict[int, Dict[str, Any]] = {}
     form_groups: Dict[Tuple[int, str], List[dict]] = {}
+    decision_form_actions: List[dict] = []
     manual: List[dict] = []
 
     def add_quarantine(registry_id: int, alias: str, record: dict,
@@ -33396,20 +33730,36 @@ def build_name_authority_alignment(
             manual.append({"registry_id": registry_id, "alias": alias,
                            "reason": "registry_row_missing"})
             continue
+        matched_decisions = _decision_for_alias(alias, decision_index)
         translations = {
-            str(record.get("decision_translation") or "").strip()
-            for record in records
-            if str(record.get("decision_translation") or "").strip()
+            str(decision.get("translation") or "").strip()
+            for decision in matched_decisions
+            if str(decision.get("translation") or "").strip()
         }
         owners = set()
         for record in records:
             owners.update(record.get("alias_registry_owners") or [])
         if len(translations) != 1:
-            manual.append({
-                "registry_id": registry_id, "alias": alias,
-                "reason": "ambiguous_decision_forms",
-                "decision_translations": sorted(translations),
-            })
+            evidence = _align_form_corpus_evidence(out_dir, translations)
+            action, reason = _align_duplicate_form_action(
+                rows=rows,
+                registry_row=row,
+                alias=alias,
+                records=records,
+                decisions=matched_decisions,
+                evidence=evidence,
+                output_dir=out_dir,
+            )
+            if action is not None:
+                decision_form_actions.append(action)
+            else:
+                manual.append({
+                    "registry_id": registry_id, "alias": alias,
+                    "reason": "ambiguous_decision_forms",
+                    "decision_translations": sorted(translations),
+                    "corpus_evidence": evidence,
+                    "blocked_reason": reason,
+                })
             continue
         target = next(iter(translations))
         if _name_key(target) == _name_key(row.get("canonical_name") or ""):
@@ -33564,6 +33914,12 @@ def build_name_authority_alignment(
             "reasons": list(dict.fromkeys(slot["reasons"])),
         })
     actions.extend(align_by_id.values())
+    actions.extend(decision_form_actions)
+    actions.extend(_align_resolved_pending_review_actions(
+        rows=rows,
+        decision_index=decision_index,
+        output_dir=out_dir,
+    ))
     actions.extend(variant_actions)
     # Apply alias removals before canonical renames on the same row: the rename
     # is guarded by the pre-plan canonical value, while quarantine only touches
@@ -33571,7 +33927,9 @@ def build_name_authority_alignment(
     action_order = {
         "quarantine_aliases": 0,
         "align_canonical": 1,
-        "register_locked_variant": 2,
+        "align_decision_forms": 2,
+        "clear_resolved_pending_review": 2,
+        "register_locked_variant": 3,
     }
     actions.sort(key=lambda item: (
         int(item.get("registry_id", 0)),
@@ -33584,6 +33942,9 @@ def build_name_authority_alignment(
     result["counts"] = {
         "quarantine_aliases": counts.get("quarantine_aliases", 0),
         "align_canonical": counts.get("align_canonical", 0),
+        "align_decision_forms": counts.get("align_decision_forms", 0),
+        "clear_resolved_pending_review": counts.get(
+            "clear_resolved_pending_review", 0),
         "register_locked_variant": counts.get("register_locked_variant", 0),
         "manual_review": len(manual),
     }
@@ -33778,7 +34139,8 @@ def align_name_authorities(
     eligible = [
         action for action in (plan.get("actions") or [])
         if action.get("action") in {
-            "quarantine_aliases", "align_canonical", "register_locked_variant",
+            "quarantine_aliases", "align_canonical", "align_decision_forms",
+            "clear_resolved_pending_review", "register_locked_variant",
         }
     ]
     result["write_attempted"] = bool(eligible)
@@ -33826,6 +34188,149 @@ def align_name_authorities(
                 out_action["status"] = "stale_canonical_changed"
                 result["actions"].append(out_action)
                 continue
+
+            if action.get("action") == "align_decision_forms":
+                winner = str(action.get("new_translation") or "").strip()
+                before_rows = action.get("decisions_before") or []
+                if not winner or not before_rows:
+                    out_action["status"] = "invalid_decision_plan"
+                    result["actions"].append(out_action)
+                    continue
+                if canonical != winner:
+                    winner_key = _name_key(winner)
+                    duplicate = None
+                    for other_id, other_canonical in con.execute(
+                            "SELECT id, canonical_name FROM entity_registry "
+                            "WHERE id!=?", (rid,)):
+                        if _name_key(other_canonical or "") == winner_key:
+                            duplicate = other_id
+                            break
+                    if duplicate:
+                        raise RuntimeError(
+                            f"decision_form_target_registry_conflict:{duplicate}")
+                for before in before_rows:
+                    did = int(before.get("decision_id") or 0)
+                    decision = con.execute(
+                        "SELECT source_key, translation, locked, reason "
+                        "FROM decision_db WHERE id=?", (did,)).fetchone()
+                    if not decision:
+                        raise RuntimeError(f"decision_form_row_missing:{did}")
+                    if int(decision["locked"] or 0):
+                        raise RuntimeError(f"decision_form_locked:{did}")
+                    if str(decision["source_key"]) != str(
+                            before.get("source_key") or ""):
+                        raise RuntimeError(f"decision_form_source_changed:{did}")
+                    if str(decision["translation"]) != str(
+                            before.get("translation") or ""):
+                        raise RuntimeError(
+                            f"decision_form_translation_changed:{did}")
+                    reason = str(decision["reason"] or "")
+                    marker = (
+                        "Round 158 duplicate source form consensus: "
+                        f"{decision['translation']} -> {winner}"
+                    )
+                    if marker not in reason:
+                        reason = (reason.rstrip() + " | " + marker).strip(" |")
+                    con.execute(
+                        "UPDATE decision_db SET translation=?, reason=? WHERE id=?",
+                        (winner, reason, did))
+
+                sources = _align_json_list(row["source_names"])
+                variants = _align_json_list(row["variant_names"])
+                quarantined = _align_json_list(row["quarantined_names"])
+                aliases_to_quarantine = [
+                    str(value) for value in
+                    action.get("aliases_to_quarantine") or []
+                    if str(value).strip()
+                ]
+                if aliases_to_quarantine:
+                    sources = _align_remove_alias(sources, aliases_to_quarantine)
+                    variants = _align_remove_alias(variants, aliases_to_quarantine)
+                    qkeys = {_phrase_key(value) for value in quarantined}
+                    for alias in aliases_to_quarantine:
+                        key = _phrase_key(alias)
+                        if key and key not in qkeys:
+                            quarantined.append(alias)
+                            qkeys.add(key)
+                assignments = ["canonical_name=?",
+                               "source_names=?", "quarantined_names=?"]
+                params: List[Any] = [
+                    winner, _align_json_dump(sources),
+                    _align_json_dump(quarantined)]
+                if "variant_names" in cols:
+                    assignments.append("variant_names=?")
+                    params.append(_align_json_dump(variants))
+                if "review_reason" in cols:
+                    old_reason = str(row["review_reason"] or "")
+                    note = (
+                        "Round158 duplicate source form consensus: "
+                        f"{canonical} -> {winner}"
+                    )
+                    assignments.append("review_reason=?")
+                    params.append(
+                        (old_reason + " | " if old_reason else "") + note)
+                if "updated_at" in cols:
+                    assignments.append("updated_at=CURRENT_TIMESTAMP")
+                params.append(rid)
+                con.execute(
+                    "UPDATE entity_registry SET " + ", ".join(assignments)
+                    + " WHERE id=?", tuple(params))
+
+                queued = [str(value) for value in action.get("queued_chunks") or []]
+                first = before_rows[0]
+                did = int(first.get("decision_id") or 0)
+                source_key = str(first.get("source_key") or "")
+                for chunk_id in queued:
+                    existing = con.execute(
+                        "SELECT decision_id, source_key FROM pending_backtrack "
+                        "WHERE chunk_id=?", (chunk_id,)).fetchone()
+                    if existing and (
+                            int(existing["decision_id"] or 0) != did
+                            or str(existing["source_key"]) != source_key):
+                        raise RuntimeError(
+                            f"decision_form_pending_conflict:{chunk_id}")
+                    con.execute(
+                        "INSERT INTO pending_backtrack (chunk_id, decision_id, "
+                        "source_key, queue_rounds, created_at, updated_at) "
+                        "VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) "
+                        "ON CONFLICT(chunk_id) DO UPDATE SET "
+                        "decision_id=excluded.decision_id, "
+                        "source_key=excluded.source_key, "
+                        "queue_rounds=COALESCE(pending_backtrack.queue_rounds,0)+1, "
+                        "updated_at=CURRENT_TIMESTAMP",
+                        (chunk_id, did, source_key))
+                out_action["status"] = "applied"
+                result["actions"].append(out_action)
+                continue
+
+            if action.get("action") == "clear_resolved_pending_review":
+                expected_reason = str(action.get("review_reason_before") or "")
+                if int(row["pending_review"] or 0) != 1:
+                    out_action["status"] = "stale_pending_review_changed"
+                    result["actions"].append(out_action)
+                    continue
+                if str(row["review_reason"] or "") != expected_reason:
+                    out_action["status"] = "stale_review_reason_changed"
+                    result["actions"].append(out_action)
+                    continue
+                note = (
+                    "Round158 duplicate source form consensus: "
+                    "pending review resolved by Decision and corpus evidence"
+                )
+                new_reason = (expected_reason.rstrip() + " | " + note).strip(" |")
+                assignments = ["pending_review=0", "review_reason=?"]
+                params: List[Any] = [new_reason]
+                if "updated_at" in cols:
+                    assignments.append("updated_at=CURRENT_TIMESTAMP")
+                params.append(rid)
+                con.execute(
+                    "UPDATE entity_registry SET " + ", ".join(assignments)
+                    + " WHERE id=? AND pending_review=1 AND review_reason=?",
+                    tuple(params + [expected_reason]))
+                out_action["status"] = "applied"
+                result["actions"].append(out_action)
+                continue
+
             if action.get("action") == "align_canonical":
                 target = str(action.get("canonical_after") or "")
                 target_key = _name_key(target)
@@ -33993,6 +34498,16 @@ def _align_markdown(result: Dict[str, Any]) -> str:
                 detail = (
                     f"{action.get('variant')} ← decision "
                     f"{','.join(str(x) for x in action.get('decision_ids') or [])}")
+            elif action.get("action") == "align_decision_forms":
+                detail = (
+                    f"decision "
+                    f"{','.join(str(x) for x in action.get('decision_ids') or [])} "
+                    f"→ {action.get('new_translation')}; queued="
+                    f"{','.join(action.get('queued_chunks') or []) or '-'}")
+            elif action.get("action") == "clear_resolved_pending_review":
+                detail = (
+                    f"pending_review 1→0; corpus_chunks="
+                    f"{action.get('corpus_chunks')}")
             else:
                 detail = f"{action.get('canonical_before')} → {action.get('canonical_after')}"
             lines.append(
@@ -34008,7 +34523,7 @@ def _align_markdown(result: Dict[str, Any]) -> str:
         lines.extend(f"- `{error}`" for error in result["errors"])
     lines.extend([
         "",
-        "本工具不改正文、不改 Decision DB；只隔离派生 registry 的冲突别名。",
+        "本工具不改正文；仅 corpus-consensus 动作会同步 Decision DB 与派生 registry。",
         "任何 ambiguous / multi-owner 项均保持原样。",
         "",
     ])
@@ -43381,6 +43896,7 @@ def classify_backend_error(
 
     Categories used by Round 145:
       auth          — 401/403 explicitly about an invalid API key/token
+      quota_exhausted— terminal account balance/quota exhaustion (no retry)
       model_access  — 403 explicitly about permission to use a model
       request_schema— 400 (question count, instructions type, etc.)
       rate_limit / timeout / network / dependency / parse / server / unknown
@@ -43407,11 +43923,25 @@ def classify_backend_error(
         "api key", "api_key", "invalid token", "invalid api",
         "令牌无效", "密钥无效", "鉴权失败", "认证失败", "authentication",
     ))
+    quota_exhausted_words = any(k in text for k in (
+        "余额已耗尽", "资源包余额", "配额已耗尽", "额度已用尽",
+        "insufficient balance", "quota exhausted", "not enough credit",
+        "credit balance", "payment required",
+    ))
     model_name_error = any(k in text for k in (
         "模型名称", "模型不存在", "model name", "model not found",
         "unknown model", "invalid model",
     ))
 
+    if quota_exhausted_words:
+        # A degraded-balance 400 is terminal: retrying every chunk only burns
+        # time and produces the same misleading schema diagnosis.
+        return {
+            "category": "quota_exhausted",
+            "retryable": False,
+            "msg": str(exc)[:200],
+            "action": "充值/切换 MoArk 资源包后重启；本轮应 fail-closed 使用旧校准证据",
+        }
     if has_403 and model_words and permission_words and not key_words:
         return {
             "category": "model_access",
@@ -44181,6 +44711,7 @@ class FallbackBackend(SystemOneBackend):
         # circuit breakers (a restart is required after fixing key/model access).
         self._jev_auth_dead = False
         self._jev_model_dead = False
+        self._jev_quota_dead = False
         self._jev_disabled_reason = ""
 
     def primary_available(self) -> bool:
@@ -44189,6 +44720,7 @@ class FallbackBackend(SystemOneBackend):
             self.primary.api_key
             and not self._jev_auth_dead
             and not self._jev_model_dead
+            and not self._jev_quota_dead
         )
 
     def evaluate(self, state, questions, *, model=None, timeout=None):
@@ -44239,6 +44771,14 @@ class FallbackBackend(SystemOneBackend):
                         )
                     self._jev_model_dead = True
                     self._jev_disabled_reason = "MoArk 模型访问被拒 (model_access)"
+                elif diag["category"] == "quota_exhausted":
+                    if not self._jev_quota_dead:
+                        logger.warning(
+                            "MoArk 资源包余额/quota 已耗尽（%s）；本进程内不再尝试主后端",
+                            e,
+                        )
+                    self._jev_quota_dead = True
+                    self._jev_disabled_reason = "MoArk 资源包余额已耗尽 (quota_exhausted)"
                 else:
                     logger.info(f"MoArk 不可用: {type(e).__name__}: {e}")
                 if not self.allow_openai_fallback:
@@ -44258,7 +44798,7 @@ class FallbackBackend(SystemOneBackend):
                     except Exception as e2:
                         logger.info(f"OpenAICompat 不可用，降级到 Mock: {e2}")
         else:
-            if self._jev_auth_dead or self._jev_model_dead:
+            if self._jev_auth_dead or self._jev_model_dead or self._jev_quota_dead:
                 logger.debug("Jev 跳过：%s", self._jev_disabled_reason or "鉴权/依赖不可用")
             else:
                 logger.debug("Jev 跳过：无 MOARK_API_KEY / TYPESAFE_API_KEY")

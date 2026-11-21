@@ -12,7 +12,10 @@ from src.judges.typesafe_backend import (
     classify_backend_error,
 )
 from src.judges.verdict import normalize_confidence_source
-from src.agents.critic_agent import _classify_backend_error as classify_critic_error
+from src.agents.critic_agent import (
+    CriticAgent,
+    _classify_backend_error as classify_critic_error,
+)
 from tests._round145_sdk_stub import install as install_sdk_stub
 
 
@@ -62,6 +65,16 @@ class TestErrorTaxonomy:
     def test_request_schema_400(self):
         out = classify_backend_error(RuntimeError("HTTP 400: too many questions"))
         assert out["category"] == "request_schema"
+
+    def test_exhausted_resource_pack_is_terminal_quota(self):
+        message = (
+            "POST https://api.moark.com/v1/systemone: 400 "
+            "您绑定的资源包余额已耗尽，无法继续使用。"
+        )
+        out = classify_backend_error(RuntimeError(message))
+        assert out["category"] == "quota_exhausted"
+        assert out["retryable"] is False
+        assert classify_critic_error(RuntimeError(message))["category"] == "quota_exhausted"
 
     def test_model_name_400_is_model_access(self):
         out = classify_backend_error(
@@ -158,6 +171,67 @@ class TestCircuitAndFailClosed:
         with pytest.raises(RuntimeError, match="所有 backend 都不可用"):
             backend.evaluate("state", {"q": {"type": "noul"}})
         assert fake.calls == 1
+
+    def test_exhausted_resource_pack_trips_quota_breaker(self):
+        fake = _FakePrimary(exc=RuntimeError(
+            "400 您绑定的资源包余额已耗尽，无法继续使用。"))
+        backend = FallbackBackend(allow_openai_fallback=False, allow_mock=False)
+        backend.primary = fake
+        with pytest.raises(RuntimeError, match="所有 backend 都不可用"):
+            backend.evaluate("state", {"q": {"type": "noul"}})
+        assert backend._jev_quota_dead is True
+        with pytest.raises(RuntimeError, match="所有 backend 都不可用"):
+            backend.evaluate("state", {"q": {"type": "noul"}})
+        assert fake.calls == 1
+
+    def test_critic_direct_primary_sets_quota_breaker(self, monkeypatch):
+        fake = _FakePrimary(exc=RuntimeError(
+            "POST https://api.moark.com/v1/systemone: 400 "
+            "您绑定的资源包余额已耗尽，无法继续使用。"))
+        backend = FallbackBackend(allow_openai_fallback=False, allow_mock=False)
+        backend.primary = fake
+        monkeypatch.setattr("src.judges.get_backend", lambda: backend)
+        critic = CriticAgent.__new__(CriticAgent)
+
+        with pytest.raises(RuntimeError, match="quota_exhausted"):
+            critic.process_chunk(
+                "ch01_chunk001", "source", "raw", "润色稿", {},
+                allow_legacy_fallback=False,
+            )
+
+        assert backend._jev_quota_dead is True
+        assert fake.calls == 1
+
+    def test_critic_direct_primary_preserves_terminal_diagnostic(
+            self, monkeypatch):
+        fake = _FakePrimary(exc=RuntimeError("DNS resolution failed"))
+        backend = FallbackBackend(allow_openai_fallback=False, allow_mock=False)
+        backend.primary = fake
+        monkeypatch.setattr("src.judges.get_backend", lambda: backend)
+        critic = CriticAgent.__new__(CriticAgent)
+
+        with pytest.raises(RuntimeError, match="DNS resolution failed"):
+            critic.process_chunk(
+                "ch01_chunk001", "source", "raw", "润色稿", {},
+                allow_legacy_fallback=False,
+            )
+
+    def test_critic_quota_breaker_stays_terminal_on_retry(self, monkeypatch):
+        fake = _FakePrimary(result={"ok": object()})
+        backend = FallbackBackend(allow_openai_fallback=False, allow_mock=False)
+        backend.primary = fake
+        backend._jev_quota_dead = True
+        backend._jev_disabled_reason = "MoArk 资源包余额已耗尽 (quota_exhausted)"
+        monkeypatch.setattr("src.judges.get_backend", lambda: backend)
+        critic = CriticAgent.__new__(CriticAgent)
+
+        with pytest.raises(RuntimeError, match="quota_exhausted"):
+            critic.process_chunk(
+                "ch01_chunk001", "source", "raw", "润色稿", {},
+                allow_legacy_fallback=False,
+            )
+
+        assert fake.calls == 0
 
     def test_fallback_false_does_not_mask_network_failure(self):
         fake = _FakePrimary(exc=RuntimeError("DNS resolution failed"))

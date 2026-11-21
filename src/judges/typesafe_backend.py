@@ -84,6 +84,7 @@ def classify_backend_error(
 
     Categories used by Round 145:
       auth          — 401/403 explicitly about an invalid API key/token
+      quota_exhausted— terminal account balance/quota exhaustion (no retry)
       model_access  — 403 explicitly about permission to use a model
       request_schema— 400 (question count, instructions type, etc.)
       rate_limit / timeout / network / dependency / parse / server / unknown
@@ -110,11 +111,25 @@ def classify_backend_error(
         "api key", "api_key", "invalid token", "invalid api",
         "令牌无效", "密钥无效", "鉴权失败", "认证失败", "authentication",
     ))
+    quota_exhausted_words = any(k in text for k in (
+        "余额已耗尽", "资源包余额", "配额已耗尽", "额度已用尽",
+        "insufficient balance", "quota exhausted", "not enough credit",
+        "credit balance", "payment required",
+    ))
     model_name_error = any(k in text for k in (
         "模型名称", "模型不存在", "model name", "model not found",
         "unknown model", "invalid model",
     ))
 
+    if quota_exhausted_words:
+        # A degraded-balance 400 is terminal: retrying every chunk only burns
+        # time and produces the same misleading schema diagnosis.
+        return {
+            "category": "quota_exhausted",
+            "retryable": False,
+            "msg": str(exc)[:200],
+            "action": "充值/切换 MoArk 资源包后重启；本轮应 fail-closed 使用旧校准证据",
+        }
     if has_403 and model_words and permission_words and not key_words:
         return {
             "category": "model_access",
@@ -923,6 +938,7 @@ class FallbackBackend(SystemOneBackend):
         # circuit breakers (a restart is required after fixing key/model access).
         self._jev_auth_dead = False
         self._jev_model_dead = False
+        self._jev_quota_dead = False
         self._jev_disabled_reason = ""
 
     def primary_available(self) -> bool:
@@ -931,6 +947,7 @@ class FallbackBackend(SystemOneBackend):
             self.primary.api_key
             and not self._jev_auth_dead
             and not self._jev_model_dead
+            and not self._jev_quota_dead
         )
 
     def evaluate(self, state, questions, *, model=None, timeout=None):
@@ -981,6 +998,14 @@ class FallbackBackend(SystemOneBackend):
                         )
                     self._jev_model_dead = True
                     self._jev_disabled_reason = "MoArk 模型访问被拒 (model_access)"
+                elif diag["category"] == "quota_exhausted":
+                    if not self._jev_quota_dead:
+                        logger.warning(
+                            "MoArk 资源包余额/quota 已耗尽（%s）；本进程内不再尝试主后端",
+                            e,
+                        )
+                    self._jev_quota_dead = True
+                    self._jev_disabled_reason = "MoArk 资源包余额已耗尽 (quota_exhausted)"
                 else:
                     logger.info(f"MoArk 不可用: {type(e).__name__}: {e}")
                 if not self.allow_openai_fallback:
@@ -1000,7 +1025,7 @@ class FallbackBackend(SystemOneBackend):
                     except Exception as e2:
                         logger.info(f"OpenAICompat 不可用，降级到 Mock: {e2}")
         else:
-            if self._jev_auth_dead or self._jev_model_dead:
+            if self._jev_auth_dead or self._jev_model_dead or self._jev_quota_dead:
                 logger.debug("Jev 跳过：%s", self._jev_disabled_reason or "鉴权/依赖不可用")
             else:
                 logger.debug("Jev 跳过：无 MOARK_API_KEY / TYPESAFE_API_KEY")
